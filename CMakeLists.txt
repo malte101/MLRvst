@@ -31,7 +31,7 @@ juce_add_plugin(mlrVST
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
-    COPY_PLUGIN_AFTER_BUILD TRUE
+    COPY_PLUGIN_AFTER_BUILD FALSE
     
     PLUGIN_MANUFACTURER_CODE Mlrx
     PLUGIN_CODE Mlrv
@@ -52,9 +52,8 @@ juce_add_plugin(mlrVST
     # Plugin channel configurations
     PLUGIN_CHANNEL_CONFIGURATIONS {2, 2}  # Stereo in, stereo out
     
-    # System-wide installation paths (requires sudo for writing)
-    VST3_COPY_DIR "/Library/Audio/Plug-Ins/VST3"
-    AU_COPY_DIR "/Library/Audio/Plug-Ins/Components"
+    # Keep build outputs in the local artefacts directory.
+    # Install/copy to system plugin folders is a separate explicit step.
 )
 
 # Source files
@@ -186,13 +185,13 @@ message(STATUS "  ✓ VST3")
 message(STATUS "  ✓ AU (Audio Unit)")
 message(STATUS "")
 if(APPLE)
-    message(STATUS "macOS Installation Paths (system-wide):")
-    message(STATUS "  VST3: /Library/Audio/Plug-Ins/VST3/mlrVST.vst3")
-    message(STATUS "  AU:   /Library/Audio/Plug-Ins/Components/mlrVST.component")
-    message(STATUS "  App:  /Applications/mlrVST.app")
+    message(STATUS "macOS build outputs:")
+    message(STATUS "  VST3: ${CMAKE_BINARY_DIR}/mlrVST_artefacts/Release/VST3/mlrVST.vst3")
+    message(STATUS "  AU:   ${CMAKE_BINARY_DIR}/mlrVST_artefacts/Release/AU/mlrVST.component")
     message(STATUS "")
-    message(STATUS "Note: System-wide installation requires admin privileges")
-    message(STATUS "      Run: sudo cmake --build build --target install")
+    message(STATUS "To install system-wide manually (admin required):")
+    message(STATUS "  sudo cp -R ${CMAKE_BINARY_DIR}/mlrVST_artefacts/Release/VST3/mlrVST.vst3 /Library/Audio/Plug-Ins/VST3/")
+    message(STATUS "  sudo cp -R ${CMAKE_BINARY_DIR}/mlrVST_artefacts/Release/AU/mlrVST.component /Library/Audio/Plug-Ins/Components/")
     message(STATUS "")
     message(STATUS "Build artifacts will be in:")
     message(STATUS "  ${CMAKE_BINARY_DIR}/mlrVST_artefacts/")
