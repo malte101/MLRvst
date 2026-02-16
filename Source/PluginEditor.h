@@ -1,0 +1,665 @@
+/*
+  ==============================================================================
+
+    PluginEditor.h
+    Modern Comprehensive UI for mlrVST
+
+  ==============================================================================
+*/
+
+#pragma once
+
+#include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_gui_basics/juce_gui_basics.h>
+#include <array>
+#include "PluginProcessor.h"
+#include "StepSequencerDisplay.h"
+
+//==============================================================================
+/**
+ * WaveformDisplay - Shows waveform with playback position
+ */
+class WaveformDisplay : public juce::Component
+{
+public:
+    WaveformDisplay();
+    
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    
+    void setAudioBuffer(const juce::AudioBuffer<float>& buffer, double sampleRate);
+    void setPlaybackPosition(double normalizedPosition);
+    void setGrainWindowOverlay(bool enabled, double windowNorm);
+    void setGrainMarkerPositions(const std::array<float, 8>& positions,
+                                 const std::array<float, 8>& pitchNorms);
+    void setGrainHudOverlay(bool enabled,
+                            const juce::String& lineA,
+                            const juce::String& lineB,
+                            float density,
+                            float spread,
+                            float emitter,
+                            float pitchSemitones,
+                            float arpDepth,
+                            float pitchJitterSemitones);
+    void setLoopPoints(int startCol, int endCol, int maxCols);
+    void setSliceMarkers(const std::array<int, 16>& normalSlices,
+                         const std::array<int, 16>& transientSlices,
+                         int totalSamples,
+                         bool transientModeActive);
+    void setWaveformColor(juce::Colour color);
+    void clear();
+    
+private:
+    std::vector<float> thumbnail;
+    double playbackPosition = 0.0;
+    int loopStart = 0;
+    int loopEnd = 16;
+    int maxColumns = 16;
+    bool hasAudio = false;
+    juce::Colour waveformColor = juce::Colour(0xff8cb8ff);  // Brighter default blue
+    std::array<int, 16> normalSliceSamples{};
+    std::array<int, 16> transientSliceSamples{};
+    int waveformTotalSamples = 0;
+    bool transientSlicesActive = false;
+    bool grainWindowOverlayEnabled = false;
+    double grainWindowNorm = 0.0;
+    std::array<float, 8> grainMarkerPositions {};
+    std::array<float, 8> grainMarkerPitchNorms {};
+    bool grainHudOverlayEnabled = false;
+    juce::String grainHudLineA;
+    juce::String grainHudLineB;
+    float grainHudDensity = 0.0f;
+    float grainHudSpread = 0.0f;
+    float grainHudEmitter = 0.0f;
+    float grainHudPitchSemitones = 0.0f;
+    float grainHudArpDepth = 0.0f;
+    float grainHudPitchJitterSemitones = 0.0f;
+    
+    void generateThumbnail(const juce::AudioBuffer<float>& buffer);
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(WaveformDisplay)
+};
+
+//==============================================================================
+/**
+ * FXStripControl - Filter controls for each strip (FX tab)
+ */
+class FXStripControl : public juce::Component,
+                       public juce::Timer
+{
+public:
+    FXStripControl(int idx, MlrVSTAudioProcessor& p);
+    
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void timerCallback() override;
+    void updateFromEngine();
+    
+private:
+    int stripIndex;
+    MlrVSTAudioProcessor& processor;
+    juce::Colour stripColor;
+    
+    juce::Label stripLabel;
+    juce::ToggleButton filterEnableButton;
+    juce::Slider filterFreqSlider;
+    juce::Slider filterResSlider;
+    juce::ComboBox filterTypeBox;
+    juce::Label filterFreqLabel;
+    juce::Label filterResLabel;
+    juce::Label filterTypeLabel;
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FXStripControl)
+};
+
+//==============================================================================
+/**
+ * StripControl - Compact horizontal strip with overlaid LED grid
+ */
+class StripControl : public juce::Component,
+                     public juce::Timer
+{
+public:
+    StripControl(int stripIndex, MlrVSTAudioProcessor& p);
+    
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void timerCallback() override;
+    
+    void updateFromEngine();
+    
+    class ColoredKnobLookAndFeel : public juce::LookAndFeel_V4
+    {
+    public:
+        void setKnobColor(juce::Colour color) { knobColor = color; }
+        
+        void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height,
+                            float sliderPos, float rotaryStartAngle, float rotaryEndAngle,
+                            juce::Slider& /*slider*/) override
+        {
+            auto radius = juce::jmin(width / 2, height / 2) - 4.0f;
+            auto centreX = x + width * 0.5f;
+            auto centreY = y + height * 0.5f;
+            auto rx = centreX - radius;
+            auto ry = centreY - radius;
+            auto rw = radius * 2.0f;
+            auto angle = rotaryStartAngle + sliderPos * (rotaryEndAngle - rotaryStartAngle);
+            
+            // Flat dark body with subtle ring and a single bright pointer.
+            g.setColour(juce::Colour(0xff2a2a2a));
+            g.fillEllipse(rx, ry, rw, rw);
+            
+            g.setColour(juce::Colour(0xff515151));
+            g.drawEllipse(rx, ry, rw, rw, 1.0f);
+            
+            g.setColour(knobColor.withAlpha(0.85f));
+            g.drawEllipse(rx + 1.5f, ry + 1.5f, rw - 3.0f, rw - 3.0f, 1.0f);
+
+            // Pointer line
+            juce::Path p;
+            auto pointerLength = radius * 0.6f;
+            auto pointerThickness = 1.5f;
+            p.addRectangle(-pointerThickness * 0.5f, -radius, pointerThickness, pointerLength);
+            p.applyTransform(juce::AffineTransform::rotation(angle).translated(centreX, centreY));
+            
+            g.setColour(juce::Colour(0xfff2f2f2));
+            g.fillPath(p);
+        }
+        
+    private:
+        juce::Colour knobColor{juce::Colour(0xff6f93c8)};
+    };
+    
+private:
+    int stripIndex;
+    MlrVSTAudioProcessor& processor;
+    juce::Colour stripColor;  // Track strip color for controls
+    ColoredKnobLookAndFeel knobLookAndFeel;
+    
+    // Main display area combines waveform + LED overlay
+    WaveformDisplay waveform;
+    StepSequencerDisplay stepDisplay;  // Step sequencer grid display
+    bool showingStepDisplay = false;   // Toggle between waveform and step display
+    
+    // Compact controls on the right
+    juce::Slider volumeSlider;      // Compact rotary
+    juce::Slider panSlider;         // Compact rotary
+    juce::Slider speedSlider;       // Compact rotary
+    juce::Slider scratchSlider;     // Compact rotary - scratch amount
+    juce::ComboBox patternLengthBox; // Step mode pattern length (16..64)
+    juce::TextButton tempoHalfButton;   // ÷2 tempo (double beats)
+    juce::TextButton tempoDoubleButton; // ×2 tempo (half beats)
+    juce::Label tempoLabel;         // Shows current beats setting
+    juce::ComboBox recordBarsBox;   // Selects input recording buffer bars for this strip
+    juce::Label recordBarsLabel;    // Label above recording bars selector
+    juce::Label recordLengthLabel;  // Shows input recording buffer length for this strip
+    juce::Label volumeLabel;        // Label below knob
+    juce::Label panLabel;           // Label below knob
+    juce::Label speedLabel;         // Label below knob
+    juce::Label scratchLabel;       // Label below knob
+    juce::Label patternLengthLabel; // Label below pattern length selector
+    juce::ComboBox playModeBox;     // Play mode selector (OneShot/Loop/Gate/Step)
+    juce::ComboBox directionModeBox; // Direction mode selector (Normal/Reverse/PingPong/Random)
+    juce::TextButton transientSliceButton; // Toggle time slices vs transient slices
+    juce::Slider grainSizeSlider;
+    juce::Slider grainDensitySlider;
+    juce::Slider grainPitchSlider;
+    juce::Slider grainPitchJitterSlider;
+    juce::Slider grainSpreadSlider;
+    juce::Slider grainJitterSlider;
+    juce::Slider grainRandomSlider;
+    juce::Slider grainArpSlider;
+    juce::Slider grainCloudSlider;
+    juce::Slider grainEmitterSlider;
+    juce::Slider grainEnvelopeSlider;
+    juce::Slider grainArpModeSlider;
+    juce::ComboBox grainArpModeBox;
+    juce::ToggleButton grainSizeSyncToggle;
+    juce::Label grainSizeDivLabel;
+    juce::Label grainSizeLabel;
+    juce::Label grainDensityLabel;
+    juce::Label grainPitchLabel;
+    juce::Label grainPitchJitterLabel;
+    juce::Label grainSpreadLabel;
+    juce::Label grainJitterLabel;
+    juce::Label grainRandomLabel;
+    juce::Label grainArpLabel;
+    juce::Label grainCloudLabel;
+    juce::Label grainEmitterLabel;
+    juce::Label grainEnvelopeLabel;
+    juce::Label grainArpModeLabel;
+    bool grainOverlayVisible = false;
+    juce::TextButton loadButton;    // Small
+    juce::ComboBox groupSelector;   // Compact
+    juce::Label stripLabel;         // Small
+    
+    // Attachments
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> volumeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> panAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> speedAttachment;
+    
+    void setupComponents();
+    void loadSample();
+    void paintLEDOverlay(juce::Graphics& g);  // Draw LED blocks over waveform
+    void updateGrainOverlayVisibility();
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(StripControl)
+};
+
+// Strip color utility - rainbow progression
+inline juce::Colour getStripColor(int stripIndex)
+{
+    const juce::Colour colors[] = {
+        juce::Colour(0xffd36f63), // Muted red
+        juce::Colour(0xffd18f4f), // Burnt orange
+        juce::Colour(0xffbda659), // Olive/yellow
+        juce::Colour(0xff6faa6f), // Muted green
+        juce::Colour(0xff5ea5a8), // Teal
+        juce::Colour(0xff6f93c8), // Muted blue
+        juce::Colour(0xff9a82bc)  // Soft violet
+    };
+    return colors[stripIndex % 7];
+}
+
+//==============================================================================
+/**
+ * MonomeGridDisplay - Interactive monome grid visualization
+ */
+class MonomeGridDisplay : public juce::Component,
+                          public juce::Timer
+{
+public:
+    MonomeGridDisplay(MlrVSTAudioProcessor& p);
+    
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void mouseDown(const juce::MouseEvent& e) override;
+    void mouseUp(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
+    void timerCallback() override;
+    
+    void updateFromEngine();
+    void sendGridStateToMonome();  // Send LED state to actual hardware
+    
+private:
+    MlrVSTAudioProcessor& processor;
+    
+    static constexpr int gridWidth = 16;
+    static constexpr int gridHeight = 8;
+    
+    int ledState[gridWidth][gridHeight] = {{0}};
+    bool buttonPressed[gridWidth][gridHeight] = {{false}};
+    
+    juce::Rectangle<int> getButtonBounds(int x, int y) const;
+    void handleButtonPress(int x, int y, bool down);
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MonomeGridDisplay)
+};
+
+//==============================================================================
+/**
+ * MonomeControlPanel - Device selection and status
+ */
+class MonomeControlPanel : public juce::Component,
+                           public juce::Timer
+{
+public:
+    MonomeControlPanel(MlrVSTAudioProcessor& p);
+    
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void timerCallback() override;
+    
+private:
+    MlrVSTAudioProcessor& processor;
+    
+    juce::Label titleLabel;
+    juce::ComboBox deviceSelector;
+    juce::TextButton refreshButton;
+    juce::TextButton connectButton;
+    juce::Label statusLabel;
+    juce::ComboBox rotationSelector;
+    juce::Label rotationLabel;
+    
+    void updateDeviceList();
+    void connectToDevice();
+    void updateStatus();
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MonomeControlPanel)
+};
+
+//==============================================================================
+/**
+ * LevelMeter - Vertical level meter display
+ */
+class LevelMeter : public juce::Component
+{
+public:
+    LevelMeter();
+    
+    void paint(juce::Graphics& g) override;
+    void setLevel(float level);  // 0.0 to 1.0
+    void setPeak(float peak);    // 0.0 to 1.0
+    
+private:
+    float currentLevel = 0.0f;
+    float peakLevel = 0.0f;
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LevelMeter)
+};
+
+//==============================================================================
+/**
+ * GlobalControlPanel - Master controls
+ */
+class GlobalControlPanel : public juce::Component
+{
+public:
+    GlobalControlPanel(MlrVSTAudioProcessor& p);
+    
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void updateMeters(float leftLevel, float rightLevel);  // Update input meters
+    std::function<void(bool)> onTooltipsToggled;
+    
+private:
+    MlrVSTAudioProcessor& processor;
+    
+    juce::Label titleLabel;
+    juce::Slider masterVolumeSlider;
+    juce::Label masterVolumeLabel;
+    juce::ComboBox quantizeSelector;
+    juce::Label quantizeLabel;
+    juce::ComboBox resamplingQualityBox;
+    juce::Label qualityLabel;
+    
+    // Input monitoring controls
+    juce::Slider inputMonitorSlider;
+    juce::Label inputMonitorLabel;
+    LevelMeter inputMeterL;
+    LevelMeter inputMeterR;
+    juce::Label inputMeterLabel;
+    
+    // Loop crossfade control
+    juce::Slider crossfadeLengthSlider;
+    juce::Label crossfadeLengthLabel;
+    juce::ToggleButton tooltipsToggle;
+    
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterVolumeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> quantizeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> grainQualityAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> inputMonitorAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> crossfadeLengthAttachment;
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GlobalControlPanel)
+};
+
+//==============================================================================
+/**
+ * MonomePagesPanel - Control row page order and behavior
+ */
+class MonomePagesPanel : public juce::Component,
+                         public juce::Timer
+{
+public:
+    MonomePagesPanel(MlrVSTAudioProcessor& p);
+
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void timerCallback() override;
+    void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override;
+
+private:
+    MlrVSTAudioProcessor& processor;
+
+    juce::Label titleLabel;
+    juce::Label modeLabel;
+    juce::ToggleButton momentaryToggle;
+
+    struct PageRow
+    {
+        juce::Label positionLabel;
+        juce::Label modeNameLabel;
+        juce::TextButton upButton;
+        juce::TextButton downButton;
+    };
+    std::array<PageRow, MlrVSTAudioProcessor::NumControlRowPages> rows;
+    juce::Label presetGridLabel;
+    juce::Label presetInstructionsLabel;
+    juce::Viewport presetViewport;
+    juce::Component presetGridContent;
+    std::array<juce::TextButton, MlrVSTAudioProcessor::MaxPresetSlots> presetButtons;
+
+    void refreshFromProcessor();
+    void updatePresetButtons();
+    void layoutPresetButtons();
+    void onPresetButtonClicked(int presetIndex);
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MonomePagesPanel)
+};
+
+//==============================================================================
+/**
+ * PatternControlPanel - Pattern recording
+ */
+class PatternControlPanel : public juce::Component,
+                            public juce::Timer
+{
+public:
+    PatternControlPanel(MlrVSTAudioProcessor& p);
+    
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void timerCallback() override;
+    
+private:
+    MlrVSTAudioProcessor& processor;
+    
+    juce::Label titleLabel;
+    juce::Label instructionsLabel;
+    juce::Label timingLabel;
+    juce::Label quantizeLabel;
+    
+    struct PatternControls
+    {
+        juce::Label nameLabel;
+        juce::TextButton recordButton;
+        juce::TextButton playButton;
+        juce::TextButton stopButton;
+        juce::TextButton clearButton;
+        juce::Label statusLabel;
+        juce::Label detailLabel;
+    };
+    
+    PatternControls patterns[4];
+    
+    void updatePatternStates();
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PatternControlPanel)
+};
+
+//==============================================================================
+/**
+ * GroupControlPanel - Mute groups
+ */
+class GroupControlPanel : public juce::Component,
+                          public juce::Timer
+{
+public:
+    GroupControlPanel(MlrVSTAudioProcessor& p);
+    
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void timerCallback() override;
+    
+private:
+    MlrVSTAudioProcessor& processor;
+    
+    juce::Label titleLabel;
+    
+    struct GroupControls
+    {
+        juce::Label nameLabel;
+        juce::ToggleButton muteButton;
+        juce::Slider volumeSlider;
+        juce::Label statusLabel;
+    };
+    
+    GroupControls groups[4];
+    
+    void updateGroupStates();
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GroupControlPanel)
+};
+
+//==============================================================================
+/**
+ * Preset Management Panel - 16x7 preset grid
+ */
+class PresetControlPanel : public juce::Component
+{
+public:
+    PresetControlPanel(MlrVSTAudioProcessor& p);
+    
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override;
+    void refreshVisualState();
+    
+private:
+    MlrVSTAudioProcessor& processor;
+    
+    juce::Label titleLabel;
+    juce::Label instructionsLabel;
+    juce::Viewport presetViewport;
+    juce::Component presetGridContent;
+    std::array<juce::TextButton, MlrVSTAudioProcessor::MaxPresetSlots> presetButtons;
+    
+    void savePresetClicked(int index);
+    void loadPresetClicked(int index);
+    void updatePresetButtons();
+    void layoutPresetButtons();
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PresetControlPanel)
+};
+
+//==============================================================================
+/**
+ * PathsControlPanel - Per-strip default load directories for Loop/Step modes
+ */
+class PathsControlPanel : public juce::Component,
+                          public juce::Timer
+{
+public:
+    PathsControlPanel(MlrVSTAudioProcessor& p);
+    
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void timerCallback() override;
+    
+private:
+    MlrVSTAudioProcessor& processor;
+    
+    juce::Label titleLabel;
+    juce::Viewport scrollViewport;
+    juce::Component scrollContent;
+    juce::Label headerStripLabel;
+    juce::Label headerLoopLabel;
+    juce::Label headerStepLabel;
+    
+    struct PathRow
+    {
+        juce::Label stripLabel;
+        juce::Label loopPathLabel;
+        juce::TextButton loopSetButton;
+        juce::TextButton loopClearButton;
+        juce::Label stepPathLabel;
+        juce::TextButton stepSetButton;
+        juce::TextButton stepClearButton;
+    };
+    std::array<PathRow, MlrVSTAudioProcessor::MaxStrips> rows;
+    
+    void refreshLabels();
+    void chooseDirectory(int stripIndex, MlrVSTAudioProcessor::SamplePathMode mode);
+    void clearDirectory(int stripIndex, MlrVSTAudioProcessor::SamplePathMode mode);
+    static juce::String pathToDisplay(const juce::File& file);
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PathsControlPanel)
+};
+
+//==============================================================================
+/**
+ * Modern mlrVST Editor - Main window
+ */
+class MlrVSTAudioProcessorEditor : public juce::AudioProcessorEditor,
+                                   public juce::Timer
+{
+public:
+    MlrVSTAudioProcessorEditor(MlrVSTAudioProcessor&);
+    ~MlrVSTAudioProcessorEditor() override;
+
+    void paint(juce::Graphics&) override;
+    void resized() override;
+    void timerCallback() override;
+    bool keyPressed(const juce::KeyPress& key) override;
+
+private:
+    class EditorLookAndFeel : public juce::LookAndFeel_V4
+    {
+    public:
+        juce::Font getComboBoxFont(juce::ComboBox&) override
+        {
+            return juce::Font(juce::FontOptions(11.0f, juce::Font::bold));
+        }
+
+        juce::Font getPopupMenuFont() override
+        {
+            return juce::Font(juce::FontOptions(11.0f, juce::Font::bold));
+        }
+    };
+
+    MlrVSTAudioProcessor& audioProcessor;
+    
+    // Main sections
+    std::unique_ptr<MonomeGridDisplay> monomeGrid;
+    std::unique_ptr<MonomeControlPanel> monomeControl;
+    std::unique_ptr<GlobalControlPanel> globalControl;
+    std::unique_ptr<MonomePagesPanel> monomePagesControl;
+    std::unique_ptr<PresetControlPanel> presetControl;
+    std::unique_ptr<PathsControlPanel> pathsControl;
+    
+    // Top controls in tabs (to save space)
+    std::unique_ptr<juce::TabbedComponent> topTabs;
+    
+    // Main unified tabs: Play / FX / Patterns / Groups
+    std::unique_ptr<juce::TabbedComponent> mainTabs;
+    
+    // Strip controls (8 rows) - Play tab
+    juce::OwnedArray<StripControl> stripControls;
+    
+    // FX strips (8 rows) - FX tab
+    juce::OwnedArray<FXStripControl> fxStripControls;
+    
+    // Pattern and Group controls
+    std::unique_ptr<PatternControlPanel> patternControl;
+    std::unique_ptr<GroupControlPanel> groupControl;
+    
+    // Layout components
+    juce::Viewport stripsViewport;
+    juce::Component stripsContainer;
+    
+    // Look and Feel
+    EditorLookAndFeel darkLookAndFeel;
+    std::unique_ptr<juce::TooltipWindow> tooltipWindow;
+    bool tooltipsEnabled = true;
+
+    void createUIComponents();
+    void setupLookAndFeel();
+    void layoutComponents();
+    void setTooltipsEnabled(bool enabled);
+    
+    static constexpr int windowWidth = 1000;
+    static constexpr int windowHeight = 1020;  // Taller to accommodate recording label
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MlrVSTAudioProcessorEditor)
+};

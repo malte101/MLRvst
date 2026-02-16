@@ -1,0 +1,315 @@
+/*
+  ==============================================================================
+
+    PluginProcessor.h
+    mlrVST - Modern Edition
+    
+    Complete modernization for JUCE 8.x with advanced audio engine
+
+  ==============================================================================
+*/
+
+#pragma once
+
+#include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_osc/juce_osc.h>
+#include <cstdint>
+#include "AudioEngine.h"
+
+//==============================================================================
+/**
+ * MonomeConnection - Handles serialosc protocol communication
+ * 
+ * Complete serialosc protocol implementation:
+ * - Device discovery and enumeration
+ * - Automatic connection and reconnection
+ * - All LED control methods (set, all, row, col, map, level row/col/map)
+ * - Grid key input
+ * - System configuration (prefix, rotation, size, info)
+ * - Device hot-plug support
+ */
+class MonomeConnection : public juce::OSCReceiver::Listener<juce::OSCReceiver::RealtimeCallback>,
+                          public juce::Timer
+{
+public:
+    MonomeConnection();
+    ~MonomeConnection() override;
+    
+    void connect(int applicationPort);
+    void disconnect();
+    bool isConnected() const { return connected; }
+    
+    // SerialOSC device discovery
+    void discoverDevices();
+    void selectDevice(int deviceIndex);
+    void refreshDeviceList();
+    
+    // LED control - Basic (0/1 states)
+    void setLED(int x, int y, int state);
+    void setAllLEDs(int state);
+    void setLEDRow(int xOffset, int y, const std::array<int, 8>& data);
+    void setLEDColumn(int x, int yOffset, const std::array<int, 8>& data);
+    void setLEDMap(int xOffset, int yOffset, const std::array<int, 8>& data);
+    
+    // LED control - Variable brightness (0-15)
+    void setLEDLevel(int x, int y, int level);
+    void setAllLEDLevels(int level);
+    void setLEDLevelRow(int xOffset, int y, const std::array<int, 8>& levels);
+    void setLEDLevelColumn(int x, int yOffset, const std::array<int, 8>& levels);
+    void setLEDLevelMap(int xOffset, int yOffset, const std::array<int, 64>& levels);
+    
+    // System commands
+    void setRotation(int degrees); // 0, 90, 180, 270
+    void setPrefix(const juce::String& newPrefix);
+    void requestInfo();
+    void requestSize();
+    
+    // Tilt support (for grids with tilt sensors)
+    void enableTilt(int sensor, bool enable);
+    
+    // Device info
+    struct DeviceInfo
+    {
+        juce::String id;
+        juce::String type;
+        int port;
+        int sizeX = 16;
+        int sizeY = 8;
+        bool hasTilt = false;
+        juce::String host = "127.0.0.1";
+    };
+    
+    std::vector<DeviceInfo> getDiscoveredDevices() const { return devices; }
+    DeviceInfo getCurrentDevice() const { return currentDevice; }
+    juce::String getConnectionStatus() const;
+    
+    // Callbacks
+    std::function<void(int x, int y, int state)> onKeyPress;
+    std::function<void(int sensor, int x, int y, int z)> onTilt;
+    std::function<void()> onDeviceConnected;
+    std::function<void()> onDeviceDisconnected;
+    std::function<void(const std::vector<DeviceInfo>&)> onDeviceListUpdated;
+    
+private:
+    void oscMessageReceived(const juce::OSCMessage& message) override;
+    void handleSerialOSCMessage(const juce::OSCMessage& message);
+    void handleGridMessage(const juce::OSCMessage& message);
+    void handleSystemMessage(const juce::OSCMessage& message);
+    void handleTiltMessage(const juce::OSCMessage& message);
+    
+    void timerCallback() override;
+    void attemptReconnection();
+    void sendPing();
+    
+    juce::OSCSender oscSender;
+    juce::OSCSender serialoscSender; // Separate sender for serialosc queries
+    juce::OSCReceiver oscReceiver;
+    
+    std::vector<DeviceInfo> devices;
+    DeviceInfo currentDevice;
+    
+    juce::String oscPrefix = "/monome";
+    int applicationPort = 8000;
+    bool connected = false;
+    bool autoReconnect = true;
+    
+    int reconnectAttempts = 0;
+    static constexpr int maxReconnectAttempts = 10;
+    static constexpr int reconnectIntervalMs = 2000;
+    
+    juce::int64 lastMessageTime = 0;
+    static constexpr int pingIntervalMs = 5000;
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MonomeConnection)
+};
+
+//==============================================================================
+/**
+ * MlrVSTAudioProcessor - Main plugin processor
+ */
+class MlrVSTAudioProcessor : public juce::AudioProcessor,
+                             public juce::Timer
+{
+public:
+    MlrVSTAudioProcessor();
+    ~MlrVSTAudioProcessor() override;
+
+    //==============================================================================
+    void prepareToPlay(double sampleRate, int samplesPerBlock) override;
+    void releaseResources() override;
+
+    bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
+
+    void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
+    //==============================================================================
+    juce::AudioProcessorEditor* createEditor() override;
+    bool hasEditor() const override;
+
+    //==============================================================================
+    const juce::String getName() const override;
+
+    bool acceptsMidi() const override;
+    bool producesMidi() const override;
+    bool isMidiEffect() const override;
+    double getTailLengthSeconds() const override;
+
+    //==============================================================================
+    int getNumPrograms() override;
+    int getCurrentProgram() override;
+    void setCurrentProgram(int index) override;
+    const juce::String getProgramName(int index) override;
+    void changeProgramName(int index, const juce::String& newName) override;
+
+    //==============================================================================
+    void getStateInformation(juce::MemoryBlock& destData) override;
+    void setStateInformation(const void* data, int sizeInBytes) override;
+
+    //==============================================================================
+    // Public API
+    ModernAudioEngine* getAudioEngine() { return audioEngine.get(); }
+    MonomeConnection& getMonomeConnection() { return monomeConnection; }
+    
+    void loadSampleToStrip(int stripIndex, const juce::File& file);
+    void loadAdjacentFile(int stripIndex, int direction);  // Browse files
+    void triggerStrip(int stripIndex, int column);
+    void stopStrip(int stripIndex);
+    
+    enum class SamplePathMode
+    {
+        Loop,
+        Step
+    };
+    juce::File getDefaultSampleDirectory(int stripIndex, SamplePathMode mode) const;
+    void setDefaultSampleDirectory(int stripIndex, SamplePathMode mode, const juce::File& directory);
+    
+    // Control mode (for GUI to check if level/pan/etc controls are active)
+    enum class ControlMode
+    {
+        Normal,
+        Speed,
+        Pitch,
+        Pan,
+        Volume,
+        Filter,
+        FileBrowser,
+        GroupAssign,
+        Preset
+    };
+    ControlMode getCurrentControlMode() const { return currentControlMode; }
+    static juce::String getControlModeName(ControlMode mode);
+    static constexpr int NumControlRowPages = 8;
+    using ControlPageOrder = std::array<ControlMode, NumControlRowPages>;
+    ControlPageOrder getControlPageOrder() const;
+    ControlMode getControlModeForControlButton(int buttonIndex) const;
+    int getControlButtonForMode(ControlMode mode) const;
+    void moveControlPage(int fromIndex, int toIndex);
+    bool isControlPageMomentary() const { return controlPageMomentary.load(std::memory_order_acquire); }
+    void setControlPageMomentary(bool shouldBeMomentary);
+    
+    // Preset management
+    void savePreset(int presetIndex);
+    void loadPreset(int presetIndex);
+    bool deletePreset(int presetIndex);
+    int getLoadedPresetIndex() const { return loadedPresetIndex; }
+    juce::String getPresetName(int presetIndex) const;
+    bool presetExists(int presetIndex) const;
+    static constexpr int PresetColumns = 16;
+    static constexpr int PresetRows = 7;
+    static constexpr int MaxPresetSlots = PresetColumns * PresetRows;
+    
+    // Parameters
+    juce::AudioProcessorValueTreeState parameters;
+    
+    static constexpr int MaxStrips = 8;
+    static constexpr int MaxColumns = 16;
+
+private:
+    //==============================================================================
+    enum class FilterSubPage
+    {
+        Frequency,    // Button 0 on group row
+        Resonance,    // Button 1 on group row
+        Type          // Button 2 on group row
+    };
+    
+    std::unique_ptr<ModernAudioEngine> audioEngine;
+    MonomeConnection monomeConnection;
+
+    // Cached parameter pointers to avoid string lookups in processBlock
+    std::atomic<float>* masterVolumeParam = nullptr;
+    std::atomic<float>* quantizeParam = nullptr;
+    std::atomic<float>* grainQualityParam = nullptr;
+    std::atomic<float>* pitchSmoothingParam = nullptr;
+    std::atomic<float>* inputMonitorParam = nullptr;
+    std::atomic<float>* crossfadeLengthParam = nullptr;
+    std::array<std::atomic<float>*, MaxStrips> stripVolumeParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripPanParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripSpeedParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripPitchParams{};
+    
+    double currentSampleRate = 44100.0;
+    ControlMode currentControlMode = ControlMode::Normal;
+    bool controlModeActive = false;  // True when control button is held
+    FilterSubPage filterSubPage = FilterSubPage::Frequency;  // Current filter sub-page
+    bool quantizeEnabled = true;
+    mutable juce::CriticalSection controlPageOrderLock;
+    ControlPageOrder controlPageOrder {
+        ControlMode::Speed,
+        ControlMode::Pan,
+        ControlMode::Volume,
+        ControlMode::FileBrowser,
+        ControlMode::GroupAssign,
+        ControlMode::Filter,
+        ControlMode::Pitch,
+        ControlMode::Preset
+    };
+    std::atomic<bool> controlPageMomentary{true};
+    
+    // LED state cache to prevent flickering
+    int ledCache[16][8] = {{0}};
+    
+    // Last loaded folder for file browsing
+    juce::File lastSampleFolder;
+    std::array<juce::File, MaxStrips> defaultLoopDirectories;
+    std::array<juce::File, MaxStrips> defaultStepDirectories;
+    
+    // Current file per strip for proper next/prev browsing
+    juce::File currentStripFiles[8];
+    
+    // LED update
+    void updateMonomeLEDs();
+    void timerCallback() override;
+    
+    void handleMonomeKeyPress(int x, int y, int state);
+    void setMomentaryScratchHold(bool shouldEnable);
+    
+    juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+    void cacheParameterPointers();
+    void loadDefaultPathsFromState(const juce::ValueTree& state);
+    void appendDefaultPathsToState(juce::ValueTree& state) const;
+    void loadControlPagesFromState(const juce::ValueTree& state);
+    void appendControlPagesToState(juce::ValueTree& state) const;
+    void loadPersistentDefaultPaths();
+    void savePersistentDefaultPaths() const;
+    void loadPersistentControlPages();
+    void savePersistentControlPages() const;
+
+    // Row 0, col 8: global momentary scratch modifier.
+    bool momentaryScratchHoldActive = false;
+    std::array<float, MaxStrips> momentaryScratchSavedAmount{};
+    std::array<EnhancedAudioStrip::DirectionMode, MaxStrips> momentaryScratchSavedDirection{};
+    std::array<bool, MaxStrips> momentaryScratchWasStepMode{};
+
+    // Preset page hold/double-tap state (used when control mode == Preset).
+    int loadedPresetIndex = -1;
+    std::array<bool, MaxPresetSlots> presetPadHeld{};
+    std::array<bool, MaxPresetSlots> presetPadHoldSaveTriggered{};
+    std::array<bool, MaxPresetSlots> presetPadDeleteTriggered{};
+    std::array<uint32_t, MaxPresetSlots> presetPadPressStartMs{};
+    std::array<uint32_t, MaxPresetSlots> presetPadLastTapMs{};
+    static constexpr uint32_t presetHoldSaveMs = 3000;
+    static constexpr uint32_t presetDoubleTapMs = 350;
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MlrVSTAudioProcessor)
+};

@@ -1,0 +1,69 @@
+# Build directories
+Build/
+build/
+cmake-build-*/
+
+# IDE files
+.vscode/
+.idea/
+*.xcodeproj
+*.xcworkspace
+*.sln
+*.vcxproj
+*.vcxproj.filters
+
+# Compiled files
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# Windows
+Thumbs.db
+*.pdb
+*.ilk
+
+# JUCE binary data
+JuceLibraryCode/
+**/JuceLibraryCode/
+
+# Build artifacts
+*.vst3
+*.component
+*.app
+*.AppImage
+
+# Logs
+*.log
+build.log
+
+# Temporary files
+*~
+*.swp
+*.swo
+.*.swp
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Backup files
+*backup*
+*.bak
