@@ -18,9 +18,7 @@ mlrVST-modern/
 │           ├── VST3/
 │           │   └── mlrVST.vst3/      ← VST3 BUNDLE (folder)
 │           ├── AU/
-│           │   └── mlrVST.component/ ← AU BUNDLE (folder)
-│           └── Standalone/
-│               └── mlrVST.app/       ← App bundle
+│           │   └── mlrVST.component/ ← AU BUNDLE (folder, macOS)
 │
 └── cmake-build-release/         ← Release builds
     └── mlrVST_artefacts/
@@ -28,9 +26,7 @@ mlrVST-modern/
             ├── VST3/
             │   └── mlrVST.vst3/      ← VST3 BUNDLE (folder)
             ├── AU/
-            │   └── mlrVST.component/ ← AU BUNDLE (folder)
-            └── Standalone/
-                └── mlrVST.app/       ← App bundle
+            │   └── mlrVST.component/ ← AU BUNDLE (folder, macOS)
 ```
 
 **Key Point:** These are **folders**, not files. They won't show in CLion's file tree by default.
@@ -57,8 +53,7 @@ ls -la cmake-build-release/mlrVST_artefacts/Release/AU/
 2. Go to `cmake-build-release/mlrVST_artefacts/Release/`
 3. You'll see:
    - `VST3/` folder → contains `mlrVST.vst3` bundle
-   - `AU/` folder → contains `mlrVST.component` bundle
-   - `Standalone/` folder → contains `mlrVST.app`
+   - `AU/` folder → contains `mlrVST.component` bundle (macOS)
 
 ### Method 3: From CLion
 
@@ -72,9 +67,9 @@ ls -la cmake-build-release/mlrVST_artefacts/Release/AU/
 
 In CLion's top toolbar:
 ```
-[Debug ▼]  [mlrVST_All ▼]  [▶ Build]
+[Debug ▼]  [mlrVST_VST3 ▼]  [▶ Build]
     ↑           ↑
-    |           └─ Build target (select "mlrVST_All")
+    |           └─ Build target (select format target)
     └─ Build type (select "Release" for final builds)
 ```
 
@@ -86,10 +81,8 @@ In CLion's top toolbar:
 ### Step 2: Select Build Target
 
 Click the target dropdown and choose:
-- `mlrVST_All` - Builds VST3, AU, and Standalone (recommended)
 - `mlrVST_VST3` - Builds VST3 only
 - `mlrVST_AU` - Builds AU only
-- `mlrVST_Standalone` - Builds standalone app only
 
 ### Step 3: Build
 
@@ -105,8 +98,6 @@ Look for these messages:
 ```
 [100%] Built target mlrVST_VST3
 [100%] Built target mlrVST_AU
-[100%] Built target mlrVST_Standalone
-[100%] Built target mlrVST_All
 ```
 
 If you see these, the bundles **are** built!
@@ -125,19 +116,9 @@ ls -la cmake-build-release/mlrVST_artefacts/Release/AU/mlrVST.component/Contents
 
 ## Installation
 
-### Automatic Installation
-
-If `COPY_PLUGIN_AFTER_BUILD TRUE` is working, bundles auto-copy to:
-
-```bash
-# Check if auto-installed
-ls -la ~/Library/Audio/Plug-Ins/VST3/mlrVST.vst3
-ls -la ~/Library/Audio/Plug-Ins/Components/mlrVST.component
-```
-
 ### Manual Installation
 
-If auto-copy didn't work:
+Install from the build output directory:
 
 ```bash
 cd mlrVST-modern/cmake-build-release/mlrVST_artefacts/Release
@@ -147,9 +128,6 @@ cp -r VST3/mlrVST.vst3 ~/Library/Audio/Plug-Ins/VST3/
 
 # Install AU
 cp -r AU/mlrVST.component ~/Library/Audio/Plug-Ins/Components/
-
-# Install Standalone (optional)
-cp -r Standalone/mlrVST.app /Applications/
 ```
 
 **Important:** Use `cp -r` to copy the entire bundle folder!
@@ -304,7 +282,7 @@ Scanning dependencies of target mlrVST_AU
 [ 88%] Linking CXX shared library...
 [ 88%] Built target mlrVST_AU
 
-[100%] Built target mlrVST_All
+[100%] Build finished
 ```
 
 ## TL;DR - Quick Check

@@ -5,7 +5,7 @@ Get mlrVST up and running in 5 minutes!
 ## 1. Clone Repository
 
 ```bash
-git clone https://github.com/yourusername/mlrVST-modern.git
+git clone https://github.com/malte90924-pixel/mlrVST-modern.git
 cd mlrVST-modern
 ```
 
@@ -21,7 +21,7 @@ git clone https://github.com/juce-framework/JUCE.git
 make
 ```
 
-That's it! The plugin will be built and installed automatically.
+That's it! The plugin will be built. Run `make install` to install it.
 
 ## 4. Install serialosc
 
@@ -45,18 +45,11 @@ Plug in your monome grid. It should be automatically detected.
 4. Load samples via GUI
 5. Press monome buttons to trigger!
 
-### Standalone
-
-```bash
-# macOS
-open Build/mlrVST_artefacts/Release/Standalone/mlrVST.app
-
-# Linux
-./Build/mlrVST_artefacts/Release/Standalone/mlrVST
-
-# Windows
-Build\mlrVST_artefacts\Release\Standalone\mlrVST.exe
-```
+Plugin install locations:
+- **macOS VST3**: `~/Library/Audio/Plug-Ins/VST3/mlrVST.vst3`
+- **macOS AU**: `~/Library/Audio/Plug-Ins/Components/mlrVST.component`
+- **Linux VST3**: `~/.vst3/mlrVST.vst3`
+- **Windows VST3**: `C:\Program Files\Common Files\VST3\mlrVST.vst3`
 
 ## Troubleshooting
 
@@ -93,8 +86,8 @@ tasklist | findstr serialosc  # Windows
 
 ## Next Steps
 
-- Read [AUDIO_ENGINE.md](Docs/AUDIO_ENGINE.md) to learn audio features
-- Check [SERIALOSC.md](Docs/SERIALOSC.md) for monome setup
+- Read [AUDIO_ENGINE_DOCS.md](Docs/AUDIO_ENGINE_DOCS.md) to learn audio features
+- Check [SERIALOSC_REFERENCE.md](Docs/SERIALOSC_REFERENCE.md) for monome setup
 - Explore the GUI for advanced features
 
 Happy looping! 🎵

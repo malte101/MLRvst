@@ -26,7 +26,7 @@ This package contains a fully modernized version of mlrVST, updated from JUCE 3.
 
 4. **CMakeLists.txt** - Modern build system
    - JUCE 8.x compatible
-   - Supports VST3, AU, and Standalone
+   - Supports VST3 and AU
    - Cross-platform (macOS, Windows, Linux)
 
 ### Documentation
@@ -51,7 +51,7 @@ This package contains a fully modernized version of mlrVST, updated from JUCE 3.
    - Usage instructions
    - Troubleshooting
 
-8. **build.sh** - Automated build script
+8. **Makefile** - Automated build workflow
    - Checks dependencies
    - Configures and builds project
    - Shows installation locations
@@ -196,7 +196,7 @@ strip.setPlaybackSpeed(1.5f);
 
 ### Quick Build
 ```bash
-./build.sh
+make
 ```
 
 ### Manual Build
@@ -304,8 +304,7 @@ If you have the original mlrVST code:
 
 ## License
 
-This modernization maintains compatibility with the original mlrVST license.
-JUCE is licensed under GPL v3 or commercial license.
+MIT - see [../LICENSE](../LICENSE).
 
 ## Credits
 
@@ -327,7 +326,7 @@ JUCE is licensed under GPL v3 or commercial license.
 ### 1.0.0 - Original
 - JUCE 3.1.0
 - oscpack library
-- VST2/AU support
+- VST2/AU support (original version)
 
 ## Getting Help
 

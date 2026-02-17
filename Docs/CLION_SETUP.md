@@ -97,7 +97,6 @@ git clone https://github.com/juce-framework/JUCE.git
 CLion should automatically:
 - Detect CMakeLists.txt
 - Configure the project
-- Download any dependencies
 
 ### 4. Select Build Configuration
 - Top-right dropdown: Select **Debug** or **Release**
@@ -106,9 +105,9 @@ CLion should automatically:
 - **Build → Build Project** (Cmd+F9 / Ctrl+F9)
 - Or click the hammer icon 🔨
 
-### 6. Run
-- Select **mlrVST_Standalone** from run configurations
-- Click Run ▶️
+### 6. Build Targets
+- Select `mlrVST_VST3` (and `mlrVST_AU` on macOS) from run/build configurations
+- Click Build ▶️
 
 ## Common CLion Issues
 
@@ -157,14 +156,13 @@ In CLion, you can build specific targets:
 3. Select target:
    - `mlrVST_VST3` - VST3 plugin
    - `mlrVST_AU` - Audio Unit (macOS only)
-   - `mlrVST_Standalone` - Standalone app
 
-## Debugging in CLion
+## Debugging with CLion
 
 1. Set breakpoints in source files
 2. Select **Debug** configuration (top-right)
 3. Click Debug 🐛 icon
-4. CLion will attach debugger to the standalone app
+4. Run your DAW/plugin host under the debugger and load the plugin
 
 ## CLion Indexing Issues
 
@@ -215,7 +213,7 @@ If CMake in CLion is problematic, you can use the Makefile:
 After successful build, check:
 ```
 Build/mlrVST_artefacts/Debug/VST3/mlrVST.vst3
-Build/mlrVST_artefacts/Debug/Standalone/mlrVST (or .app on macOS)
+Build/mlrVST_artefacts/Debug/AU/mlrVST.component   # macOS
 ```
 
 ## Getting Help

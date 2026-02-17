@@ -89,7 +89,7 @@ oscSender.send("/sys/info", "localhost", applicationPort);
    - juce_gui_extra
    - juce_osc (NEW - replaces oscpack)
 
-3. Set plugin formats: VST3, AU, Standalone
+3. Set plugin formats: VST3 and AU
 4. Remove oscpack dependency
 
 ### Step 2: Update PluginProcessor
@@ -367,4 +367,3 @@ void loadAudioFile(const juce::File& file)
 5. **Day 5**: Port GUI components
 6. **Day 6**: Testing and bug fixes
 7. **Day 7**: Documentation and release
-

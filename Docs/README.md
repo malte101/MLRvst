@@ -10,7 +10,7 @@ A modernized version of mlrVST, the VST port of the popular monome mlr applicati
 - **Modern serialosc** - Full compatibility with current serialosc protocol
 - **CMake Build System** - Modern build system replacing the old Projucer-only workflow
 - **Better Thread Safety** - Improved audio thread handling and lock-free structures
-- **VST3 Support** - Now supports VST3 format in addition to VST2 and AU
+- **VST3/AU Support** - Modern plugin formats with JUCE 8
 - **Cross-Platform** - Builds on Windows, macOS, and Linux
 
 ### Features
@@ -37,14 +37,14 @@ A modernized version of mlrVST, the VST port of the popular monome mlr applicati
 ### Runtime Requirements
 - serialosc installed and running
 - A monome grid controller (64, 128, 256, etc.)
-- Audio workstation (DAW) or standalone use
+- Audio workstation (DAW) or plugin host
 
 ## Building from Source
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/yourusername/mlrVST.git
-cd mlrVST
+git clone https://github.com/malte90924-pixel/mlrVST-modern.git
+cd mlrVST-modern
 ```
 
 ### 2. Get JUCE
@@ -103,7 +103,7 @@ Verify it's running:
 Plug in your monome grid controller. serialosc should automatically detect it.
 
 ### 3. Load the Plugin
-Add mlrVST to a track in your DAW or run it standalone.
+Add mlrVST to a track in your DAW.
 
 ### 4. Connect to Monome
 The plugin will automatically discover and connect to your monome. If multiple devices are connected, use the device selector to choose which one to use.
@@ -171,14 +171,15 @@ Row 7 (Strip 8): [------ Sample 8 ------]
 
 ### Project Structure
 ```
-mlrVST/
-├── PluginProcessor.h       # Main processor header
-├── PluginProcessor.cpp     # Main processor implementation
-├── PluginEditor.h          # GUI header
-├── PluginEditor.cpp        # GUI implementation
-├── CMakeLists.txt          # Build configuration
-├── MODERNIZATION_GUIDE.md  # Detailed migration guide
-└── README.md               # This file
+mlrVST-modern/
+├── Source/
+│   ├── PluginProcessor.h       # Main processor header
+│   ├── PluginProcessor.cpp     # Main processor implementation
+│   ├── PluginEditor.h          # GUI header
+│   └── PluginEditor.cpp        # GUI implementation
+├── CMakeLists.txt              # Build configuration
+├── Docs/MODERNIZATION_GUIDE.md # Detailed migration guide
+└── README.md                   # Main project readme
 ```
 
 ### Key Classes
@@ -275,13 +276,13 @@ Contributions are welcome! Please:
 
 ## License
 
-This project maintains the same license as the original mlrVST.
+MIT - see [../LICENSE](../LICENSE).
 
 ## Credits
 
 - **Original mlrVST**: hemmer (Ewan Hemingway)
 - **Original mlr**: Brian Crabtree (monome)
-- **Modernization**: [Your name/organization]
+- **Modernization**: 2024/2025 Contributors
 - **JUCE Framework**: JUCE Team
 - **monome**: monome.org
 
@@ -305,4 +306,4 @@ This project maintains the same license as the original mlrVST.
 ### v1.0.0 (Original)
 - JUCE 3.1.0
 - oscpack library
-- VST2 / AU support
+- VST2/AU support (original version)

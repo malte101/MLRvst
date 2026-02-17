@@ -4,7 +4,7 @@ A complete modernization of mlrVST, the VST port of the legendary monome mlr app
 
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 ![JUCE](https://img.shields.io/badge/JUCE-8.x-blue)
-![License](https://img.shields.io/badge/license-GPL--3.0-orange)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 ## 🎵 Features
 
@@ -30,7 +30,7 @@ A complete modernization of mlrVST, the VST port of the legendary monome mlr app
 - 🏗️ **JUCE 8.x** - Latest framework with all modern features
 - 🎵 **Native OSC** - Built-in juce_osc module (no external deps)
 - 🔧 **CMake Build** - Modern, cross-platform build system
-- 📦 **VST3 / AU / Standalone** - All major plugin formats
+- 📦 **VST3 / AU** - Native plugin formats
 - 🖥️ **Cross-Platform** - macOS, Windows, Linux
 
 ## 🚀 Quick Start
@@ -46,7 +46,7 @@ A complete modernization of mlrVST, the VST port of the legendary monome mlr app
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/mlrVST-modern.git
+git clone https://github.com/malte90924-pixel/mlrVST-modern.git
 cd mlrVST-modern
 
 # Get JUCE
@@ -61,7 +61,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . --config Release -j8
 
 # Install plugins
-make install
+cmake --install .
 ```
 
 ### Quick Build Commands
@@ -70,7 +70,6 @@ make install
 make                # Build everything (default)
 make vst3          # Build VST3 only
 make au            # Build Audio Unit (macOS)
-make standalone    # Build standalone app
 make install       # Install to system
 make clean         # Clean build
 make help          # Show all options
@@ -78,7 +77,7 @@ make help          # Show all options
 
 ### Building with CLion
 
-See [CLION_SETUP.md](CLION_SETUP.md) for detailed CLion instructions.
+See [CLION_SETUP.md](Docs/CLION_SETUP.md) for detailed CLion instructions.
 
 **Quick setup:**
 1. Install build tools (see error fix below)
@@ -112,9 +111,9 @@ This will check all requirements and tell you what's missing.
 ## 📖 Documentation
 
 - **[BUILD.md](Docs/BUILD.md)** - Detailed build instructions
-- **[AUDIO_ENGINE.md](Docs/AUDIO_ENGINE.md)** - Audio engine documentation
-- **[SERIALOSC.md](Docs/SERIALOSC.md)** - SerialOSC protocol reference
-- **[COMPARISON.md](Docs/COMPARISON.md)** - Old vs new comparison
+- **[AUDIO_ENGINE_DOCS.md](Docs/AUDIO_ENGINE_DOCS.md)** - Audio engine documentation
+- **[SERIALOSC_REFERENCE.md](Docs/SERIALOSC_REFERENCE.md)** - SerialOSC protocol reference
+- **[AUDIO_MODERNIZATION_COMPARISON.md](Docs/AUDIO_MODERNIZATION_COMPARISON.md)** - Old vs new comparison
 
 ## 🎮 Usage
 
@@ -122,7 +121,7 @@ This will check all requirements and tell you what's missing.
 
 1. **Install serialosc** from [monome.org](https://monome.org/docs/serialosc/setup/)
 2. **Connect your monome** grid
-3. **Load mlrVST** in your DAW or run standalone
+3. **Load mlrVST** in your DAW
 4. **Auto-connect** - Plugin will discover and connect automatically
 
 ### Basic Operation
@@ -287,7 +286,7 @@ Contributions welcome! Areas for improvement:
 ### Development Setup
 
 ```bash
-git clone https://github.com/yourusername/mlrVST-modern.git
+git clone https://github.com/malte90924-pixel/mlrVST-modern.git
 cd mlrVST-modern
 git clone https://github.com/juce-framework/JUCE.git
 make CONFIG=Debug VERBOSE=1
@@ -295,7 +294,7 @@ make CONFIG=Debug VERBOSE=1
 
 ## 📜 License
 
-GPL-3.0 - see [LICENSE](LICENSE) file
+MIT - see [LICENSE](LICENSE) file
 
 ## 🙏 Credits
 

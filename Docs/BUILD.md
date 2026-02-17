@@ -109,7 +109,6 @@ make
 # Build specific targets
 make vst3        # VST3 only
 make au          # Audio Unit only
-make standalone  # Standalone app
 
 # Install to system
 make install
@@ -143,7 +142,6 @@ open mlrVST.xcodeproj
 After `make install`:
 - **VST3**: `~/Library/Audio/Plug-Ins/VST3/mlrVST.vst3`
 - **AU**: `~/Library/Audio/Plug-Ins/Components/mlrVST.component`
-- **Standalone**: `Build/mlrVST_artefacts/Release/Standalone/mlrVST.app`
 
 ## Building on Linux
 
@@ -172,20 +170,6 @@ sudo cmake --install .
 
 After `make install`:
 - **VST3**: `~/.vst3/mlrVST.vst3`
-- **Standalone**: `Build/mlrVST_artefacts/Release/Standalone/mlrVST`
-
-### Desktop Entry (Optional)
-
-Create `~/.local/share/applications/mlrVST.desktop`:
-
-```desktop
-[Desktop Entry]
-Type=Application
-Name=mlrVST
-Exec=/path/to/mlrVST
-Icon=audio-x-generic
-Categories=AudioVideo;Audio;
-```
 
 ## Building on Windows
 
@@ -218,7 +202,6 @@ cmake --build . -j8
 ### Installation Locations
 
 - **VST3**: `C:\Program Files\Common Files\VST3\mlrVST.vst3`
-- **Standalone**: `Build\mlrVST_artefacts\Release\Standalone\mlrVST.exe`
 
 ## Build Options
 
@@ -255,12 +238,10 @@ cmake --build Build -j4
 # CMake targets
 cmake --build Build --target mlrVST_VST3
 cmake --build Build --target mlrVST_AU
-cmake --build Build --target mlrVST_Standalone
 
 # Makefile targets
 make vst3
 make au
-make standalone
 ```
 
 ### Custom JUCE Location
@@ -472,6 +453,6 @@ If you encounter issues:
 After successful build:
 
 1. Read [README.md](../README.md) for usage instructions
-2. Check [AUDIO_ENGINE.md](AUDIO_ENGINE.md) for audio features
-3. Review [SERIALOSC.md](SERIALOSC.md) for monome setup
+2. Check [AUDIO_ENGINE_DOCS.md](AUDIO_ENGINE_DOCS.md) for audio features
+3. Review [SERIALOSC_REFERENCE.md](SERIALOSC_REFERENCE.md) for monome setup
 4. Install serialosc from [monome.org](https://monome.org/docs/serialosc/setup/)
