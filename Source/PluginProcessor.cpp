@@ -1152,7 +1152,19 @@ void MlrVSTAudioProcessor::captureRecentAudioToStrip(int stripIndex)
     {
         const int bars = strip->getRecordingBars();
         audioEngine->captureLoopToStrip(stripIndex, bars);
-        triggerStrip(stripIndex, 0);
+
+        // Captured audio comes from the live input ring buffer, not a source file.
+        // Clear stale path so preset save can embed the audio data.
+        currentStripFiles[stripIndex] = juce::File();
+
+        // Trigger directly so we do not apply group-choke behavior to other strips.
+        juce::AudioPlayHead::PositionInfo posInfo;
+        if (auto* playHead = getPlayHead())
+            posInfo = playHead->getPosition().orFallback(juce::AudioPlayHead::PositionInfo());
+
+        const int64_t triggerGlobalSample = audioEngine->getGlobalSampleCount();
+        strip->triggerAtSample(0, audioEngine->getCurrentTempo(), triggerGlobalSample, posInfo);
+        updateMonomeLEDs();
     }
 }
 
@@ -1899,6 +1911,10 @@ void MlrVSTAudioProcessor::savePreset(int presetIndex)
 
 void MlrVSTAudioProcessor::loadPreset(int presetIndex)
 {
+    // Clear stale file references; preset load repopulates file-backed strips.
+    for (auto& f : currentStripFiles)
+        f = juce::File();
+
     PresetStore::loadPreset(
         presetIndex,
         MaxStrips,

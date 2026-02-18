@@ -1,5 +1,7 @@
 #include "PresetStore.h"
 #include "AudioEngine.h"
+#include <cmath>
+#include <limits>
 
 namespace PresetStore
 {
@@ -7,6 +9,8 @@ static constexpr int kMaxPresetSlots = 16 * 7;
 
 namespace
 {
+constexpr const char* kEmbeddedSampleAttr = "embeddedSampleWavBase64";
+
 struct GlobalParameterSnapshot
 {
     float masterVolume = 1.0f;
@@ -108,6 +112,66 @@ bool writeDefaultPresetFile(const juce::File& presetFile, int presetIndex)
 
     return preset.writeTo(presetFile);
 }
+
+bool encodeBufferAsWavBase64(const juce::AudioBuffer<float>& buffer,
+                             double sampleRate,
+                             juce::String& outBase64)
+{
+    outBase64.clear();
+
+    if (buffer.getNumSamples() <= 0 || buffer.getNumChannels() <= 0
+        || !std::isfinite(sampleRate) || sampleRate <= 1000.0)
+        return false;
+
+    juce::MemoryOutputStream wavBytes;
+    juce::WavAudioFormat wavFormat;
+    std::unique_ptr<juce::AudioFormatWriter> writer(
+        wavFormat.createWriterFor(&wavBytes,
+                                  sampleRate,
+                                  static_cast<unsigned int>(buffer.getNumChannels()),
+                                  24,
+                                  {},
+                                  0));
+
+    if (!writer)
+        return false;
+
+    if (!writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples()))
+        return false;
+
+    writer.reset();
+
+    const auto data = wavBytes.getMemoryBlock();
+    outBase64 = data.toBase64Encoding();
+    return outBase64.isNotEmpty();
+}
+
+bool decodeWavBase64ToStrip(const juce::String& base64Data, EnhancedAudioStrip& strip)
+{
+    juce::MemoryBlock wavBytes;
+    if (!wavBytes.fromBase64Encoding(base64Data) || wavBytes.getSize() == 0)
+        return false;
+
+    juce::WavAudioFormat wavFormat;
+    std::unique_ptr<juce::AudioFormatReader> reader(
+        wavFormat.createReaderFor(new juce::MemoryInputStream(wavBytes.getData(), wavBytes.getSize(), false), true));
+    if (!reader)
+        return false;
+
+    const int64_t totalSamples64 = reader->lengthInSamples;
+    if (totalSamples64 <= 0 || totalSamples64 > static_cast<int64_t>(std::numeric_limits<int>::max()))
+        return false;
+
+    const int totalSamples = static_cast<int>(totalSamples64);
+    const int channelCount = juce::jlimit(1, 2, static_cast<int>(reader->numChannels));
+    juce::AudioBuffer<float> buffer(channelCount, totalSamples);
+
+    if (!reader->read(&buffer, 0, totalSamples, 0, true, true))
+        return false;
+
+    strip.loadSample(buffer, reader->sampleRate);
+    return strip.hasAudio();
+}
 }
 
 juce::File getPresetDirectory()
@@ -148,8 +212,19 @@ void savePreset(int presetIndex,
         auto* stripXml = preset.createNewChildElement("Strip");
         stripXml->setAttribute("index", i);
 
-        if (strip->hasAudio() && currentStripFiles[i] != juce::File())
-            stripXml->setAttribute("samplePath", currentStripFiles[i].getFullPathName());
+        if (strip->hasAudio())
+        {
+            if (currentStripFiles[i] != juce::File())
+            {
+                stripXml->setAttribute("samplePath", currentStripFiles[i].getFullPathName());
+            }
+            else if (const auto* audioBuffer = strip->getAudioBuffer())
+            {
+                juce::String embeddedWav;
+                if (encodeBufferAsWavBase64(*audioBuffer, strip->getSourceSampleRate(), embeddedWav))
+                    stripXml->setAttribute(kEmbeddedSampleAttr, embeddedWav);
+            }
+        }
 
         stripXml->setAttribute("volume", strip->getVolume());
         stripXml->setAttribute("pan", strip->getPan());
@@ -315,12 +390,23 @@ void loadPreset(int presetIndex,
         if (strip == nullptr)
             continue;
 
-        juce::String samplePath = stripXml->getStringAttribute("samplePath");
+        const juce::String samplePath = stripXml->getStringAttribute("samplePath");
+        bool loadedStripAudio = false;
         if (samplePath.isNotEmpty())
         {
             juce::File sampleFile(samplePath);
             if (sampleFile.existsAsFile())
+            {
                 loadSampleToStrip(stripIndex, sampleFile);
+                loadedStripAudio = true;
+            }
+        }
+
+        if (!loadedStripAudio)
+        {
+            const juce::String embeddedSample = stripXml->getStringAttribute(kEmbeddedSampleAttr);
+            if (embeddedSample.isNotEmpty())
+                loadedStripAudio = decodeWavBase64ToStrip(embeddedSample, *strip);
         }
 
         strip->setVolume(static_cast<float>(stripXml->getDoubleAttribute("volume", 1.0)));
