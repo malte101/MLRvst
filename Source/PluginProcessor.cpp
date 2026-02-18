@@ -21,9 +21,13 @@ juce::String controlModeToKey(MlrVSTAudioProcessor::ControlMode mode)
         case MlrVSTAudioProcessor::ControlMode::Pitch: return "pitch";
         case MlrVSTAudioProcessor::ControlMode::Pan: return "pan";
         case MlrVSTAudioProcessor::ControlMode::Volume: return "volume";
+        case MlrVSTAudioProcessor::ControlMode::GrainSize: return "grainsize";
         case MlrVSTAudioProcessor::ControlMode::Filter: return "filter";
+        case MlrVSTAudioProcessor::ControlMode::Swing: return "swing";
+        case MlrVSTAudioProcessor::ControlMode::Gate: return "gate";
         case MlrVSTAudioProcessor::ControlMode::FileBrowser: return "browser";
         case MlrVSTAudioProcessor::ControlMode::GroupAssign: return "group";
+        case MlrVSTAudioProcessor::ControlMode::Modulation: return "modulation";
         case MlrVSTAudioProcessor::ControlMode::Preset: return "preset";
         case MlrVSTAudioProcessor::ControlMode::Normal:
         default: return "normal";
@@ -37,9 +41,13 @@ bool controlModeFromKey(const juce::String& key, MlrVSTAudioProcessor::ControlMo
     if (normalized == "pitch") { mode = MlrVSTAudioProcessor::ControlMode::Pitch; return true; }
     if (normalized == "pan") { mode = MlrVSTAudioProcessor::ControlMode::Pan; return true; }
     if (normalized == "volume") { mode = MlrVSTAudioProcessor::ControlMode::Volume; return true; }
+    if (normalized == "grainsize" || normalized == "grain_size" || normalized == "grain") { mode = MlrVSTAudioProcessor::ControlMode::GrainSize; return true; }
     if (normalized == "filter") { mode = MlrVSTAudioProcessor::ControlMode::Filter; return true; }
+    if (normalized == "swing") { mode = MlrVSTAudioProcessor::ControlMode::Swing; return true; }
+    if (normalized == "gate") { mode = MlrVSTAudioProcessor::ControlMode::Gate; return true; }
     if (normalized == "browser") { mode = MlrVSTAudioProcessor::ControlMode::FileBrowser; return true; }
     if (normalized == "group") { mode = MlrVSTAudioProcessor::ControlMode::GroupAssign; return true; }
+    if (normalized == "mod" || normalized == "modulation") { mode = MlrVSTAudioProcessor::ControlMode::Modulation; return true; }
     if (normalized == "preset") { mode = MlrVSTAudioProcessor::ControlMode::Preset; return true; }
     return false;
 }
@@ -73,6 +81,7 @@ void MonomeConnection::connect(int appPort)
     applicationPort = appPort;
     
     // Disconnect if already connected
+    oscReceiver.removeListener(this);
     oscReceiver.disconnect();
     
     // Bind to application port for receiving messages from device
@@ -84,7 +93,15 @@ void MonomeConnection::connect(int appPort)
     oscReceiver.addListener(this);
     
     // Connect to serialosc for device discovery
-    serialoscSender.connect("127.0.0.1", 12002);
+    (void) serialoscSender.connect("127.0.0.1", 12002);
+
+    reconnectAttempts = 0;
+    lastMessageTime = juce::Time::currentTimeMillis();
+    lastConnectAttemptTime = lastMessageTime;
+    lastPingTime = 0;
+    lastDiscoveryTime = 0;
+    lastReconnectAttemptTime = 0;
+    awaitingDeviceResponse = false;
     
     // Start device discovery
     discoverDevices();
@@ -101,19 +118,32 @@ void MonomeConnection::disconnect()
     oscReceiver.removeListener(this);
     oscReceiver.disconnect();
     oscSender.disconnect();
+    serialoscSender.disconnect();
     connected = false;
+    reconnectAttempts = 0;
+    lastMessageTime = 0;
+    lastConnectAttemptTime = 0;
+    lastPingTime = 0;
+    lastDiscoveryTime = 0;
+    lastReconnectAttemptTime = 0;
+    awaitingDeviceResponse = false;
 }
 
 void MonomeConnection::discoverDevices()
 {
-    serialoscSender.connect("127.0.0.1", 12002);
+    if (!serialoscSender.connect("127.0.0.1", 12002))
+        return;
     
     // Query for device list
-    serialoscSender.send(juce::OSCMessage("/serialosc/list", juce::String("127.0.0.1"), applicationPort));
+    const bool sentList = serialoscSender.send(
+        juce::OSCMessage("/serialosc/list", juce::String("127.0.0.1"), applicationPort));
     
     // Subscribe to device notifications
-    serialoscSender.send(juce::OSCMessage("/serialosc/notify", juce::String("127.0.0.1"), applicationPort));
-    
+    const bool sentNotify = serialoscSender.send(
+        juce::OSCMessage("/serialosc/notify", juce::String("127.0.0.1"), applicationPort));
+
+    if (sentList || sentNotify)
+        lastDiscoveryTime = juce::Time::currentTimeMillis();
 }
 
 void MonomeConnection::selectDevice(int deviceIndex)
@@ -129,22 +159,18 @@ void MonomeConnection::selectDevice(int deviceIndex)
     // Connect to the device's port
     if (oscSender.connect(currentDevice.host, currentDevice.port))
     {
-        
-        // Configure device to send messages to our application port
-        oscSender.send(juce::OSCMessage("/sys/port", applicationPort));
-        oscSender.send(juce::OSCMessage("/sys/host", juce::String(currentDevice.host)));
-        oscSender.send(juce::OSCMessage("/sys/prefix", oscPrefix));
-        
-        // Request device information
-        requestInfo();
-        requestSize();
+        configureCurrentDevice();
+        sendPing();
         
         // Clear all LEDs on connection
         setAllLEDs(0);
         
         connected = true;
         reconnectAttempts = 0;
-        lastMessageTime = juce::Time::currentTimeMillis();
+        lastMessageTime = 0;
+        lastConnectAttemptTime = juce::Time::currentTimeMillis();
+        lastPingTime = 0;
+        awaitingDeviceResponse = true;
         
         if (onDeviceConnected)
             onDeviceConnected();
@@ -314,6 +340,7 @@ void MonomeConnection::oscMessageReceived(const juce::OSCMessage& message)
     
     // Update last message time for connection monitoring
     lastMessageTime = juce::Time::currentTimeMillis();
+    awaitingDeviceResponse = false;
     
     if (address.startsWith("/serialosc"))
         handleSerialOSCMessage(message);
@@ -327,21 +354,53 @@ void MonomeConnection::oscMessageReceived(const juce::OSCMessage& message)
 
 void MonomeConnection::timerCallback()
 {
+    const auto currentTime = juce::Time::currentTimeMillis();
+
     if (!connected)
     {
-        // Attempt reconnection if we have a device and auto-reconnect is enabled
-        if (autoReconnect && !currentDevice.id.isEmpty() && reconnectAttempts < maxReconnectAttempts)
+        if (!autoReconnect)
+            return;
+
+        if (currentTime - lastDiscoveryTime >= discoveryIntervalMs)
+            discoverDevices();
+
+        // Attempt direct reconnection while we still have a candidate endpoint.
+        if (!currentDevice.id.isEmpty()
+            && currentDevice.port > 0
+            && reconnectAttempts < maxReconnectAttempts
+            && (currentTime - lastReconnectAttemptTime) >= reconnectIntervalMs)
         {
+            lastReconnectAttemptTime = currentTime;
             attemptReconnection();
         }
+
         return;
     }
-    
-    // Send ping to keep connection alive
-    auto currentTime = juce::Time::currentTimeMillis();
-    if (currentTime - lastMessageTime > pingIntervalMs)
+
+    // A successful UDP "connect" does not guarantee the device is reachable.
+    // Require a real response shortly after claiming an endpoint.
+    if (awaitingDeviceResponse
+        && lastConnectAttemptTime > 0
+        && (currentTime - lastConnectAttemptTime) > handshakeTimeoutMs)
+    {
+        markDisconnected();
+        discoverDevices();
+        return;
+    }
+
+    // Treat long silence as dead connection, then fall back to discovery/reconnect.
+    if (lastMessageTime > 0 && (currentTime - lastMessageTime) > connectionTimeoutMs)
+    {
+        markDisconnected();
+        discoverDevices();
+        return;
+    }
+
+    // Send periodic ping to keep connection alive and refresh sys state.
+    if (lastPingTime == 0 || (currentTime - lastPingTime) >= pingIntervalMs)
     {
         sendPing();
+        lastPingTime = currentTime;
     }
 }
 
@@ -352,17 +411,23 @@ void MonomeConnection::attemptReconnection()
     // Try to reconnect to current device
     if (oscSender.connect(currentDevice.host, currentDevice.port))
     {
-        oscSender.send(juce::OSCMessage("/sys/port", applicationPort));
-        oscSender.send(juce::OSCMessage("/sys/host", juce::String(currentDevice.host)));
-        oscSender.send(juce::OSCMessage("/sys/prefix", oscPrefix));
+        configureCurrentDevice();
+        sendPing();
         
         connected = true;
         reconnectAttempts = 0;
-        lastMessageTime = juce::Time::currentTimeMillis();
+        lastMessageTime = 0;
+        lastConnectAttemptTime = juce::Time::currentTimeMillis();
+        lastPingTime = 0;
+        awaitingDeviceResponse = true;
         
         if (onDeviceConnected)
             onDeviceConnected();
         
+    }
+    else if (autoReconnect)
+    {
+        discoverDevices();
     }
 }
 
@@ -372,7 +437,6 @@ void MonomeConnection::sendPing()
     
     // Request device info as a "ping"
     oscSender.send(juce::OSCMessage("/sys/info", juce::String(currentDevice.host), applicationPort));
-    lastMessageTime = juce::Time::currentTimeMillis();
 }
 
 void MonomeConnection::handleSerialOSCMessage(const juce::OSCMessage& message)
@@ -389,11 +453,19 @@ void MonomeConnection::handleSerialOSCMessage(const juce::OSCMessage& message)
         
         // Check if device already exists in list
         bool deviceExists = false;
-        for (const auto& existing : devices)
+        bool endpointChanged = false;
+        for (auto& existing : devices)
         {
-            if (existing.id == info.id && existing.port == info.port)
+            if (existing.id == info.id)
             {
                 deviceExists = true;
+                if (existing.port != info.port || existing.type != info.type || existing.host != info.host)
+                {
+                    existing.type = info.type;
+                    existing.port = info.port;
+                    existing.host = info.host;
+                    endpointChanged = true;
+                }
                 break;
             }
         }
@@ -401,22 +473,55 @@ void MonomeConnection::handleSerialOSCMessage(const juce::OSCMessage& message)
         if (!deviceExists)
         {
             devices.push_back(info);
-            
-            // Notify about device list update
+        }
+
+        // If this is our selected device and serialosc changed its endpoint,
+        // switch to the new endpoint immediately.
+        if (currentDevice.id == info.id
+            && (currentDevice.port != info.port || currentDevice.host != info.host))
+        {
+            currentDevice.port = info.port;
+            currentDevice.host = info.host;
+
+            if (connected)
+            {
+                oscSender.disconnect();
+                markDisconnected();
+            }
+        }
+
+        if (!deviceExists || endpointChanged)
+        {
             if (onDeviceListUpdated)
                 onDeviceListUpdated(devices);
-            
-            // Auto-connect to first device if not connected
-            if (devices.size() == 1 && !connected)
+        }
+
+        if (!connected)
+        {
+            int bestIndex = -1;
+            if (!currentDevice.id.isEmpty())
             {
-                selectDevice(0);
+                for (int i = 0; i < static_cast<int>(devices.size()); ++i)
+                {
+                    if (devices[static_cast<size_t>(i)].id == currentDevice.id)
+                    {
+                        bestIndex = i;
+                        break;
+                    }
+                }
             }
+
+            if (bestIndex < 0 && !devices.empty())
+                bestIndex = 0;
+
+            if (bestIndex >= 0)
+                selectDevice(bestIndex);
         }
     }
     else if (address == "/serialosc/add" && message.size() >= 3)
     {
         // Device was plugged in
-        juce::Timer::callAfterDelay(500, [this]()
+        juce::Timer::callAfterDelay(250, [this]()
         {
             discoverDevices(); // Refresh device list
         });
@@ -425,8 +530,6 @@ void MonomeConnection::handleSerialOSCMessage(const juce::OSCMessage& message)
     {
         // Device was unplugged
         auto removedId = message[0].getString();
-        auto removedType = message[1].getString();
-        
         
         // Remove from device list
         devices.erase(std::remove_if(devices.begin(), devices.end(),
@@ -436,21 +539,43 @@ void MonomeConnection::handleSerialOSCMessage(const juce::OSCMessage& message)
         // Check if it was our connected device
         if (removedId == currentDevice.id)
         {
-            connected = false;
-            
-            if (onDeviceDisconnected)
-                onDeviceDisconnected();
+            markDisconnected();
             
             // Try to auto-connect to another device if available
             if (!devices.empty() && autoReconnect)
-            {
                 selectDevice(0);
-            }
         }
         
         if (onDeviceListUpdated)
             onDeviceListUpdated(devices);
     }
+}
+
+void MonomeConnection::markDisconnected()
+{
+    if (!connected)
+        return;
+
+    connected = false;
+    oscSender.disconnect();
+    awaitingDeviceResponse = false;
+    lastConnectAttemptTime = 0;
+    lastPingTime = 0;
+
+    if (onDeviceDisconnected)
+        onDeviceDisconnected();
+}
+
+void MonomeConnection::configureCurrentDevice()
+{
+    // Configure device to send messages to our application port.
+    oscSender.send(juce::OSCMessage("/sys/port", applicationPort));
+    oscSender.send(juce::OSCMessage("/sys/host", juce::String("127.0.0.1")));
+    oscSender.send(juce::OSCMessage("/sys/prefix", oscPrefix));
+    
+    // Request device information and refresh prefix/size state.
+    oscSender.send(juce::OSCMessage("/sys/info", juce::String("127.0.0.1"), applicationPort));
+    oscSender.send(juce::OSCMessage("/sys/size"));
 }
 
 void MonomeConnection::handleGridMessage(const juce::OSCMessage& message)
@@ -530,6 +655,7 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
     cacheParameterPointers();
     loadPersistentDefaultPaths();
     loadPersistentControlPages();
+    setSwingDivisionSelection(swingDivisionSelection.load(std::memory_order_acquire));
     
     // Setup monome callbacks
     monomeConnection.onKeyPress = [this](int x, int y, int state)
@@ -539,6 +665,11 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
     
     monomeConnection.onDeviceConnected = [this]()
     {
+        // Force full LED resend after any reconnect to avoid stale cache mismatch.
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 16; ++x)
+                ledCache[x][y] = -1;
+
         // Defer LED update slightly to ensure everything is ready
         juce::MessageManager::callAsync([this]()
         {
@@ -581,9 +712,13 @@ juce::String MlrVSTAudioProcessor::getControlModeName(ControlMode mode)
         case ControlMode::Pitch: return "Pitch";
         case ControlMode::Pan: return "Pan";
         case ControlMode::Volume: return "Volume";
+        case ControlMode::GrainSize: return "Grain Size";
         case ControlMode::Filter: return "Filter";
+        case ControlMode::Swing: return "Swing";
+        case ControlMode::Gate: return "Gate";
         case ControlMode::FileBrowser: return "Browser";
         case ControlMode::GroupAssign: return "Group";
+        case ControlMode::Modulation: return "Modulation";
         case ControlMode::Preset: return "Preset";
         case ControlMode::Normal:
         default: return "Normal";
@@ -637,6 +772,31 @@ void MlrVSTAudioProcessor::setControlPageMomentary(bool shouldBeMomentary)
 {
     controlPageMomentary.store(shouldBeMomentary, std::memory_order_release);
     savePersistentControlPages();
+}
+
+void MlrVSTAudioProcessor::setSwingDivisionSelection(int mode)
+{
+    const int clamped = juce::jlimit(0, 3, mode);
+    swingDivisionSelection.store(clamped, std::memory_order_release);
+    if (audioEngine)
+        audioEngine->setGlobalSwingDivision(static_cast<EnhancedAudioStrip::SwingDivision>(clamped));
+    savePersistentControlPages();
+}
+
+void MlrVSTAudioProcessor::setControlModeFromGui(ControlMode mode, bool shouldBeActive)
+{
+    if (!shouldBeActive || mode == ControlMode::Normal)
+    {
+        currentControlMode = ControlMode::Normal;
+        controlModeActive = false;
+    }
+    else
+    {
+        currentControlMode = mode;
+        controlModeActive = true;
+    }
+
+    updateMonomeLEDs();
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::createParameterLayout()
@@ -729,7 +889,7 @@ void MlrVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
             // Initialize LED cache
             for (int y = 0; y < 8; ++y)
                 for (int x = 0; x < 16; ++x)
-                    ledCache[x][y] = 0;
+                    ledCache[x][y] = -1;
         }
     });
 
@@ -833,6 +993,9 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
 
     if (crossfadeLengthParam)
         audioEngine->setCrossfadeLengthMs(*crossfadeLengthParam);
+
+    // Apply any pending loop enter/exit actions that were quantized to timeline.
+    applyPendingLoopChanges(posInfo);
     
     // Update strip parameters
     for (int i = 0; i < MaxStrips; ++i)
@@ -930,6 +1093,164 @@ void MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& f
     }
 }
 
+int MlrVSTAudioProcessor::getQuantizeDivision() const
+{
+    auto* quantizeParamLocal = parameters.getRawParameterValue("quantize");
+    const int quantizeChoice = quantizeParamLocal ? static_cast<int>(*quantizeParamLocal) : 5;
+    const int divisionMap[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32};
+    return (quantizeChoice >= 0 && quantizeChoice < 10) ? divisionMap[quantizeChoice] : 8;
+}
+
+void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int startColumn, int endColumn, bool reverseDirection, int markerColumn)
+{
+    if (!audioEngine || stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    auto* strip = audioEngine->getStrip(stripIndex);
+    if (!strip)
+        return;
+
+    const int quantizeDivision = getQuantizeDivision();
+    const bool useQuantize = quantizeEnabled && quantizeDivision > 1;
+
+    if (!useQuantize)
+    {
+        {
+            const juce::ScopedLock lock(pendingLoopChangeLock);
+            pendingLoopChanges[static_cast<size_t>(stripIndex)].active = false;
+        }
+
+        bool markerApplied = false;
+        if (clearLoop)
+        {
+            strip->clearLoop();
+            strip->setReverse(false);
+            if (markerColumn >= 0)
+            {
+                strip->setPlaybackMarkerColumn(markerColumn, audioEngine->getGlobalSampleCount());
+                markerApplied = true;
+            }
+        }
+        else
+        {
+            strip->setLoop(startColumn, endColumn);
+            strip->setReverse(reverseDirection);
+        }
+
+        if (!markerApplied && strip->isPlaying() && strip->hasAudio())
+            strip->snapToTimeline(audioEngine->getGlobalSampleCount());
+        return;
+    }
+
+    double currentPpq = audioEngine->getTimelineBeat();
+    if (auto* playHead = getPlayHead())
+    {
+        if (auto position = playHead->getPosition())
+        {
+            if (position->getPpqPosition().hasValue())
+                currentPpq = *position->getPpqPosition();
+        }
+    }
+
+    if (!std::isfinite(currentPpq))
+    {
+        // If host PPQ is unavailable, apply immediately to avoid stuck requests.
+        if (clearLoop)
+        {
+            strip->clearLoop();
+            strip->setReverse(false);
+            if (markerColumn >= 0)
+                strip->setPlaybackMarkerColumn(markerColumn, audioEngine->getGlobalSampleCount());
+        }
+        else
+        {
+            strip->setLoop(startColumn, endColumn);
+            strip->setReverse(reverseDirection);
+        }
+
+        if (strip->isPlaying() && strip->hasAudio())
+            strip->snapToTimeline(audioEngine->getGlobalSampleCount());
+        return;
+    }
+
+    const double quantBeats = 4.0 / static_cast<double>(quantizeDivision);
+    double targetPpq = std::ceil(currentPpq / quantBeats) * quantBeats;
+    if (targetPpq <= (currentPpq + 1.0e-6))
+        targetPpq += quantBeats;
+    targetPpq = std::round(targetPpq / quantBeats) * quantBeats;
+
+    const juce::ScopedLock lock(pendingLoopChangeLock);
+    auto& pending = pendingLoopChanges[static_cast<size_t>(stripIndex)];
+    pending.active = true;
+    pending.clear = clearLoop;
+    pending.startColumn = juce::jlimit(0, MaxColumns - 1, startColumn);
+    pending.endColumn = juce::jlimit(pending.startColumn + 1, MaxColumns, endColumn);
+    pending.markerColumn = juce::jlimit(-1, MaxColumns - 1, markerColumn);
+    pending.reverse = reverseDirection;
+    pending.quantized = true;
+    pending.targetPpq = targetPpq;
+}
+
+void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::PositionInfo& posInfo)
+{
+    if (!audioEngine)
+        return;
+
+    double currentPpq = audioEngine->getTimelineBeat();
+    if (posInfo.getPpqPosition().hasValue())
+        currentPpq = *posInfo.getPpqPosition();
+
+    std::array<PendingLoopChange, MaxStrips> readyChanges{};
+    {
+        const juce::ScopedLock lock(pendingLoopChangeLock);
+        for (int i = 0; i < MaxStrips; ++i)
+        {
+            auto& pending = pendingLoopChanges[static_cast<size_t>(i)];
+            if (!pending.active)
+                continue;
+
+            const bool canApplyNow = !pending.quantized
+                || !std::isfinite(currentPpq)
+                || (currentPpq + 1.0e-6 >= pending.targetPpq);
+
+            if (!canApplyNow)
+                continue;
+
+            readyChanges[static_cast<size_t>(i)] = pending;
+            pending.active = false;
+        }
+    }
+
+    const int64_t currentGlobalSample = audioEngine->getGlobalSampleCount();
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        const auto& change = readyChanges[static_cast<size_t>(i)];
+        if (!change.active)
+            continue;
+
+        auto* strip = audioEngine->getStrip(i);
+        if (!strip)
+            continue;
+
+        if (change.clear)
+        {
+            strip->clearLoop();
+            strip->setReverse(false);
+            if (change.markerColumn >= 0)
+                strip->setPlaybackMarkerColumn(change.markerColumn, currentGlobalSample);
+        }
+        else
+        {
+            strip->setLoop(change.startColumn, change.endColumn);
+            strip->setReverse(change.reverse);
+        }
+
+        const bool markerApplied = (change.clear && change.markerColumn >= 0);
+        if (!markerApplied && strip->isPlaying() && strip->hasAudio())
+            strip->snapToTimeline(currentGlobalSample);
+    }
+}
+
 juce::File MlrVSTAudioProcessor::getDefaultSampleDirectory(int stripIndex, SamplePathMode mode) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
@@ -991,6 +1312,7 @@ void MlrVSTAudioProcessor::appendControlPagesToState(juce::ValueTree& state) con
     }
 
     controlPages.setProperty("momentary", isControlPageMomentary(), nullptr);
+    controlPages.setProperty("swingDivision", swingDivisionSelection.load(std::memory_order_acquire), nullptr);
 }
 
 void MlrVSTAudioProcessor::loadDefaultPathsFromState(const juce::ValueTree& state)
@@ -1062,10 +1384,14 @@ void MlrVSTAudioProcessor::loadControlPagesFromState(const juce::ValueTree& stat
         ControlMode::Speed,
         ControlMode::Pan,
         ControlMode::Volume,
+        ControlMode::GrainSize,
+        ControlMode::Swing,
+        ControlMode::Gate,
         ControlMode::FileBrowser,
         ControlMode::GroupAssign,
         ControlMode::Filter,
         ControlMode::Pitch,
+        ControlMode::Modulation,
         ControlMode::Preset
     };
 
@@ -1092,6 +1418,8 @@ void MlrVSTAudioProcessor::loadControlPagesFromState(const juce::ValueTree& stat
 
     const bool momentary = controlPages.getProperty("momentary", true);
     controlPageMomentary.store(momentary, std::memory_order_release);
+    const int swingDivision = static_cast<int>(controlPages.getProperty("swingDivision", 1));
+    setSwingDivisionSelection(swingDivision);
     savePersistentControlPages();
 }
 
@@ -1177,6 +1505,7 @@ void MlrVSTAudioProcessor::loadPersistentControlPages()
         controlPages.setProperty(key, xml->getStringAttribute(key), nullptr);
     }
     controlPages.setProperty("momentary", xml->getBoolAttribute("momentary", true), nullptr);
+    controlPages.setProperty("swingDivision", xml->getIntAttribute("swingDivision", 1), nullptr);
     state.addChild(controlPages, -1, nullptr);
 
     loadControlPagesFromState(state);
@@ -1197,6 +1526,7 @@ void MlrVSTAudioProcessor::savePersistentControlPages() const
         xml.setAttribute(key, controlModeToKey(orderSnapshot[static_cast<size_t>(i)]));
     }
     xml.setAttribute("momentary", isControlPageMomentary());
+    xml.setAttribute("swingDivision", swingDivisionSelection.load(std::memory_order_acquire));
 
     xml.writeTo(settingsFile);
 }
@@ -1211,10 +1541,9 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     // CHECK: If inner loop is active, clear it and return to full loop
     if (strip->getLoopStart() != 0 || strip->getLoopEnd() != MaxColumns)
     {
-        // Inner loop is active - next press clears it
-        strip->clearLoop();
-        strip->setReverse(false);  // Restore normal (forward) playback
-        DBG("Inner loop cleared on strip " << stripIndex << " - restored to full loop, normal playback");
+        // Inner loop is active - next press clears it, aligned to current quantize grid.
+        queueLoopChange(stripIndex, true, 0, MaxColumns, false, column);
+        DBG("Inner loop clear requested on strip " << stripIndex << " (quantized when enabled)");
         return;  // Don't trigger, just clear the loop
     }
     
@@ -1251,7 +1580,10 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     
     // Apply quantization if enabled
     bool useQuantize = quantizeEnabled && quantizeValue > 1;
-    const bool isHoldScratchTransition = (strip->getScratchAmount() > 0.0f && strip->getHeldButtonCount() > 1);
+    const bool isHoldScratchTransition = (strip->getScratchAmount() > 0.0f
+        && ((strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
+            ? strip->isButtonHeld()
+            : (strip->getHeldButtonCount() > 1)));
     if (isHoldScratchTransition)
         useQuantize = false;
     
@@ -1516,6 +1848,7 @@ void MlrVSTAudioProcessor::loadPreset(int presetIndex)
 
     if (PresetStore::presetExists(presetIndex))
         loadedPresetIndex = presetIndex;
+    presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
 }
 
 bool MlrVSTAudioProcessor::deletePreset(int presetIndex)

@@ -3,7 +3,7 @@
 
     StepSequencerDisplay.h
     Visual display for step sequencer mode
-    Shows 16-step grid with current step indicator
+    Shows full pattern grid (16/32/48/64 steps)
 
   ==============================================================================
 */
@@ -29,22 +29,26 @@ public:
     void paint(juce::Graphics& g) override
     {
         auto bounds = getLocalBounds();
-        
+        const auto content = bounds.reduced(1).toFloat();
+
         // Background
         g.fillAll(juce::Colour(0xff1f1f1f));
-        
-        // Calculate step size
-        int numSteps = 16;
-        float stepWidth = bounds.getWidth() / static_cast<float>(numSteps);
-        float stepHeight = bounds.getHeight();
+
+        const int numSteps = juce::jlimit(16, 64, totalSteps);
+        const int numRows = juce::jmax(1, (numSteps + 15) / 16);
+        const int stepsPerRow = 16;
+        const float stepWidth = content.getWidth() / static_cast<float>(stepsPerRow);
+        const float stepHeight = content.getHeight() / static_cast<float>(numRows);
         
         for (int i = 0; i < numSteps; ++i)
         {
+            const int row = i / stepsPerRow;
+            const int col = i % stepsPerRow;
             juce::Rectangle<float> stepRect(
-                i * stepWidth,
-                0.0f,
+                content.getX() + (col * stepWidth),
+                content.getY() + (row * stepHeight),
                 stepWidth - 2.0f,  // 2px gap between steps
-                stepHeight
+                stepHeight - 2.0f
             );
             
             // Determine step color using strip color
@@ -76,28 +80,39 @@ public:
             
             // Draw step number
             g.setColour(juce::Colour(0xffa8a8a8));
-            g.setFont(10.0f);
-            g.drawText(juce::String(i + 1), 
+            g.setFont(stepHeight < 18.0f ? 8.0f : 10.0f);
+            g.drawText(juce::String(i + 1),
                       stepRect.toNearestInt(), 
                       juce::Justification::centred);
         }
         
-        // Draw beat divisions (every 4 steps = 1 beat)
+        // Draw beat divisions (every 4 steps = 1 beat), per row.
         g.setColour(juce::Colour(0xff4f4f4f));
-        for (int i = 4; i < numSteps; i += 4)
+        for (int col = 4; col < stepsPerRow; col += 4)
         {
-            float x = i * stepWidth;
-            g.drawLine(x, 0, x, stepHeight, 2.0f);
+            const float x = content.getX() + (col * stepWidth);
+            g.drawLine(x, content.getY(), x, content.getBottom(), 1.5f);
+        }
+
+        // Draw row separators for multi-row patterns.
+        if (numRows > 1)
+        {
+            g.setColour(juce::Colour(0xff1a1a1a));
+            for (int row = 1; row < numRows; ++row)
+            {
+                const float y = content.getY() + (row * stepHeight);
+                g.drawLine(content.getX(), y, content.getRight(), y, 1.0f);
+            }
         }
         
         // Draw playback position indicator (independent of step)
         if (playbackPosition >= 0.0f && playbackPosition <= 1.0f)
         {
-            float playheadX = playbackPosition * bounds.getWidth();
+            float playheadX = content.getX() + (playbackPosition * content.getWidth());
             
             // Vertical line
             g.setColour(juce::Colour(0xffffb347).withAlpha(0.9f));
-            g.drawLine(playheadX, 0, playheadX, stepHeight, 2.0f);
+            g.drawLine(playheadX, content.getY(), playheadX, content.getY() + stepHeight, 2.0f);
             
             // Small triangle at top
             juce::Path triangle;
@@ -107,9 +122,10 @@ public:
         }
     }
     
-    void setStepPattern(const std::array<bool, 16>& pattern)
+    void setStepPattern(const std::array<bool, 64>& pattern, int steps)
     {
         stepPattern = pattern;
+        totalSteps = juce::jlimit(16, 64, steps);
         repaint();
     }
     
@@ -152,8 +168,8 @@ public:
     void mouseDown(const juce::MouseEvent& event) override
     {
         // Allow clicking to toggle steps
-        int stepIndex = getStepIndexFromX(event.x);
-        if (stepIndex >= 0 && stepIndex < 16)
+        const int stepIndex = getStepIndexFromPosition(event.position);
+        if (stepIndex >= 0 && stepIndex < totalSteps)
         {
             if (onStepClicked)
                 onStepClicked(stepIndex);
@@ -163,16 +179,26 @@ public:
     std::function<void(int)> onStepClicked;
     
 private:
-    std::array<bool, 16> stepPattern = {};
+    std::array<bool, 64> stepPattern = {};
+    int totalSteps = 16;
     int currentStep = 0;
     bool isPlaying = false;
     float playbackPosition = -1.0f;  // -1 = hidden, 0.0-1.0 = normalized position
     juce::Colour stripColor = juce::Colour(0xff6f93c8);  // Default muted blue
     
-    int getStepIndexFromX(int x)
+    int getStepIndexFromPosition(juce::Point<float> position) const
     {
-        float stepWidth = getWidth() / 16.0f;
-        return juce::jlimit(0, 15, static_cast<int>(x / stepWidth));
+        const auto content = getLocalBounds().reduced(1).toFloat();
+        const int stepsPerRow = 16;
+        const int numRows = juce::jmax(1, (totalSteps + 15) / 16);
+        const float stepWidth = content.getWidth() / static_cast<float>(stepsPerRow);
+        const float stepHeight = content.getHeight() / static_cast<float>(numRows);
+        const float px = juce::jlimit(content.getX(), content.getRight() - 0.001f, position.x) - content.getX();
+        const float py = juce::jlimit(content.getY(), content.getBottom() - 0.001f, position.y) - content.getY();
+        const int col = juce::jlimit(0, stepsPerRow - 1, static_cast<int>(px / stepWidth));
+        const int row = juce::jlimit(0, numRows - 1, static_cast<int>(py / stepHeight));
+        const int index = row * stepsPerRow + col;
+        return juce::jlimit(0, totalSteps - 1, index);
     }
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(StepSequencerDisplay)

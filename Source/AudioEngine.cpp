@@ -20,6 +20,7 @@ constexpr bool kEnableRealtimeFileLogging = false;
 constexpr double kMaxScratchRateAbs = 2.5;
 constexpr double kMaxPatternRateAbs = 4.0;
 constexpr double kForwardScratchDecay = 7.0;
+constexpr double kReverseScratchAccelExp = 1.6;
 constexpr int kMinGrainWindowSamples = 32;
 constexpr float kGrainMinSizeMs = 5.0f;
 constexpr float kGrainMaxSizeMs = 2400.0f;
@@ -578,6 +579,25 @@ void PatternRecorder::clear()
     recordingEndBeat.store(-1.0, std::memory_order_release);
 }
 
+std::vector<PatternRecorder::Event> PatternRecorder::getEventsSnapshot() const
+{
+    juce::ScopedLock lock(recordLock);
+    return events;
+}
+
+void PatternRecorder::setEventsSnapshot(const std::vector<Event>& newEvents, int lengthBeats)
+{
+    juce::ScopedLock lock(recordLock);
+    events = newEvents;
+    std::sort(events.begin(), events.end());
+    lengthInBeats.store(juce::jmax(1, lengthBeats), std::memory_order_release);
+    recording.store(false, std::memory_order_release);
+    playing.store(false, std::memory_order_release);
+    playbackPosition.store(0.0, std::memory_order_release);
+    playbackStartBeat.store(-1.0, std::memory_order_release);
+    lastProcessedBeat.store(-1.0, std::memory_order_release);
+}
+
 bool PatternRecorder::updateRecording(double currentBeat)
 {
     if (!recording.load(std::memory_order_acquire))
@@ -1061,6 +1081,9 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     for (auto& p : grainPreviewPitchNorms)
         p.store(0.0f, std::memory_order_release);
     grainArpStep = 0;
+    grainPreviewDecimationCounter = 0;
+    grainSizeJitterBeatGroup = std::numeric_limits<int64_t>::min();
+    grainSizeJitterMul = grainParams.sizeMs;
     grainCloudDelayWritePos = 0;
     const int cloudDelaySamples = juce::jmax(1, static_cast<int>(std::round(sampleRate * 2.0)));
     grainCloudDelayBuffer.setSize(2, cloudDelaySamples, false, true, true);
@@ -1408,6 +1431,9 @@ void EnhancedAudioStrip::resetGrainState()
     for (auto& p : grainPreviewPitchNorms)
         p.store(0.0f, std::memory_order_release);
     grainArpStep = 0;
+    grainPreviewDecimationCounter = 0;
+    grainSizeJitterBeatGroup = std::numeric_limits<int64_t>::min();
+    grainSizeJitterMul = grainParams.sizeMs;
     grainCloudDelayWritePos = 0;
     if (grainCloudDelayBuffer.getNumSamples() > 0)
         grainCloudDelayBuffer.clear();
@@ -1492,22 +1518,22 @@ void EnhancedAudioStrip::updateGrainAnchorFromHeld()
     }
 
     int newestIdx = 0;
+    int secondNewestIdx = -1;
     for (int i = 1; i < grainGesture.heldCount; ++i)
     {
         if (grainGesture.heldOrder[i] > grainGesture.heldOrder[newestIdx])
+        {
+            secondNewestIdx = newestIdx;
             newestIdx = i;
+        }
+        else if (secondNewestIdx < 0 || grainGesture.heldOrder[i] > grainGesture.heldOrder[secondNewestIdx])
+        {
+            secondNewestIdx = i;
+        }
     }
 
     grainGesture.anchorX = grainGesture.heldX[newestIdx];
-    grainGesture.secondaryX = -1;
-    for (int i = 0; i < grainGesture.heldCount; ++i)
-    {
-        if (i != newestIdx)
-        {
-            grainGesture.secondaryX = grainGesture.heldX[i];
-            break;
-        }
-    }
+    grainGesture.secondaryX = (secondNewestIdx >= 0) ? grainGesture.heldX[secondNewestIdx] : -1;
 }
 
 void EnhancedAudioStrip::updateGrainSizeFromGrip()
@@ -1594,6 +1620,7 @@ void EnhancedAudioStrip::updateGrainGestureOnPress(int column, int64_t globalSam
 
     updateGrainAnchorFromHeld();
     grainGesture.freeze = true;
+    grainGesture.returningToTimeline = false;
 
     if (grainGesture.heldCount == 3)
     {
@@ -1642,6 +1669,19 @@ double EnhancedAudioStrip::getTimelinePositionForSample(int64_t globalSample) co
 {
     if (sampleLength <= 0.0)
         return 0.0;
+
+    // In grain mode, RandomSlice (and other non-linear directions) can remap
+    // position away from raw timeline phase. Use audible position as timeline
+    // return target so release from held-grain state follows the active mode.
+    if (playMode == PlayMode::Grain
+        && (directionMode == DirectionMode::RandomSlice
+            || directionMode == DirectionMode::Random
+            || directionMode == DirectionMode::RandomWalk
+            || directionMode == DirectionMode::PingPong
+            || directionMode == DirectionMode::Reverse))
+    {
+        return playbackPosition.load();
+    }
 
     int loopCols = loopEnd - loopStart;
     if (loopCols <= 0)
@@ -1779,11 +1819,13 @@ void EnhancedAudioStrip::updateGrainGestureOnRelease(int column, int64_t globalS
     if (grainGesture.heldCount <= 0)
     {
         grainGesture.freeze = false;
+        grainGesture.returningToTimeline = false;
         grainGesture.anchorX = -1;
         grainGesture.secondaryX = -1;
         grainGesture.sizeControlX = -1;
-        grainGesture.centerRampMs = juce::jmax(10.0f, grainGesture.centerRampMs * 0.5f);
         const float grainScratch = scratchAmount.load(std::memory_order_acquire);
+        const double tempoNow = (lastObservedTempo > 0.0) ? lastObservedTempo : 120.0;
+        grainGesture.centerRampMs = static_cast<float>(juce::jmax(10.0, grainScratchSecondsFromAmount(grainScratch) * 1000.0));
         const double timelineTarget = getTimelinePositionForSample(globalSample);
         if (grainScratch <= 0.001f)
         {
@@ -1802,18 +1844,20 @@ void EnhancedAudioStrip::updateGrainGestureOnRelease(int column, int64_t globalS
         }
         else
         {
-            setGrainCenterTarget(timelineTarget, false);
+            // Full release: smooth proportional return to timeline target.
+            grainGesture.freeze = true;
+            grainGesture.returningToTimeline = true;
+            setGrainCenterTarget(timelineTarget, true);
         }
 
         restoreSnapshotIfNeeded();
-
-        const double tempoNow = (lastObservedTempo > 0.0) ? lastObservedTempo : 120.0;
         setGrainScratchSceneTarget(0.0f, 0, tempoNow);
     }
     else
     {
         updateGrainAnchorFromHeld();
         grainGesture.freeze = true;
+        grainGesture.returningToTimeline = false;
         grainGesture.sizeControlX = (grainGesture.heldCount == 3) ? grainGesture.heldX[2] : -1;
         if (grainGesture.heldCount == 3)
             updateGrainSizeFromGrip();
@@ -1825,7 +1869,7 @@ void EnhancedAudioStrip::updateGrainGestureOnRelease(int column, int64_t globalS
             const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
             const double loopLength = (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
             const double target = getTriggerTargetPositionForColumn(grainGesture.anchorX, loopStartSamples, loopLength);
-            setGrainCenterTarget(target, false);
+            setGrainCenterTarget(target, true);
         }
 
         const double tempoNow = (lastObservedTempo > 0.0) ? lastObservedTempo : 120.0;
@@ -1892,24 +1936,60 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
     const float pitchJitterSpan = grainPitchJitterAtomic.load(std::memory_order_acquire);
     std::uniform_real_distribution<float> pitchJitterDist(-pitchJitterSpan, pitchJitterSpan);
     const float arpDepth = grainArpDepthAtomic.load(std::memory_order_acquire);
-    float pitchSemi = ((arpDepth > 0.001f) ? 0.0f : pitchBase) + pitchOffsetSemitones + pitchJitterDist(randomGenerator);
-
-    if (arpDepth > 0.001f)
+    const bool arpActive = (arpDepth > 0.001f);
+    const int arpMode = arpActive ? juce::jlimit(0, 5, grainArpModeAtomic.load(std::memory_order_acquire)) : 0;
+    const float arpRangeSemis = juce::jlimit(0.0f, 48.0f, std::abs(pitchBase));
+    auto quantizeToScale = [](float semi, const std::array<int, 7>& scale, int rootMidi)
     {
-        const int arpMode = juce::jlimit(0, 5, grainArpModeAtomic.load(std::memory_order_acquire));
+        const int midi = static_cast<int>(std::round(semi + static_cast<float>(rootMidi)));
+        int bestMidi = midi;
+        int bestDist = 999;
+        for (int oct = -4; oct <= 4; ++oct)
+        {
+            for (int deg : scale)
+            {
+                const int cand = (12 * oct) + deg + rootMidi;
+                const int dist = std::abs(cand - midi);
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    bestMidi = cand;
+                }
+            }
+        }
+        return static_cast<float>(bestMidi - rootMidi);
+    };
+    auto quantizeToArpMode = [&](float semi) -> float
+    {
+        static constexpr std::array<int, 7> majorScale { 0, 2, 4, 5, 7, 9, 11 };
+        static constexpr std::array<int, 7> minorScale { 0, 2, 3, 5, 7, 8, 11 };
+        static constexpr std::array<int, 7> pentaScale { 0, 2, 4, 7, 9, 12, 14 };
+        if (arpMode == 3)
+            return quantizeToScale(semi, majorScale, 60);
+        if (arpMode == 4)
+            return quantizeToScale(semi, minorScale, 57);
+        if (arpMode == 5)
+            return quantizeToScale(semi, pentaScale, 62);
+        if (arpMode == 0)
+            return 12.0f * std::round(semi / 12.0f);
+        if (arpMode == 1)
+            return 7.0f * std::round(semi / 7.0f);
+        if (arpMode == 2)
+            return 5.0f * std::round(semi / 5.0f);
+        return semi;
+    };
+
+    float pitchSemi = (arpActive ? 0.0f : pitchBase) + pitchOffsetSemitones + pitchJitterDist(randomGenerator);
+
+    if (arpActive)
+    {
         static constexpr std::array<float, 8> octavePattern { 0.0f, 12.0f, 0.0f, -12.0f, 0.0f, 12.0f, 0.0f, -12.0f };
         static constexpr std::array<float, 8> powerPattern  { 0.0f, 7.0f, 12.0f, 7.0f, 0.0f, 7.0f, 12.0f, 7.0f };
         static constexpr std::array<float, 8> zigzagPattern { 12.0f, -12.0f, 12.0f, -12.0f, 7.0f, -7.0f, 7.0f, -7.0f };
-        const float densityScale = juce::jlimit(0.35f, 1.0f, 0.35f + (density * 0.65f));
-        static constexpr std::array<int, 6> majorArp  { 0, 4, 7, 12, 7, 4 };
-        static constexpr std::array<int, 6> minorArp  { 0, 3, 7, 12, 7, 3 };
-        static constexpr std::array<int, 6> pentaArp  { 0, 5, 7, 12, 14, 7 };
-
         const int stepCount = (arpMode <= 2) ? 8 : 6;
         const int stepIdxInt = juce::jmax(0, grainArpStep % stepCount);
         const size_t stepIdx = static_cast<size_t>(stepIdxInt);
         float interval = 0.0f;
-        const float arpRangeSemis = juce::jlimit(0.0f, 48.0f, std::abs(pitchBase));
         const float rangeScale = juce::jlimit(0.0f, 1.0f, arpRangeSemis / 48.0f);
         if (arpMode == 0)
         {
@@ -1930,23 +2010,26 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
         }
         else if (arpMode == 3)
         {
-            interval = static_cast<float>(majorArp[stepIdx]) * juce::jlimit(0.5f, 2.8f, 0.5f + (2.3f * rangeScale));
+            static constexpr std::array<float, 6> majorContour { -1.0f, -0.45f, 0.0f, 0.45f, 1.0f, 0.22f };
+            interval = majorContour[stepIdx] * arpRangeSemis;
         }
         else if (arpMode == 4)
         {
-            interval = static_cast<float>(minorArp[stepIdx]) * juce::jlimit(0.5f, 2.8f, 0.5f + (2.3f * rangeScale));
+            static constexpr std::array<float, 6> minorContour { -1.0f, -0.62f, -0.14f, 0.32f, 0.86f, 0.12f };
+            interval = minorContour[stepIdx] * arpRangeSemis;
         }
         else
         {
-            interval = static_cast<float>(pentaArp[stepIdx]) * juce::jlimit(0.5f, 3.0f, 0.5f + (2.5f * rangeScale));
+            static constexpr std::array<float, 6> pentaContour { -1.0f, -0.38f, 0.18f, 0.58f, 1.0f, -0.2f };
+            interval = pentaContour[stepIdx] * arpRangeSemis;
         }
-        if (arpMode >= 1)
+        if (arpMode >= 1 && arpMode <= 2)
         {
             const float sign = ((stepIdxInt & 1) == 0) ? 1.0f : -1.0f;
             interval *= sign;
         }
         interval = juce::jlimit(-arpRangeSemis, arpRangeSemis, interval);
-        pitchSemi += interval * juce::jlimit(0.0f, 1.0f, arpDepth) * densityScale;
+        pitchSemi += interval * juce::jlimit(0.0f, 1.0f, arpDepth);
 
         // Add bipolar random excursion within the selected range so ARP can move
         // both up and down musically instead of biasing upward.
@@ -1956,18 +2039,13 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
             float bipolar = bipolarDist(randomGenerator);
             if (arpMode == 0)
                 bipolar = 12.0f * std::round(bipolar / 12.0f);
-            pitchSemi += bipolar * (0.22f + (0.58f * juce::jlimit(0.0f, 1.0f, arpDepth)));
+            const float bipolarAmount = (arpMode >= 3)
+                ? (0.08f + (0.22f * juce::jlimit(0.0f, 1.0f, arpDepth)))
+                : (0.22f + (0.58f * juce::jlimit(0.0f, 1.0f, arpDepth)));
+            pitchSemi += bipolar * bipolarAmount;
         }
 
-        // JITR now affects ARP step movement and rhythmic length variation.
-        int stepAdvance = 1;
-        if (jitter > 0.0f)
-        {
-            std::uniform_real_distribution<float> arpSkipDist(0.0f, 1.0f);
-            if (arpSkipDist(randomGenerator) < (jitter * 0.5f))
-                stepAdvance = 2;
-        }
-        grainArpStep = (grainArpStep + stepAdvance) % stepCount;
+        grainArpStep = (grainArpStep + 1) % stepCount;
 
         if (arpMode == 0)
         {
@@ -1985,42 +2063,15 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
         }
         else if (arpMode >= 3)
         {
-            auto quantizeToScale = [](float semi, const std::array<int, 7>& scale)
-            {
-                const int midi = static_cast<int>(std::round(semi + 60.0f));
-                int bestMidi = midi;
-                int bestDist = 999;
-                for (int oct = -4; oct <= 4; ++oct)
-                {
-                    for (int deg : scale)
-                    {
-                        const int cand = (12 * oct) + deg + 60;
-                        const int dist = std::abs(cand - midi);
-                        if (dist < bestDist)
-                        {
-                            bestDist = dist;
-                            bestMidi = cand;
-                        }
-                    }
-                }
-                return static_cast<float>(bestMidi - 60);
-            };
-
-            static constexpr std::array<int, 7> majorScale { 0, 2, 4, 5, 7, 9, 11 };
-            static constexpr std::array<int, 7> minorScale { 0, 2, 3, 5, 7, 8, 10 };
-            static constexpr std::array<int, 7> pentaScale { 0, 3, 5, 7, 10, 12, 15 };
-            if (arpMode == 3)
-                pitchSemi = quantizeToScale(pitchSemi, majorScale);
-            else if (arpMode == 4)
-                pitchSemi = quantizeToScale(pitchSemi, minorScale);
-            else
-                pitchSemi = quantizeToScale(pitchSemi, pentaScale);
-
+            pitchSemi = quantizeToArpMode(pitchSemi);
             // Keep tonal arp modes musical and less clicky.
             sizeSamples = static_cast<int>(sizeSamples * (0.94f + (0.26f * static_cast<float>(stepIdxInt % 3 == 0))));
         }
         const float emitterDepth = grainEmitterDepthAtomic.load(std::memory_order_acquire);
-        const float lengthFloorScale = juce::jlimit(0.68f, 1.0f, 0.68f + (0.32f * juce::jmax(arpDepth, emitterDepth)));
+        // Keep ARP and emitter contributions independent so emitter remains audible
+        // even when ARP depth is high.
+        const float lengthFloorDriver = juce::jlimit(0.0f, 1.0f, (arpDepth * 0.45f) + (emitterDepth * 0.55f));
+        const float lengthFloorScale = juce::jlimit(0.62f, 1.0f, 0.62f + (0.38f * lengthFloorDriver));
         const int lengthFloor = static_cast<int>(std::round(static_cast<float>(baseSizeSamples) * lengthFloorScale));
         sizeSamples = juce::jmax(sizeSamples, lengthFloor);
         sizeSamples = juce::jlimit(kMinGrainWindowSamples, maxSizeSamplesByRange, sizeSamples);
@@ -2036,7 +2087,7 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
 
     if (randomDepth > 0.001f)
     {
-        // RAND: wide, macro variation (distinct from JITR micro-motion).
+        // RAND: wide, macro variation (distinct from SJTR size movement).
         std::uniform_real_distribution<float> randPitchDist(-12.0f * randomDepth, 12.0f * randomDepth);
         pitchSemi += randPitchDist(randomGenerator);
         std::uniform_real_distribution<float> randSizeDist(0.6f, 1.9f);
@@ -2045,13 +2096,19 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
         sizeSamples = juce::jlimit(kMinGrainWindowSamples, maxSizeSamplesByRange, sizeSamples);
     }
 
+    if (arpActive)
+    {
+        pitchSemi = quantizeToArpMode(pitchSemi);
+        pitchSemi = juce::jlimit(-arpRangeSemis, arpRangeSemis, pitchSemi);
+    }
+
     voice.pitchSemitones = juce::jlimit(-48.0f, 48.0f, pitchSemi);
     const double pitchRatio = std::pow(2.0, static_cast<double>(voice.pitchSemitones) / 12.0);
     bool reverseVoice = grainParams.reverse;
     if (!reverseVoice)
     {
         std::uniform_real_distribution<float> reverseDist(0.0f, 1.0f);
-        const float reverseChance = juce::jlimit(0.0f, 0.92f, (randomDepth * 0.86f) + (jitter * 0.08f));
+        const float reverseChance = juce::jlimit(0.0f, 0.92f, randomDepth * 0.88f);
         reverseVoice = (reverseDist(randomGenerator) < reverseChance);
     }
     voice.step = (reverseVoice ? -1.0 : 1.0) * pitchRatio;
@@ -2072,7 +2129,7 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
     const float envelopeBase = grainEnvelopeAtomic.load(std::memory_order_acquire);
     voice.envelopeCurve = juce::jlimit(0.6f, 2.4f, 2.2f - (1.4f * clampedDensity));
     voice.envelopeSkew = juce::jlimit(0.28f, 0.72f, 0.5f + (panPos * 0.18f));
-    const float envelopeJitter = (jitter * 0.14f) + (randomDepth * 0.08f);
+    const float envelopeJitter = randomDepth * 0.08f;
     std::uniform_real_distribution<float> envDist(-envelopeJitter, envelopeJitter);
     voice.envelopeFade = juce::jlimit(0.0f, 1.0f, envelopeBase + envDist(randomGenerator));
 }
@@ -2097,6 +2154,7 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     const double beatNow = getGrainBeatPositionAtSample(globalSample);
     const float targetBloom = (heldCount > 0) ? juce::jlimit(0.0f, 1.0f, 0.5f + (0.18f * static_cast<float>(heldCount - 1))) : 0.0f;
     grainBloomAmount += (targetBloom - grainBloomAmount) * 0.0025f;
+    const float arpDepth = grainArpDepthAtomic.load(std::memory_order_acquire);
     float jitterAmount = grainJitterAtomic.load(std::memory_order_acquire);
     float randomDepth = grainRandomDepthAtomic.load(std::memory_order_acquire);
     const float cloudDepth = grainCloudDepthAtomic.load(std::memory_order_acquire);
@@ -2203,9 +2261,54 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
                                      static_cast<int>(std::round(t * static_cast<float>(sizeDivisionsBeats.size() - 1))));
         tempoSyncedSizeMs = static_cast<float>(sizeDivisionsBeats[static_cast<size_t>(idx)] * (60.0 / lastObservedTempo) * 1000.0);
     }
-    const float sizeWobble = 1.0f + (grainBloomAmount * jitterAmount * 0.38f
+    // SJTR: tempo-quantized size jitter with full-range excursion at 100%.
+    float sjtrSizeMs = tempoSyncedSizeMs;
+    if (jitterAmount > 0.001f)
+    {
+        static constexpr std::array<double, 6> jitterGridBeats { 1.0 / 32.0, 1.0 / 24.0, 1.0 / 16.0, 1.0 / 12.0, 1.0 / 8.0, 1.0 / 4.0 };
+        const int gridIdx = juce::jlimit(0, static_cast<int>(jitterGridBeats.size()) - 1,
+            static_cast<int>(std::floor(jitterAmount * static_cast<float>(jitterGridBeats.size()))));
+        const double gridBeats = jitterGridBeats[static_cast<size_t>(gridIdx)];
+        const int64_t beatGroup = static_cast<int64_t>(std::floor(beatNow / juce::jmax(1.0 / 64.0, gridBeats)));
+        if (beatGroup != grainSizeJitterBeatGroup)
+        {
+            grainSizeJitterBeatGroup = beatGroup;
+            const float minSize = tempoSyncedSizeMs + ((kGrainMinSizeMs - tempoSyncedSizeMs) * jitterAmount);
+            const float maxSize = tempoSyncedSizeMs + ((kGrainMaxSizeMs - tempoSyncedSizeMs) * jitterAmount);
+            std::uniform_real_distribution<float> pickSize(minSize, maxSize);
+            float pickedSize = pickSize(randomGenerator);
+
+            // Keep SJTR musical when tempo sync is enabled: quantize picked size
+            // to the nearest tempo division duration.
+            if (tempoSyncEnabled && lastObservedTempo > 0.0)
+            {
+                static constexpr std::array<double, 13> sizeDivisionsBeats {
+                    1.0 / 64.0, 1.0 / 48.0, 1.0 / 32.0, 1.0 / 24.0, 1.0 / 16.0,
+                    1.0 / 12.0, 1.0 / 8.0, 1.0 / 6.0, 1.0 / 4.0, 1.0 / 3.0,
+                    1.0 / 2.0, 1.0, 2.0
+                };
+                float best = static_cast<float>(sizeDivisionsBeats[0] * (60.0 / lastObservedTempo) * 1000.0);
+                float bestDiff = std::abs(best - pickedSize);
+                for (size_t i = 1; i < sizeDivisionsBeats.size(); ++i)
+                {
+                    const float ms = static_cast<float>(sizeDivisionsBeats[i] * (60.0 / lastObservedTempo) * 1000.0);
+                    const float diff = std::abs(ms - pickedSize);
+                    if (diff < bestDiff)
+                    {
+                        bestDiff = diff;
+                        best = ms;
+                    }
+                }
+                pickedSize = best;
+            }
+
+            grainSizeJitterMul = juce::jlimit(kGrainMinSizeMs, kGrainMaxSizeMs, pickedSize);
+        }
+        sjtrSizeMs = tempoSyncedSizeMs + ((grainSizeJitterMul - tempoSyncedSizeMs) * jitterAmount);
+    }
+    const float sizeWobble = 1.0f + (grainBloomAmount * 0.2f
                            * (0.55f + 0.45f * static_cast<float>(std::sin(grainBloomPhase * 0.61))));
-    float effectiveSizeMs = juce::jlimit(kGrainMinSizeMs, kGrainMaxSizeMs, tempoSyncedSizeMs * sizeWobble);
+    float effectiveSizeMs = juce::jlimit(kGrainMinSizeMs, kGrainMaxSizeMs, sjtrSizeMs * sizeWobble);
     const float baseDensity = grainDensitySmoother.getNextValue();
     float effectiveDensity = juce::jlimit(kGrainMinDensity, 0.82f, baseDensity + (grainBloomAmount * 0.14f));
     float effectiveSpread = juce::jlimit(0.0f, 1.0f, grainSpreadAtomic.load(std::memory_order_acquire)
@@ -2219,6 +2322,16 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         effectiveDensity = juce::jlimit(kGrainMinDensity, 0.9f, effectiveDensity + (0.24f * cloudLift));
         effectiveSpread = juce::jlimit(0.0f, 1.0f, effectiveSpread + (0.2f * cloudLift));
         effectiveEmitterDepth = juce::jlimit(0.0f, 1.0f, juce::jmax(effectiveEmitterDepth, 0.2f + (0.55f * cloudLift)));
+    }
+
+    // ARP can dominate motion perception; keep cloud/emitter influence audible while ARP is active.
+    if (arpDepth > 0.001f)
+    {
+        const float arpMix = juce::jlimit(0.0f, 1.0f, arpDepth);
+        effectiveEmitterDepth = juce::jlimit(0.0f, 1.0f,
+            effectiveEmitterDepth + (0.18f + (0.38f * arpMix)) * emitterDepth);
+        effectiveDensity = juce::jlimit(kGrainMinDensity, 0.88f,
+            effectiveDensity + (cloudLift * (0.05f + (0.14f * arpMix))));
     }
 
     if (sceneMix > 0.001f)
@@ -2287,11 +2400,11 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
 
     const double jitterLfo = std::sin(grainBloomPhase) + (0.45 * std::sin((grainBloomPhase * 2.37) + 1.3));
     const double jitterSamples = jitterLfo * static_cast<double>(effectiveSizeMs * 0.001f * static_cast<float>(currentSampleRate))
-                                 * static_cast<double>(grainBloomAmount * jitterAmount * 0.3f);
+                                 * static_cast<double>(grainBloomAmount * randomDepth * 0.22f);
     std::uniform_real_distribution<double> markerJitterDist(-1.0, 1.0);
     const double markerJitterSamples = markerJitterDist(randomGenerator)
         * static_cast<double>(effectiveSizeMs * 0.001f * static_cast<float>(currentSampleRate))
-        * static_cast<double>(jitterAmount * 0.45f);
+        * static_cast<double>(randomDepth * 0.3f);
     const double centerDelta = computeScratchTravelDistance(centerSamplePos, sceneCenterSample);
     const double blendedCenter = centerSamplePos + (centerDelta * static_cast<double>(sceneMix));
     const double emitterReferenceCenter = blendedCenter;
@@ -2321,17 +2434,17 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         bloomCenter = bloomCenter + ((quantCenter - bloomCenter) * static_cast<double>(effectiveEmitterDepth));
     }
     const double emitShape = std::pow(static_cast<double>(effectiveEmitterDepth), 1.8);
-    const double overlapFactor = 0.9
-        + (6.2 * static_cast<double>(effectiveDensity))
-        + (18.0 * emitShape);
+    const double overlapFactor = 0.72
+        + (4.6 * static_cast<double>(effectiveDensity))
+        + (8.0 * emitShape);
     const double baseSpawnRate = overlapFactor / sizeSamplesD; // grains per output sample
     const double jitterRateMul = 1.0 + (grainSchedulerNoise * static_cast<double>(0.35f + (0.65f * randomDepth)) * 0.45);
-    const double emitterRateMul = 1.0 + (6.0 * emitShape);
-    const double spawnRate = juce::jlimit(0.00005, 0.98, baseSpawnRate * jitterRateMul * emitterRateMul);
-    grainSpawnAccumulator += spawnRate;
+    const double emitterRateMul = 1.0 + (2.0 * emitShape);
+    const double spawnRate = juce::jlimit(0.00005, 0.24, baseSpawnRate * jitterRateMul * emitterRateMul);
+    grainSpawnAccumulator = juce::jlimit(0.0, 2.5, grainSpawnAccumulator + spawnRate);
 
     int spawnSafety = 0;
-    const int maxSpawnsPerSample = 6 + static_cast<int>(std::round(28.0 * emitShape));
+    const int maxSpawnsPerSample = juce::jlimit(1, 6, 1 + static_cast<int>(std::round(5.0 * emitShape)));
     while (grainSpawnAccumulator >= 1.0 && spawnSafety < maxSpawnsPerSample)
     {
         grainSpawnAccumulator -= 1.0;
@@ -2359,13 +2472,18 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         ++spawnSafety;
     }
 
-    for (auto& p : grainPreviewPositions)
-        p.store(-1.0f, std::memory_order_release);
-    for (auto& p : grainPreviewPitchNorms)
-        p.store(0.0f, std::memory_order_release);
+    const bool refreshPreview = ((++grainPreviewDecimationCounter & 0x3) == 0);
+    if (refreshPreview)
+    {
+        for (auto& p : grainPreviewPositions)
+            p.store(-1.0f, std::memory_order_release);
+        for (auto& p : grainPreviewPitchNorms)
+            p.store(0.0f, std::memory_order_release);
+    }
 
     int activeVoices = 0;
     int previewCount = 0;
+    const auto grainQuality = grainResampler.getQuality();
     for (auto& voice : grainVoices)
     {
         if (!voice.active)
@@ -2378,7 +2496,9 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         }
 
         ++activeVoices;
-        if (previewCount < static_cast<int>(grainPreviewPositions.size()) && sampleLength > 0.0)
+        if (refreshPreview
+            && previewCount < static_cast<int>(grainPreviewPositions.size())
+            && sampleLength > 0.0)
         {
             const float previewNormPos = static_cast<float>(juce::jlimit(0.0, 1.0, voice.readPos / sampleLength));
             grainPreviewPositions[static_cast<size_t>(previewCount++)].store(previewNormPos, std::memory_order_release);
@@ -2390,21 +2510,8 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         const int windowIdx = juce::jlimit(0, static_cast<int>(grainWindow.size()) - 1,
             static_cast<int>(std::round(normPos * static_cast<float>(grainWindow.size() - 1))));
         const float window = grainWindow[static_cast<size_t>(windowIdx)];
-        const float skew = juce::jlimit(0.01f, 0.99f, voice.envelopeSkew);
-        const float curve = juce::jmax(0.2f, voice.envelopeCurve);
-        float shapedPos = 0.0f;
-        if (normPos <= skew)
-        {
-            const float u = juce::jlimit(0.0f, 1.0f, normPos / skew);
-            shapedPos = 0.5f * std::pow(u, curve);
-        }
-        else
-        {
-            const float u = juce::jlimit(0.0f, 1.0f, (normPos - skew) / (1.0f - skew));
-            shapedPos = 0.5f + (0.5f * (1.0f - std::pow(1.0f - u, curve)));
-        }
-        float env = std::pow(std::sin(juce::MathConstants<float>::pi * shapedPos), 2.0f);
-        switch (grainResampler.getQuality())
+        float env = 1.0f;
+        switch (grainQuality)
         {
             case Resampler::Quality::Linear:
             {
@@ -2415,34 +2522,25 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
             case Resampler::Quality::Cubic:
                 break;
             case Resampler::Quality::Sinc:
-            {
-                const float x = (normPos - 0.5f) / 0.24f;
-                env = std::exp(-0.5f * x * x);
+                env = 0.72f + (0.28f * std::sqrt(juce::jmax(0.0f, window)));
                 break;
-            }
             case Resampler::Quality::SincHQ:
-            {
-                const float x = (normPos - 0.5f) / 0.2f;
-                const float gauss = std::exp(-0.5f * x * x);
-                env = std::pow(gauss, 0.85f);
+                env = 0.66f + (0.34f * window);
                 break;
-            }
         }
-        // Exponential fade shaping: high ENV strongly collapses the grain body.
+        // ENV: higher values shorten perceived grain body and emphasize the center.
         const float fade = juce::jlimit(0.0f, 1.0f, voice.envelopeFade);
-        const float fadeWidth = juce::jlimit(0.035f, 0.5f, 0.05f + (fade * 0.45f));
+        const float fadeWidth = juce::jlimit(0.02f, 0.30f, 0.28f - (fade * 0.24f));
         const float edgeDistance = juce::jmin(normPos, 1.0f - normPos);
         const float fadeNorm = juce::jlimit(0.0f, 1.0f, edgeDistance / fadeWidth);
-        const float edgeExponent = 1.0f + (7.0f * std::pow(fade, 2.4f));
-        env *= std::pow(fadeNorm, edgeExponent);
+        const float edgeExponent = 1.0f + (3.2f * fade);
+        const float shapedFade = std::pow(fadeNorm, edgeExponent);
+        env *= juce::jlimit(0.0f, 1.0f, shapedFade);
 
-        // Additional center focus with exponential narrowing towards ENV=100%.
-        const float focusAmount = std::pow(fade, 1.8f);
-        const float sigma = 0.22f * std::pow(0.03f / 0.22f, focusAmount);
-        const float centerDist = std::abs(normPos - 0.5f);
-        const float focusExponent = 2.0f + (4.0f * fade);
-        const float centerFocus = std::exp(-std::pow(centerDist / juce::jmax(0.0001f, sigma), focusExponent));
-        env *= centerFocus;
+        const float centerTri = juce::jlimit(0.0f, 1.0f, 1.0f - std::abs((normPos * 2.0f) - 1.0f));
+        const float centerExponent = 1.0f + (4.5f * fade);
+        const float centerFocus = std::pow(centerTri, centerExponent);
+        env *= juce::jlimit(0.10f, 1.0f, 0.18f + (0.82f * centerFocus));
         const float amp = window * env;
 
         float l = grainResampler.getSample(sampleBuffer, 0, voice.readPos, 1.0);
@@ -2469,7 +2567,8 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     }
 
     // Cloud-delay style smear feeding the granular output with short feedback tails.
-    if (grainCloudDelayBuffer.getNumSamples() > 0)
+    const float cloudBoost = juce::jlimit(0.0f, 1.0f, cloudDepth);
+    if (grainCloudDelayBuffer.getNumSamples() > 0 && cloudBoost > 0.001f)
     {
         const int delaySize = grainCloudDelayBuffer.getNumSamples();
         const float densityNow = juce::jlimit(kGrainMinDensity, kGrainMaxDensity, grainDensitySmoother.getCurrentValue());
@@ -2482,9 +2581,10 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
 
         const float delayedL = grainCloudDelayBuffer.getSample(0, readPos);
         const float delayedR = grainCloudDelayBuffer.getSample(1, readPos);
-        const float cloudBoost = juce::jlimit(0.0f, 1.0f, cloudDepth);
-        const float feedback = juce::jlimit(0.0f, 0.97f, (0.18f + (cloudBoost * 0.79f)) * (0.78f + (0.22f * jitterAmount)));
-        const float mix = juce::jlimit(0.0f, 0.95f, (0.14f + (cloudBoost * 0.76f)) + (grainBloomAmount * 0.14f));
+        const float feedback = juce::jlimit(0.0f, 0.95f,
+            cloudBoost * (0.12f + (0.72f * (0.78f + (0.22f * jitterAmount)))));
+        const float mix = juce::jlimit(0.0f, 0.9f,
+            cloudBoost * (0.08f + 0.8f * (0.72f + (0.28f * grainBloomAmount))));
 
         const float writeL = juce::jlimit(-1.2f, 1.2f, outL + (delayedL * feedback));
         const float writeR = juce::jlimit(-1.2f, 1.2f, outR + (delayedR * feedback));
@@ -2500,103 +2600,107 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     const float densityNow = juce::jlimit(kGrainMinDensity, kGrainMaxDensity, grainDensitySmoother.getCurrentValue());
     const float sizeNow = juce::jlimit(kGrainMinSizeMs, kGrainMaxSizeMs, grainSizeSmoother.getCurrentValue());
     const float sizeNorm = juce::jlimit(0.0f, 1.0f, (sizeNow - kGrainMinSizeMs) / (kGrainMaxSizeMs - kGrainMinSizeMs));
-    const float loudnessComp = juce::jlimit(1.1f, 1.95f, 1.25f + (0.28f * (1.0f - densityNow)) + (0.18f * sizeNorm));
+    const float envelopeNow = grainEnvelopeAtomic.load(std::memory_order_acquire);
+    const float loudnessComp = juce::jlimit(1.35f, 3.2f,
+        1.72f
+        + (0.48f * (1.0f - densityNow))
+        + (0.26f * sizeNorm)
+        + (0.20f * emitterDepth)
+        + (0.22f * cloudBoost)
+        + (0.40f * envelopeNow));
     outL *= loudnessComp;
     outR *= loudnessComp;
 }
 
 void EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
 {
+    if (!file.existsAsFile())
+    {
+        DBG("Sample load rejected (missing file): " << file.getFullPathName());
+        return;
+    }
+
     try
     {
-        // Validate file exists
-        if (!file.existsAsFile())
-        {
-            return;
-        }
-        
         juce::AudioFormatManager formatManager;
         formatManager.registerBasicFormats();
-        
+
         std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(file));
-        
+
         if (reader == nullptr)
         {
+            DBG("Sample load rejected (unsupported format): " << file.getFullPathName());
             return;
         }
-        
-        // Validate sample specs
-        if (reader->sampleRate <= 0 || reader->sampleRate > 384000)
+
+        // Validate stream metadata before any allocation/engine state changes.
+        constexpr int64_t kMaxReaderSamples = 100000000; // ~38 minutes at 44.1 kHz
+        constexpr int64_t kMaxIntSamples = 0x7fffffff;
+        if (!std::isfinite(reader->sampleRate) || reader->sampleRate <= 0.0 || reader->sampleRate > 384000.0)
         {
+            DBG("Sample load rejected (invalid sample rate): " << reader->sampleRate);
             return;
         }
-        
-        if (reader->lengthInSamples <= 0 || reader->lengthInSamples > 100000000)  // Max ~38 minutes at 44.1kHz
+
+        if (reader->lengthInSamples <= 0 || reader->lengthInSamples > kMaxReaderSamples || reader->lengthInSamples > kMaxIntSamples)
         {
+            DBG("Sample load rejected (invalid length): " << reader->lengthInSamples);
             return;
         }
-        
+
         if (reader->numChannels <= 0 || reader->numChannels > 8)
         {
+            DBG("Sample load rejected (invalid channels): " << static_cast<int>(reader->numChannels));
             return;
         }
-        
-        juce::ScopedLock lock(bufferLock);
-        
-        // Save playback state
-        bool wasPlaying = playing;
-        double savedNormalizedPosition = sampleLength > 0 ? (playbackPosition / sampleLength) : 0.0;
-        
-        sourceSampleRate = reader->sampleRate;
-        sampleLength = reader->lengthInSamples;
-        
-        // Read into temp buffer with try-catch for allocation failures
+
+        const int channelCount = static_cast<int>(reader->numChannels);
+        const int sampleCount = static_cast<int>(reader->lengthInSamples);
+
+        // Read into a temporary buffer so engine state is only mutated on full success.
         juce::AudioBuffer<float> tempBuffer;
-        
-        try
+        tempBuffer.setSize(channelCount, sampleCount, false, true, false);
+        if (!reader->read(&tempBuffer, 0, sampleCount, 0, true, true))
         {
-            tempBuffer.setSize(static_cast<int>(reader->numChannels), 
-                             static_cast<int>(reader->lengthInSamples));
-        }
-        catch (const std::exception& e)
-        {
+            DBG("Sample load failed during read: " << file.getFullPathName());
             return;
         }
-        
-        // Read audio data
-        if (!reader->read(&tempBuffer, 0, static_cast<int>(reader->lengthInSamples), 0, true, true))
-        {
-            return;
-        }
-        
-        // Convert mono to stereo if needed
+
+        juce::AudioBuffer<float> newSampleBuffer;
+        newSampleBuffer.setSize(2, tempBuffer.getNumSamples(), false, true, false);
+
+        // Convert to stereo (duplicate mono or take first two channels).
         if (tempBuffer.getNumChannels() == 1)
         {
-            sampleBuffer.setSize(2, tempBuffer.getNumSamples());
-            sampleBuffer.copyFrom(0, 0, tempBuffer, 0, 0, tempBuffer.getNumSamples());
-            sampleBuffer.copyFrom(1, 0, tempBuffer, 0, 0, tempBuffer.getNumSamples());
-        }
-        else if (tempBuffer.getNumChannels() >= 2)
-        {
-            // Take first two channels for stereo
-            sampleBuffer.setSize(2, tempBuffer.getNumSamples());
-            sampleBuffer.copyFrom(0, 0, tempBuffer, 0, 0, tempBuffer.getNumSamples());
-            sampleBuffer.copyFrom(1, 0, tempBuffer, juce::jmin(1, tempBuffer.getNumChannels() - 1), 0, tempBuffer.getNumSamples());
-        }
-        
-        // Load into appropriate sampler based on mode
-        if (playMode == PlayMode::Step)
-        {
-            // In step mode: load ONLY into stepSampler, not audio strip
-            stepSampler.loadSampleFromBuffer(sampleBuffer, sourceSampleRate);
-            DBG("Loaded sample into stepSampler (step mode)");
+            newSampleBuffer.copyFrom(0, 0, tempBuffer, 0, 0, tempBuffer.getNumSamples());
+            newSampleBuffer.copyFrom(1, 0, tempBuffer, 0, 0, tempBuffer.getNumSamples());
         }
         else
         {
-            // In normal modes: restore playback state in audio strip
-            playbackPosition = savedNormalizedPosition * sampleLength;
+            newSampleBuffer.copyFrom(0, 0, tempBuffer, 0, 0, tempBuffer.getNumSamples());
+            newSampleBuffer.copyFrom(1, 0, tempBuffer, 1, 0, tempBuffer.getNumSamples());
+        }
+
+        juce::ScopedLock lock(bufferLock);
+
+        const bool wasPlaying = playing;
+        const double previousLength = sampleLength;
+        const double savedNormalizedPosition = previousLength > 0.0
+            ? juce::jlimit(0.0, 1.0, playbackPosition.load() / previousLength)
+            : 0.0;
+
+        sampleBuffer.makeCopyOf(newSampleBuffer, true);
+        sourceSampleRate = reader->sampleRate;
+        sampleLength = static_cast<double>(sampleBuffer.getNumSamples());
+        playbackPosition = juce::jlimit(0.0, juce::jmax(0.0, sampleLength - 1.0), savedNormalizedPosition * sampleLength);
+
+        if (playMode == PlayMode::Step)
+        {
+            stepSampler.loadSampleFromBuffer(sampleBuffer, sourceSampleRate);
+        }
+        else
+        {
             playing = wasPlaying;
-            DBG("Loaded sample into audio strip (normal mode)");
         }
 
         if (transientSliceMode.load(std::memory_order_acquire))
@@ -2609,9 +2713,11 @@ void EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
     }
     catch (const std::exception& e)
     {
+        DBG("Sample load exception: " << e.what());
     }
     catch (...)
     {
+        DBG("Sample load exception: unknown");
     }
 }
 
@@ -2703,6 +2809,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         tapeStopActive = false;
         scratchGestureActive = false;
         isReverseScratch = false;
+        reverseScratchPpqRetarget = false;
+        reverseScratchUseRateBlend = false;
         buttonHeld = false;
         heldButton = -1;
     }
@@ -3165,13 +3273,14 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         // Sample-accurate in-block scheduling using PPQ timeline.
         if (positionInfo.getPpqPosition().hasValue() && tempo > 0.0)
         {
-            const double ppqStart = *positionInfo.getPpqPosition();
+            const double ppqStartRaw = *positionInfo.getPpqPosition();
             const double samplesPerBeatLocal = (60.0 / tempo) * currentSampleRate;
 
             int processed = 0;
             while (processed < numSamples)
             {
-                const double ppqAtProcessed = ppqStart + (static_cast<double>(processed) / samplesPerBeatLocal);
+                const double ppqAtProcessedRaw = ppqStartRaw + (static_cast<double>(processed) / samplesPerBeatLocal);
+                const double ppqAtProcessed = applySwingToPpq(ppqAtProcessedRaw);
                 const int64_t sixteenthNow = static_cast<int64_t>(std::floor(ppqAtProcessed * 4.0));
                 const int64_t lastSixteenth = static_cast<int64_t>(lastStepTime);
 
@@ -3227,7 +3336,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         // Returning speed to unity hard-snaps to PPQ timeline.
         if (!speedBypassPpq && positionInfo.getPpqPosition().hasValue() && tempo > 0.0)
         {
-            const double currentPpq = *positionInfo.getPpqPosition();
+            const double currentPpq = applySwingToPpq(*positionInfo.getPpqPosition());
             if (ppqTimelineAnchored)
             {
                 const double timelineBeats = currentPpq + ppqTimelineOffsetBeats;
@@ -3251,7 +3360,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     if (positionInfo.getPpqPosition().hasValue() && !bypassPpqSync && playing
         && (triggerPpqPosition >= 0.0 || ppqTimelineAnchored))
     {
-        double currentPpq = *positionInfo.getPpqPosition();
+        double currentPpq = applySwingToPpq(*positionInfo.getPpqPosition());
         double positionInLoop = 0.0;
         double columnOffsetSamples = 0.0;
         double samplesElapsed = 0.0;
@@ -3327,7 +3436,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     {
         // ABSOLUTE PPQ MODE (for stop/restart with no trigger)
         // Position locked to timeline PPQ - no column offset
-        double currentPpq = *positionInfo.getPpqPosition();
+        double currentPpq = applySwingToPpq(*positionInfo.getPpqPosition());
         double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
         double timelineSamples = currentPpq * samplesPerBeat * autoWarpSpeed;
         
@@ -3344,7 +3453,17 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         
         // Start from trigger column offset
         double triggerOffset = triggerOffsetRatioLocal * loopLength;
-        double totalPosition = triggerOffset + (samplesElapsed * playbackSpeed.load());
+        double swungElapsedSamples = static_cast<double>(samplesElapsed);
+        const float swing = swingAmount.load(std::memory_order_acquire);
+        if (swing > 1.0e-6f && tempo > 1.0e-6)
+        {
+            const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
+            const double beatElapsed = swungElapsedSamples / juce::jmax(1.0, samplesPerBeat);
+            const double swungBeatElapsed = applySwingToPpq(beatElapsed);
+            swungElapsedSamples = swungBeatElapsed * samplesPerBeat;
+        }
+
+        double totalPosition = triggerOffset + (swungElapsedSamples * playbackSpeed.load());
         
         double positionInLoop = mapLoopPositionForMode(totalPosition);
         
@@ -3377,8 +3496,52 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             progress = juce::jlimit(0.0, 1.0, progress);
             
             double totalDistance = scratchTravelDistance;
+            if (isReverseScratch
+                && reverseScratchPpqRetarget
+                && ppqTimelineAnchored
+                && positionInfo.getPpqPosition().hasValue()
+                && tempo > 0.0)
+            {
+                const int64_t samplesRemaining = juce::jmax<int64_t>(0, targetSampleTime - currentGlobalSample);
+                const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
+                const double ppqNowAtSample = *positionInfo.getPpqPosition()
+                                            + (static_cast<double>(i) / samplesPerBeat);
+                const double ppqAtCompletion = ppqNowAtSample
+                                             + (static_cast<double>(samplesRemaining) / samplesPerBeat);
+                const double beatsForLoopSafe = juce::jmax(1.0, reverseScratchBeatsForLoop);
+                double beatInLoop = std::fmod(ppqAtCompletion + scratchSavedPpqTimelineOffsetBeats, beatsForLoopSafe);
+                if (beatInLoop < 0.0)
+                    beatInLoop += beatsForLoopSafe;
+                const double loopLengthSafe = juce::jmax(1.0, reverseScratchLoopLengthSamples);
+                targetPosition = reverseScratchLoopStartSamples + ((beatInLoop / beatsForLoopSafe) * loopLengthSafe);
+                totalDistance = computeScratchTravelDistance(scratchStartPosition, targetPosition);
+                scratchTravelDistance = totalDistance;
+
+            }
             if (!std::isfinite(totalDistance))
                 totalDistance = targetPosition - scratchStartPosition;
+
+            if (isReverseScratch && playMode != PlayMode::Loop)
+            {
+                // If return becomes impossible in remaining time, override
+                // release-only timing and keep motion smooth from current pos.
+                const int64_t remainingSamples = juce::jmax<int64_t>(0, targetSampleTime - currentGlobalSample);
+                const double currentPosNow = playbackPosition.load();
+                const int64_t feasibleRemaining = makeFeasibleScratchDuration(currentPosNow,
+                                                                              targetPosition,
+                                                                              remainingSamples,
+                                                                              true);
+                if (feasibleRemaining > remainingSamples + 64)
+                {
+                    scratchStartPosition = currentPosNow;
+                    scratchStartTime = currentGlobalSample;
+                    scratchDuration = feasibleRemaining;
+                    targetSampleTime = currentGlobalSample + feasibleRemaining;
+                    totalDistance = computeScratchTravelDistance(scratchStartPosition, targetPosition);
+                    scratchTravelDistance = totalDistance;
+                    progress = 0.0;
+                }
+            }
             
             if (scratchDuration <= 0)
             {
@@ -3388,9 +3551,44 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             }
             else if (isReverseScratch)
             {
-                // Reverse scratch return: stable linear interpolation.
-                scratchRate = totalDistance / static_cast<double>(scratchDuration);
-                scratchExplicitPosition = scratchStartPosition + (totalDistance * progress);
+                // Reverse return:
+                // - Grain: accelerating profile.
+                // - Loop: vinyl-like release profile (rate ramps from hand-held
+                //   speed toward restore speed while landing exactly on target).
+                // - Gate/OneShot: smoothstep profile (zero jerk at edges).
+                double travelledNorm = 0.0;
+                double envelope = 0.0;
+                bool useLoopRateBlend = false;
+                if (playMode == PlayMode::Grain)
+                {
+                    travelledNorm = std::pow(progress, kReverseScratchAccelExp);
+                    envelope = (progress > 0.0)
+                        ? (kReverseScratchAccelExp * std::pow(progress, kReverseScratchAccelExp - 1.0))
+                        : 0.0;
+                }
+                else if (playMode == PlayMode::Loop)
+                {
+                    // Deterministic smooth catch-up: monotonic and C1 continuous.
+                    travelledNorm = progress * progress * (3.0 - (2.0 * progress)); // smoothstep
+                    envelope = 6.0 * progress * (1.0 - progress);
+                    useLoopRateBlend = reverseScratchUseRateBlend;
+                }
+                else
+                {
+                    travelledNorm = progress * progress * (3.0 - (2.0 * progress)); // smoothstep
+                    envelope = 6.0 * progress * (1.0 - progress);
+                }
+                const double avgRate = totalDistance / static_cast<double>(scratchDuration);
+                if (useLoopRateBlend)
+                {
+                    scratchRate = reverseScratchStartRate
+                                + ((reverseScratchEndRate - reverseScratchStartRate) * progress);
+                }
+                else
+                {
+                    scratchRate = avgRate * envelope;
+                }
+                scratchExplicitPosition = scratchStartPosition + (totalDistance * travelledNorm);
                 scratchHasExplicitPosition = true;
             }
             else
@@ -3414,27 +3612,35 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 // Check if this is a reverse scratch (returning to timeline)
                 if (isReverseScratch)
                 {
-                    // Reverse return complete. If we have a PPQ anchor, snap exactly
-                    // to the anchor phase so timeline continuity is preserved.
+                    // Reverse return complete. Land on the precomputed future
+                    // timeline target (computed at release time), then re-lock
+                    // PPQ offset from that exact landed target.
                     ppqTimelineAnchored = scratchSavedPpqTimelineAnchored;
                     ppqTimelineOffsetBeats = scratchSavedPpqTimelineOffsetBeats;
                     if (ppqTimelineAnchored && positionInfo.getPpqPosition().hasValue() && tempo > 0.0)
                     {
                         float anchoredManualBeats = beatsPerLoop.load();
                         const double anchoredBeatsForLoop = (anchoredManualBeats >= 0.0f) ? static_cast<double>(anchoredManualBeats) : 4.0;
-                        double ppqAtSample = *positionInfo.getPpqPosition()
-                                           + (static_cast<double>(i) / ((60.0 / tempo) * currentSampleRate));
-                        double beatInLoop = std::fmod(ppqAtSample + ppqTimelineOffsetBeats, anchoredBeatsForLoop);
-                        if (beatInLoop < 0.0)
-                            beatInLoop += anchoredBeatsForLoop;
-                        double positionInLoop = (beatInLoop / anchoredBeatsForLoop) * loopLength;
-                        const double expectedPosition = loopStartSamples + positionInLoop;
-                        const double phaseError = std::abs(playbackPosition.load() - expectedPosition);
+                        const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
+                        const double ppqAtSample = *positionInfo.getPpqPosition()
+                                                 + (static_cast<double>(i) / samplesPerBeat);
 
-                        // Final sync guard: hard-snap if residual phase error is present.
-                        if (phaseError > juce::jmax(4.0, loopLength * 0.001))
-                            DBG("Scratch sync guard applied, phase error=" << phaseError);
-                        playbackPosition = expectedPosition;
+                        playbackPosition = targetPosition;
+
+                        double targetInLoop = std::fmod(targetPosition - loopStartSamples, loopLength);
+                        if (targetInLoop < 0.0)
+                            targetInLoop += loopLength;
+                        const double beatInLoop = (targetInLoop / juce::jmax(1.0, loopLength)) * anchoredBeatsForLoop;
+                        ppqTimelineOffsetBeats = std::fmod(beatInLoop - ppqAtSample, anchoredBeatsForLoop);
+                        if (ppqTimelineOffsetBeats < 0.0)
+                            ppqTimelineOffsetBeats += anchoredBeatsForLoop;
+
+                        // Re-lock trigger references so sample/fallback paths
+                        // remain continuous immediately after release.
+                        triggerSample = currentGlobalSample;
+                        triggerPpqPosition = ppqAtSample;
+                        triggerOffsetRatio = juce::jlimit(0.0, 0.999999,
+                            (targetPosition - loopStartSamples) / juce::jmax(1.0, loopLength));
                     }
                     else
                     {
@@ -3444,6 +3650,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     // Exit scratch mode.
                     scrubActive = false;
                     isReverseScratch = false;
+                    reverseScratchPpqRetarget = false;
+                    reverseScratchUseRateBlend = false;
                     tapeStopActive = false;
                     scratchGestureActive = false;
                     scratchTravelDistance = 0.0;
@@ -3451,6 +3659,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     smoothedSpeed.setCurrentAndTargetValue(restoreSpeed);
                     rateSmoother.setCurrentAndTargetValue(1.0);
                     scratchRate = 1.0;
+                    crossfader.startFade(true, 32);
                 }
                 else
                 {
@@ -3495,7 +3704,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         // Calculate effective speed
         // When scrubbing: use scratchRate (which already includes direction!)
         // When normal: use currentSpeed (user speed control)
-        if (scrubActive && stripScratch > 0.0f)
+        if (scrubActive && stripScratch > 0.0f
+            && !(isReverseScratch && playMode == PlayMode::Loop && reverseScratchUseRateBlend))
         {
             const double clampAbs = patternActive ? kMaxPatternRateAbs : kMaxScratchRateAbs;
             scratchRate = juce::jlimit(-clampAbs, clampAbs, scratchRate);
@@ -3514,11 +3724,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         if (playMode == PlayMode::Grain)
         {
             const float grainScratch = scratchAmount.load(std::memory_order_acquire);
-            if (grainGesture.heldCount <= 0)
-            {
-                uiDisplaySpeed = 0.0f;
-            }
-            else if (grainScratch <= 0.001f)
+            if (grainScratch <= 0.001f)
             {
                 uiDisplaySpeed = 0.0f;
             }
@@ -3630,10 +3836,15 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             
             if (ppqSyncActiveForCalc)
             {
-                // PPQ sync: derive sample positions from raw timeline phase.
-                // Using mapped playbackPosition here can double-apply direction.
+                // PPQ sync: derive sample positions from swung timeline phase.
+                // Compute PPQ at this sample index so swing can audibly affect playback,
+                // not just marker display.
                 const auto ppqOpt = positionInfo.getPpqPosition();
-                const double currentPpq = ppqOpt.hasValue() ? *ppqOpt : 0.0;
+                const double basePpq = ppqOpt.hasValue() ? *ppqOpt : 0.0;
+                const double samplesPerBeatLocal = secondsPerBeat * currentSampleRate;
+                const double ppqPerSample = (samplesPerBeatLocal > 0.0) ? (1.0 / samplesPerBeatLocal) : 0.0;
+                const double ppqAtSampleRaw = basePpq + (static_cast<double>(i) * ppqPerSample);
+                const double currentPpq = applySwingToPpq(ppqAtSampleRaw);
                 double rawBase = 0.0;
                 if (ppqTimelineAnchored)
                 {
@@ -3657,7 +3868,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     rawBase = triggerOffset + (samplesElapsed * effectiveSpeed);
                 }
 
-                positionInLoop = mapLoopPositionForMode(rawBase + (static_cast<double>(i) * effectiveSpeed));
+                positionInLoop = mapLoopPositionForMode(rawBase);
                 }
                 else
                 {
@@ -3688,14 +3899,14 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 break;
             }
 
-            // Update playbackPosition for next iteration
-            // During scratch/tape-stop: ALWAYS update (we're independent of PPQ)
-            // During normal playback with PPQ sync: DON'T update (PPQ recalculates next buffer)
-            bool ppqSyncActive = positionInfo.getPpqPosition().hasValue() && !bypassPpqSync && playing;
-        if (!ppqSyncActive || bypassPpqSync)
-        {
-            playbackPosition = samplePosition;
-        }
+            // Loop/Gate/OneShot keep legacy PPQ/fallback behavior here.
+            // Grain writes playbackPosition after grain center is computed.
+            if (playMode != PlayMode::Grain)
+            {
+                bool ppqSyncActive = positionInfo.getPpqPosition().hasValue() && !bypassPpqSync && playing;
+                if (!ppqSyncActive || bypassPpqSync)
+                    playbackPosition = samplePosition;
+            }
 
         // Hold state silence only once we have fully stopped at target.
         if (tapeStopActive)
@@ -3760,6 +3971,17 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             grainGesture.centerSampleSmoothed = grainCenter;
             playbackPosition = grainCenter;
 
+            if (grainGesture.returningToTimeline && !grainGesture.anyHeld)
+            {
+                const double remain = std::abs(computeScratchTravelDistance(grainCenter, grainGesture.targetCenterSample));
+                if (remain < 1.0)
+                {
+                    grainGesture.returningToTimeline = false;
+                    grainGesture.freeze = false;
+                    grainGesture.centerTravelDistanceAbs = 0.0;
+                }
+            }
+
             float grainL = 0.0f;
             float grainR = 0.0f;
             renderGrainAtSample(grainL, grainR, grainCenter, effectiveSpeed, globalSampleStart + i);
@@ -3817,6 +4039,17 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         {
             leftSample = filter.processSample(0, leftSample);
             rightSample = filter.processSample(1, rightSample);
+        }
+
+        // Tempo-synced gate effect (independent from PlayMode::Gate trigger behavior).
+        if (positionInfo.getPpqPosition().hasValue() && tempo > 0.0f)
+        {
+            const double samplesPerBeatLocal = (60.0 / tempo) * currentSampleRate;
+            const double ppqAtSampleRaw = *positionInfo.getPpqPosition()
+                                        + (static_cast<double>(i) / samplesPerBeatLocal);
+            const float gateMod = computeGateModulation(applySwingToPpq(ppqAtSampleRaw));
+            leftSample *= gateMod;
+            rightSample *= gateMod;
         }
         
         output.addSample(0, startSample + i, leftSample * finalGainLeft);
@@ -4110,6 +4343,8 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         scratchGestureActive = true;
         scratchArrived = false;
         isReverseScratch = false;
+        reverseScratchPpqRetarget = false;
+        reverseScratchUseRateBlend = false;
         rateSmoother.setCurrentAndTargetValue(1.0);
 
         // Match RandomSlice behavior: short fade-in to suppress retrigger clicks.
@@ -4189,6 +4424,8 @@ void EnhancedAudioStrip::onButtonPress(int column, int64_t globalSample)
 
     // Add to set of held buttons
     heldButtons.insert(column);
+    heldButtonOrder.erase(std::remove(heldButtonOrder.begin(), heldButtonOrder.end(), column), heldButtonOrder.end());
+    heldButtonOrder.push_back(column);
     const float stripScratch = scratchAmount.load();
 
     auto activatePatternMode = [&](int requiredCount, int patternId, const juce::String& modeName)
@@ -4240,6 +4477,8 @@ void EnhancedAudioStrip::onButtonPress(int column, int64_t globalSample)
     tapeStopActive = keepHoldMute;
     scratchGestureActive = keepHoldMute;
     isReverseScratch = false;
+    reverseScratchPpqRetarget = false;
+    reverseScratchUseRateBlend = false;
     
     DBG("Button " << column << " pressed (scratch: " << scratchAmount.load() << "%)");
 }
@@ -4261,6 +4500,7 @@ void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
 
     // Remove from held buttons set
     heldButtons.erase(column);
+    heldButtonOrder.erase(std::remove(heldButtonOrder.begin(), heldButtonOrder.end(), column), heldButtonOrder.end());
     
     // If pattern was active and we now have fewer held buttons than required,
     // deactivate and return to timeline.
@@ -4299,6 +4539,66 @@ void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
     }
     
     DBG("Button " << column << " released");
+
+    // If another button is still held, retarget scratch to that held button
+    // instead of returning to timeline.
+    if (!heldButtonOrder.empty())
+    {
+        const int fallbackColumn = heldButtonOrder.back();
+        if (heldButtons.count(fallbackColumn) > 0)
+        {
+            const float stripScratch = scratchAmount.load();
+            if (stripScratch > 0.0f)
+            {
+                const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
+                const double loopLength = loopLengthSamples;
+                const double fallbackTarget = getTriggerTargetPositionForColumn(fallbackColumn, loopStartSamples, loopLength);
+                const double startPosition = playbackPosition.load();
+                const double tempoForScratch = (lastObservedTempo > 0.0) ? lastObservedTempo : 120.0;
+                const int64_t requestedDuration = calculateScratchDuration(stripScratch, tempoForScratch);
+                const double scratchDistance = computeScratchTravelDistance(startPosition, fallbackTarget);
+                const int64_t rampDuration = makeFeasibleScratchDuration(startPosition,
+                                                                         startPosition + scratchDistance,
+                                                                         requestedDuration,
+                                                                         false);
+
+                buttonHeld = true;
+                heldButton = fallbackColumn;
+                buttonPressTime = globalSample;
+                scratchArrived = false;
+                scrubActive = true;
+                tapeStopActive = false;
+                scratchGestureActive = true;
+                isReverseScratch = false;
+                reverseScratchPpqRetarget = false;
+                reverseScratchUseRateBlend = false;
+                targetPosition = fallbackTarget;
+                targetSampleTime = globalSample + rampDuration;
+                scratchStartTime = globalSample;
+                scratchStartPosition = startPosition;
+                scratchTravelDistance = scratchDistance;
+                scratchDuration = rampDuration;
+                rateSmoother.setCurrentAndTargetValue(1.0);
+                crossfader.startFade(true, 64);
+
+                DBG("Button " << column << " released -> retarget to held button " << fallbackColumn);
+                return;
+            }
+        }
+    }
+
+    if (playMode == PlayMode::Loop)
+    {
+        // Loop mode: restore pre-grain reverse-scratch implementation.
+        reverseScratchPpqRetarget = false;
+        reverseScratchUseRateBlend = false;
+        reverseScratchToTimeline(globalSample);
+
+        buttonHeld = false;
+        heldButton = -1;
+        scratchArrived = false;
+        return;
+    }
     
     // Release always performs a reverse scratch back to the timeline.
     float stripScratch = scratchAmount.load();
@@ -4309,14 +4609,19 @@ void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
 
     double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
     double loopLength = loopLengthSamples;
+    const float manualBeats = beatsPerLoop.load();
+    const double beatsForLoop = (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0;
+    reverseScratchLoopStartSamples = loopStartSamples;
+    reverseScratchLoopLengthSamples = juce::jmax(1.0, loopLength);
+    reverseScratchBeatsForLoop = juce::jmax(1.0, beatsForLoop);
+    reverseScratchPpqRetarget = false;
+    reverseScratchUseRateBlend = false;
 
     auto predictTimelinePositionAtDuration = [&](int64_t durationSamples, bool& usedPpqOut) -> double
     {
         usedPpqOut = false;
-        if (ppqTimelineAnchored && lastObservedPpqValid && lastObservedTempo > 0.0)
+        if (scratchSavedPpqTimelineAnchored && lastObservedPpqValid && lastObservedTempo > 0.0)
         {
-            float manualBeats = beatsPerLoop.load();
-            const double beatsForLoop = (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0;
             const double samplesPerBeat = (60.0 / lastObservedTempo) * currentSampleRate;
             const double ppqNow = lastObservedPPQ + (static_cast<double>(globalSample - lastObservedGlobalSample) / samplesPerBeat);
             const double ppqAtCompletion = ppqNow + (static_cast<double>(durationSamples) / samplesPerBeat);
@@ -4369,6 +4674,11 @@ void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
     // Re-assert saved PPQ alignment at release stage.
     ppqTimelineAnchored = scratchSavedPpqTimelineAnchored;
     ppqTimelineOffsetBeats = scratchSavedPpqTimelineOffsetBeats;
+    // Continuous PPQ retargeting can sound like varispeed wobble in loop mode.
+    // Keep loop-mode reverse return locked to the single release-time target.
+    reverseScratchPpqRetarget = usedPpqPrediction
+        && ppqTimelineAnchored
+        && (playMode == PlayMode::Grain);
 
     DBG("Reverse scratch release: target=" << targetPosition
         << " duration=" << (static_cast<double>(rampDuration) / currentSampleRate)
@@ -4408,6 +4718,8 @@ void EnhancedAudioStrip::snapToTimeline(int64_t currentGlobalSample)
     tapeStopActive = false;
     scratchGestureActive = false;
     isReverseScratch = false;
+    reverseScratchPpqRetarget = false;
+    reverseScratchUseRateBlend = false;
     scratchTravelDistance = 0.0;
     const float restoreSpeed = static_cast<float>(playbackSpeed.load(std::memory_order_acquire));
     smoothedSpeed.setCurrentAndTargetValue(restoreSpeed);
@@ -4418,104 +4730,86 @@ void EnhancedAudioStrip::snapToTimeline(int64_t currentGlobalSample)
 
 void EnhancedAudioStrip::reverseScratchToTimeline(int64_t currentGlobalSample)
 {
-    // CRITICAL: Calculate where timeline WILL BE when reverse scratch completes
-    // Not where it is NOW!
-    
-    // First, determine reverse scratch duration
+    // Loop-mode release: return to the timeline position where PPQ will be
+    // after the release duration, preserving the saved trigger phase offset.
     int64_t reverseDuration = scratchDuration;
     if (reverseDuration == 0 || reverseDuration > currentSampleRate * 2.0)
     {
-        // No valid forward duration or too long - calculate fresh
         reverseDuration = calculateScratchDuration(scratchAmount.load(), 120.0);
     }
-    
-    // Calculate the future time when reverse scratch will complete
-    int64_t reverseTargetTime = currentGlobalSample + reverseDuration;
-    
-    // Now calculate where timeline WILL BE at that future time
-    int64_t samplesElapsedAtCompletion = reverseTargetTime - triggerSample;
-    
-    double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
-    double loopLength = loopLengthSamples;
-    double triggerOffset = juce::jlimit(0.0, 0.999999, triggerOffsetRatio) * loopLength;
-    
-    double currentSpeedValue = smoothedSpeed.getNextValue();
-    double futureAdvance = samplesElapsedAtCompletion * currentSpeedValue;
-    double futurePosInLoop = std::fmod(triggerOffset + futureAdvance, loopLength);
-    if (futurePosInLoop < 0) futurePosInLoop += loopLength;
-    
-    double futureTimelinePosition = loopStartSamples + futurePosInLoop;
-    
-    // Calculate distance from CURRENT position to FUTURE timeline position
-    double currentPos = playbackPosition.load();
-    
-    // Calculate position in loop space for proper wrapping
-    double currentPosInLoop = currentPos - loopStartSamples;
-    double targetPosInLoop = futurePosInLoop;
-    
-    // Calculate distance with wrapping - SHORTEST PATH
-    double rawDistance = targetPosInLoop - currentPosInLoop;
-    
-    // Handle wrapping - take shortest path
-    if (rawDistance > loopLength * 0.5)
-        rawDistance -= loopLength;
-    else if (rawDistance < -loopLength * 0.5)
-        rawDistance += loopLength;
-    
-    double distance = rawDistance;
-    
-    // SMART DECISION: Reverse scratch vs catch-up
-    // If we need to move forward a LOT, it might be better to just speed up
-    // and "catch" the incoming playhead rather than reverse scratch
-    
-    double avgRate = distance / static_cast<double>(reverseDuration);
-    double speedupFactor = std::abs(avgRate);
-    
-    bool shouldCatchUp = false;
-    
-    // If we need to go forward at more than 3× speed, just catch up instead
-    if (distance > 0 && speedupFactor > 3.0)
+
+    reverseDuration = juce::jmax<int64_t>(1, reverseDuration);
+
+    const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
+    const double loopLength = loopLengthSamples;
+    const double triggerOffset = juce::jlimit(0.0, 0.999999, triggerOffsetRatio) * loopLength;
+    const float manualBeats = beatsPerLoop.load();
+    const double beatsForLoop = (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0;
+
+    auto predictFutureTimeline = [&](int64_t durationSamples, bool& usedPpqOut) -> double
     {
-        shouldCatchUp = true;
-        DBG("Catch-up mode: speeding up " << speedupFactor << "× to meet timeline");
-    }
-    
-    DBG("Reverse scratch to FUTURE timeline:");
-    DBG("  Current pos in loop: " << currentPosInLoop);
-    DBG("  Future timeline in loop: " << targetPosInLoop);
-    DBG("  Shortest distance: " << distance << " samples");
-    DBG("  Required rate: " << avgRate);
-    DBG("  Mode: " << (shouldCatchUp ? "CATCH-UP" : "REVERSE SCRATCH"));
-    
-    if (shouldCatchUp)
-    {
-        // CATCH-UP MODE: Gradually speed up to meet the timeline
-        // Instead of reverse scratch, we'll smoothly accelerate to catch up
-        
-        targetPosition = futureTimelinePosition;
-        targetSampleTime = reverseTargetTime;
-        scrubActive = true;
-        isReverseScratch = true;  // Still use linear interp (not exponential)
-        
-        scratchStartTime = currentGlobalSample;
-        scratchStartPosition = currentPos;
-        scratchTravelDistance = distance;
-        scratchDuration = reverseDuration;
-    }
-    else
-    {
-        // NORMAL REVERSE SCRATCH: Linear interpolation back to timeline
-        
-        targetPosition = futureTimelinePosition;
-        targetSampleTime = reverseTargetTime;
-        scrubActive = true;
-        isReverseScratch = true;
-        
-        scratchStartTime = currentGlobalSample;
-        scratchStartPosition = currentPos;
-        scratchTravelDistance = distance;
-        scratchDuration = reverseDuration;
-    }
+        usedPpqOut = false;
+        if (scratchSavedPpqTimelineAnchored && lastObservedPpqValid && lastObservedTempo > 0.0)
+        {
+            const double samplesPerBeat = (60.0 / lastObservedTempo) * currentSampleRate;
+            const double ppqNow = lastObservedPPQ
+                                + (static_cast<double>(currentGlobalSample - lastObservedGlobalSample) / samplesPerBeat);
+            const double ppqAtCompletion = ppqNow + (static_cast<double>(durationSamples) / samplesPerBeat);
+
+            double beatInLoop = std::fmod(ppqAtCompletion + scratchSavedPpqTimelineOffsetBeats, beatsForLoop);
+            if (beatInLoop < 0.0)
+                beatInLoop += beatsForLoop;
+            usedPpqOut = true;
+            return loopStartSamples + ((beatInLoop / beatsForLoop) * loopLength);
+        }
+
+        const int64_t reverseTargetTimeLocal = currentGlobalSample + durationSamples;
+        const int64_t samplesElapsedAtCompletion = reverseTargetTimeLocal - triggerSample;
+        const double currentSpeedValue = static_cast<double>(playbackSpeed.load(std::memory_order_acquire));
+        double futureAdvance = samplesElapsedAtCompletion * currentSpeedValue;
+        double futurePosInLoop = std::fmod(triggerOffset + futureAdvance, loopLength);
+        if (futurePosInLoop < 0.0)
+            futurePosInLoop += loopLength;
+        return loopStartSamples + futurePosInLoop;
+    };
+
+    bool usedPpqPrediction = false;
+    double futureTimelinePosition = predictFutureTimeline(reverseDuration, usedPpqPrediction);
+    const double currentPos = playbackPosition.load();
+    // Always use shortest wrapped path to the release target.
+    double distance = computeScratchTravelDistance(currentPos, futureTimelinePosition);
+
+    const int64_t reverseTargetTime = currentGlobalSample + reverseDuration;
+    const float displaySpeedNow = displaySpeedAtomic.load(std::memory_order_acquire);
+    const double startRateMag = (tapeStopActive || !std::isfinite(displaySpeedNow))
+        ? 0.0
+        : std::abs(static_cast<double>(displaySpeedNow));
+    const double restoreRateMag = std::abs(static_cast<double>(playbackSpeed.load(std::memory_order_acquire)));
+    const double direction = (distance >= 0.0) ? 1.0 : -1.0;
+
+    targetPosition = futureTimelinePosition;
+    targetSampleTime = reverseTargetTime;
+    scrubActive = true;
+    isReverseScratch = true;
+    reverseScratchPpqRetarget = false;
+    reverseScratchUseRateBlend = true;
+    reverseScratchStartRate = direction * startRateMag;
+    reverseScratchEndRate = direction * restoreRateMag;
+    scratchStartTime = currentGlobalSample;
+    scratchStartPosition = currentPos;
+    scratchTravelDistance = distance;
+    scratchDuration = reverseDuration;
+    tapeStopActive = false;
+
+    ppqTimelineAnchored = scratchSavedPpqTimelineAnchored;
+    ppqTimelineOffsetBeats = scratchSavedPpqTimelineOffsetBeats;
+
+    DBG("Loop reverse scratch: target=" << targetPosition
+        << " dur=" << (static_cast<double>(reverseDuration) / currentSampleRate)
+        << "s ppq=" << (usedPpqPrediction ? "YES" : "NO")
+        << " dist=" << distance
+        << " v0=" << reverseScratchStartRate
+        << " v1=" << reverseScratchEndRate);
 }
 
 double EnhancedAudioStrip::computeScratchTravelDistance(double startPosSamples, double endPosSamples) const
@@ -4648,6 +4942,8 @@ void EnhancedAudioStrip::enforceMomentaryPhaseReference(double hostPpq, int64_t 
     tapeStopActive = false;
     scratchGestureActive = false;
     isReverseScratch = false;
+    reverseScratchPpqRetarget = false;
+    reverseScratchUseRateBlend = false;
     scratchTravelDistance = 0.0;
     buttonHeld = false;
     heldButton = -1;
@@ -4671,7 +4967,7 @@ int64_t EnhancedAudioStrip::makeFeasibleScratchDuration(double startPosSamples,
     // Cap to the runtime clamp used in process().
     const double maxRate = kMaxScratchRateAbs;
     const double minDurationByClamp = reverseScratch
-        ? std::ceil(distanceSamples / maxRate)
+        ? std::ceil((distanceSamples * kReverseScratchAccelExp) / maxRate)
         : std::ceil((distanceSamples * kForwardScratchDecay) / ((1.0 - std::exp(-kForwardScratchDecay)) * maxRate));
 
     const int64_t feasible = static_cast<int64_t>(juce::jmax(1.0, minDurationByClamp));
@@ -4913,6 +5209,31 @@ void EnhancedAudioStrip::clearLoop()
     loopEnd = ModernAudioEngine::MaxColumns;
 }
 
+void EnhancedAudioStrip::setPlaybackMarkerColumn(int column, int64_t currentGlobalSample)
+{
+    juce::ScopedLock lock(bufferLock);
+    if (sampleLength <= 0.0)
+        return;
+
+    const int clampedColumn = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, column);
+    int loopCols = loopEnd - loopStart;
+    if (loopCols <= 0)
+        loopCols = ModernAudioEngine::MaxColumns;
+
+    const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
+    const double loopLength = (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
+    if (loopLength <= 0.0)
+        return;
+
+    const double targetPos = getTriggerTargetPositionForColumn(clampedColumn, loopStartSamples, loopLength);
+    playbackPosition = juce::jlimit(0.0, juce::jmax(0.0, sampleLength - 1.0), targetPos);
+    stopLoopPosition = playbackPosition.load();
+    triggerColumn = clampedColumn;
+    triggerSample = currentGlobalSample;
+    triggerOffsetRatio = (playbackPosition.load() - loopStartSamples) / loopLength;
+    triggerOffsetRatio = juce::jlimit(0.0, 0.999999, triggerOffsetRatio);
+}
+
 void EnhancedAudioStrip::setVolume(float vol)
 {
     vol = juce::jlimit(0.0f, 1.0f, vol);
@@ -5092,6 +5413,92 @@ void EnhancedAudioStrip::setFilterType(FilterType type)
     // Auto-enable filter when type is changed
     if (!filterEnabled)
         filterEnabled = true;
+}
+
+double EnhancedAudioStrip::applySwingToPpq(double ppq) const
+{
+    const double swing = static_cast<double>(swingAmount.load(std::memory_order_acquire));
+    if (swing <= 1.0e-6)
+        return ppq;
+
+    const auto division = getSwingDivision();
+    const double unitBeats = [&]()
+    {
+        switch (division)
+        {
+            case SwingDivision::Quarter: return 1.0;
+            case SwingDivision::Sixteenth: return 0.25;
+            case SwingDivision::Triplet: return 1.0 / 3.0;
+            case SwingDivision::Eighth:
+            default: return 0.5;
+        }
+    }();
+
+    const double pairLength = unitBeats * 2.0;
+    if (pairLength <= 1.0e-9)
+        return ppq;
+
+    const double pairIndex = std::floor(ppq / pairLength);
+    const double pairBase = pairIndex * pairLength;
+    const double pairPhase = ppq - pairBase; // [0..pairLength)
+
+    // More gradual onset in low range, still extreme near max.
+    const double shapedSwing = std::pow(juce::jlimit(0.0, 1.0, swing), 1.7);
+    const double splitShift = juce::jlimit(0.0, 0.96, shapedSwing * 0.96);
+    const double splitPoint = unitBeats * (1.0 + splitShift);
+
+    double swungPhase = pairPhase;
+    if (pairPhase < unitBeats)
+    {
+        const double t = pairPhase / juce::jmax(1.0e-9, unitBeats);
+        swungPhase = splitPoint * t;
+    }
+    else
+    {
+        const double t = (pairPhase - unitBeats) / juce::jmax(1.0e-9, unitBeats);
+        swungPhase = splitPoint + ((pairLength - splitPoint) * t);
+    }
+
+    return pairBase + swungPhase;
+}
+
+float EnhancedAudioStrip::computeGateModulation(double ppq) const
+{
+    const float amount = gateAmount.load(std::memory_order_acquire);
+    if (amount <= 1.0e-4f)
+        return 1.0f;
+
+    const float speed = gateSpeed.load(std::memory_order_acquire);
+    const float env = gateEnvelope.load(std::memory_order_acquire);
+    const GateShape shape = gateShape;
+
+    const double phase = ppq * static_cast<double>(speed);
+    const float p = static_cast<float>(phase - std::floor(phase)); // 0..1
+
+    float wave = 1.0f;
+    switch (shape)
+    {
+        case GateShape::Triangle:
+            wave = 1.0f - std::abs((2.0f * p) - 1.0f);
+            break;
+        case GateShape::Square:
+        {
+            const float edge = 0.01f + (env * 0.24f);
+            const float rise = juce::jlimit(0.0f, 1.0f, p / edge);
+            const float fall = juce::jlimit(0.0f, 1.0f, (1.0f - p) / edge);
+            wave = juce::jmin(rise, fall);
+            break;
+        }
+        case GateShape::Sine:
+        default:
+            wave = 0.5f + (0.5f * std::sin(juce::MathConstants<float>::twoPi * p));
+            break;
+    }
+
+    // Envelope controls curve softness (hard at 0, smooth at 1).
+    const float exponent = juce::jmap(env, 0.0f, 1.0f, 3.2f, 0.8f);
+    const float shaped = std::pow(juce::jlimit(0.0f, 1.0f, wave), exponent);
+    return juce::jlimit(0.0f, 1.0f, (1.0f - amount) + (amount * shaped));
 }
 
 double EnhancedAudioStrip::getNormalizedPosition() const
@@ -5428,6 +5835,17 @@ ModernAudioEngine::ModernAudioEngine()
         patterns[static_cast<size_t>(i)] = std::make_unique<PatternRecorder>();
     
     liveRecorder = std::make_unique<LiveRecorder>();
+
+    for (auto& seq : modSequencers)
+    {
+        seq.target.store(static_cast<int>(ModTarget::None), std::memory_order_release);
+        seq.bipolar.store(0, std::memory_order_release);
+        seq.curveMode.store(0, std::memory_order_release);
+        seq.depth.store(1.0f, std::memory_order_release);
+        seq.offset.store(0, std::memory_order_release);
+        for (auto& step : seq.steps)
+            step.store(0.0f, std::memory_order_release);
+    }
 }
 
 void ModernAudioEngine::prepareToPlay(double sampleRate, int maxBlockSize)
@@ -5545,22 +5963,139 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             if (!strips[i])
                 continue;
 
-            int groupId = strips[i]->getGroup();
+            auto* strip = strips[i].get();
+            const auto& seq = modSequencers[i];
+            const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
+            const bool applyMod = (target != ModTarget::None) && strip->isPlaying();
+
+            const float originalVol = strip->getVolume();
+            const float originalPan = strip->getPan();
+            const float originalSpeed = strip->getPlaybackSpeed();
+            const float originalPitch = strip->getPitchShift();
+            const float originalFilterFreq = strip->getFilterFrequency();
+            const float originalFilterRes = strip->getFilterResonance();
+            const float originalGrainSize = strip->getGrainSizeMs();
+            const float originalGrainDensity = strip->getGrainDensity();
+            const float originalGrainPitch = strip->getGrainPitch();
+            const float originalGrainPitchJitter = strip->getGrainPitchJitter();
+            const float originalGrainSpread = strip->getGrainSpread();
+            const float originalGrainJitter = strip->getGrainJitter();
+            const float originalGrainRandom = strip->getGrainRandomDepth();
+            const float originalGrainArp = strip->getGrainArpDepth();
+            const float originalGrainCloud = strip->getGrainCloudDepth();
+            const float originalGrainEmitter = strip->getGrainEmitterDepth();
+            const float originalGrainEnvelope = strip->getGrainEnvelope();
+
+            if (applyMod)
+            {
+                const int currentCol = strip->getCurrentColumn();
+                const int offset = seq.offset.load(std::memory_order_acquire);
+                const int stepIndex = ((currentCol + offset) % ModSteps + ModSteps) % ModSteps;
+                const float raw = seq.steps[static_cast<size_t>(stepIndex)].load(std::memory_order_acquire);
+                const float depth = juce::jlimit(0.0f, 1.0f, seq.depth.load(std::memory_order_acquire));
+                const bool bipolar = seq.bipolar.load(std::memory_order_acquire) != 0;
+                const float signedValue = bipolar ? ((raw * 2.0f) - 1.0f) : raw;
+                const float mod = juce::jlimit(-1.0f, 1.0f, signedValue * depth);
+
+                switch (target)
+                {
+                    case ModTarget::Volume:
+                        strip->setVolume(juce::jlimit(0.0f, 1.0f, originalVol + (0.7f * mod)));
+                        break;
+                    case ModTarget::Pan:
+                        strip->setPan(juce::jlimit(-1.0f, 1.0f, originalPan + mod));
+                        break;
+                    case ModTarget::Pitch:
+                        strip->setPitchShift(juce::jlimit(-12.0f, 12.0f, originalPitch + (12.0f * mod)));
+                        break;
+                    case ModTarget::Speed:
+                        strip->setPlaybackSpeed(juce::jlimit(0.0f, 4.0f, originalSpeed + (1.5f * mod)));
+                        break;
+                    case ModTarget::Cutoff:
+                    {
+                        const float factor = std::pow(2.0f, mod * 2.5f);
+                        strip->setFilterFrequency(juce::jlimit(20.0f, 20000.0f, originalFilterFreq * factor));
+                        break;
+                    }
+                    case ModTarget::Resonance:
+                        strip->setFilterResonance(juce::jlimit(0.1f, 10.0f, strip->getFilterResonance() + (2.0f * mod)));
+                        break;
+                    case ModTarget::GrainSize:
+                        strip->setGrainSizeMs(juce::jlimit(5.0f, 2400.0f, strip->getGrainSizeMs() + (600.0f * mod)));
+                        break;
+                    case ModTarget::GrainDensity:
+                        strip->setGrainDensity(juce::jlimit(0.05f, 0.9f, strip->getGrainDensity() + (0.4f * mod)));
+                        break;
+                    case ModTarget::GrainPitch:
+                        strip->setGrainPitch(juce::jlimit(-48.0f, 48.0f, strip->getGrainPitch() + (24.0f * mod)));
+                        break;
+                    case ModTarget::GrainPitchJitter:
+                        strip->setGrainPitchJitter(juce::jlimit(0.0f, 48.0f, strip->getGrainPitchJitter() + (16.0f * std::abs(mod))));
+                        break;
+                    case ModTarget::GrainSpread:
+                        strip->setGrainSpread(juce::jlimit(0.0f, 1.0f, strip->getGrainSpread() + (0.5f * mod)));
+                        break;
+                    case ModTarget::GrainJitter:
+                        strip->setGrainJitter(juce::jlimit(0.0f, 1.0f, strip->getGrainJitter() + (0.5f * std::abs(mod))));
+                        break;
+                    case ModTarget::GrainRandom:
+                        strip->setGrainRandomDepth(juce::jlimit(0.0f, 1.0f, strip->getGrainRandomDepth() + (0.5f * std::abs(mod))));
+                        break;
+                    case ModTarget::GrainArp:
+                        strip->setGrainArpDepth(juce::jlimit(0.0f, 1.0f, strip->getGrainArpDepth() + (0.5f * std::abs(mod))));
+                        break;
+                    case ModTarget::GrainCloud:
+                        strip->setGrainCloudDepth(juce::jlimit(0.0f, 1.0f, strip->getGrainCloudDepth() + (0.5f * std::abs(mod))));
+                        break;
+                    case ModTarget::GrainEmitter:
+                        strip->setGrainEmitterDepth(juce::jlimit(0.0f, 1.0f, strip->getGrainEmitterDepth() + (0.5f * std::abs(mod))));
+                        break;
+                    case ModTarget::GrainEnvelope:
+                        strip->setGrainEnvelope(juce::jlimit(0.0f, 1.0f, strip->getGrainEnvelope() + (0.5f * std::abs(mod))));
+                        break;
+                    case ModTarget::None:
+                    default:
+                        break;
+                }
+            }
+
+            int groupId = strip->getGroup();
             if (groupId >= 0 && groupId < MaxGroups && groups[static_cast<size_t>(groupId)])
             {
                 auto* group = groups[static_cast<size_t>(groupId)].get();
                 if (!group->isMuted())
                 {
                     float groupVol = group->getVolume();
-                    float originalVol = strips[i]->getVolume();
-                    strips[i]->setVolume(originalVol * groupVol);
-                    strips[i]->process(buffer, startSample, segmentSamples, segmentPosInfo, segmentGlobalSample, tempoNow, quantizeBeatsNow);
-                    strips[i]->setVolume(originalVol);
+                    float preGroupVol = strip->getVolume();
+                    strip->setVolume(preGroupVol * groupVol);
+                    strip->process(buffer, startSample, segmentSamples, segmentPosInfo, segmentGlobalSample, tempoNow, quantizeBeatsNow);
+                    strip->setVolume(preGroupVol);
                 }
             }
             else
             {
-                strips[i]->process(buffer, startSample, segmentSamples, segmentPosInfo, segmentGlobalSample, tempoNow, quantizeBeatsNow);
+                strip->process(buffer, startSample, segmentSamples, segmentPosInfo, segmentGlobalSample, tempoNow, quantizeBeatsNow);
+            }
+
+            if (applyMod)
+            {
+                strip->setVolume(originalVol);
+                strip->setPan(originalPan);
+                strip->setPlaybackSpeed(originalSpeed);
+                strip->setPitchShift(originalPitch);
+                strip->setFilterFrequency(originalFilterFreq);
+                strip->setFilterResonance(originalFilterRes);
+                strip->setGrainSizeMs(originalGrainSize);
+                strip->setGrainDensity(originalGrainDensity);
+                strip->setGrainPitch(originalGrainPitch);
+                strip->setGrainPitchJitter(originalGrainPitchJitter);
+                strip->setGrainSpread(originalGrainSpread);
+                strip->setGrainJitter(originalGrainJitter);
+                strip->setGrainRandomDepth(originalGrainRandom);
+                strip->setGrainArpDepth(originalGrainArp);
+                strip->setGrainCloudDepth(originalGrainCloud);
+                strip->setGrainEmitterDepth(originalGrainEmitter);
+                strip->setGrainEnvelope(originalGrainEnvelope);
             }
         }
     };
@@ -5841,6 +6376,25 @@ void ModernAudioEngine::setCrossfadeLengthMs(float ms)
     }
 }
 
+void ModernAudioEngine::setGlobalSwingDivision(EnhancedAudioStrip::SwingDivision division)
+{
+    for (auto& strip : strips)
+    {
+        if (strip)
+            strip->setSwingDivision(division);
+    }
+}
+
+EnhancedAudioStrip::SwingDivision ModernAudioEngine::getGlobalSwingDivision() const
+{
+    for (const auto& strip : strips)
+    {
+        if (strip)
+            return strip->getSwingDivision();
+    }
+    return EnhancedAudioStrip::SwingDivision::Eighth;
+}
+
 void ModernAudioEngine::updateTempo(const juce::AudioPlayHead::PositionInfo& positionInfo)
 {
     if (positionInfo.getBpm().hasValue())
@@ -5949,6 +6503,150 @@ PatternRecorder* ModernAudioEngine::getPattern(int index)
     if (index >= 0 && index < 4)
         return patterns[static_cast<size_t>(index)].get();
     return nullptr;
+}
+
+ModernAudioEngine::ModSequencerState ModernAudioEngine::getModSequencerState(int stripIndex) const
+{
+    ModSequencerState state{};
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return state;
+
+    const auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    state.target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
+    state.bipolar = (seq.bipolar.load(std::memory_order_acquire) != 0);
+    state.curveMode = (seq.curveMode.load(std::memory_order_acquire) != 0);
+    state.depth = seq.depth.load(std::memory_order_acquire);
+    state.offset = seq.offset.load(std::memory_order_acquire);
+    for (int i = 0; i < ModSteps; ++i)
+        state.steps[static_cast<size_t>(i)] = seq.steps[static_cast<size_t>(i)].load(std::memory_order_acquire);
+    return state;
+}
+
+void ModernAudioEngine::setModTarget(int stripIndex, ModTarget target)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    seq.target.store(static_cast<int>(target), std::memory_order_release);
+
+    const bool bipolarDefault = (target == ModTarget::Pan
+        || target == ModTarget::Pitch
+        || target == ModTarget::GrainPitch
+        || target == ModTarget::Speed);
+    seq.bipolar.store(bipolarDefault ? 1 : 0, std::memory_order_release);
+}
+
+ModernAudioEngine::ModTarget ModernAudioEngine::getModTarget(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return ModTarget::None;
+    return static_cast<ModTarget>(modSequencers[static_cast<size_t>(stripIndex)].target.load(std::memory_order_acquire));
+}
+
+void ModernAudioEngine::setModBipolar(int stripIndex, bool bipolar)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    seq.bipolar.store(bipolar ? 1 : 0, std::memory_order_release);
+    for (auto& step : seq.steps)
+    {
+        const float clamped = juce::jlimit(0.0f, 1.0f, step.load(std::memory_order_acquire));
+        step.store(clamped, std::memory_order_release);
+    }
+}
+
+bool ModernAudioEngine::isModBipolar(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return false;
+    return modSequencers[static_cast<size_t>(stripIndex)].bipolar.load(std::memory_order_acquire) != 0;
+}
+
+void ModernAudioEngine::setModDepth(int stripIndex, float depth)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    modSequencers[static_cast<size_t>(stripIndex)].depth.store(juce::jlimit(0.0f, 1.0f, depth), std::memory_order_release);
+}
+
+float ModernAudioEngine::getModDepth(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return 1.0f;
+    return modSequencers[static_cast<size_t>(stripIndex)].depth.load(std::memory_order_acquire);
+}
+
+void ModernAudioEngine::setModCurveMode(int stripIndex, bool curveMode)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    modSequencers[static_cast<size_t>(stripIndex)].curveMode.store(curveMode ? 1 : 0, std::memory_order_release);
+}
+
+bool ModernAudioEngine::isModCurveMode(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return true;
+    return modSequencers[static_cast<size_t>(stripIndex)].curveMode.load(std::memory_order_acquire) != 0;
+}
+
+void ModernAudioEngine::setModOffset(int stripIndex, int offset)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    modSequencers[static_cast<size_t>(stripIndex)].offset.store(juce::jlimit(-15, 15, offset), std::memory_order_release);
+}
+
+int ModernAudioEngine::getModOffset(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return 0;
+    return modSequencers[static_cast<size_t>(stripIndex)].offset.load(std::memory_order_acquire);
+}
+
+void ModernAudioEngine::setModStepValue(int stripIndex, int step, float value01)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || step < 0 || step >= ModSteps)
+        return;
+    modSequencers[static_cast<size_t>(stripIndex)].steps[static_cast<size_t>(step)].store(
+        juce::jlimit(0.0f, 1.0f, value01), std::memory_order_release);
+}
+
+float ModernAudioEngine::getModStepValue(int stripIndex, int step) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || step < 0 || step >= ModSteps)
+        return 0.0f;
+    return modSequencers[static_cast<size_t>(stripIndex)].steps[static_cast<size_t>(step)].load(std::memory_order_acquire);
+}
+
+void ModernAudioEngine::toggleModStep(int stripIndex, int step)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || step < 0 || step >= ModSteps)
+        return;
+    auto& cell = modSequencers[static_cast<size_t>(stripIndex)].steps[static_cast<size_t>(step)];
+    const float prev = cell.load(std::memory_order_acquire);
+    cell.store(prev >= 0.5f ? 0.0f : 1.0f, std::memory_order_release);
+}
+
+void ModernAudioEngine::clearModSteps(int stripIndex)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    for (auto& step : modSequencers[static_cast<size_t>(stripIndex)].steps)
+        step.store(0.0f, std::memory_order_release);
+}
+
+int ModernAudioEngine::getModCurrentStep(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return 0;
+    const auto* strip = strips[static_cast<size_t>(stripIndex)].get();
+    if (!strip)
+        return 0;
+    const int offset = getModOffset(stripIndex);
+    const int currentCol = strip->getCurrentColumn();
+    return ((currentCol + offset) % ModSteps + ModSteps) % ModSteps;
 }
 
 void ModernAudioEngine::startPatternRecording(int patternIndex)
@@ -6106,6 +6804,12 @@ void EnhancedAudioStrip::toggleStepAtVisibleColumn(int column)
     const int absoluteStep = getVisibleStepOffset() + visibleColumn;
     if (absoluteStep < getStepTotalSteps())
         stepPattern[static_cast<size_t>(absoluteStep)] = !stepPattern[static_cast<size_t>(absoluteStep)];
+}
+
+void EnhancedAudioStrip::toggleStepAtIndex(int absoluteStep)
+{
+    const int clamped = juce::jlimit(0, getStepTotalSteps() - 1, absoluteStep);
+    stepPattern[static_cast<size_t>(clamped)] = !stepPattern[static_cast<size_t>(clamped)];
 }
 
 std::array<bool, 16> EnhancedAudioStrip::getVisibleStepPattern() const

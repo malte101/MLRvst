@@ -23,6 +23,7 @@
 #include <juce_dsp/juce_dsp.h>
 #include <atomic>
 #include <array>
+#include <limits>
 #include <set>
 #include <random>
 
@@ -194,6 +195,8 @@ public:
     int getLengthInBeats() const { return lengthInBeats.load(std::memory_order_acquire); }
     double getRecordingStartBeat() const { return recordingStartBeat.load(std::memory_order_acquire); }
     void stop() { stopPlayback(); }
+    std::vector<Event> getEventsSnapshot() const;
+    void setEventsSnapshot(const std::vector<Event>& newEvents, int lengthBeats);
     
 private:
     // Events sorted by time for efficient range queries
@@ -213,7 +216,7 @@ private:
     std::atomic<double> playbackStartBeat{-1.0}; // Absolute beat where playback is anchored
     
     // Only used during recording (not in audio thread)
-    juce::CriticalSection recordLock;
+    mutable juce::CriticalSection recordLock;
     
     // Last processed beat to avoid duplicate triggers
     mutable std::atomic<double> lastProcessedBeat{-1.0};
@@ -322,6 +325,21 @@ public:
         BandPass,
         HighPass
     };
+
+    enum class GateShape
+    {
+        Sine = 0,
+        Triangle,
+        Square
+    };
+
+    enum class SwingDivision
+    {
+        Quarter = 0,   // 1/4
+        Eighth,        // 1/8
+        Sixteenth,     // 1/16
+        Triplet        // 1/8T
+    };
     
     // Public member variables (must be declared before inline methods that use them)
     int loopStart = 0;
@@ -350,6 +368,12 @@ public:
     std::atomic<float> filterResonance{0.707f};    // Q = 0.707 (butterworth)
     FilterType filterType = FilterType::LowPass;
     bool filterEnabled = false;  // Disabled by default, auto-enables on use
+    std::atomic<float> swingAmount{0.0f};   // 0..1 transport swing depth
+    std::atomic<int> swingDivision{static_cast<int>(SwingDivision::Eighth)};
+    std::atomic<float> gateAmount{0.0f};    // 0..1 gate effect depth
+    std::atomic<float> gateSpeed{4.0f};     // cycles per beat (default 1/16)
+    std::atomic<float> gateEnvelope{0.5f};  // 0..1 smoothing
+    GateShape gateShape = GateShape::Sine;
     
     // Public methods
     EnhancedAudioStrip(int stripIndex);
@@ -375,6 +399,7 @@ public:
     void calculatePositionFromGlobalSample(int64_t globalSample, double tempo);  // Calculate from global clock
     void setLoop(int startColumn, int endColumn);
     void clearLoop();
+    void setPlaybackMarkerColumn(int column, int64_t currentGlobalSample);
     
     // Step sequencer control
     void startStepSequencer();  // Start step sequencer playback (auto-runs with clock)
@@ -387,6 +412,7 @@ public:
     int getVisibleCurrentStep() const;
     int getVisibleStepOffset() const;
     void toggleStepAtVisibleColumn(int column);
+    void toggleStepAtIndex(int absoluteStep);
     
     void setBeatsPerLoop(float beats);  // Manual override: how many beats is this loop?
     float getBeatsPerLoop() const { return beatsPerLoop.load(); }
@@ -471,6 +497,18 @@ public:
     float getFilterResonance() const { return filterResonance.load(); }
     void setFilterType(FilterType type);
     FilterType getFilterType() const { return filterType; }
+    void setSwingAmount(float amount) { swingAmount = juce::jlimit(0.0f, 1.0f, amount); }
+    float getSwingAmount() const { return swingAmount.load(std::memory_order_acquire); }
+    void setSwingDivision(SwingDivision division) { swingDivision.store(static_cast<int>(division), std::memory_order_release); }
+    SwingDivision getSwingDivision() const { return static_cast<SwingDivision>(swingDivision.load(std::memory_order_acquire)); }
+    void setGateAmount(float amount) { gateAmount = juce::jlimit(0.0f, 1.0f, amount); }
+    float getGateAmount() const { return gateAmount.load(std::memory_order_acquire); }
+    void setGateSpeed(float speed) { gateSpeed = juce::jlimit(0.25f, 8.0f, speed); }
+    float getGateSpeed() const { return gateSpeed.load(std::memory_order_acquire); }
+    void setGateEnvelope(float amount) { gateEnvelope = juce::jlimit(0.0f, 1.0f, amount); }
+    float getGateEnvelope() const { return gateEnvelope.load(std::memory_order_acquire); }
+    void setGateShape(GateShape shape) { gateShape = shape; }
+    GateShape getGateShape() const { return gateShape; }
     void setLoopCrossfadeLengthMs(float ms) { loopCrossfadeLengthMs.store(juce::jlimit(1.0f, 50.0f, ms), std::memory_order_release); }
     
     // Play mode setters/getters
@@ -571,7 +609,7 @@ private:
     struct GrainParams
     {
         // Tuned for cleaner "near-normal" default grain playback.
-        float sizeMs = 980.0f;     // 5..2400
+        float sizeMs = 1240.0f;    // 5..2400
         float density = 0.22f;     // 0..1
         float pitchSemitones = 0.0f;
         float pitchJitterSemitones = 0.0f;
@@ -581,7 +619,7 @@ private:
         float arpDepth = 0.0f;     // 0..1 arpeggiation depth
         float cloudDepth = 0.0f;   // 0..1 cloud delay mix/feedback
         float emitterDepth = 0.0f; // 0..1 quantized emitter around playhead
-        float envelope = 0.35f;    // 0..1 edge fade length (higher = longer fades)
+        float envelope = 0.2f;     // 0..1 edge fade length (higher = longer fades)
         int arpMode = 0;           // 0=Octave, 1=Power, 2=Zigzag
         bool reverse = false;
     };
@@ -604,6 +642,7 @@ private:
         double centerTravelDistanceAbs = 0.0;
         float centerRampMs = 40.0f;
         bool freeze = false;
+        bool returningToTimeline = false;
         int64_t sceneStartSample = 0;
     };
 
@@ -646,7 +685,7 @@ private:
     double grainSchedulerNoiseTarget = 0.0;
     int grainSchedulerNoiseCountdown = 0;
     juce::SmoothedValue<double> grainCenterSmoother{0.0};
-    juce::SmoothedValue<float> grainSizeSmoother{980.0f};
+    juce::SmoothedValue<float> grainSizeSmoother{1240.0f};
     juce::SmoothedValue<float> grainDensitySmoother{0.22f};
     juce::SmoothedValue<float> grainFreezeBlendSmoother{0.0f};
     juce::SmoothedValue<float> grainScratchSceneMix{0.0f};
@@ -705,6 +744,13 @@ private:
     bool tapeStopActive = false;      // Is tape stop effect active?
     bool scratchGestureActive = false; // True once a press has engaged scratch motion
     bool isReverseScratch = false;    // Is this a reverse scratch (back to timeline)?
+    bool reverseScratchPpqRetarget = false; // Continuously retarget reverse return to PPQ horizon
+    double reverseScratchBeatsForLoop = 4.0;
+    double reverseScratchLoopStartSamples = 0.0;
+    double reverseScratchLoopLengthSamples = 1.0;
+    bool reverseScratchUseRateBlend = false; // Loop mode: blend reverse rate from current->restore speed
+    double reverseScratchStartRate = 0.0;
+    double reverseScratchEndRate = 1.0;
 
     // Non-step random direction state
     std::mt19937 randomGenerator;
@@ -736,6 +782,7 @@ private:
     
     // Rhythmic scratch patterns - multi-button hold system
     std::set<int> heldButtons;        // All currently held buttons
+    std::vector<int> heldButtonOrder; // Press order for held buttons (latest at back)
     int activePattern = -1;           // Which pattern is active (-1 = none)
     int patternHoldCountRequired = 3; // 2-button or 3-button hold requirement
     double patternStartBeat = 0.0;    // When pattern started
@@ -749,7 +796,7 @@ private:
     std::atomic<int> grainLedSecondary{-1};
     std::atomic<int> grainLedSizeControl{-1};
     std::atomic<bool> grainLedFreeze{false};
-    std::atomic<float> grainSizeMsAtomic{980.0f};
+    std::atomic<float> grainSizeMsAtomic{1240.0f};
     std::atomic<float> grainDensityAtomic{0.22f};
     std::atomic<float> grainPitchAtomic{0.0f};
     std::atomic<float> grainPitchJitterAtomic{0.0f};
@@ -759,7 +806,7 @@ private:
     std::atomic<float> grainArpDepthAtomic{0.0f};
     std::atomic<float> grainCloudDepthAtomic{0.0f};
     std::atomic<float> grainEmitterDepthAtomic{0.0f};
-    std::atomic<float> grainEnvelopeAtomic{0.35f};
+    std::atomic<float> grainEnvelopeAtomic{0.2f};
     std::atomic<int> grainArpModeAtomic{0};
     std::atomic<bool> grainTempoSyncAtomic{true};
     std::array<std::atomic<float>, 8> grainPreviewPositions {
@@ -770,6 +817,9 @@ private:
         std::atomic<float>{0.0f}, std::atomic<float>{0.0f}, std::atomic<float>{0.0f}, std::atomic<float>{0.0f},
         std::atomic<float>{0.0f}, std::atomic<float>{0.0f}, std::atomic<float>{0.0f}, std::atomic<float>{0.0f}
     };
+    int grainPreviewDecimationCounter = 0;
+    int64_t grainSizeJitterBeatGroup = std::numeric_limits<int64_t>::min();
+    float grainSizeJitterMul = 1.0f;
     GrainParams grainParamsBeforeGesture;
     bool grainParamsSnapshotValid = false;
     bool grainThreeButtonSnapshotActive = false;
@@ -818,6 +868,8 @@ public:
     juce::CriticalSection bufferLock;
     
     void updatePlaybackDirection();
+    double applySwingToPpq(double ppq) const;
+    float computeGateModulation(double ppq) const;
     void handleLooping();
     float getPanGain(int channel) const; // 0=left, 1=right
     void rebuildTransientSliceMap();
@@ -868,6 +920,40 @@ public:
     static constexpr int MaxColumns = 16;
     static constexpr int MaxGroups = 4;
     static constexpr int MaxPatterns = 4;
+    static constexpr int ModSteps = 16;
+
+    enum class ModTarget
+    {
+        None = 0,
+        Volume,
+        Pan,
+        Pitch,
+        Speed,
+        Cutoff,
+        Resonance,
+        GrainSize,
+        GrainDensity,
+        GrainPitch,
+        GrainPitchJitter,
+        GrainSpread,
+        GrainJitter,
+        GrainRandom,
+        GrainArp,
+        GrainCloud,
+        GrainEmitter,
+        GrainEnvelope,
+        FilterFrequency = Cutoff
+    };
+
+    struct ModSequencerState
+    {
+        ModTarget target = ModTarget::None;
+        bool bipolar = false;
+        bool curveMode = true;
+        float depth = 1.0f;
+        int offset = 0;
+        std::array<float, ModSteps> steps{};
+    };
     
     ModernAudioEngine();
     
@@ -899,6 +985,24 @@ public:
     void clearPattern(int patternIndex);
     void stopPattern(int patternIndex);
     PatternRecorder* getPattern(int index);
+
+    // Per-strip modulation sequencers.
+    ModSequencerState getModSequencerState(int stripIndex) const;
+    void setModTarget(int stripIndex, ModTarget target);
+    ModTarget getModTarget(int stripIndex) const;
+    void setModBipolar(int stripIndex, bool bipolar);
+    bool isModBipolar(int stripIndex) const;
+    void setModDepth(int stripIndex, float depth);
+    float getModDepth(int stripIndex) const;
+    void setModCurveMode(int stripIndex, bool curveMode);
+    bool isModCurveMode(int stripIndex) const;
+    void setModOffset(int stripIndex, int offset);
+    int getModOffset(int stripIndex) const;
+    void setModStepValue(int stripIndex, int step, float value01);
+    float getModStepValue(int stripIndex, int step) const;
+    void toggleModStep(int stripIndex, int step);
+    void clearModSteps(int stripIndex);
+    int getModCurrentStep(int stripIndex) const;
     
     // Live recording - Continuous buffer
     void setRecordingLoopLength(int bars);  // Legacy - now per-strip
@@ -921,6 +1025,8 @@ public:
     float getInputMonitorVolume() const { return inputMonitorVolume; }
     void setCrossfadeLengthMs(float ms);
     float getCrossfadeLengthMs() const { return crossfadeLengthMs.load(std::memory_order_acquire); }
+    void setGlobalSwingDivision(EnhancedAudioStrip::SwingDivision division);
+    EnhancedAudioStrip::SwingDivision getGlobalSwingDivision() const;
     
     // Input metering
     float getInputLevelL() const { return inputLevelL.load(); }
@@ -934,9 +1040,20 @@ public:
     int64_t getGlobalSampleCount() const { return globalSampleCount; }
     
 private:
+    struct ModSequencer
+    {
+        std::atomic<int> target{static_cast<int>(ModTarget::None)};
+        std::atomic<int> bipolar{0};
+        std::atomic<int> curveMode{0};
+        std::atomic<float> depth{1.0f};
+        std::atomic<int> offset{0};
+        std::array<std::atomic<float>, ModSteps> steps;
+    };
+
     std::array<std::unique_ptr<EnhancedAudioStrip>, MaxStrips> strips;
     std::array<std::unique_ptr<StripGroup>, MaxGroups> groups;
     std::array<std::unique_ptr<PatternRecorder>, 4> patterns;
+    std::array<ModSequencer, MaxStrips> modSequencers;
     std::unique_ptr<LiveRecorder> liveRecorder;
     
     QuantizationClock quantizeClock;

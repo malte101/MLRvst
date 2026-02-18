@@ -15,4 +15,13 @@ void renderRow(const EnhancedAudioStrip& strip,
                int y,
                int newLedState[16][8],
                int mode);
+
+void handleGrainPageButtonPress(EnhancedAudioStrip& targetStrip,
+                                int controlRow,
+                                int x);
+
+void renderGrainPageRow(const EnhancedAudioStrip& targetStrip,
+                        int controlRow,
+                        int y,
+                        int newLedState[16][8]);
 } // namespace MonomeMixActions

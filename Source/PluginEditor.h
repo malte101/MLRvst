@@ -108,6 +108,12 @@ private:
     juce::Label filterFreqLabel;
     juce::Label filterResLabel;
     juce::Label filterTypeLabel;
+    juce::Label gateSpeedLabel;
+    juce::Label gateEnvLabel;
+    juce::Label gateShapeLabel;
+    juce::ComboBox gateSpeedBox;
+    juce::Slider gateEnvSlider;
+    juce::ComboBox gateShapeBox;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FXStripControl)
 };
@@ -125,8 +131,11 @@ public:
     void paint(juce::Graphics& g) override;
     void resized() override;
     void timerCallback() override;
+    void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
     
     void updateFromEngine();
+    void setModulationLaneView(bool shouldShow);
     
     class ColoredKnobLookAndFeel : public juce::LookAndFeel_V4
     {
@@ -180,6 +189,13 @@ private:
     WaveformDisplay waveform;
     StepSequencerDisplay stepDisplay;  // Step sequencer grid display
     bool showingStepDisplay = false;   // Toggle between waveform and step display
+    bool modulationLaneView = false;
+    bool preModulationShowingStepDisplay = false;
+    bool preModulationWaveformVisible = true;
+    bool preModulationStepVisible = false;
+    juce::Rectangle<int> modulationLaneBounds;
+    int modulationLastDrawStep = -1;
+    float modulationLastDrawValue = 0.0f;
     
     // Compact controls on the right
     juce::Slider volumeSlider;      // Compact rotary
@@ -228,6 +244,15 @@ private:
     juce::Label grainEmitterLabel;
     juce::Label grainEnvelopeLabel;
     juce::Label grainArpModeLabel;
+    juce::Label modTargetLabel;
+    juce::ComboBox modTargetBox;
+    juce::ToggleButton modBipolarToggle;
+    juce::Label modDepthLabel;
+    juce::Slider modDepthSlider;
+    juce::Label modOffsetLabel;
+    juce::Slider modOffsetSlider;
+    juce::Label modShapeLabel;
+    juce::ComboBox modShapeBox;
     bool grainOverlayVisible = false;
     juce::TextButton loadButton;    // Small
     juce::ComboBox groupSelector;   // Compact
@@ -241,6 +266,11 @@ private:
     void setupComponents();
     void loadSample();
     void paintLEDOverlay(juce::Graphics& g);  // Draw LED blocks over waveform
+    void paintModulationLane(juce::Graphics& g);
+    juce::Rectangle<int> getModulationLaneBounds() const;
+    void applyModulationPoint(juce::Point<int> p);
+    void hideAllPrimaryControls();
+    void hideAllGrainControls();
     void updateGrainOverlayVisibility();
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(StripControl)
@@ -360,6 +390,7 @@ public:
     void paint(juce::Graphics& g) override;
     void resized() override;
     void updateMeters(float leftLevel, float rightLevel);  // Update input meters
+    void refreshFromProcessor();
     std::function<void(bool)> onTooltipsToggled;
     
 private:
@@ -372,6 +403,8 @@ private:
     juce::Label quantizeLabel;
     juce::ComboBox resamplingQualityBox;
     juce::Label qualityLabel;
+    juce::ComboBox swingDivisionBox;
+    juce::Label swingDivisionLabel;
     
     // Input monitoring controls
     juce::Slider inputMonitorSlider;
@@ -419,7 +452,7 @@ private:
     struct PageRow
     {
         juce::Label positionLabel;
-        juce::Label modeNameLabel;
+        juce::TextButton modeButton;
         juce::TextButton upButton;
         juce::TextButton downButton;
     };
@@ -510,6 +543,40 @@ private:
     void updateGroupStates();
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GroupControlPanel)
+};
+
+//==============================================================================
+/**
+ * ModulationControlPanel - Per-row modulation sequencer editor
+ */
+class ModulationControlPanel : public juce::Component,
+                               public juce::Timer
+{
+public:
+    ModulationControlPanel(MlrVSTAudioProcessor& p);
+
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void timerCallback() override;
+
+private:
+    MlrVSTAudioProcessor& processor;
+    int selectedStrip = 0;
+
+    juce::Label titleLabel;
+    juce::Label stripLabel;
+    juce::Label targetLabel;
+    juce::ComboBox targetBox;
+    juce::ToggleButton bipolarToggle;
+    juce::Label depthLabel;
+    juce::Slider depthSlider;
+    juce::Label offsetLabel;
+    juce::Slider offsetSlider;
+    std::array<juce::TextButton, ModernAudioEngine::ModSteps> stepButtons;
+
+    void refreshFromEngine();
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ModulationControlPanel)
 };
 
 //==============================================================================
@@ -643,6 +710,7 @@ private:
     // Pattern and Group controls
     std::unique_ptr<PatternControlPanel> patternControl;
     std::unique_ptr<GroupControlPanel> groupControl;
+    std::unique_ptr<ModulationControlPanel> modulationControl;
     
     // Layout components
     juce::Viewport stripsViewport;
@@ -652,6 +720,7 @@ private:
     EditorLookAndFeel darkLookAndFeel;
     std::unique_ptr<juce::TooltipWindow> tooltipWindow;
     bool tooltipsEnabled = true;
+    uint32_t lastPresetRefreshToken = 0;
 
     void createUIComponents();
     void setupLookAndFeel();

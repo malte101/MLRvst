@@ -100,6 +100,8 @@ private:
     void timerCallback() override;
     void attemptReconnection();
     void sendPing();
+    void markDisconnected();
+    void configureCurrentDevice();
     
     juce::OSCSender oscSender;
     juce::OSCSender serialoscSender; // Separate sender for serialosc queries
@@ -116,9 +118,17 @@ private:
     int reconnectAttempts = 0;
     static constexpr int maxReconnectAttempts = 10;
     static constexpr int reconnectIntervalMs = 2000;
+    static constexpr int discoveryIntervalMs = 2000;
     
     juce::int64 lastMessageTime = 0;
+    juce::int64 lastConnectAttemptTime = 0;
+    juce::int64 lastPingTime = 0;
+    juce::int64 lastDiscoveryTime = 0;
+    juce::int64 lastReconnectAttemptTime = 0;
+    bool awaitingDeviceResponse = false;
     static constexpr int pingIntervalMs = 5000;
+    static constexpr int handshakeTimeoutMs = 3000;
+    static constexpr int connectionTimeoutMs = 15000;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MonomeConnection)
 };
@@ -191,14 +201,19 @@ public:
         Pitch,
         Pan,
         Volume,
+        GrainSize,
         Filter,
+        Swing,
+        Gate,
         FileBrowser,
         GroupAssign,
+        Modulation,
         Preset
     };
     ControlMode getCurrentControlMode() const { return currentControlMode; }
+    bool isControlModeActive() const { return controlModeActive; }
     static juce::String getControlModeName(ControlMode mode);
-    static constexpr int NumControlRowPages = 8;
+    static constexpr int NumControlRowPages = 12;
     using ControlPageOrder = std::array<ControlMode, NumControlRowPages>;
     ControlPageOrder getControlPageOrder() const;
     ControlMode getControlModeForControlButton(int buttonIndex) const;
@@ -206,6 +221,10 @@ public:
     void moveControlPage(int fromIndex, int toIndex);
     bool isControlPageMomentary() const { return controlPageMomentary.load(std::memory_order_acquire); }
     void setControlPageMomentary(bool shouldBeMomentary);
+    void setControlModeFromGui(ControlMode mode, bool shouldBeActive);
+    void setSwingDivisionSelection(int mode);
+    int getSwingDivisionSelection() const { return swingDivisionSelection.load(std::memory_order_acquire); }
+    int getLastMonomePressedStripRow() const { return lastMonomePressedStripRow.load(std::memory_order_acquire); }
     
     // Preset management
     void savePreset(int presetIndex);
@@ -214,6 +233,7 @@ public:
     int getLoadedPresetIndex() const { return loadedPresetIndex; }
     juce::String getPresetName(int presetIndex) const;
     bool presetExists(int presetIndex) const;
+    uint32_t getPresetRefreshToken() const { return presetRefreshToken.load(std::memory_order_acquire); }
     static constexpr int PresetColumns = 16;
     static constexpr int PresetRows = 7;
     static constexpr int MaxPresetSlots = PresetColumns * PresetRows;
@@ -236,6 +256,18 @@ private:
     std::unique_ptr<ModernAudioEngine> audioEngine;
     MonomeConnection monomeConnection;
 
+    struct PendingLoopChange
+    {
+        bool active = false;
+        bool clear = false;
+        int startColumn = 0;
+        int endColumn = MaxColumns;
+        int markerColumn = -1;
+        bool reverse = false;
+        bool quantized = false;
+        double targetPpq = 0.0;
+    };
+
     // Cached parameter pointers to avoid string lookups in processBlock
     std::atomic<float>* masterVolumeParam = nullptr;
     std::atomic<float>* quantizeParam = nullptr;
@@ -247,24 +279,32 @@ private:
     std::array<std::atomic<float>*, MaxStrips> stripPanParams{};
     std::array<std::atomic<float>*, MaxStrips> stripSpeedParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPitchParams{};
+    juce::CriticalSection pendingLoopChangeLock;
+    std::array<PendingLoopChange, MaxStrips> pendingLoopChanges{};
     
     double currentSampleRate = 44100.0;
     ControlMode currentControlMode = ControlMode::Normal;
     bool controlModeActive = false;  // True when control button is held
     FilterSubPage filterSubPage = FilterSubPage::Frequency;  // Current filter sub-page
     bool quantizeEnabled = true;
+    std::atomic<int> lastMonomePressedStripRow{0};
     mutable juce::CriticalSection controlPageOrderLock;
     ControlPageOrder controlPageOrder {
         ControlMode::Speed,
         ControlMode::Pan,
         ControlMode::Volume,
+        ControlMode::GrainSize,
+        ControlMode::Swing,
+        ControlMode::Gate,
         ControlMode::FileBrowser,
         ControlMode::GroupAssign,
         ControlMode::Filter,
         ControlMode::Pitch,
+        ControlMode::Modulation,
         ControlMode::Preset
     };
     std::atomic<bool> controlPageMomentary{true};
+    std::atomic<int> swingDivisionSelection{1}; // 0=1/4,1=1/8,2=1/16,3=Triplet
     
     // LED state cache to prevent flickering
     int ledCache[16][8] = {{0}};
@@ -294,6 +334,9 @@ private:
     void savePersistentDefaultPaths() const;
     void loadPersistentControlPages();
     void savePersistentControlPages() const;
+    int getQuantizeDivision() const;
+    void queueLoopChange(int stripIndex, bool clearLoop, int startColumn, int endColumn, bool reverseDirection, int markerColumn = -1);
+    void applyPendingLoopChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
 
     // Row 0, col 8: global momentary scratch modifier.
     bool momentaryScratchHoldActive = false;
@@ -307,6 +350,7 @@ private:
     std::array<bool, MaxPresetSlots> presetPadHoldSaveTriggered{};
     std::array<bool, MaxPresetSlots> presetPadDeleteTriggered{};
     std::array<uint32_t, MaxPresetSlots> presetPadPressStartMs{};
+    std::atomic<uint32_t> presetRefreshToken{0};
     std::array<uint32_t, MaxPresetSlots> presetPadLastTapMs{};
     static constexpr uint32_t presetHoldSaveMs = 3000;
     static constexpr uint32_t presetDoubleTapMs = 350;

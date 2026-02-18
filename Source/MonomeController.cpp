@@ -85,6 +85,15 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         // GROUP ROW (y=0): Groups 0-3 + Pattern Recorders 4-7
         if (y == GROUP_ROW)
         {
+            // In Monome control-page modes, top row is reserved/disabled except Modulation.
+            // This prevents accidental access to group/pattern/scratch/transient controls.
+            if (controlModeActive
+                && currentControlMode != ControlMode::Normal
+                && currentControlMode != ControlMode::Modulation)
+            {
+                return;
+            }
+
             if (presetModeActive && isPresetCell(x, y))
             {
                 const int presetIndex = toPresetIndex(x, y);
@@ -112,23 +121,15 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 return;
             }
 
-            // Row 0, col 8: global momentary scratch modifier.
-            if (x == 8)
+            // Restore ONLY row 0 col 8 momentary scratch hold.
+            if (x == 8 && (!controlModeActive || currentControlMode == ControlMode::Normal))
             {
                 setMomentaryScratchHold(true);
                 updateMonomeLEDs();
                 return;
             }
 
-            // Row 0, cols 9-14: per-strip transient slice mode toggle (strips 1-6).
-            if (x >= 9 && x <= 14)
-            {
-                const int stripIndex = x - 9;
-                if (auto* strip = audioEngine->getStrip(stripIndex))
-                    strip->setTransientSliceMode(!strip->isTransientSliceMode());
-                updateMonomeLEDs();
-                return;
-            }
+            // Row 0 cols 9..14 remain intentionally unused (time/trans not implemented).
 
             // FILTER MODE: Buttons 0-3 select filter sub-pages
             if (controlModeActive && currentControlMode == ControlMode::Filter)
@@ -153,6 +154,26 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 }
                 // Buttons 4-7 (patterns) are disabled in Filter mode
                 return;  // Don't process any other buttons on GROUP_ROW in Filter mode
+            }
+
+            if (controlModeActive && currentControlMode == ControlMode::Modulation)
+            {
+                const int targetStrip = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+                auto* engine = getAudioEngine();
+                if (!engine)
+                    return;
+                const bool bipolar = engine->isModBipolar(targetStrip);
+                const float normalizedY = 1.0f; // y=0 is highest value
+                float value = normalizedY;
+                if (bipolar)
+                {
+                    const float signedValue = (normalizedY * 2.0f) - 1.0f;
+                    value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
+                }
+                engine->setModStepValue(targetStrip, x, value);
+
+                updateMonomeLEDs();
+                return;
             }
             
             // NORMAL MODE: Columns 0-3 = Group mute/unmute
@@ -272,6 +293,9 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             int stripIndex = y - FIRST_STRIP_ROW;
             if (stripIndex < 6 && x < 16)
             {
+                if (!(controlModeActive && (currentControlMode == ControlMode::GrainSize
+                    || currentControlMode == ControlMode::Modulation)))
+                    lastMonomePressedStripRow.store(stripIndex, std::memory_order_release);
                 auto* strip = audioEngine->getStrip(stripIndex);
                 if (!strip) 
                 {
@@ -290,8 +314,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     // Detect reverse: first button > second button
                     bool shouldReverse = (loopSetFirstButton > x);
                     
-                    strip->setLoop(start, end);
-                    strip->setReverse(shouldReverse);  // Set reverse if backwards loop
+                    queueLoopChange(stripIndex, false, start, end, shouldReverse);
                     
                     DBG("Inner loop set: " << start << "-" << end << 
                         (shouldReverse ? " (REVERSE)" : " (NORMAL)"));
@@ -318,6 +341,20 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     {
                         MonomeMixActions::handleButtonPress(*this, *strip, stripIndex, x, static_cast<int>(currentControlMode));
                     }
+                    else if (currentControlMode == ControlMode::Swing)
+                    {
+                        MonomeMixActions::handleButtonPress(*this, *strip, stripIndex, x, static_cast<int>(currentControlMode));
+                    }
+                    else if (currentControlMode == ControlMode::Gate)
+                    {
+                        MonomeMixActions::handleButtonPress(*this, *strip, stripIndex, x, static_cast<int>(currentControlMode));
+                    }
+                    else if (currentControlMode == ControlMode::GrainSize)
+                    {
+                        const int targetStripIndex = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+                        if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
+                            MonomeMixActions::handleGrainPageButtonPress(*targetStrip, stripIndex, x);
+                    }
                     else if (currentControlMode == ControlMode::Filter)
                     {
                         MonomeFilterActions::handleButtonPress(*strip, x, static_cast<int>(filterSubPage));
@@ -330,6 +367,21 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     {
                         if (MonomeGroupAssignActions::handleButtonPress(*audioEngine, stripIndex, x))
                             updateMonomeLEDs();
+                    }
+                    else if (currentControlMode == ControlMode::Modulation)
+                    {
+                        const int targetStrip = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+                        const bool bipolar = audioEngine->isModBipolar(targetStrip);
+                        const float normalizedY = juce::jlimit(0.0f, 1.0f, (6.0f - static_cast<float>(y)) / 6.0f);
+                        float value = normalizedY;
+                        if (bipolar)
+                        {
+                            // In bipolar mode, center row maps to 0.5 and extremes map to 0/1.
+                            const float signedValue = (normalizedY * 2.0f) - 1.0f;
+                            value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
+                        }
+                        audioEngine->setModStepValue(targetStrip, x, value);
+                        updateMonomeLEDs();
                     }
                 }
                 else
@@ -414,7 +466,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
         }
         
-        // Release control mode in momentary behavior (buttons 0-6)
+        // Release control mode in momentary behavior (control-page buttons)
         if (isControlPageMomentary() && y == CONTROL_ROW && (x >= 0 && x < NumControlRowPages))
         {
             currentControlMode = ControlMode::Normal;
@@ -505,7 +557,16 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
 
     // ROW 0: Group status (0-3) + Pattern recorders (4-7)
     // BUT in Filter mode: Buttons 0,1,3 = sub-page selectors
-    if (currentControlMode == ControlMode::Filter && controlModeActive)
+    if (controlModeActive
+        && currentControlMode != ControlMode::Normal
+        && currentControlMode != ControlMode::Modulation
+        && currentControlMode != ControlMode::Preset)
+    {
+        // In non-modulation control pages, top row is intentionally disabled.
+        for (int i = 0; i < 16; ++i)
+            newLedState[i][GROUP_ROW] = 0;
+    }
+    else if (currentControlMode == ControlMode::Filter && controlModeActive)
     {
         // Filter sub-page indicators
         newLedState[0][GROUP_ROW] = (filterSubPage == FilterSubPage::Frequency) ? 15 : 5;  // Frequency
@@ -516,6 +577,58 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         // Patterns disabled in Filter mode (columns 4-7 off)
         for (int i = 4; i < 8; ++i)
             newLedState[i][GROUP_ROW] = 0;
+    }
+    else if (currentControlMode == ControlMode::Modulation && controlModeActive)
+    {
+        const int targetStrip = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+        const auto seq = audioEngine->getModSequencerState(targetStrip);
+        const int activeStep = audioEngine->getModCurrentStep(targetStrip);
+        const bool stripPlaying = audioEngine->getStrip(targetStrip) && audioEngine->getStrip(targetStrip)->isPlaying();
+        const int displayRow = 0; // Top row is highest value in modulation mode.
+
+        auto valueToRow = [&](float v)
+        {
+            v = juce::jlimit(0.0f, 1.0f, v);
+            if (seq.bipolar)
+            {
+                const float signedV = (v * 2.0f) - 1.0f;
+                const float n = (signedV + 1.0f) * 0.5f;
+                return juce::jlimit(0, 6, static_cast<int>(std::round((1.0f - n) * 6.0f)));
+            }
+            return juce::jlimit(0, 6, static_cast<int>(std::round((1.0f - v) * 6.0f)));
+        };
+
+        for (int x = 0; x < 16; ++x)
+        {
+            newLedState[x][GROUP_ROW] = 0;
+            const float v = seq.steps[static_cast<size_t>(x)];
+            const int pointRow = valueToRow(v);
+
+            if (seq.curveMode)
+            {
+                int level = (displayRow == pointRow) ? 10 : 1;
+                if (x < 15)
+                {
+                    const int nextRow = valueToRow(seq.steps[static_cast<size_t>(x + 1)]);
+                    const int minRow = juce::jmin(pointRow, nextRow);
+                    const int maxRow = juce::jmax(pointRow, nextRow);
+                    if (displayRow >= minRow && displayRow <= maxRow)
+                        level = juce::jmax(level, 6);
+                }
+                newLedState[x][GROUP_ROW] = level;
+            }
+            else
+            {
+                const int baseRow = seq.bipolar ? 3 : 6;
+                const int minRow = juce::jmin(baseRow, pointRow);
+                const int maxRow = juce::jmax(baseRow, pointRow);
+                if (displayRow >= minRow && displayRow <= maxRow)
+                    newLedState[x][GROUP_ROW] = (displayRow == pointRow) ? 10 : 5;
+            }
+
+            if (stripPlaying && x == activeStep)
+                newLedState[x][GROUP_ROW] = juce::jmax(newLedState[x][GROUP_ROW], 15);
+        }
     }
     else
     {
@@ -579,17 +692,11 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
     }  // End else (normal mode)
 
-    // Row 0, col 8: momentary scratch indicator.
-    // Keep idle state steady to avoid unintended dim blinking artifacts.
-    newLedState[8][GROUP_ROW] = momentaryScratchHoldActive ? 15 : 4;
+    // Row 0 col 8: momentary scratch indicator in normal mode.
+    if (!controlModeActive || currentControlMode == ControlMode::Normal)
+        newLedState[8][GROUP_ROW] = momentaryScratchHoldActive ? 15 : 4;
 
-    // Row 0, cols 9-14: transient slice mode per strip (strips 1-6).
-    for (int i = 0; i < 6; ++i)
-    {
-        const int x = 9 + i;
-        if (auto* strip = audioEngine->getStrip(i))
-            newLedState[x][GROUP_ROW] = strip->isTransientSliceMode() ? 12 : 2;
-    }
+    // Row 0 columns 9..14 intentionally left unused (time/trans not implemented).
     
     // ROWS 1-6: Strip displays
     for (int stripIndex = 0; stripIndex < 6; ++stripIndex)
@@ -640,6 +747,20 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         {
             MonomeMixActions::renderRow(*strip, y, newLedState, static_cast<int>(currentControlMode));
         }
+        else if (controlModeActive && currentControlMode == ControlMode::Swing)
+        {
+            MonomeMixActions::renderRow(*strip, y, newLedState, static_cast<int>(currentControlMode));
+        }
+        else if (controlModeActive && currentControlMode == ControlMode::Gate)
+        {
+            MonomeMixActions::renderRow(*strip, y, newLedState, static_cast<int>(currentControlMode));
+        }
+        else if (controlModeActive && currentControlMode == ControlMode::GrainSize)
+        {
+            const int targetStripIndex = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+            if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
+                MonomeMixActions::renderGrainPageRow(*targetStrip, stripIndex, y, newLedState);
+        }
         else if (controlModeActive && currentControlMode == ControlMode::Filter)
         {
             MonomeFilterActions::renderRow(*strip, y, newLedState, static_cast<int>(filterSubPage));
@@ -651,6 +772,60 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         else if (controlModeActive && currentControlMode == ControlMode::GroupAssign)
         {
             MonomeGroupAssignActions::renderRow(*strip, y, newLedState);
+        }
+        else if (controlModeActive && currentControlMode == ControlMode::Modulation)
+        {
+            const int selectedStrip = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+            const auto seq = audioEngine->getModSequencerState(selectedStrip);
+            const int activeStep = audioEngine->getModCurrentStep(selectedStrip);
+            const bool stripPlaying = audioEngine->getStrip(selectedStrip) && audioEngine->getStrip(selectedStrip)->isPlaying();
+            const int displayRow = y; // 1..6, with row 0 rendered in GROUP_ROW branch
+
+            auto valueToRow = [&](float v)
+            {
+                v = juce::jlimit(0.0f, 1.0f, v);
+                if (seq.bipolar)
+                {
+                    const float signedV = (v * 2.0f) - 1.0f;
+                    const float n = (signedV + 1.0f) * 0.5f;
+                    return juce::jlimit(0, 6, static_cast<int>(std::round((1.0f - n) * 6.0f)));
+                }
+                return juce::jlimit(0, 6, static_cast<int>(std::round((1.0f - v) * 6.0f)));
+            };
+
+            for (int x = 0; x < 16; ++x)
+            {
+                newLedState[x][y] = 0;
+                const float v = seq.steps[static_cast<size_t>(x)];
+                const int pointRow = valueToRow(v);
+
+                if (seq.curveMode)
+                {
+                    // Draw point + interpolated line to next point for readable curve graph.
+                    int level = (displayRow == pointRow) ? 10 : 1;
+                    if (x < 15)
+                    {
+                        const int nextRow = valueToRow(seq.steps[static_cast<size_t>(x + 1)]);
+                        const int minRow = juce::jmin(pointRow, nextRow);
+                        const int maxRow = juce::jmax(pointRow, nextRow);
+                        if (displayRow >= minRow && displayRow <= maxRow)
+                            level = juce::jmax(level, 6);
+                    }
+                    newLedState[x][y] = level;
+                }
+                else
+                {
+                    // Step-slider mode: vertical bar to value.
+                    const int baseRow = seq.bipolar ? 3 : 6;
+                    const int minRow = juce::jmin(baseRow, pointRow);
+                    const int maxRow = juce::jmax(baseRow, pointRow);
+                    if (displayRow >= minRow && displayRow <= maxRow)
+                        newLedState[x][y] = (displayRow == pointRow) ? 10 : 5;
+                }
+
+                if (stripPlaying && x == activeStep)
+                    newLedState[x][y] = juce::jmax(newLedState[x][y], 15);
+            }
         }
         else // Normal - playhead or step sequencer
         {
