@@ -1147,10 +1147,9 @@ void EnhancedAudioStrip::loadSample(const juce::AudioBuffer<float>& buffer, doub
         DBG("Step sequencer loaded into sampler and ready to sync with clock");
     }
 
-    if (transientSliceMode.load(std::memory_order_acquire))
-        rebuildTransientSliceMap();
-    else
-        transientSliceMapDirty = true;
+    // Build transient map eagerly on sample load to keep transient mode behavior
+    // deterministic and avoid stale/lazy map edge-cases.
+    rebuildTransientSliceMap();
 }
 
 void EnhancedAudioStrip::setTransientSliceMode(bool enabled)
@@ -1304,8 +1303,13 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
     }
 
     const float noveltyMean = noveltySum / static_cast<float>(juce::jmax(1, frames));
-    const float minPeakLevel = juce::jmax(1.0e-6f, noveltyMean * 0.6f);
-    const int minPeakSpacingFrames = juce::jmax(1, static_cast<int>((0.02 * currentSampleRate) / static_cast<double>(hop))); // 20ms
+    const float noveltyMax = *std::max_element(novelty.begin(), novelty.end());
+    const float minPeakLevel = juce::jmax(1.0e-6f,
+                                          juce::jmax(noveltyMean * 0.35f, noveltyMax * 0.10f));
+    const double analysisSampleRate = (sourceSampleRate > 1000.0)
+        ? sourceSampleRate
+        : juce::jmax(1.0, currentSampleRate);
+    const int minPeakSpacingFrames = juce::jmax(1, static_cast<int>((0.015 * analysisSampleRate) / static_cast<double>(hop))); // 15ms
 
     std::vector<std::pair<int, float>> onsetFrames;
     onsetFrames.reserve(static_cast<size_t>(frames));
@@ -1318,69 +1322,98 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
         if (center < novelty[static_cast<size_t>(i - 1)] || center < novelty[static_cast<size_t>(i + 1)])
             continue;
 
-        int backtracked = i;
-        float bestRise = -1.0f;
-        for (int j = juce::jmax(1, i - 8); j <= i; ++j)
-        {
-            const float rise = energyDiff[static_cast<size_t>(j)];
-            if (rise > bestRise)
-            {
-                bestRise = rise;
-                backtracked = j;
-            }
-        }
-
-        if (!onsetFrames.empty() && (backtracked - onsetFrames.back().first) < minPeakSpacingFrames)
+        if (!onsetFrames.empty() && (i - onsetFrames.back().first) < minPeakSpacingFrames)
         {
             if (center > onsetFrames.back().second)
-                onsetFrames.back() = { backtracked, center };
+                onsetFrames.back() = { i, center };
             continue;
         }
 
-        onsetFrames.emplace_back(backtracked, center);
+        onsetFrames.emplace_back(i, center);
     }
 
-    if (static_cast<int>(onsetFrames.size()) > (ModernAudioEngine::MaxColumns - 1))
+    if (onsetFrames.empty())
     {
-        std::sort(onsetFrames.begin(), onsetFrames.end(),
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
-        onsetFrames.resize(ModernAudioEngine::MaxColumns - 1);
-        std::sort(onsetFrames.begin(), onsetFrames.end(),
-                  [](const auto& a, const auto& b) { return a.first < b.first; });
-    }
-
-    std::vector<int> positions;
-    positions.reserve(ModernAudioEngine::MaxColumns);
-    positions.push_back(0);
-    for (const auto& onset : onsetFrames)
-        positions.push_back(juce::jlimit(0, totalSamples - 1, onset.first * hop));
-
-    if (static_cast<int>(positions.size()) < ModernAudioEngine::MaxColumns)
-    {
-        for (int i = 1; i < ModernAudioEngine::MaxColumns && static_cast<int>(positions.size()) < ModernAudioEngine::MaxColumns; ++i)
+        const float energyMax = *std::max_element(energyDiff.begin(), energyDiff.end());
+        const float energyMinPeak = juce::jmax(1.0e-6f, energyMax * 0.18f);
+        for (int i = 1; i < (frames - 1); ++i)
         {
-            const int uniformPos = juce::jlimit(0, totalSamples - 1,
-                                                static_cast<int>((static_cast<double>(i) / 15.0) * static_cast<double>(totalSamples - 1)));
-            positions.push_back(uniformPos);
+            const float center = energyDiff[static_cast<size_t>(i)];
+            if (center < energyMinPeak)
+                continue;
+            if (center < energyDiff[static_cast<size_t>(i - 1)] || center < energyDiff[static_cast<size_t>(i + 1)])
+                continue;
+
+            if (!onsetFrames.empty() && (i - onsetFrames.back().first) < minPeakSpacingFrames)
+                continue;
+
+            onsetFrames.emplace_back(i, center);
         }
     }
 
-    std::sort(positions.begin(), positions.end());
-    positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
-
-    while (static_cast<int>(positions.size()) < ModernAudioEngine::MaxColumns)
+    std::vector<int> onsetSamples;
+    onsetSamples.reserve(onsetFrames.size());
+    for (const auto& onset : onsetFrames)
     {
-        const int idx = static_cast<int>(positions.size());
-        const int uniformPos = juce::jlimit(0, totalSamples - 1,
-                                            static_cast<int>((static_cast<double>(idx) / 15.0) * static_cast<double>(totalSamples - 1)));
-        positions.push_back(uniformPos);
+        // Frame index marks the analysis frame start; shift to frame center so
+        // markers land on the transient hit rather than a few ms early.
+        const int centered = (onset.first * hop) + (frameSize / 2);
+        onsetSamples.push_back(juce::jlimit(0, totalSamples - 1, centered));
     }
 
-    if (static_cast<int>(positions.size()) > ModernAudioEngine::MaxColumns)
-        positions.resize(ModernAudioEngine::MaxColumns);
+    std::sort(onsetSamples.begin(), onsetSamples.end());
+    onsetSamples.erase(std::unique(onsetSamples.begin(), onsetSamples.end()), onsetSamples.end());
+    if (onsetSamples.empty())
+    {
+        fillUniform();
+        return;
+    }
 
+    const int lastIndex = ModernAudioEngine::MaxColumns - 1;
     for (int i = 0; i < ModernAudioEngine::MaxColumns; ++i)
-        transientSliceSamples[static_cast<size_t>(i)] = positions[static_cast<size_t>(i)];
+    {
+        if (i == 0)
+        {
+            transientSliceSamples[static_cast<size_t>(i)] = 0;
+            continue;
+        }
+
+        const int target = juce::jlimit(0, totalSamples - 1,
+            static_cast<int>((static_cast<double>(i) / static_cast<double>(lastIndex))
+                * static_cast<double>(totalSamples - 1)));
+
+        int chosen = target;
+        auto it = std::lower_bound(onsetSamples.begin(), onsetSamples.end(), target);
+
+        int bestCandidate = chosen;
+        int bestDistance = std::numeric_limits<int>::max();
+        if (it != onsetSamples.end())
+        {
+            const int dist = std::abs(*it - target);
+            if (dist < bestDistance)
+            {
+                bestDistance = dist;
+                bestCandidate = *it;
+            }
+        }
+        if (it != onsetSamples.begin())
+        {
+            const int prev = *std::prev(it);
+            const int dist = std::abs(prev - target);
+            if (dist < bestDistance)
+            {
+                bestDistance = dist;
+                bestCandidate = prev;
+            }
+        }
+
+        if (bestDistance < std::numeric_limits<int>::max())
+            chosen = bestCandidate;
+
+        const int prevPos = transientSliceSamples[static_cast<size_t>(i - 1)];
+        chosen = juce::jmax(prevPos + 1, chosen);
+        transientSliceSamples[static_cast<size_t>(i)] = juce::jlimit(0, totalSamples - 1, chosen);
+    }
 
     transientSliceMapDirty = false;
 }
@@ -1691,8 +1724,7 @@ double EnhancedAudioStrip::getTimelinePositionForSample(int64_t globalSample) co
 
     if (ppqTimelineAnchored && lastObservedPpqValid && lastObservedTempo > 0.0)
     {
-        const float manualBeats = beatsPerLoop.load();
-        const double beatsForLoop = (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0;
+        const double beatsForLoop = getEffectiveBeatsForLoop(lastObservedTempo);
         const double samplesPerBeat = (60.0 / lastObservedTempo) * currentSampleRate;
         const double ppqAtSample = lastObservedPPQ + (static_cast<double>(globalSample - lastObservedGlobalSample) / samplesPerBeat);
 
@@ -1720,6 +1752,45 @@ double EnhancedAudioStrip::getGrainBeatPositionAtSample(int64_t globalSample) co
         return lastObservedPPQ + (static_cast<double>(globalSample - lastObservedGlobalSample) / samplesPerBeat);
 
     return static_cast<double>(globalSample - triggerSample) / samplesPerBeat;
+}
+
+double EnhancedAudioStrip::getEffectiveBeatsForLoop(double tempoHintBpm) const
+{
+    const float manualBeats = beatsPerLoop.load(std::memory_order_acquire);
+    if (manualBeats >= 0.0f)
+        return juce::jlimit(0.25, 64.0, static_cast<double>(manualBeats));
+
+    const double tempoForEstimate = (tempoHintBpm > 1.0)
+        ? tempoHintBpm
+        : ((lastObservedTempo > 1.0) ? lastObservedTempo : 120.0);
+    const double srForDuration = (sourceSampleRate > 1000.0)
+        ? sourceSampleRate
+        : juce::jmax(1.0, currentSampleRate);
+    if (sampleLength <= 0.0 || srForDuration <= 0.0)
+        return 4.0;
+
+    const double durationSeconds = sampleLength / srForDuration;
+    const double rawBeats = juce::jlimit(0.25, 64.0, durationSeconds * (tempoForEstimate / 60.0));
+
+    static constexpr std::array<double, 14> loopBeatCandidates {
+        1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0, 0.5, 0.25
+    };
+
+    double snapped = rawBeats;
+    double bestDist = std::numeric_limits<double>::max();
+    for (double c : loopBeatCandidates)
+    {
+        const double dist = std::abs(rawBeats - c);
+        if (dist < bestDist)
+        {
+            bestDist = dist;
+            snapped = c;
+        }
+    }
+
+    if (bestDist <= juce::jmax(0.25, rawBeats * 0.08))
+        return snapped;
+    return juce::jlimit(0.25, 64.0, std::round(rawBeats * 4.0) / 4.0);
 }
 
 double EnhancedAudioStrip::getGrainColumnCenterPosition(int column) const
@@ -2371,8 +2442,8 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
             scenePitchOffset += riserFall;
 
             // Add slower 1-bar and 2-bar macro movement for pitch/size/position.
-            const float manualBeats = beatsPerLoop.load(std::memory_order_acquire);
-            const double barBeats = juce::jmax(1.0, (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0);
+            const double barBeats = juce::jmax(1.0,
+                getEffectiveBeatsForLoop(lastObservedTempo > 0.0 ? lastObservedTempo : 120.0));
             double barPhase = std::fmod(beatNow / barBeats, 1.0);
             if (barPhase < 0.0)
                 barPhase += 1.0;
@@ -2703,10 +2774,9 @@ void EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
             playing = wasPlaying;
         }
 
-        if (transientSliceMode.load(std::memory_order_acquire))
-            rebuildTransientSliceMap();
-        else
-            transientSliceMapDirty = true;
+        // Build transient map eagerly on sample load to keep transient mode behavior
+        // deterministic and avoid stale/lazy map edge-cases.
+        rebuildTransientSliceMap();
         grainCenterSmoother.setCurrentAndTargetValue(playbackPosition.load());
         resetGrainState();
         resetPitchShifter();
@@ -3136,19 +3206,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     // CRITICAL: Always use the FULL sample's beat count for tempo calculation
     // Inner loops should NOT change the playback speed, just the looping section
     
-    // Use manual setting if provided (>= 0), otherwise auto-detect from FULL sample
-    float manualBeats = beatsPerLoop.load();
-    if (manualBeats >= 0)
-    {
-        // Manual override set
-        beatsForLoop = manualBeats;
-    }
-    else
-    {
-        // Auto-detect from FULL sample length (always 16 columns = 4 beats)
-        // NOT from inner loop length - this keeps tempo consistent
-        beatsForLoop = 4.0;  // Full sample is always 4 beats
-    }
+    beatsForLoop = getEffectiveBeatsForLoop(tempo);
     
     // Calculate how long this loop SHOULD take at current tempo (in samples)
     double secondsPerBeat = 60.0 / tempo;
@@ -4161,8 +4219,7 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         {
             // Build a timeline anchor so strip position can be:
             // absolute host PPQ phase + selected row offset.
-            float manualBeats = beatsPerLoop.load();
-            const double beatsForLoop = (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0;
+            const double beatsForLoop = getEffectiveBeatsForLoop(tempo);
             const double targetBeatOffset = triggerOffsetRatio * beatsForLoop;
             double currentBeatInLoop = std::fmod(triggerPpqPosition, beatsForLoop);
             if (currentBeatInLoop < 0.0)
@@ -4316,8 +4373,7 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         // stored offsets from earlier state transitions.
         if (positionInfo.getPpqPosition().hasValue() && tempo > 0.0)
         {
-            float manualBeats = beatsPerLoop.load();
-            const double beatsForLoop = (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0;
+            const double beatsForLoop = getEffectiveBeatsForLoop(tempo);
             if (loopLengthSamples > 0.0 && beatsForLoop > 0.0)
             {
                 double posInLoop = startPosition - loopStartSamples;
@@ -4609,8 +4665,7 @@ void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
 
     double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
     double loopLength = loopLengthSamples;
-    const float manualBeats = beatsPerLoop.load();
-    const double beatsForLoop = (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0;
+    const double beatsForLoop = getEffectiveBeatsForLoop(tempoForScratch);
     reverseScratchLoopStartSamples = loopStartSamples;
     reverseScratchLoopLengthSamples = juce::jmax(1.0, loopLength);
     reverseScratchBeatsForLoop = juce::jmax(1.0, beatsForLoop);
@@ -4743,8 +4798,7 @@ void EnhancedAudioStrip::reverseScratchToTimeline(int64_t currentGlobalSample)
     const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
     const double loopLength = loopLengthSamples;
     const double triggerOffset = juce::jlimit(0.0, 0.999999, triggerOffsetRatio) * loopLength;
-    const float manualBeats = beatsPerLoop.load();
-    const double beatsForLoop = (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0;
+    const double beatsForLoop = getEffectiveBeatsForLoop(lastObservedTempo > 0.0 ? lastObservedTempo : 120.0);
 
     auto predictFutureTimeline = [&](int64_t durationSamples, bool& usedPpqOut) -> double
     {
@@ -4869,8 +4923,7 @@ void EnhancedAudioStrip::captureMomentaryPhaseReference(double hostPpq)
         return;
     }
 
-    float manualBeats = beatsPerLoop.load();
-    const double beatsForLoop = (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0;
+    const double beatsForLoop = getEffectiveBeatsForLoop(lastObservedTempo > 0.0 ? lastObservedTempo : 120.0);
     if (beatsForLoop <= 0.0)
     {
         momentaryPhaseGuardValid = false;
@@ -5195,11 +5248,11 @@ void EnhancedAudioStrip::setLoop(int startColumn, int endColumn)
 
 void EnhancedAudioStrip::setBeatsPerLoop(float beats)
 {
-    // -1 = auto-detect, otherwise manual override (0.25 to 16 beats)
+    // -1 = auto-detect, otherwise manual override (0.25 to 64 beats)
     if (beats < 0)
         beatsPerLoop = -1.0f;  // Reset to auto
     else
-        beatsPerLoop = juce::jlimit(0.25f, 16.0f, beats);
+        beatsPerLoop = juce::jlimit(0.25f, 64.0f, beats);
 }
 
 void EnhancedAudioStrip::clearLoop()
@@ -6251,6 +6304,39 @@ void ModernAudioEngine::loadSampleToStrip(int stripIndex, const juce::File& file
     if (auto* strip = getStrip(stripIndex))
     {
         strip->loadSampleFromFile(file);
+
+        if (!strip->hasAudio())
+            return;
+
+        const auto* buffer = strip->getAudioBuffer();
+        if (buffer == nullptr || buffer->getNumSamples() <= 0)
+            return;
+
+        const double sr = (strip->getSourceSampleRate() > 1000.0)
+            ? strip->getSourceSampleRate()
+            : juce::jmax(1.0, currentSampleRate);
+        const double tempoNow = juce::jmax(1.0, currentTempo.load(std::memory_order_acquire));
+        const double durationSeconds = static_cast<double>(buffer->getNumSamples()) / sr;
+        const double rawBeats = juce::jlimit(0.25, 64.0, durationSeconds * (tempoNow / 60.0));
+
+        static constexpr std::array<int, 4> barChoices { 1, 2, 4, 8 };
+        int bestBars = 1;
+        double bestDist = std::numeric_limits<double>::max();
+        for (int bars : barChoices)
+        {
+            const double candidateBeats = static_cast<double>(bars * 4);
+            const double dist = std::abs(rawBeats - candidateBeats);
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestBars = bars;
+            }
+        }
+
+        // Lock detected loop length as explicit beat count so all PPQ/timeline
+        // calculations use the same stable value (loop + transient modes).
+        strip->setBeatsPerLoop(static_cast<float>(bestBars * 4));
+        strip->setRecordingBars(bestBars);
     }
 }
 

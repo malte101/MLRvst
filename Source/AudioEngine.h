@@ -883,6 +883,7 @@ public:
     void updateGrainGestureOnRelease(int column, int64_t globalSample);
     void updateGrainGripModulation();
     void updateGrainSizeFromGrip();
+    double getEffectiveBeatsForLoop(double tempoHintBpm) const;
     double getTimelinePositionForSample(int64_t globalSample) const;
     double getGrainBeatPositionAtSample(int64_t globalSample) const;
     double getGrainColumnCenterPosition(int column) const;

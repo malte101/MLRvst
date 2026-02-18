@@ -182,6 +182,7 @@ public:
     
     void loadSampleToStrip(int stripIndex, const juce::File& file);
     void loadAdjacentFile(int stripIndex, int direction);  // Browse files
+    void captureRecentAudioToStrip(int stripIndex);
     void triggerStrip(int stripIndex, int column);
     void stopStrip(int stripIndex);
     

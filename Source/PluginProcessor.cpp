@@ -78,17 +78,27 @@ MonomeConnection::~MonomeConnection()
 
 void MonomeConnection::connect(int appPort)
 {
-    applicationPort = appPort;
-    
     // Disconnect if already connected
     oscReceiver.removeListener(this);
     oscReceiver.disconnect();
-    
-    // Bind to application port for receiving messages from device
-    if (!oscReceiver.connect(applicationPort))
+
+    // Bind to application port for receiving messages from device.
+    // After restart, preferred port can be temporarily unavailable, so fall back.
+    int boundPort = -1;
+    for (int offset = 0; offset < 32; ++offset)
     {
-        return;
+        const int candidate = appPort + offset;
+        if (oscReceiver.connect(candidate))
+        {
+            boundPort = candidate;
+            break;
+        }
     }
+
+    if (boundPort < 0)
+        return;
+
+    applicationPort = boundPort;
     
     oscReceiver.addListener(this);
     
@@ -151,10 +161,17 @@ void MonomeConnection::selectDevice(int deviceIndex)
     if (deviceIndex < 0 || deviceIndex >= static_cast<int>(devices.size()))
         return;
     
+    const bool hadActiveConnection = connected;
     currentDevice = devices[static_cast<size_t>(deviceIndex)];
     
-    // Disconnect previous device sender if connected
+    // Hard switch sender endpoint/state before attaching to new device.
     oscSender.disconnect();
+    connected = false;
+    awaitingDeviceResponse = false;
+    lastConnectAttemptTime = 0;
+    lastPingTime = 0;
+    if (hadActiveConnection && onDeviceDisconnected)
+        onDeviceDisconnected();
     
     // Connect to the device's port
     if (oscSender.connect(currentDevice.host, currentDevice.port))
@@ -174,6 +191,17 @@ void MonomeConnection::selectDevice(int deviceIndex)
         
         if (onDeviceConnected)
             onDeviceConnected();
+
+        // Some serialosc/device combinations can ignore initial sys routing
+        // commands during rapid endpoint switching. Reassert once shortly after.
+        const auto selectedId = currentDevice.id;
+        juce::Timer::callAfterDelay(120, [this, selectedId]()
+        {
+            if (!connected || currentDevice.id != selectedId)
+                return;
+            configureCurrentDevice();
+            sendPing();
+        });
         
     }
     else
@@ -337,11 +365,19 @@ juce::String MonomeConnection::getConnectionStatus() const
 void MonomeConnection::oscMessageReceived(const juce::OSCMessage& message)
 {
     auto address = message.getAddressPattern().toString();
-    
-    // Update last message time for connection monitoring
-    lastMessageTime = juce::Time::currentTimeMillis();
-    awaitingDeviceResponse = false;
-    
+
+    // Only treat actual device/system traffic as successful handshake activity.
+    // serialosc discovery traffic can be present even if the selected device is
+    // not correctly routed to this app yet.
+    const bool isDeviceTraffic = address.startsWith("/sys")
+        || address.startsWith(oscPrefix + "/grid")
+        || address.startsWith(oscPrefix + "/tilt");
+    if (isDeviceTraffic)
+    {
+        lastMessageTime = juce::Time::currentTimeMillis();
+        awaitingDeviceResponse = false;
+    }
+
     if (address.startsWith("/serialosc"))
         handleSerialOSCMessage(message);
     else if (address.startsWith(oscPrefix + "/grid"))
@@ -442,6 +478,14 @@ void MonomeConnection::sendPing()
 void MonomeConnection::handleSerialOSCMessage(const juce::OSCMessage& message)
 {
     auto address = message.getAddressPattern().toString();
+    auto renewNotify = [this]()
+    {
+        if (!serialoscSender.connect("127.0.0.1", 12002))
+            return;
+        serialoscSender.send(juce::OSCMessage("/serialosc/notify",
+                                              juce::String("127.0.0.1"),
+                                              applicationPort));
+    };
     
     if (address == "/serialosc/device" && message.size() >= 3)
     {
@@ -518,16 +562,22 @@ void MonomeConnection::handleSerialOSCMessage(const juce::OSCMessage& message)
                 selectDevice(bestIndex);
         }
     }
-    else if (address == "/serialosc/add" && message.size() >= 3)
+    else if (address == "/serialosc/add" && message.size() >= 1)
     {
+        // serialosc notify is one-shot; re-register each time we get add/remove.
+        renewNotify();
+
         // Device was plugged in
         juce::Timer::callAfterDelay(250, [this]()
         {
             discoverDevices(); // Refresh device list
         });
     }
-    else if (address == "/serialosc/remove" && message.size() >= 2)
+    else if (address == "/serialosc/remove" && message.size() >= 1)
     {
+        // serialosc notify is one-shot; re-register each time we get add/remove.
+        renewNotify();
+
         // Device was unplugged
         auto removedId = message[0].getString();
         
@@ -1090,6 +1140,19 @@ void MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& f
         currentStripFiles[stripIndex] = file;
         
         audioEngine->loadSampleToStrip(stripIndex, file);
+    }
+}
+
+void MlrVSTAudioProcessor::captureRecentAudioToStrip(int stripIndex)
+{
+    if (!audioEngine || stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    if (auto* strip = audioEngine->getStrip(stripIndex))
+    {
+        const int bars = strip->getRecordingBars();
+        audioEngine->captureLoopToStrip(stripIndex, bars);
+        triggerStrip(stripIndex, 0);
     }
 }
 

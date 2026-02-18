@@ -24,10 +24,7 @@ void handleButtonPress(MlrVSTAudioProcessor& processor, EnhancedAudioStrip& stri
     }
     else if (x == 15)
     {
-        if (auto* engine = processor.getAudioEngine())
-            engine->captureLoopToStrip(stripIndex, strip.getRecordingBars());
-
-        processor.triggerStrip(stripIndex, 0);
+        processor.captureRecentAudioToStrip(stripIndex);
     }
 }
 
@@ -94,4 +91,3 @@ void renderRow(const ModernAudioEngine& engine, const EnhancedAudioStrip& strip,
         newLedState[15][y] = 8 + static_cast<int>(smoothPulse * 5.0);
 }
 } // namespace MonomeFileBrowserActions
-

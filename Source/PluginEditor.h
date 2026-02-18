@@ -123,7 +123,8 @@ private:
  * StripControl - Compact horizontal strip with overlaid LED grid
  */
 class StripControl : public juce::Component,
-                     public juce::Timer
+                     public juce::Timer,
+                     public juce::FileDragAndDropTarget
 {
 public:
     StripControl(int stripIndex, MlrVSTAudioProcessor& p);
@@ -134,6 +135,8 @@ public:
     void mouseDown(const juce::MouseEvent& e) override;
     void mouseDrag(const juce::MouseEvent& e) override;
     void mouseUp(const juce::MouseEvent& e) override;
+    bool isInterestedInFileDrag(const juce::StringArray& files) override;
+    void filesDropped(const juce::StringArray& files, int x, int y) override;
     
     void updateFromEngine();
     void setModulationLaneView(bool shouldShow);
@@ -208,6 +211,7 @@ private:
     juce::TextButton tempoDoubleButton; // ×2 tempo (half beats)
     juce::Label tempoLabel;         // Shows current beats setting
     juce::ComboBox recordBarsBox;   // Selects input recording buffer bars for this strip
+    juce::TextButton recordButton;  // Captures recent input into this strip
     juce::Label recordBarsLabel;    // Label above recording bars selector
     juce::Label recordLengthLabel;  // Shows input recording buffer length for this strip
     juce::Label volumeLabel;        // Label below knob
@@ -266,6 +270,8 @@ private:
     
     void setupComponents();
     void loadSample();
+    void loadSampleFromFile(const juce::File& file);
+    static bool isSupportedAudioFile(const juce::File& file);
     void paintLEDOverlay(juce::Graphics& g);  // Draw LED blocks over waveform
     void paintModulationLane(juce::Graphics& g);
     juce::Rectangle<int> getModulationLaneBounds() const;
@@ -573,8 +579,18 @@ public:
     void paint(juce::Graphics& g) override;
     void resized() override;
     void timerCallback() override;
+    void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
+    void mouseUp(const juce::MouseEvent& e) override;
 
 private:
+    enum class EditGestureMode
+    {
+        None = 0,
+        DuplicateCell,
+        ShapeCell
+    };
+
     MlrVSTAudioProcessor& processor;
     int selectedStrip = 0;
 
@@ -588,8 +604,17 @@ private:
     juce::Label offsetLabel;
     juce::Slider offsetSlider;
     std::array<juce::TextButton, ModernAudioEngine::ModSteps> stepButtons;
+    EditGestureMode gestureMode = EditGestureMode::None;
+    bool gestureActive = false;
+    bool suppressNextStepClick = false;
+    int gestureStartY = 0;
+    int gestureStep = -1;
+    std::array<float, ModernAudioEngine::ModSteps> gestureSourceSteps{};
 
     void refreshFromEngine();
+    int stepIndexForComponent(juce::Component* c) const;
+    void applyDuplicateGesture(int deltaY);
+    void applyShapeGesture(int deltaY);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ModulationControlPanel)
 };
@@ -730,7 +755,6 @@ private:
     // Pattern and Group controls
     std::unique_ptr<PatternControlPanel> patternControl;
     std::unique_ptr<GroupControlPanel> groupControl;
-    std::unique_ptr<ModulationControlPanel> modulationControl;
     
     // Layout components
     juce::Viewport stripsViewport;

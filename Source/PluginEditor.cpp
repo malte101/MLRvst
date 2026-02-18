@@ -1232,6 +1232,14 @@ void StripControl::setupComponents()
     };
     addAndMakeVisible(recordBarsBox);
 
+    recordButton.setButtonText("REC");
+    recordButton.setTooltip("Capture recent input audio into this strip (same action as monome record button).");
+    recordButton.onClick = [this]()
+    {
+        processor.captureRecentAudioToStrip(stripIndex);
+    };
+    addAndMakeVisible(recordButton);
+
     modTargetLabel.setText("TARGET", juce::dontSendNotification);
     modTargetLabel.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
     modTargetLabel.setColour(juce::Label::textColourId, kTextMuted);
@@ -1565,18 +1573,70 @@ void StripControl::applyModulationCellDuplicateFromDrag(int deltaY)
     if (!engine || stripIndex >= 6 || modTransformStep < 0 || modTransformStep >= ModernAudioEngine::ModSteps)
         return;
 
-    // Upward drag duplicates the selected cell to following cells; limit spread.
-    const int duplicateCount = juce::jlimit(1, 8, 1 + juce::jmax(0, (-deltaY) / 18));
-    const float src = modTransformSourceSteps[static_cast<size_t>(modTransformStep)];
-
-    // Reset to captured state first so reducing drag removes extra copies cleanly.
-    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
-        engine->setModStepValue(stripIndex, i, modTransformSourceSteps[static_cast<size_t>(i)]);
-
-    for (int i = 0; i < duplicateCount; ++i)
+    // Cmd/Ctrl drag edits local virtual density while keeping the cycle duration fixed.
+    // Drag up: more virtual steps around the selected cell.
+    // Drag down: fewer virtual steps around the selected cell.
+    const int stepDelta = juce::jlimit(-(ModernAudioEngine::ModSteps - 2), 32, (-deltaY) / 14);
+    const int targetCount = juce::jlimit(2, ModernAudioEngine::ModSteps + 32, ModernAudioEngine::ModSteps + stepDelta);
+    if (targetCount == ModernAudioEngine::ModSteps)
     {
-        const int target = juce::jlimit(0, ModernAudioEngine::ModSteps - 1, modTransformStep + i);
-        engine->setModStepValue(stripIndex, target, src);
+        for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+            engine->setModStepValue(stripIndex, i, modTransformSourceSteps[static_cast<size_t>(i)]);
+        return;
+    }
+
+    std::vector<float> expanded;
+    expanded.reserve(static_cast<size_t>(juce::jmax(ModernAudioEngine::ModSteps, targetCount)));
+    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+        expanded.push_back(modTransformSourceSteps[static_cast<size_t>(i)]);
+
+    int pivot = juce::jlimit(0, static_cast<int>(expanded.size()) - 1, modTransformStep);
+    if (targetCount > ModernAudioEngine::ModSteps)
+    {
+        const int extraNodes = targetCount - ModernAudioEngine::ModSteps;
+        for (int n = 0; n < extraNodes; ++n)
+        {
+            const float v = expanded[static_cast<size_t>(pivot)];
+            expanded.insert(expanded.begin() + (pivot + 1), v);
+            ++pivot;
+        }
+    }
+    else
+    {
+        const int removeNodes = ModernAudioEngine::ModSteps - targetCount;
+        for (int n = 0; n < removeNodes && expanded.size() > 2; ++n)
+        {
+            const int left = pivot - 1;
+            const int right = pivot + 1;
+            int removeIdx = -1;
+            if (right < static_cast<int>(expanded.size()) && left >= 0)
+                removeIdx = (n % 2 == 0) ? right : left;
+            else if (right < static_cast<int>(expanded.size()))
+                removeIdx = right;
+            else if (left >= 0)
+                removeIdx = left;
+            if (removeIdx < 0)
+                break;
+            expanded.erase(expanded.begin() + removeIdx);
+            if (removeIdx < pivot)
+                --pivot;
+        }
+    }
+
+    const int expandedCount = static_cast<int>(expanded.size());
+    if (expandedCount <= 0)
+        return;
+
+    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+    {
+        const double phase = (static_cast<double>(i) * static_cast<double>(expandedCount))
+                           / static_cast<double>(ModernAudioEngine::ModSteps);
+        const int idxA = juce::jlimit(0, expandedCount - 1, static_cast<int>(std::floor(phase)));
+        const int idxB = (idxA + 1) % expandedCount;
+        const float frac = static_cast<float>(phase - static_cast<double>(idxA));
+        const float v = expanded[static_cast<size_t>(idxA)]
+                      + ((expanded[static_cast<size_t>(idxB)] - expanded[static_cast<size_t>(idxA)]) * frac);
+        engine->setModStepValue(stripIndex, i, juce::jlimit(0.0f, 1.0f, v));
     }
 }
 
@@ -1586,21 +1646,22 @@ void StripControl::applyModulationCellCurveFromDrag(int deltaY)
     if (!engine || stripIndex >= 6 || modTransformStep < 0 || modTransformStep >= ModernAudioEngine::ModSteps)
         return;
 
-    // Only shape the currently selected cell against its neighbors.
-    const int prev = (modTransformStep - 1 + ModernAudioEngine::ModSteps) % ModernAudioEngine::ModSteps;
-    const int next = (modTransformStep + 1) % ModernAudioEngine::ModSteps;
-    const float prevV = modTransformSourceSteps[static_cast<size_t>(prev)];
-    const float nextV = modTransformSourceSteps[static_cast<size_t>(next)];
     const float srcV = modTransformSourceSteps[static_cast<size_t>(modTransformStep)];
-    const float span = nextV - prevV;
-    if (std::abs(span) < 1.0e-6f)
-        return;
+    const float dragNorm = juce::jlimit(-1.0f, 1.0f, static_cast<float>(-deltaY) / 120.0f);
+    float exponent = 1.0f; // Middle = linear
+    if (dragNorm >= 0.0f)
+    {
+        // Drag up: progressively more exponential.
+        exponent = 1.0f + (dragNorm * 5.0f); // 1 .. 6
+    }
+    else
+    {
+        // Drag down: progressively less exponential.
+        exponent = 1.0f / (1.0f + ((-dragNorm) * 0.75f)); // 1 .. ~0.57
+    }
 
-    float t = juce::jlimit(0.0f, 1.0f, (srcV - prevV) / span);
-    const float shapeAmt = juce::jlimit(-1.0f, 1.0f, static_cast<float>(-deltaY) / 120.0f);
-    const float exponent = std::pow(2.0f, shapeAmt * 2.5f);
-    t = std::pow(t, exponent);
-    const float shaped = juce::jlimit(0.0f, 1.0f, prevV + (span * t));
+    const float shaped = juce::jlimit(0.0f, 1.0f,
+                                      std::pow(juce::jlimit(0.0f, 1.0f, srcV), exponent));
     engine->setModStepValue(stripIndex, modTransformStep, shaped);
 }
 
@@ -1614,13 +1675,15 @@ void StripControl::mouseDown(const juce::MouseEvent& e)
 
         const auto mods = e.mods;
         const int clickedStep = getModulationStepFromPoint(e.getPosition());
-        if ((mods.isCommandDown() || mods.isAltDown()) && clickedStep >= 0)
+        const bool duplicateGesture = mods.isCommandDown() || mods.isCtrlDown();
+        const bool shapeGesture = mods.isAltDown();
+        if ((duplicateGesture || shapeGesture) && clickedStep >= 0)
         {
             const auto seq = engine->getModSequencerState(stripIndex);
             modTransformSourceSteps = seq.steps;
             modTransformStartY = e.y;
             modTransformStep = clickedStep;
-            modTransformMode = mods.isCommandDown()
+            modTransformMode = duplicateGesture
                 ? ModTransformMode::DuplicateCell
                 : ModTransformMode::ShapeCell;
             return;
@@ -1662,7 +1725,7 @@ void StripControl::hideAllPrimaryControls()
     auto hide = [](juce::Component& c){ c.setVisible(false); };
     hide(loadButton); hide(transientSliceButton); hide(playModeBox); hide(directionModeBox); hide(groupSelector);
     hide(volumeSlider); hide(panSlider); hide(speedSlider); hide(scratchSlider); hide(patternLengthBox);
-    hide(tempoHalfButton); hide(tempoDoubleButton); hide(tempoLabel); hide(recordBarsBox); hide(recordBarsLabel);
+    hide(tempoHalfButton); hide(tempoDoubleButton); hide(tempoLabel); hide(recordBarsBox); hide(recordButton); hide(recordBarsLabel);
     hide(volumeLabel); hide(panLabel); hide(speedLabel); hide(scratchLabel); hide(patternLengthLabel);
     hide(recordLengthLabel);
 }
@@ -1849,6 +1912,7 @@ void StripControl::resized()
     tempoLabel.setVisible(showTempoControls);
     const bool showRecordBars = (!isGrainMode) && controlsArea.getHeight() >= 18;
     recordBarsBox.setVisible(showRecordBars);
+    recordButton.setVisible(showRecordBars);
     recordBarsLabel.setVisible(showRecordBars);
 
     // Tempo controls row - only if we have space
@@ -1866,6 +1930,8 @@ void StripControl::resized()
         recordBarsLabel.setBounds(recBarsRow.removeFromLeft(20));
         recBarsRow.removeFromLeft(2);
         recordBarsBox.setBounds(recBarsRow.removeFromLeft(50));
+        recBarsRow.removeFromLeft(2);
+        recordButton.setBounds(recBarsRow.removeFromLeft(46));
         controlsArea.removeFromTop(2);
     }
     else if (showRecordBars)
@@ -1874,6 +1940,8 @@ void StripControl::resized()
         recordBarsLabel.setBounds(recBarsRow.removeFromLeft(18));
         recBarsRow.removeFromLeft(2);
         recordBarsBox.setBounds(recBarsRow.removeFromLeft(46));
+        recBarsRow.removeFromLeft(2);
+        recordButton.setBounds(recBarsRow.removeFromLeft(42));
         controlsArea.removeFromTop(2);
     }
     
@@ -1986,11 +2054,52 @@ void StripControl::loadSample()
     
     if (chooser.browseForFileToOpen())
     {
-        auto file = chooser.getResult();
-        processor.loadSampleToStrip(stripIndex, file);
-        
-        // Remember this path for the current mode
-        processor.setDefaultSampleDirectory(stripIndex, mode, file.getParentDirectory());
+        loadSampleFromFile(chooser.getResult());
+    }
+}
+
+bool StripControl::isSupportedAudioFile(const juce::File& file)
+{
+    if (!file.existsAsFile())
+        return false;
+
+    return file.hasFileExtension(".wav;.aif;.aiff;.mp3;.ogg;.flac");
+}
+
+void StripControl::loadSampleFromFile(const juce::File& file)
+{
+    if (!isSupportedAudioFile(file))
+        return;
+
+    processor.loadSampleToStrip(stripIndex, file);
+
+    auto* strip = processor.getAudioEngine() ? processor.getAudioEngine()->getStrip(stripIndex) : nullptr;
+    const bool isStepMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+    auto mode = isStepMode ? MlrVSTAudioProcessor::SamplePathMode::Step
+                           : MlrVSTAudioProcessor::SamplePathMode::Loop;
+    processor.setDefaultSampleDirectory(stripIndex, mode, file.getParentDirectory());
+}
+
+bool StripControl::isInterestedInFileDrag(const juce::StringArray& files)
+{
+    for (const auto& path : files)
+    {
+        if (isSupportedAudioFile(juce::File(path)))
+            return true;
+    }
+    return false;
+}
+
+void StripControl::filesDropped(const juce::StringArray& files, int /*x*/, int /*y*/)
+{
+    for (const auto& path : files)
+    {
+        juce::File file(path);
+        if (isSupportedAudioFile(file))
+        {
+            loadSampleFromFile(file);
+            break;
+        }
     }
 }
 
@@ -2108,7 +2217,7 @@ void StripControl::updateFromEngine()
         float beats = strip->getBeatsPerLoop();
         
         // Simple, safe validation
-        if (beats >= 0.25f && beats <= 16.0f && std::isfinite(beats))
+        if (beats >= 0.25f && beats <= 64.0f && std::isfinite(beats))
         {
             // Valid range - format it
             tempoLabel.setText(juce::String(beats, 1) + "b", juce::dontSendNotification);
@@ -2124,6 +2233,14 @@ void StripControl::updateFromEngine()
     scratchSlider.setValue(strip->getScratchAmount(), juce::dontSendNotification);
     patternLengthBox.setSelectedId(strip->getStepPatternBars(), juce::dontSendNotification);
     recordBarsBox.setSelectedId(strip->getRecordingBars(), juce::dontSendNotification);
+    const bool recordArmed = !strip->hasAudio();
+    const bool blinkOn = processor.getAudioEngine()->shouldBlinkRecordLED();
+    recordButton.setButtonText(recordArmed ? "ARM" : "REC");
+    recordButton.setColour(juce::TextButton::buttonColourId,
+                           recordArmed
+                               ? (blinkOn ? juce::Colour(0xffc95252) : juce::Colour(0xff743636))
+                               : (blinkOn ? juce::Colour(0xffa64a4a) : juce::Colour(0xff444444)));
+    recordButton.setColour(juce::TextButton::textColourOffId, juce::Colour(0xfff0f0f0));
     
     // Sync volume and pan from engine
     volumeSlider.setValue(strip->getVolume(), juce::dontSendNotification);
@@ -4313,10 +4430,16 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         b.setButtonText(juce::String(i + 1));
         b.onClick = [this, i]()
         {
+            if (suppressNextStepClick)
+            {
+                suppressNextStepClick = false;
+                return;
+            }
             if (auto* engine = processor.getAudioEngine())
                 engine->toggleModStep(selectedStrip, i);
             refreshFromEngine();
         };
+        b.addMouseListener(this, true);
         addAndMakeVisible(b);
     }
 
@@ -4363,6 +4486,146 @@ void ModulationControlPanel::resized()
 void ModulationControlPanel::timerCallback()
 {
     refreshFromEngine();
+}
+
+void ModulationControlPanel::mouseDown(const juce::MouseEvent& e)
+{
+    if (!processor.getAudioEngine())
+        return;
+
+    const int step = stepIndexForComponent(e.eventComponent);
+    if (step < 0)
+        return;
+
+    if (e.mods.isCommandDown() || e.mods.isAltDown())
+    {
+        const auto state = processor.getAudioEngine()->getModSequencerState(selectedStrip);
+        gestureSourceSteps = state.steps;
+        gestureMode = e.mods.isCommandDown() ? EditGestureMode::DuplicateCell : EditGestureMode::ShapeCell;
+        gestureActive = true;
+        gestureStartY = e.getScreenPosition().y;
+        gestureStep = step;
+        suppressNextStepClick = true;
+    }
+}
+
+void ModulationControlPanel::mouseDrag(const juce::MouseEvent& e)
+{
+    if (!gestureActive || !processor.getAudioEngine())
+        return;
+
+    const int deltaY = e.getScreenPosition().y - gestureStartY;
+    if (gestureMode == EditGestureMode::DuplicateCell)
+        applyDuplicateGesture(deltaY);
+    else if (gestureMode == EditGestureMode::ShapeCell)
+        applyShapeGesture(deltaY);
+
+    refreshFromEngine();
+}
+
+void ModulationControlPanel::mouseUp(const juce::MouseEvent&)
+{
+    gestureActive = false;
+    gestureMode = EditGestureMode::None;
+    gestureStep = -1;
+}
+
+int ModulationControlPanel::stepIndexForComponent(juce::Component* c) const
+{
+    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+    {
+        if (c == &stepButtons[static_cast<size_t>(i)])
+            return i;
+    }
+    return -1;
+}
+
+void ModulationControlPanel::applyDuplicateGesture(int deltaY)
+{
+    auto* engine = processor.getAudioEngine();
+    if (!engine || gestureStep < 0 || gestureStep >= ModernAudioEngine::ModSteps)
+        return;
+
+    const int stepDelta = juce::jlimit(-(ModernAudioEngine::ModSteps - 2), 32, (-deltaY) / 14);
+    const int targetCount = juce::jlimit(2, ModernAudioEngine::ModSteps + 32, ModernAudioEngine::ModSteps + stepDelta);
+    if (targetCount == ModernAudioEngine::ModSteps)
+    {
+        for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+            engine->setModStepValue(selectedStrip, i, gestureSourceSteps[static_cast<size_t>(i)]);
+        return;
+    }
+
+    std::vector<float> expanded;
+    expanded.reserve(static_cast<size_t>(juce::jmax(ModernAudioEngine::ModSteps, targetCount)));
+    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+        expanded.push_back(gestureSourceSteps[static_cast<size_t>(i)]);
+
+    int pivot = juce::jlimit(0, static_cast<int>(expanded.size()) - 1, gestureStep);
+    if (targetCount > ModernAudioEngine::ModSteps)
+    {
+        const int extraNodes = targetCount - ModernAudioEngine::ModSteps;
+        for (int n = 0; n < extraNodes; ++n)
+        {
+            const float v = expanded[static_cast<size_t>(pivot)];
+            expanded.insert(expanded.begin() + (pivot + 1), v);
+            ++pivot;
+        }
+    }
+    else
+    {
+        const int removeNodes = ModernAudioEngine::ModSteps - targetCount;
+        for (int n = 0; n < removeNodes && expanded.size() > 2; ++n)
+        {
+            const int left = pivot - 1;
+            const int right = pivot + 1;
+            int removeIdx = -1;
+            if (right < static_cast<int>(expanded.size()) && left >= 0)
+                removeIdx = (n % 2 == 0) ? right : left;
+            else if (right < static_cast<int>(expanded.size()))
+                removeIdx = right;
+            else if (left >= 0)
+                removeIdx = left;
+            if (removeIdx < 0)
+                break;
+            expanded.erase(expanded.begin() + removeIdx);
+            if (removeIdx < pivot)
+                --pivot;
+        }
+    }
+
+    const int expandedCount = static_cast<int>(expanded.size());
+    if (expandedCount <= 0)
+        return;
+
+    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+    {
+        const double phase = (static_cast<double>(i) * static_cast<double>(expandedCount))
+                           / static_cast<double>(ModernAudioEngine::ModSteps);
+        const int idxA = juce::jlimit(0, expandedCount - 1, static_cast<int>(std::floor(phase)));
+        const int idxB = (idxA + 1) % expandedCount;
+        const float frac = static_cast<float>(phase - static_cast<double>(idxA));
+        const float v = expanded[static_cast<size_t>(idxA)]
+                      + ((expanded[static_cast<size_t>(idxB)] - expanded[static_cast<size_t>(idxA)]) * frac);
+        engine->setModStepValue(selectedStrip, i, juce::jlimit(0.0f, 1.0f, v));
+    }
+}
+
+void ModulationControlPanel::applyShapeGesture(int deltaY)
+{
+    auto* engine = processor.getAudioEngine();
+    if (!engine || gestureStep < 0 || gestureStep >= ModernAudioEngine::ModSteps)
+        return;
+
+    const float srcV = gestureSourceSteps[static_cast<size_t>(gestureStep)];
+    const float dragNorm = juce::jlimit(-1.0f, 1.0f, static_cast<float>(-deltaY) / 120.0f);
+    float exponent = 1.0f;
+    if (dragNorm >= 0.0f)
+        exponent = 1.0f + (dragNorm * 5.0f);
+    else
+        exponent = 1.0f / (1.0f + ((-dragNorm) * 0.75f));
+
+    const float shaped = juce::jlimit(0.0f, 1.0f, std::pow(juce::jlimit(0.0f, 1.0f, srcV), exponent));
+    engine->setModStepValue(selectedStrip, gestureStep, shaped);
 }
 
 void ModulationControlPanel::refreshFromEngine()
@@ -4522,15 +4785,11 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     // GROUPS TAB
     groupControl = std::make_unique<GroupControlPanel>(audioProcessor);
 
-    // MODULATION TAB
-    modulationControl = std::make_unique<ModulationControlPanel>(audioProcessor);
-    
-    // Add all 4 tabs to main container
+    // Add main tabs to container
     mainTabs->addTab("Play", juce::Colour(0xff282828), playPanel, true);
     mainTabs->addTab("FX", juce::Colour(0xff282828), fxPanel, true);
     mainTabs->addTab("Patterns", juce::Colour(0xff282828), patternControl.get(), false);
     mainTabs->addTab("Groups", juce::Colour(0xff282828), groupControl.get(), false);
-    mainTabs->addTab("Modulation", juce::Colour(0xff282828), modulationControl.get(), false);
     mainTabs->setTabBarDepth(32);
     mainTabs->setCurrentTabIndex(0);  // Start on Play tab
     addAndMakeVisible(*mainTabs);
