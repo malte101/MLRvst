@@ -19,6 +19,7 @@ void loadPreset(int presetIndex,
                 juce::AudioProcessorValueTreeState& parameters,
                 const std::function<void(int, const juce::File&)>& loadSampleToStrip);
 juce::String getPresetName(int presetIndex);
+bool setPresetName(int presetIndex, const juce::String& presetName);
 bool presetExists(int presetIndex);
 bool deletePreset(int presetIndex);
 } // namespace PresetStore

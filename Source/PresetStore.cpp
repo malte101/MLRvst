@@ -91,6 +91,15 @@ bool writeDefaultPresetFile(const juce::File& presetFile, int presetIndex)
     juce::XmlElement preset("mlrVSTPreset");
     preset.setAttribute("version", "1.0");
     preset.setAttribute("index", presetIndex);
+    if (presetFile.existsAsFile())
+    {
+        if (auto existing = juce::XmlDocument::parse(presetFile))
+        {
+            const auto existingName = existing->getStringAttribute("name").trim();
+            if (existingName.isNotEmpty())
+                preset.setAttribute("name", existingName);
+        }
+    }
 
     auto* globalsXml = preset.createNewChildElement("Globals");
     globalsXml->setAttribute("masterVolume", 0.7);
@@ -388,8 +397,21 @@ void loadPreset(int presetIndex,
         if (auto* speedParam = parameters.getParameter("stripSpeed" + juce::String(stripIndex)))
         {
             float speedValue = static_cast<float>(stripXml->getDoubleAttribute("speed", 1.0));
-            auto speedRange = juce::NormalisableRange<float>(0.25f, 4.0f, 0.01f, 0.5f);
-            speedParam->setValueNotifyingHost(speedRange.convertTo0to1(speedValue));
+            if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(speedParam))
+            {
+                speedParam->setValueNotifyingHost(
+                    juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(speedValue)));
+            }
+        }
+
+        if (auto* pitchParam = parameters.getParameter("stripPitch" + juce::String(stripIndex)))
+        {
+            float pitchValue = static_cast<float>(stripXml->getDoubleAttribute("pitchShift", 0.0));
+            if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(pitchParam))
+            {
+                pitchParam->setValueNotifyingHost(
+                    juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(pitchValue)));
+            }
         }
     }
 
@@ -450,8 +472,41 @@ juce::String getPresetName(int presetIndex)
 {
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots)
         return {};
-
+    auto presetDir = getPresetDirectory();
+    auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+    if (presetFile.existsAsFile())
+    {
+        if (auto preset = juce::XmlDocument::parse(presetFile))
+        {
+            const auto storedName = preset->getStringAttribute("name").trim();
+            if (storedName.isNotEmpty())
+                return storedName;
+        }
+    }
     return "Preset " + juce::String(presetIndex + 1);
+}
+
+bool setPresetName(int presetIndex, const juce::String& presetName)
+{
+    if (presetIndex < 0 || presetIndex >= kMaxPresetSlots)
+        return false;
+
+    auto presetDir = getPresetDirectory();
+    auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+    if (!presetFile.existsAsFile())
+        return false;
+
+    auto preset = juce::XmlDocument::parse(presetFile);
+    if (!preset || preset->getTagName() != "mlrVSTPreset")
+        return false;
+
+    const auto trimmed = presetName.trim();
+    if (trimmed.isNotEmpty())
+        preset->setAttribute("name", trimmed);
+    else
+        preset->removeAttribute("name");
+
+    return preset->writeTo(presetFile);
 }
 
 bool presetExists(int presetIndex)

@@ -996,7 +996,7 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
 
     // Apply any pending loop enter/exit actions that were quantized to timeline.
     applyPendingLoopChanges(posInfo);
-    
+
     // Update strip parameters
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -1862,6 +1862,14 @@ bool MlrVSTAudioProcessor::deletePreset(int presetIndex)
 juce::String MlrVSTAudioProcessor::getPresetName(int presetIndex) const
 {
     return PresetStore::getPresetName(presetIndex);
+}
+
+bool MlrVSTAudioProcessor::setPresetName(int presetIndex, const juce::String& name)
+{
+    const bool ok = PresetStore::setPresetName(presetIndex, name);
+    if (ok)
+        presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+    return ok;
 }
 
 bool MlrVSTAudioProcessor::presetExists(int presetIndex) const

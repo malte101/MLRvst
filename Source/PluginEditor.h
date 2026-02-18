@@ -133,6 +133,7 @@ public:
     void timerCallback() override;
     void mouseDown(const juce::MouseEvent& e) override;
     void mouseDrag(const juce::MouseEvent& e) override;
+    void mouseUp(const juce::MouseEvent& e) override;
     
     void updateFromEngine();
     void setModulationLaneView(bool shouldShow);
@@ -269,9 +270,23 @@ private:
     void paintModulationLane(juce::Graphics& g);
     juce::Rectangle<int> getModulationLaneBounds() const;
     void applyModulationPoint(juce::Point<int> p);
+    int getModulationStepFromPoint(juce::Point<int> p) const;
+    void applyModulationCellDuplicateFromDrag(int deltaY);
+    void applyModulationCellCurveFromDrag(int deltaY);
     void hideAllPrimaryControls();
     void hideAllGrainControls();
     void updateGrainOverlayVisibility();
+
+    enum class ModTransformMode
+    {
+        None = 0,
+        DuplicateCell,
+        ShapeCell
+    };
+    ModTransformMode modTransformMode = ModTransformMode::None;
+    int modTransformStartY = 0;
+    int modTransformStep = -1;
+    std::array<float, ModernAudioEngine::ModSteps> modTransformSourceSteps{};
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(StripControl)
 };
@@ -598,11 +613,16 @@ private:
     
     juce::Label titleLabel;
     juce::Label instructionsLabel;
+    juce::TextEditor presetNameEditor;
+    juce::TextButton saveButton;
+    juce::TextButton deleteButton;
     juce::Viewport presetViewport;
     juce::Component presetGridContent;
     std::array<juce::TextButton, MlrVSTAudioProcessor::MaxPresetSlots> presetButtons;
+    int selectedPresetIndex = 0;
+    juce::String presetNameDraft;
     
-    void savePresetClicked(int index);
+    void savePresetClicked(int index, juce::String typedName = {});
     void loadPresetClicked(int index);
     void updatePresetButtons();
     void layoutPresetButtons();
@@ -721,6 +741,9 @@ private:
     std::unique_ptr<juce::TooltipWindow> tooltipWindow;
     bool tooltipsEnabled = true;
     uint32_t lastPresetRefreshToken = 0;
+    bool monomePagesAutoOpenActive = false;
+    int topTabIndexBeforeMonomeAutoOpen = 0;
+    bool monomePagesAutoRestoreArmed = false;
 
     void createUIComponents();
     void setupLookAndFeel();

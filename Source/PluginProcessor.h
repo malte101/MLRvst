@@ -232,6 +232,7 @@ public:
     bool deletePreset(int presetIndex);
     int getLoadedPresetIndex() const { return loadedPresetIndex; }
     juce::String getPresetName(int presetIndex) const;
+    bool setPresetName(int presetIndex, const juce::String& name);
     bool presetExists(int presetIndex) const;
     uint32_t getPresetRefreshToken() const { return presetRefreshToken.load(std::memory_order_acquire); }
     static constexpr int PresetColumns = 16;

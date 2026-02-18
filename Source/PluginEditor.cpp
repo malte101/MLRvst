@@ -1544,10 +1544,90 @@ void StripControl::applyModulationPoint(juce::Point<int> p)
     modulationLastDrawValue = value;
 }
 
+int StripControl::getModulationStepFromPoint(juce::Point<int> p) const
+{
+    auto lane = getModulationLaneBounds();
+    if (lane.isEmpty())
+        return -1;
+    if (!lane.contains(p))
+        return -1;
+
+    const float nx = juce::jlimit(0.0f, 1.0f,
+                                  (static_cast<float>(p.x - lane.getX()))
+                                  / juce::jmax(1.0f, static_cast<float>(lane.getWidth())));
+    return juce::jlimit(0, ModernAudioEngine::ModSteps - 1,
+                        static_cast<int>(std::round(nx * static_cast<float>(ModernAudioEngine::ModSteps - 1))));
+}
+
+void StripControl::applyModulationCellDuplicateFromDrag(int deltaY)
+{
+    auto* engine = processor.getAudioEngine();
+    if (!engine || stripIndex >= 6 || modTransformStep < 0 || modTransformStep >= ModernAudioEngine::ModSteps)
+        return;
+
+    // Upward drag duplicates the selected cell to following cells; limit spread.
+    const int duplicateCount = juce::jlimit(1, 8, 1 + juce::jmax(0, (-deltaY) / 18));
+    const float src = modTransformSourceSteps[static_cast<size_t>(modTransformStep)];
+
+    // Reset to captured state first so reducing drag removes extra copies cleanly.
+    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+        engine->setModStepValue(stripIndex, i, modTransformSourceSteps[static_cast<size_t>(i)]);
+
+    for (int i = 0; i < duplicateCount; ++i)
+    {
+        const int target = juce::jlimit(0, ModernAudioEngine::ModSteps - 1, modTransformStep + i);
+        engine->setModStepValue(stripIndex, target, src);
+    }
+}
+
+void StripControl::applyModulationCellCurveFromDrag(int deltaY)
+{
+    auto* engine = processor.getAudioEngine();
+    if (!engine || stripIndex >= 6 || modTransformStep < 0 || modTransformStep >= ModernAudioEngine::ModSteps)
+        return;
+
+    // Only shape the currently selected cell against its neighbors.
+    const int prev = (modTransformStep - 1 + ModernAudioEngine::ModSteps) % ModernAudioEngine::ModSteps;
+    const int next = (modTransformStep + 1) % ModernAudioEngine::ModSteps;
+    const float prevV = modTransformSourceSteps[static_cast<size_t>(prev)];
+    const float nextV = modTransformSourceSteps[static_cast<size_t>(next)];
+    const float srcV = modTransformSourceSteps[static_cast<size_t>(modTransformStep)];
+    const float span = nextV - prevV;
+    if (std::abs(span) < 1.0e-6f)
+        return;
+
+    float t = juce::jlimit(0.0f, 1.0f, (srcV - prevV) / span);
+    const float shapeAmt = juce::jlimit(-1.0f, 1.0f, static_cast<float>(-deltaY) / 120.0f);
+    const float exponent = std::pow(2.0f, shapeAmt * 2.5f);
+    t = std::pow(t, exponent);
+    const float shaped = juce::jlimit(0.0f, 1.0f, prevV + (span * t));
+    engine->setModStepValue(stripIndex, modTransformStep, shaped);
+}
+
 void StripControl::mouseDown(const juce::MouseEvent& e)
 {
     if (modulationLaneView)
     {
+        auto* engine = processor.getAudioEngine();
+        if (!engine || stripIndex >= 6)
+            return;
+
+        const auto mods = e.mods;
+        const int clickedStep = getModulationStepFromPoint(e.getPosition());
+        if ((mods.isCommandDown() || mods.isAltDown()) && clickedStep >= 0)
+        {
+            const auto seq = engine->getModSequencerState(stripIndex);
+            modTransformSourceSteps = seq.steps;
+            modTransformStartY = e.y;
+            modTransformStep = clickedStep;
+            modTransformMode = mods.isCommandDown()
+                ? ModTransformMode::DuplicateCell
+                : ModTransformMode::ShapeCell;
+            return;
+        }
+
+        modTransformMode = ModTransformMode::None;
+        modTransformStep = -1;
         modulationLastDrawStep = -1;
         applyModulationPoint(e.getPosition());
     }
@@ -1556,7 +1636,25 @@ void StripControl::mouseDown(const juce::MouseEvent& e)
 void StripControl::mouseDrag(const juce::MouseEvent& e)
 {
     if (modulationLaneView)
+    {
+        if (modTransformMode != ModTransformMode::None)
+        {
+            const int deltaY = e.y - modTransformStartY;
+            if (modTransformMode == ModTransformMode::DuplicateCell)
+                applyModulationCellDuplicateFromDrag(deltaY);
+            else if (modTransformMode == ModTransformMode::ShapeCell)
+                applyModulationCellCurveFromDrag(deltaY);
+            return;
+        }
+
         applyModulationPoint(e.getPosition());
+    }
+}
+
+void StripControl::mouseUp(const juce::MouseEvent&)
+{
+    modTransformMode = ModTransformMode::None;
+    modTransformStep = -1;
 }
 
 void StripControl::hideAllPrimaryControls()
@@ -2975,18 +3073,39 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
 PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     : processor(p)
 {
-    // Title - compact
-    titleLabel.setText("PRESETS", juce::dontSendNotification);
-    titleLabel.setFont(juce::Font(juce::FontOptions(12.0f, juce::Font::bold)));  // Smaller
-    titleLabel.setColour(juce::Label::textColourId, kTextPrimary);
-    addAndMakeVisible(titleLabel);
-    
     // Instructions - very compact
-    instructionsLabel.setText("Click=Load • Shift+Click=Save • Mouse wheel scroll", juce::dontSendNotification);
+    instructionsLabel.setText("Click=Load  Shift+Click=Save name  Save/Delete use selected slot", juce::dontSendNotification);
     instructionsLabel.setFont(juce::Font(juce::FontOptions(9.0f)));  // Smaller
     instructionsLabel.setColour(juce::Label::textColourId, kTextMuted);
     instructionsLabel.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(instructionsLabel);
+
+    presetNameEditor.setTextToShowWhenEmpty("Preset name", kTextMuted);
+    presetNameEditor.setMultiLine(false);
+    presetNameEditor.setReturnKeyStartsNewLine(false);
+    presetNameEditor.setSelectAllWhenFocused(true);
+    presetNameEditor.setMouseClickGrabsKeyboardFocus(true);
+    presetNameEditor.onTextChange = [this]() { presetNameDraft = presetNameEditor.getText(); };
+    presetNameEditor.onReturnKey = [this]()
+    {
+        savePresetClicked(selectedPresetIndex, presetNameEditor.getText());
+    };
+    addAndMakeVisible(presetNameEditor);
+
+    saveButton.setButtonText("Save");
+    saveButton.onClick = [this]()
+    {
+        savePresetClicked(selectedPresetIndex, presetNameEditor.getText());
+    };
+    addAndMakeVisible(saveButton);
+
+    deleteButton.setButtonText("Delete");
+    deleteButton.onClick = [this]()
+    {
+        if (processor.deletePreset(selectedPresetIndex))
+            updatePresetButtons();
+    };
+    addAndMakeVisible(deleteButton);
 
     presetViewport.setViewedComponent(&presetGridContent, false);
     presetViewport.setScrollBarsShown(true, true, true, true);
@@ -3004,8 +3123,8 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
 
         button.onClick = [this, i]()
         {
-            if (juce::ModifierKeys::getCurrentModifiers().isShiftDown())
-                savePresetClicked(i);
+            if (juce::ModifierKeys::getCurrentModifiersRealtime().isShiftDown())
+                savePresetClicked(i, presetNameEditor.getText());
             else
                 loadPresetClicked(i);
         };
@@ -3013,6 +3132,9 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
         presetGridContent.addAndMakeVisible(button);
     }
     
+    selectedPresetIndex = juce::jmax(0, processor.getLoadedPresetIndex());
+    presetNameDraft = processor.getPresetName(selectedPresetIndex);
+    presetNameEditor.setText(presetNameDraft, juce::dontSendNotification);
     layoutPresetButtons();
     updatePresetButtons();
 }
@@ -3025,39 +3147,79 @@ void PresetControlPanel::paint(juce::Graphics& g)
 void PresetControlPanel::resized()
 {
     auto bounds = getLocalBounds().reduced(8);
-    
-    // Title at top
-    auto titleArea = bounds.removeFromTop(18);
-    titleLabel.setBounds(titleArea);
-    bounds.removeFromTop(4);  // Gap after title
-    
-    // Instructions
-    auto instructionsArea = bounds.removeFromTop(14);
+
+    auto instructionsArea = bounds.removeFromTop(12);
     instructionsLabel.setBounds(instructionsArea);
-    bounds.removeFromTop(4);
+    bounds.removeFromTop(2);
+
+    auto editorArea = bounds.removeFromTop(22);
+    const int buttonW = 58;
+    deleteButton.setBounds(editorArea.removeFromRight(buttonW));
+    editorArea.removeFromRight(4);
+    saveButton.setBounds(editorArea.removeFromRight(buttonW));
+    editorArea.removeFromRight(6);
+    presetNameEditor.setBounds(editorArea);
+    bounds.removeFromTop(2);
 
     presetViewport.setBounds(bounds);
     layoutPresetButtons();
 }
 
-void PresetControlPanel::savePresetClicked(int index)
+void PresetControlPanel::savePresetClicked(int index, juce::String typedName)
 {
     processor.savePreset(index);
+    const auto trimmed = (typedName.isNotEmpty() ? typedName : presetNameEditor.getText()).trim();
+    if (trimmed.isNotEmpty())
+    {
+        processor.setPresetName(index, trimmed);
+        presetNameDraft = trimmed;
+        presetNameEditor.setText(trimmed, juce::dontSendNotification);
+    }
+    selectedPresetIndex = index;
     updatePresetButtons();
 }
 
 void PresetControlPanel::loadPresetClicked(int index)
 {
     processor.loadPreset(index);
+    selectedPresetIndex = index;
+    const auto name = processor.getPresetName(index);
+    presetNameDraft = name;
+    presetNameEditor.setText(name, juce::dontSendNotification);
 }
 
 void PresetControlPanel::updatePresetButtons()
 {
     const int loadedPreset = processor.getLoadedPresetIndex();
+    deleteButton.setEnabled(processor.presetExists(selectedPresetIndex));
+    auto shortPresetLabel = [](const juce::String& name, int fallbackIndex) -> juce::String
+    {
+        auto n = name.trim();
+        if (n.isEmpty())
+            return juce::String(fallbackIndex + 1);
+        juce::String compact;
+        for (auto c : n)
+        {
+            if (!juce::CharacterFunctions::isWhitespace(c))
+                compact << juce::String::charToString(c);
+            if (compact.length() >= 4)
+                break;
+        }
+        if (compact.isEmpty())
+            compact = juce::String(fallbackIndex + 1);
+        return compact.toUpperCase();
+    };
+
     for (int i = 0; i < MlrVSTAudioProcessor::MaxPresetSlots; ++i)
     {
         bool exists = processor.presetExists(i);
         auto& button = presetButtons[static_cast<size_t>(i)];
+        const juce::String presetName = exists ? processor.getPresetName(i) : juce::String();
+        button.setButtonText(shortPresetLabel(presetName, i));
+        juce::String tip = "Preset " + juce::String(i + 1);
+        if (exists)
+            tip << " - " << presetName;
+        button.setTooltip(tip);
         if (i == loadedPreset && exists)
         {
             button.setColour(juce::TextButton::buttonColourId, juce::Colour(0xffb8d478));
@@ -3065,10 +3227,13 @@ void PresetControlPanel::updatePresetButtons()
         }
         else
         {
+            const bool isSelected = (i == selectedPresetIndex);
             button.setColour(juce::TextButton::buttonColourId,
-                             exists ? kAccent.withMultipliedBrightness(0.9f) : juce::Colour(0xff2b2b2b));
+                             exists
+                                 ? (isSelected ? kAccent.withMultipliedBrightness(1.1f) : kAccent.withMultipliedBrightness(0.9f))
+                                 : (isSelected ? juce::Colour(0xff3a3a3a) : juce::Colour(0xff2b2b2b)));
             button.setColour(juce::TextButton::textColourOffId,
-                             exists ? juce::Colour(0xff111111) : kTextMuted);
+                             exists ? juce::Colour(0xfff3f3f3) : kTextMuted);
         }
     }
 }
@@ -4277,6 +4442,7 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     // Create TABBED top controls to save space
     topTabs = std::make_unique<juce::TabbedComponent>(juce::TabbedButtonBar::TabsAtTop);
     topTabs->addTab("Global Controls", juce::Colour(0xff2c2c2c), globalControl.get(), false);
+    topTabs->addTab("Presets", juce::Colour(0xff2c2c2c), presetControl.get(), false);
     topTabs->addTab("Monome Device", juce::Colour(0xff2c2c2c), monomeControl.get(), false);
     topTabs->addTab("Monome Pages", juce::Colour(0xff2c2c2c), monomePagesControl.get(), false);
     topTabs->addTab("Paths", juce::Colour(0xff2c2c2c), pathsControl.get(), false);
@@ -4494,6 +4660,53 @@ void MlrVSTAudioProcessorEditor::timerCallback()
 {
     if (!audioProcessor.getAudioEngine())
         return;
+
+    if (topTabs)
+    {
+        const bool monomePageHeld = audioProcessor.isControlPageMomentary()
+            && audioProcessor.isControlModeActive()
+            && audioProcessor.getCurrentControlMode() != MlrVSTAudioProcessor::ControlMode::Normal;
+        const int monomePagesTabIndex = [&]() -> int
+        {
+            for (int i = 0; i < topTabs->getNumTabs(); ++i)
+            {
+                if (topTabs->getTabNames()[i] == "Monome Pages")
+                    return i;
+            }
+            return -1;
+        }();
+
+        if (monomePagesTabIndex >= 0 && monomePageHeld && !monomePagesAutoOpenActive)
+        {
+            topTabIndexBeforeMonomeAutoOpen = topTabs->getCurrentTabIndex();
+            monomePagesAutoOpenActive = true;
+            monomePagesAutoRestoreArmed = (topTabIndexBeforeMonomeAutoOpen != monomePagesTabIndex);
+            if (monomePagesAutoRestoreArmed)
+                topTabs->setCurrentTabIndex(monomePagesTabIndex);
+        }
+        else if (monomePagesAutoOpenActive)
+        {
+            // If user manually changed tabs while held, disarm restore.
+            if (monomePageHeld && monomePagesAutoRestoreArmed
+                && topTabs->getCurrentTabIndex() != monomePagesTabIndex)
+            {
+                monomePagesAutoRestoreArmed = false;
+            }
+
+            if (!monomePageHeld)
+            {
+                if (monomePagesAutoRestoreArmed
+                    && topTabIndexBeforeMonomeAutoOpen >= 0
+                    && topTabIndexBeforeMonomeAutoOpen < topTabs->getNumTabs())
+                {
+                    topTabs->setCurrentTabIndex(topTabIndexBeforeMonomeAutoOpen);
+                }
+
+                monomePagesAutoOpenActive = false;
+                monomePagesAutoRestoreArmed = false;
+            }
+        }
+    }
     
     // Update input meters
     if (globalControl)
