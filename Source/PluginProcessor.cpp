@@ -738,6 +738,7 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
     pitchSmoothingParam = parameters.getRawParameterValue("pitchSmoothing");
     inputMonitorParam = parameters.getRawParameterValue("inputMonitor");
     crossfadeLengthParam = parameters.getRawParameterValue("crossfadeLength");
+    triggerFadeInParam = parameters.getRawParameterValue("triggerFadeIn");
 
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -889,6 +890,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         "Crossfade Length (ms)",
         juce::NormalisableRange<float>(1.0f, 50.0f, 0.1f),
         10.0f));
+
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        "triggerFadeIn",
+        "Trigger Fade In (ms)",
+        juce::NormalisableRange<float>(0.1f, 120.0f, 0.1f),
+        12.0f));
     
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -1044,6 +1051,9 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     if (crossfadeLengthParam)
         audioEngine->setCrossfadeLengthMs(*crossfadeLengthParam);
 
+    if (triggerFadeInParam)
+        audioEngine->setTriggerFadeInMs(*triggerFadeInParam);
+
     // Apply any pending loop enter/exit actions that were quantized to timeline.
     applyPendingLoopChanges(posInfo);
 
@@ -1157,13 +1167,8 @@ void MlrVSTAudioProcessor::captureRecentAudioToStrip(int stripIndex)
         // Clear stale path so preset save can embed the audio data.
         currentStripFiles[stripIndex] = juce::File();
 
-        // Trigger directly so we do not apply group-choke behavior to other strips.
-        juce::AudioPlayHead::PositionInfo posInfo;
-        if (auto* playHead = getPlayHead())
-            posInfo = playHead->getPosition().orFallback(juce::AudioPlayHead::PositionInfo());
-
-        const int64_t triggerGlobalSample = audioEngine->getGlobalSampleCount();
-        strip->triggerAtSample(0, audioEngine->getCurrentTempo(), triggerGlobalSample, posInfo);
+        // Recording stop auto-trigger must still respect group choke behavior.
+        audioEngine->triggerStripWithQuantization(stripIndex, 0, false);
         updateMonomeLEDs();
     }
 }
@@ -1609,6 +1614,11 @@ void MlrVSTAudioProcessor::savePersistentControlPages() const
 void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
 {
     if (!audioEngine) return;
+
+    // Apply trigger-fade setting immediately for Monome row presses, even if
+    // the host isn't currently invoking processBlock.
+    if (triggerFadeInParam)
+        audioEngine->setTriggerFadeInMs(*triggerFadeInParam);
     
     auto* strip = audioEngine->getStrip(stripIndex);
     if (!strip) return;
@@ -1712,30 +1722,8 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     }
     else
     {
-        // Immediate trigger - handle group choke here
-        int groupId = strip->getGroup();
-        if (groupId >= 0 && groupId < 4)
-        {
-            auto* group = audioEngine->getGroup(groupId);
-            if (group)
-            {
-                // If group is muted, unmute it when triggering
-                if (group->isMuted())
-                    group->setMuted(false);
-                
-                // Stop all OTHER strips in the same group
-                auto strips = group->getStrips();
-                for (int otherStripIndex : strips)
-                {
-                    if (otherStripIndex != stripIndex)
-                    {
-                        auto* otherStrip = audioEngine->getStrip(otherStripIndex);
-                        if (otherStrip && otherStrip->isPlaying())
-                            otherStrip->stop(true);
-                    }
-                }
-            }
-        }
+        // Immediate trigger - handle group choke here with short fade in engine path.
+        audioEngine->enforceGroupExclusivity(stripIndex, false);
         
         // Trigger immediately with PPQ sync
         int64_t triggerGlobalSample = audioEngine->getGlobalSampleCount();
@@ -1905,37 +1893,66 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
 
 void MlrVSTAudioProcessor::savePreset(int presetIndex)
 {
-    PresetStore::savePreset(presetIndex, MaxStrips, audioEngine.get(), parameters, currentStripFiles);
-    loadedPresetIndex = presetIndex;
+    try
+    {
+        PresetStore::savePreset(presetIndex, MaxStrips, audioEngine.get(), parameters, currentStripFiles);
+        loadedPresetIndex = presetIndex;
+    }
+    catch (const std::exception& e)
+    {
+        DBG("savePreset exception for slot " << presetIndex << ": " << e.what());
+    }
+    catch (...)
+    {
+        DBG("savePreset exception for slot " << presetIndex << ": unknown");
+    }
 }
 
 void MlrVSTAudioProcessor::loadPreset(int presetIndex)
 {
-    // Clear stale file references; preset load repopulates file-backed strips.
-    for (auto& f : currentStripFiles)
-        f = juce::File();
+    try
+    {
+        // Clear stale file references; preset load repopulates file-backed strips.
+        for (auto& f : currentStripFiles)
+            f = juce::File();
 
-    PresetStore::loadPreset(
-        presetIndex,
-        MaxStrips,
-        audioEngine.get(),
-        parameters,
-        [this](int stripIndex, const juce::File& sampleFile)
-        {
-            loadSampleToStrip(stripIndex, sampleFile);
-        });
+        PresetStore::loadPreset(
+            presetIndex,
+            MaxStrips,
+            audioEngine.get(),
+            parameters,
+            [this](int stripIndex, const juce::File& sampleFile)
+            {
+                loadSampleToStrip(stripIndex, sampleFile);
+            });
 
-    if (PresetStore::presetExists(presetIndex))
-        loadedPresetIndex = presetIndex;
-    presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+        if (PresetStore::presetExists(presetIndex))
+            loadedPresetIndex = presetIndex;
+        presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+    }
+    catch (const std::exception& e)
+    {
+        DBG("loadPreset exception for slot " << presetIndex << ": " << e.what());
+    }
+    catch (...)
+    {
+        DBG("loadPreset exception for slot " << presetIndex << ": unknown");
+    }
 }
 
 bool MlrVSTAudioProcessor::deletePreset(int presetIndex)
 {
-    const bool deleted = PresetStore::deletePreset(presetIndex);
-    if (deleted && loadedPresetIndex == presetIndex)
-        loadedPresetIndex = -1;
-    return deleted;
+    try
+    {
+        const bool deleted = PresetStore::deletePreset(presetIndex);
+        if (deleted && loadedPresetIndex == presetIndex)
+            loadedPresetIndex = -1;
+        return deleted;
+    }
+    catch (...)
+    {
+        return false;
+    }
 }
 
 juce::String MlrVSTAudioProcessor::getPresetName(int presetIndex) const
@@ -1945,15 +1962,29 @@ juce::String MlrVSTAudioProcessor::getPresetName(int presetIndex) const
 
 bool MlrVSTAudioProcessor::setPresetName(int presetIndex, const juce::String& name)
 {
-    const bool ok = PresetStore::setPresetName(presetIndex, name);
-    if (ok)
-        presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
-    return ok;
+    try
+    {
+        const bool ok = PresetStore::setPresetName(presetIndex, name);
+        if (ok)
+            presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+        return ok;
+    }
+    catch (...)
+    {
+        return false;
+    }
 }
 
 bool MlrVSTAudioProcessor::presetExists(int presetIndex) const
 {
-    return PresetStore::presetExists(presetIndex);
+    try
+    {
+        return PresetStore::presetExists(presetIndex);
+    }
+    catch (...)
+    {
+        return false;
+    }
 }
 
 //==============================================================================

@@ -159,20 +159,22 @@ void Crossfader::reset(int sampleRate)
     currentGain = 1.0f;
 }
 
-void Crossfader::startFade(bool fadeIn, int numSamples)
+void Crossfader::startFade(bool fadeIn, int numSamples, bool forceRestartFromEdge)
 {
     if (numSamples < 0)
         numSamples = 256; // Default fade length
     
     targetGain = fadeIn ? 1.0f : 0.0f;
     
-    // CRITICAL: Start from current gain, don't reset!
-    // This prevents clicks when retriggering
-    // (old code: currentGain = fadeIn ? 0.0f : 1.0f;)
     float startGain = currentGain.load();
-    
-    // If not active, initialize to opposite of target
-    if (!active)
+
+    // Row retriggers should always ramp from an edge so the trigger-fade
+    // time remains audible and deterministic at every retrigger.
+    if (forceRestartFromEdge)
+    {
+        startGain = fadeIn ? 0.0f : 1.0f;
+    }
+    else if (!active)
     {
         startGain = fadeIn ? 0.0f : 1.0f;
     }
@@ -1026,6 +1028,13 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
 {
     currentSampleRate = sampleRate;
     crossfader.reset(static_cast<int>(sampleRate));
+    triggerOutputBlendActive = false;
+    triggerOutputBlendSamplesRemaining = 0;
+    triggerOutputBlendTotalSamples = 0;
+    triggerOutputBlendStartL = 0.0f;
+    triggerOutputBlendStartR = 0.0f;
+    lastOutputSampleL = 0.0f;
+    lastOutputSampleR = 0.0f;
     
     // Initialize step sampler
     stepSampler.prepareToPlay(sampleRate, maxBlockSize);
@@ -1113,6 +1122,13 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
 void EnhancedAudioStrip::loadSample(const juce::AudioBuffer<float>& buffer, double sourceRate)
 {
     juce::ScopedLock lock(bufferLock);
+    triggerOutputBlendActive = false;
+    triggerOutputBlendSamplesRemaining = 0;
+    triggerOutputBlendTotalSamples = 0;
+    triggerOutputBlendStartL = 0.0f;
+    triggerOutputBlendStartR = 0.0f;
+    lastOutputSampleL = 0.0f;
+    lastOutputSampleR = 0.0f;
     
     // Safety check
     if (buffer.getNumSamples() == 0)
@@ -1420,6 +1436,55 @@ double EnhancedAudioStrip::getWrappedSamplePosition(double samplePos, double loo
     if (posInLoop < 0.0)
         posInLoop += loopLengthSafe;
     return loopStartSamples + posInLoop;
+}
+
+double EnhancedAudioStrip::snapToNearestZeroCrossing(double targetPos, int radiusSamples) const
+{
+    const int numChannels = sampleBuffer.getNumChannels();
+    const int totalSamples = sampleBuffer.getNumSamples();
+    if (numChannels <= 0 || totalSamples < 2 || radiusSamples <= 0)
+        return juce::jlimit(0.0, juce::jmax(0.0, sampleLength - 1.0), targetPos);
+
+    const int center = juce::jlimit(1, totalSamples - 2, static_cast<int>(std::lround(targetPos)));
+    const int radius = juce::jlimit(1, totalSamples - 2, radiusSamples);
+    const int channelsToCheck = juce::jmin(2, numChannels);
+
+    auto sampleAt = [&](int idx) -> float
+    {
+        float sum = 0.0f;
+        for (int ch = 0; ch < channelsToCheck; ++ch)
+            sum += sampleBuffer.getSample(ch, juce::jlimit(0, totalSamples - 1, idx));
+        return sum / static_cast<float>(channelsToCheck);
+    };
+
+    int bestIndex = center;
+    float bestAbs = std::abs(sampleAt(center));
+
+    for (int d = 0; d <= radius; ++d)
+    {
+        const int candidates[2] = { center - d, center + d };
+        for (int c = 0; c < 2; ++c)
+        {
+            const int idx = candidates[c];
+            if (idx <= 0 || idx >= (totalSamples - 1))
+                continue;
+
+            const float prev = sampleAt(idx - 1);
+            const float curr = sampleAt(idx);
+            const float absCurr = std::abs(curr);
+
+            if ((prev <= 0.0f && curr >= 0.0f) || (prev >= 0.0f && curr <= 0.0f))
+                return static_cast<double>(idx);
+
+            if (absCurr < bestAbs)
+            {
+                bestAbs = absCurr;
+                bestIndex = idx;
+            }
+        }
+    }
+
+    return static_cast<double>(bestIndex);
 }
 
 void EnhancedAudioStrip::resetGrainState()
@@ -3920,6 +3985,18 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
 
         // Get crossfade value (for triggers)
         float fadeValue = crossfader.isActive() ? crossfader.getNextValue() : 1.0f;
+        if (stopAfterFade && !crossfader.isActive() && fadeValue <= 1.0e-4f)
+        {
+            stopAfterFade = false;
+            playing = false;
+            playbackPosition = 0.0;
+            scrubActive = false;
+            tapeStopActive = false;
+            scratchGestureActive = false;
+            buttonHeld = false;
+            heldButton = -1;
+            break;
+        }
         
         // INNER LOOP CROSSFADE:
         // Blend BEFORE loop start (pre-roll) into end of loop
@@ -4034,6 +4111,52 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             rightSample = rightSource * rightGain;
         }
         
+        if (retriggerBlendActive
+            && retriggerBlendSamplesRemaining > 0
+            && retriggerBlendTotalSamples > 0
+            && playMode != PlayMode::Step
+            && playMode != PlayMode::Grain)
+        {
+            float oldLeft = 0.0f;
+            float oldRight = 0.0f;
+            const double oldPos = retriggerBlendOldPosition;
+
+            if (numChannels == 1)
+            {
+                const float monoOld = resampler.getSample(sampleBuffer, 0, oldPos, playbackSpeed);
+                oldLeft = monoOld * leftGain;
+                oldRight = monoOld * rightGain;
+            }
+            else if (numChannels == 2)
+            {
+                oldLeft = resampler.getSample(sampleBuffer, 0, oldPos, playbackSpeed) * leftGain;
+                oldRight = resampler.getSample(sampleBuffer, 1, oldPos, playbackSpeed) * rightGain;
+            }
+
+            const float progress = 1.0f - (static_cast<float>(retriggerBlendSamplesRemaining)
+                                           / static_cast<float>(retriggerBlendTotalSamples));
+            const float x = juce::jlimit(0.0f, 1.0f, progress);
+            const float inGain = std::sin(juce::MathConstants<float>::halfPi * x);
+            const float outGain = std::cos(juce::MathConstants<float>::halfPi * x);
+
+            leftSample = (leftSample * inGain) + (oldLeft * outGain);
+            rightSample = (rightSample * inGain) + (oldRight * outGain);
+
+            const double oldAdvance = std::isfinite(effectiveSpeed) ? effectiveSpeed : 0.0;
+            if (playMode == PlayMode::OneShot)
+                retriggerBlendOldPosition = juce::jlimit(0.0, juce::jmax(0.0, sampleLength - 1.0), oldPos + oldAdvance);
+            else
+                retriggerBlendOldPosition = getWrappedSamplePosition(oldPos + oldAdvance, loopStartSamples, loopLength);
+
+            --retriggerBlendSamplesRemaining;
+            if (retriggerBlendSamplesRemaining <= 0)
+            {
+                retriggerBlendActive = false;
+                retriggerBlendSamplesRemaining = 0;
+                retriggerBlendTotalSamples = 0;
+            }
+        }
+
         // Apply volume and crossfade
         float finalGainLeft = currentVol * fadeValue;
         float finalGainRight = currentVol * fadeValue;
@@ -4064,9 +4187,36 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         if (!std::isfinite(rightSample)) rightSample = 0.0f;
         if (!std::isfinite(finalGainLeft)) finalGainLeft = 0.0f;
         if (!std::isfinite(finalGainRight)) finalGainRight = 0.0f;
-        
-        output.addSample(0, startSample + i, leftSample * finalGainLeft);
-        output.addSample(1, startSample + i, rightSample * finalGainRight);
+
+        float outL = leftSample * finalGainLeft;
+        float outR = rightSample * finalGainRight;
+
+        if (triggerOutputBlendActive
+            && triggerOutputBlendSamplesRemaining > 0
+            && triggerOutputBlendTotalSamples > 0)
+        {
+            const float progress = 1.0f - (static_cast<float>(triggerOutputBlendSamplesRemaining)
+                                           / static_cast<float>(triggerOutputBlendTotalSamples));
+            const float t = juce::jlimit(0.0f, 1.0f, progress);
+            outL = (triggerOutputBlendStartL * (1.0f - t)) + (outL * t);
+            outR = (triggerOutputBlendStartR * (1.0f - t)) + (outR * t);
+
+            --triggerOutputBlendSamplesRemaining;
+            if (triggerOutputBlendSamplesRemaining <= 0)
+            {
+                triggerOutputBlendActive = false;
+                triggerOutputBlendSamplesRemaining = 0;
+                triggerOutputBlendTotalSamples = 0;
+            }
+        }
+
+        if (!std::isfinite(outL)) outL = 0.0f;
+        if (!std::isfinite(outR)) outR = 0.0f;
+
+        output.addSample(0, startSample + i, outL);
+        output.addSample(1, startSample + i, outR);
+        lastOutputSampleL = outL;
+        lastOutputSampleR = outR;
     }
 }
 }  // Extra closing brace to fix imbalance
@@ -4074,6 +4224,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
 void EnhancedAudioStrip::trigger(int column, double tempo, bool quantized)
 {
     juce::ScopedLock lock(bufferLock);
+    const bool wasPlaying = playing;
 
     (void) tempo;
     (void) quantized;
@@ -4094,7 +4245,46 @@ void EnhancedAudioStrip::trigger(int column, double tempo, bool quantized)
     loopLengthSamples = (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
     
     double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
-    const double newTargetPosition = getTriggerTargetPositionForColumn(column, loopStartSamples, loopLengthSamples);
+    const double rawTargetPosition = getTriggerTargetPositionForColumn(column, loopStartSamples, loopLengthSamples);
+    const int zeroSnapRadius = juce::jmax(8, static_cast<int>(currentSampleRate * 0.0007)); // ~0.7ms
+    const double newTargetPosition = snapToNearestZeroCrossing(rawTargetPosition, zeroSnapRadius);
+
+    // Crossfade old read-head into new trigger target to reduce retrigger clicks
+    // on sustained material without altering PPQ timeline math.
+    if (wasPlaying && sampleLength > 1.0 && playMode != PlayMode::Step && playMode != PlayMode::Grain)
+    {
+        const float triggerFadeMs = triggerFadeInMs.load(std::memory_order_acquire);
+        if (retriggerBlendActive && retriggerBlendSamplesRemaining > 0 && retriggerBlendTotalSamples > 0)
+        {
+            const float progress = 1.0f - (static_cast<float>(retriggerBlendSamplesRemaining)
+                                           / static_cast<float>(retriggerBlendTotalSamples));
+            const float x = juce::jlimit(0.0f, 1.0f, progress);
+            const float inGain = std::sin(juce::MathConstants<float>::halfPi * x);
+            const float outGain = std::cos(juce::MathConstants<float>::halfPi * x);
+            const double newPos = playbackPosition.load(std::memory_order_acquire);
+            retriggerBlendOldPosition = (retriggerBlendOldPosition * static_cast<double>(outGain))
+                                      + (newPos * static_cast<double>(inGain));
+        }
+        else
+            retriggerBlendOldPosition = playbackPosition.load(std::memory_order_acquire);
+        retriggerBlendTotalSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
+        retriggerBlendSamplesRemaining = retriggerBlendTotalSamples;
+        retriggerBlendActive = true;
+        triggerOutputBlendTotalSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
+        triggerOutputBlendSamplesRemaining = triggerOutputBlendTotalSamples;
+        triggerOutputBlendStartL = lastOutputSampleL;
+        triggerOutputBlendStartR = lastOutputSampleR;
+        triggerOutputBlendActive = true;
+    }
+    else
+    {
+        retriggerBlendActive = false;
+        retriggerBlendSamplesRemaining = 0;
+        retriggerBlendTotalSamples = 0;
+        triggerOutputBlendActive = false;
+        triggerOutputBlendSamplesRemaining = 0;
+        triggerOutputBlendTotalSamples = 0;
+    }
     playbackPosition = newTargetPosition;
     triggerOffsetRatio = juce::jlimit(0.0, 0.999999, (newTargetPosition - loopStartSamples) / juce::jmax(1.0, loopLengthSamples));
 
@@ -4105,6 +4295,7 @@ void EnhancedAudioStrip::trigger(int column, double tempo, bool quantized)
         updateGrainHeldLedState();
     }
     
+    stopAfterFade = false;
     playing = true;
     
     // DEBUG: Log that strip was triggered
@@ -4120,17 +4311,18 @@ void EnhancedAudioStrip::trigger(int column, double tempo, bool quantized)
         stream.writeText(logMsg, false, false, nullptr);
     }
     
-    // Minimal 1-sample crossfade for sample-accurate, click-free retriggering
-    // Since we trigger at EXACT grid positions (PPQ-locked), we don't need
-    // a long fade - just 1 sample to prevent the tiniest click
-    int fadeSamples = 1;
-    crossfader.startFade(true, fadeSamples);
+    // Configurable fade-in to suppress discontinuities on sustained material retriggers.
+    const float triggerFadeMs = triggerFadeInMs.load(std::memory_order_acquire);
+    int fadeSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
+    if (!wasPlaying)
+        crossfader.startFade(true, fadeSamples, true);
 }
 
 void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globalSample,
                                          const juce::AudioPlayHead::PositionInfo& positionInfo)
 {
     juce::ScopedLock lock(bufferLock);
+    const bool wasPlaying = playing;
 
     // STEP SEQUENCER MODE
     if (playMode == PlayMode::Step)
@@ -4167,7 +4359,9 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         // One-shot should be trigger-relative and must not be phase-wrapped
         // to host timeline. Loop/Gate keep timeline anchoring.
         const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
-        const double triggerTargetPos = getTriggerTargetPositionForColumn(column, loopStartSamples, loopLengthSamples);
+        const double rawTriggerTargetPos = getTriggerTargetPositionForColumn(column, loopStartSamples, loopLengthSamples);
+        const int zeroSnapRadius = juce::jmax(8, static_cast<int>(currentSampleRate * 0.0007)); // ~0.7ms
+        const double triggerTargetPos = snapToNearestZeroCrossing(rawTriggerTargetPos, zeroSnapRadius);
         triggerOffsetRatio = juce::jlimit(0.0, 0.999999, (triggerTargetPos - loopStartSamples) / juce::jmax(1.0, loopLengthSamples));
 
         if (playMode != PlayMode::OneShot)
@@ -4220,11 +4414,51 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
     
     // Calculate target position for this column
     const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
-    const double newTargetPosition = getTriggerTargetPositionForColumn(column, loopStartSamples, loopLengthSamples);
+    const double rawTargetPosition = getTriggerTargetPositionForColumn(column, loopStartSamples, loopLengthSamples);
+    const int zeroSnapRadius = juce::jmax(8, static_cast<int>(currentSampleRate * 0.0007)); // ~0.7ms
+    const double newTargetPosition = snapToNearestZeroCrossing(rawTargetPosition, zeroSnapRadius);
+
+    // Crossfade old read-head into new trigger target to reduce retrigger clicks
+    // on sustained material without altering PPQ timeline math.
+    if (wasPlaying && sampleLength > 1.0 && playMode != PlayMode::Step && playMode != PlayMode::Grain)
+    {
+        const float triggerFadeMs = triggerFadeInMs.load(std::memory_order_acquire);
+        if (retriggerBlendActive && retriggerBlendSamplesRemaining > 0 && retriggerBlendTotalSamples > 0)
+        {
+            const float progress = 1.0f - (static_cast<float>(retriggerBlendSamplesRemaining)
+                                           / static_cast<float>(retriggerBlendTotalSamples));
+            const float x = juce::jlimit(0.0f, 1.0f, progress);
+            const float inGain = std::sin(juce::MathConstants<float>::halfPi * x);
+            const float outGain = std::cos(juce::MathConstants<float>::halfPi * x);
+            const double newPos = playbackPosition.load(std::memory_order_acquire);
+            retriggerBlendOldPosition = (retriggerBlendOldPosition * static_cast<double>(outGain))
+                                      + (newPos * static_cast<double>(inGain));
+        }
+        else
+            retriggerBlendOldPosition = playbackPosition.load(std::memory_order_acquire);
+        retriggerBlendTotalSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
+        retriggerBlendSamplesRemaining = retriggerBlendTotalSamples;
+        retriggerBlendActive = true;
+        triggerOutputBlendTotalSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
+        triggerOutputBlendSamplesRemaining = triggerOutputBlendTotalSamples;
+        triggerOutputBlendStartL = lastOutputSampleL;
+        triggerOutputBlendStartR = lastOutputSampleR;
+        triggerOutputBlendActive = true;
+    }
+    else
+    {
+        retriggerBlendActive = false;
+        retriggerBlendSamplesRemaining = 0;
+        retriggerBlendTotalSamples = 0;
+        triggerOutputBlendActive = false;
+        triggerOutputBlendSamplesRemaining = 0;
+        triggerOutputBlendTotalSamples = 0;
+    }
     triggerOffsetRatio = juce::jlimit(0.0, 0.999999, (newTargetPosition - loopStartSamples) / juce::jmax(1.0, loopLengthSamples));
 
     if (playMode == PlayMode::Grain)
     {
+        stopAfterFade = false;
         playing = true;
         triggerSample = globalSample;
         const float grainScratch = scratchAmount.load(std::memory_order_acquire);
@@ -4384,6 +4618,7 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         rateSmoother.setCurrentAndTargetValue(1.0);
     }
     
+    stopAfterFade = false;
     playing = true;
     
     // Check for potential double triggers (debug)
@@ -4414,10 +4649,11 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         stream.writeText(logMsg, false, false, nullptr);
     }
     
-    // 10ms microfade for click-free retriggering
-    // Starts from current gain level (no discontinuity)
-    int fadeSamples = static_cast<int>(currentSampleRate * 0.010);
-    crossfader.startFade(true, fadeSamples);
+    // Configurable trigger fade-in for sustained/phase-misaligned retriggers.
+    const float triggerFadeMs = triggerFadeInMs.load(std::memory_order_acquire);
+    int fadeSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
+    if (!wasPlaying)
+        crossfader.startFade(true, fadeSamples, true);
 }
 
 void EnhancedAudioStrip::onButtonPress(int column, int64_t globalSample)
@@ -5169,24 +5405,35 @@ void EnhancedAudioStrip::stop(bool immediate)
 {
     juce::ScopedLock lock(bufferLock);
 
+    retriggerBlendActive = false;
+    retriggerBlendSamplesRemaining = 0;
+    retriggerBlendTotalSamples = 0;
+    triggerOutputBlendActive = false;
+    triggerOutputBlendSamplesRemaining = 0;
+    triggerOutputBlendTotalSamples = 0;
+
     if (immediate)
     {
+        stopAfterFade = false;
         playing = false;
         playbackPosition = 0.0;
+        lastOutputSampleL = 0.0f;
+        lastOutputSampleR = 0.0f;
         resetGrainState();
     }
     else
     {
-        // 128 sample microfade out for click-free stopping (~2.9ms @ 44.1kHz, ~2.7ms @ 48kHz)
-        int fadeSamples = 128;
+        // Keep choke/stop release independent from trigger fade-in control.
+        int fadeSamples = juce::jmax(128, static_cast<int>(currentSampleRate * 0.006)); // ~6ms
+        stopAfterFade = true;
         crossfader.startFade(false, fadeSamples);
-        // Will stop when fade completes
     }
 }
 
 void EnhancedAudioStrip::startStepSequencer()
 {
     // Step sequencer runs with global clock, not manual triggers
+    stopAfterFade = false;
     playing = true;
     playbackPosition = 0.0;
     currentStep = 0;
@@ -5245,6 +5492,79 @@ void EnhancedAudioStrip::setPlaybackMarkerColumn(int column, int64_t currentGlob
     triggerSample = currentGlobalSample;
     triggerOffsetRatio = (playbackPosition.load() - loopStartSamples) / loopLength;
     triggerOffsetRatio = juce::jlimit(0.0, 0.999999, triggerOffsetRatio);
+}
+
+void EnhancedAudioStrip::restorePresetPpqState(bool shouldPlay,
+                                               bool timelineAnchored,
+                                               double timelineOffsetBeats,
+                                               int fallbackColumn,
+                                               double tempo,
+                                               double currentTimelineBeat,
+                                               int64_t currentGlobalSample)
+{
+    if (sampleLength <= 0.0)
+        return;
+
+    if (!shouldPlay)
+    {
+        setPlaybackMarkerColumn(fallbackColumn, currentGlobalSample);
+        stop(true);
+        return;
+    }
+
+    if (!timelineAnchored || !std::isfinite(timelineOffsetBeats) || tempo <= 0.0 || !std::isfinite(currentTimelineBeat))
+    {
+        juce::AudioPlayHead::PositionInfo posInfo;
+        posInfo.setPpqPosition(currentTimelineBeat);
+        triggerAtSample(fallbackColumn, tempo, currentGlobalSample, posInfo);
+        return;
+    }
+
+    juce::ScopedLock lock(bufferLock);
+
+    const int clampedColumn = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, fallbackColumn);
+    int loopCols = loopEnd - loopStart;
+    if (loopCols <= 0)
+        loopCols = ModernAudioEngine::MaxColumns;
+
+    const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
+    const double loopLength = (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
+    if (loopLength <= 0.0)
+        return;
+
+    const float manualBeats = beatsPerLoop.load(std::memory_order_acquire);
+    const double beatsForLoop = (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0;
+    if (beatsForLoop <= 0.0)
+        return;
+
+    // Restore timeline-relative anchor (offset from host PPQ), not absolute playback sample.
+    ppqTimelineAnchored = true;
+    ppqTimelineOffsetBeats = std::fmod(timelineOffsetBeats, beatsForLoop);
+    if (ppqTimelineOffsetBeats < 0.0)
+        ppqTimelineOffsetBeats += beatsForLoop;
+
+    triggerColumn = clampedColumn;
+    triggerSample = currentGlobalSample;
+    triggerPpqPosition = currentTimelineBeat;
+    lastTriggerPPQ = triggerPpqPosition;
+    playheadSample = 0;
+    loopLengthSamples = loopLength;
+
+    const double timelineBeats = currentTimelineBeat + ppqTimelineOffsetBeats;
+    const double timelinePosition = (timelineBeats / beatsForLoop) * sampleLength;
+    const double mappedPos = getWrappedSamplePosition(loopStartSamples + timelinePosition, loopStartSamples, loopLength);
+    playbackPosition = juce::jlimit(0.0, juce::jmax(0.0, sampleLength - 1.0), mappedPos);
+    stopLoopPosition = playbackPosition.load();
+
+    double posInLoop = playbackPosition.load() - loopStartSamples;
+    posInLoop = std::fmod(posInLoop, loopLength);
+    if (posInLoop < 0.0)
+        posInLoop += loopLength;
+    triggerOffsetRatio = juce::jlimit(0.0, 0.999999, posInLoop / juce::jmax(1.0, loopLength));
+
+    stopAfterFade = false;
+    playing = true;
+    wasPlayingBeforeStop = false;
 }
 
 void EnhancedAudioStrip::setVolume(float vol)
@@ -5874,6 +6194,7 @@ void ModernAudioEngine::prepareToPlay(double sampleRate, int maxBlockSize)
     
     liveRecorder->prepareToPlay(sampleRate, maxBlockSize);
     setCrossfadeLengthMs(crossfadeLengthMs.load(std::memory_order_acquire));
+    setTriggerFadeInMs(triggerFadeInMs.load(std::memory_order_acquire));
 }
 
 void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer, 
@@ -6146,22 +6467,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
 
             if (auto* strip = getStrip(event.stripIndex))
             {
-                int groupId = strip->getGroup();
-                if (groupId >= 0 && groupId < MaxGroups && groups[static_cast<size_t>(groupId)])
-                {
-                    auto* group = groups[static_cast<size_t>(groupId)].get();
-                    if (group->isMuted())
-                        group->setMuted(false);
-
-                    auto stripIndices = group->getStrips();
-                    for (int otherStripIndex : stripIndices)
-                    {
-                        if (otherStripIndex == event.stripIndex)
-                            continue;
-                        if (auto* otherStrip = getStrip(otherStripIndex))
-                            otherStrip->stop(true);
-                    }
-                }
+                enforceGroupExclusivity(event.stripIndex, false);
 
                 auto triggerPosInfo = makeSegmentPositionInfo(eventOffset);
                 if (hasPpq)
@@ -6310,6 +6616,35 @@ void ModernAudioEngine::assignStripToGroup(int stripIndex, int groupIndex)
     }
 }
 
+void ModernAudioEngine::enforceGroupExclusivity(int activeStripIndex, bool immediateStop)
+{
+    auto* activeStrip = getStrip(activeStripIndex);
+    if (!activeStrip)
+        return;
+
+    const int groupId = activeStrip->getGroup();
+    if (groupId < 0 || groupId >= MaxGroups || !groups[static_cast<size_t>(groupId)])
+        return;
+
+    auto* group = groups[static_cast<size_t>(groupId)].get();
+    if (group->isMuted())
+        group->setMuted(false);
+
+    // Keep group membership coherent for dynamic reassignment paths (record/preset restore).
+    if (!group->containsStrip(activeStripIndex))
+        group->addStrip(activeStripIndex);
+
+    const auto& stripList = group->getStrips();
+    for (int otherStripIndex : stripList)
+    {
+        if (otherStripIndex == activeStripIndex)
+            continue;
+
+        if (auto* otherStrip = getStrip(otherStripIndex))
+            otherStrip->stop(immediateStop);
+    }
+}
+
 void ModernAudioEngine::setQuantization(int division)
 {
     quantizeClock.setQuantization(division);
@@ -6336,25 +6671,8 @@ void ModernAudioEngine::triggerStripWithQuantization(int stripIndex, int column,
     }
     else
     {
-        // Immediate trigger - handle group choke
-        int groupId = strip->getGroup();
-        if (groupId >= 0 && groupId < MaxGroups && groups[static_cast<size_t>(groupId)])
-        {
-            // If group is muted, unmute it
-            if (groups[static_cast<size_t>(groupId)]->isMuted())
-                groups[static_cast<size_t>(groupId)]->setMuted(false);
-            
-            // Stop all OTHER strips in the same group
-            auto stripList = groups[static_cast<size_t>(groupId)]->getStrips();
-            for (int otherStripIndex : stripList)
-            {
-                if (otherStripIndex != stripIndex)
-                {
-                    if (auto* otherStrip = getStrip(otherStripIndex))
-                        otherStrip->stop(true);
-                }
-            }
-        }
+        // Immediate trigger - handle group choke with short fade to avoid clicks.
+        enforceGroupExclusivity(stripIndex, false);
         
         // Trigger immediately with current PPQ/sample so timeline anchor can be built.
         juce::AudioPlayHead::PositionInfo immediatePosInfo;
@@ -6397,6 +6715,18 @@ void ModernAudioEngine::setCrossfadeLengthMs(float ms)
     {
         if (strip)
             strip->setLoopCrossfadeLengthMs(clampedMs);
+    }
+}
+
+void ModernAudioEngine::setTriggerFadeInMs(float ms)
+{
+    const float clampedMs = juce::jlimit(0.1f, 120.0f, ms);
+    triggerFadeInMs.store(clampedMs, std::memory_order_release);
+
+    for (auto& strip : strips)
+    {
+        if (strip)
+            strip->setTriggerFadeInMs(clampedMs);
     }
 }
 

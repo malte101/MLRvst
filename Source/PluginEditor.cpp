@@ -3166,6 +3166,19 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(crossfadeLengthSlider);
     crossfadeLengthSlider.setTooltip("Loop/capture crossfade time in milliseconds.");
 
+    triggerFadeInLabel.setText("Trig Fade", juce::dontSendNotification);
+    triggerFadeInLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(triggerFadeInLabel);
+
+    triggerFadeInSlider.setSliderStyle(juce::Slider::Rotary);
+    triggerFadeInSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 50, 18);
+    triggerFadeInSlider.setRange(0.1, 120.0, 0.1);
+    triggerFadeInSlider.setValue(12.0);
+    enableAltClickReset(triggerFadeInSlider, 12.0);
+    triggerFadeInSlider.setTextValueSuffix(" ms");
+    addAndMakeVisible(triggerFadeInSlider);
+    triggerFadeInSlider.setTooltip("Fade-in time for Monome row strip triggers.");
+
     tooltipsToggle.setButtonText("Tooltips");
     tooltipsToggle.setClickingTogglesState(true);
     tooltipsToggle.setToggleState(false, juce::dontSendNotification);
@@ -3179,6 +3192,8 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     
     crossfadeLengthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
         processor.parameters, "crossfadeLength", crossfadeLengthSlider);
+    triggerFadeInAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "triggerFadeIn", triggerFadeInSlider);
 
     refreshFromProcessor();
 }
@@ -3633,6 +3648,13 @@ void GlobalControlPanel::resized()
     crossfadeLengthLabel.setBounds(crossfadeArea.removeFromTop(16));
     crossfadeArea.removeFromTop(2);
     crossfadeLengthSlider.setBounds(crossfadeArea.removeFromTop(70));
+    controlsArea.removeFromLeft(spacing);
+
+    // Trigger fade-in - compact knob
+    auto triggerFadeArea = controlsArea.removeFromLeft(knobWidth);
+    triggerFadeInLabel.setBounds(triggerFadeArea.removeFromTop(16));
+    triggerFadeArea.removeFromTop(2);
+    triggerFadeInSlider.setBounds(triggerFadeArea.removeFromTop(70));
     controlsArea.removeFromLeft(spacing);
     
     // Quantize - compact dropdown

@@ -10,6 +10,8 @@ static constexpr int kMaxPresetSlots = 16 * 7;
 namespace
 {
 constexpr const char* kEmbeddedSampleAttr = "embeddedSampleWavBase64";
+constexpr int kMaxEmbeddedBase64Chars = 64 * 1024 * 1024;
+constexpr size_t kMaxEmbeddedWavBytes = 48 * 1024 * 1024;
 
 struct GlobalParameterSnapshot
 {
@@ -19,6 +21,7 @@ struct GlobalParameterSnapshot
     float pitchSmoothing = 0.05f;
     float inputMonitor = 1.0f;
     float crossfadeMs = 10.0f;
+    float triggerFadeInMs = 12.0f;
 };
 
 GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeState& parameters)
@@ -36,6 +39,8 @@ GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeSta
         snapshot.inputMonitor = *p;
     if (auto* p = parameters.getRawParameterValue("crossfadeLength"))
         snapshot.crossfadeMs = *p;
+    if (auto* p = parameters.getRawParameterValue("triggerFadeIn"))
+        snapshot.triggerFadeInMs = *p;
     return snapshot;
 }
 
@@ -53,6 +58,8 @@ void restoreGlobalParameters(juce::AudioProcessorValueTreeState& parameters, con
         param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, snapshot.inputMonitor));
     if (auto* param = parameters.getParameter("crossfadeLength"))
         param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, (snapshot.crossfadeMs - 1.0f) / 49.0f));
+    if (auto* param = parameters.getParameter("triggerFadeIn"))
+        param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, (snapshot.triggerFadeInMs - 0.1f) / 119.9f));
 }
 
 juce::String encodeStepPatternBits(const std::array<bool, 64>& bits)
@@ -123,10 +130,11 @@ bool encodeBufferAsWavBase64(const juce::AudioBuffer<float>& buffer,
         || !std::isfinite(sampleRate) || sampleRate <= 1000.0)
         return false;
 
-    juce::MemoryOutputStream wavBytes;
+    auto wavBytes = std::make_unique<juce::MemoryOutputStream>();
+    auto* wavBytesRaw = wavBytes.get();
     juce::WavAudioFormat wavFormat;
     std::unique_ptr<juce::AudioFormatWriter> writer(
-        wavFormat.createWriterFor(&wavBytes,
+        wavFormat.createWriterFor(wavBytesRaw,
                                   sampleRate,
                                   static_cast<unsigned int>(buffer.getNumChannels()),
                                   24,
@@ -136,20 +144,29 @@ bool encodeBufferAsWavBase64(const juce::AudioBuffer<float>& buffer,
     if (!writer)
         return false;
 
+    // createWriterFor transfers stream ownership to the writer on success.
+    wavBytes.release();
+
     if (!writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples()))
         return false;
 
-    writer.reset();
+    writer->flush();
 
-    const auto data = wavBytes.getMemoryBlock();
+    const auto data = wavBytesRaw->getMemoryBlock();
     outBase64 = data.toBase64Encoding();
+    writer.reset();
     return outBase64.isNotEmpty();
 }
 
 bool decodeWavBase64ToStrip(const juce::String& base64Data, EnhancedAudioStrip& strip)
 {
+    if (base64Data.isEmpty() || base64Data.length() > kMaxEmbeddedBase64Chars)
+        return false;
+
     juce::MemoryBlock wavBytes;
     if (!wavBytes.fromBase64Encoding(base64Data) || wavBytes.getSize() == 0)
+        return false;
+    if (wavBytes.getSize() > kMaxEmbeddedWavBytes)
         return false;
 
     juce::WavAudioFormat wavFormat;
@@ -193,15 +210,17 @@ void savePreset(int presetIndex,
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots || audioEngine == nullptr || currentStripFiles == nullptr)
         return;
 
-    auto presetDir = getPresetDirectory();
-    if (!presetDir.exists())
-        presetDir.createDirectory();
+    try
+    {
+        auto presetDir = getPresetDirectory();
+        if (!presetDir.exists())
+            presetDir.createDirectory();
 
-    auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+        auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
 
-    juce::XmlElement preset("mlrVSTPreset");
-    preset.setAttribute("version", "1.0");
-    preset.setAttribute("index", presetIndex);
+        juce::XmlElement preset("mlrVSTPreset");
+        preset.setAttribute("version", "1.0");
+        preset.setAttribute("index", presetIndex);
 
     for (int i = 0; i < maxStrips; ++i)
     {
@@ -232,6 +251,10 @@ void savePreset(int presetIndex,
         stripXml->setAttribute("loopStart", strip->getLoopStart());
         stripXml->setAttribute("loopEnd", strip->getLoopEnd());
         stripXml->setAttribute("playMode", static_cast<int>(strip->getPlayMode()));
+        stripXml->setAttribute("isPlaying", strip->isPlaying());
+        stripXml->setAttribute("playbackColumn", strip->getCurrentColumn());
+        stripXml->setAttribute("ppqTimelineAnchored", strip->isPpqTimelineAnchored());
+        stripXml->setAttribute("ppqTimelineOffsetBeats", strip->getPpqTimelineOffsetBeats());
         stripXml->setAttribute("directionMode", static_cast<int>(strip->getDirectionMode()));
         stripXml->setAttribute("reversed", strip->isReversed());
         stripXml->setAttribute("group", strip->getGroup());
@@ -324,8 +347,17 @@ void savePreset(int presetIndex,
     if (auto* crossfade = parameters.getRawParameterValue("crossfadeLength"))
         globalsXml->setAttribute("crossfadeLength", *crossfade);
 
-    if (preset.writeTo(presetFile))
-        DBG("Preset " << (presetIndex + 1) << " saved: " << presetFile.getFullPathName());
+        if (preset.writeTo(presetFile))
+            DBG("Preset " << (presetIndex + 1) << " saved: " << presetFile.getFullPathName());
+    }
+    catch (const std::exception& e)
+    {
+        DBG("Preset save failed for slot " << (presetIndex + 1) << ": " << e.what());
+    }
+    catch (...)
+    {
+        DBG("Preset save failed for slot " << (presetIndex + 1) << ": unknown exception");
+    }
 }
 
 void loadPreset(int presetIndex,
@@ -337,8 +369,10 @@ void loadPreset(int presetIndex,
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots || audioEngine == nullptr)
         return;
 
-    auto presetDir = getPresetDirectory();
-    auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+    try
+    {
+        auto presetDir = getPresetDirectory();
+        auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
 
     if (!presetFile.existsAsFile())
     {
@@ -368,20 +402,20 @@ void loadPreset(int presetIndex,
         }
     }
 
-    const auto globalSnapshot = captureGlobalParameters(parameters);
+        const auto globalSnapshot = captureGlobalParameters(parameters);
 
-    if (auto* paramsXml = preset->getChildByName("ParametersState"))
-    {
-        auto state = juce::ValueTree::fromXml(*paramsXml);
-        if (state.isValid())
-            parameters.replaceState(state);
-    }
+        if (auto* paramsXml = preset->getChildByName("ParametersState"))
+        {
+            auto state = juce::ValueTree::fromXml(*paramsXml);
+            if (state.isValid())
+                parameters.replaceState(state);
+        }
 
-    // Preset recall should not overwrite global controls.
-    restoreGlobalParameters(parameters, globalSnapshot);
+        // Preset recall should not overwrite global controls.
+        restoreGlobalParameters(parameters, globalSnapshot);
 
-    for (auto* stripXml : preset->getChildWithTagNameIterator("Strip"))
-    {
+        for (auto* stripXml : preset->getChildWithTagNameIterator("Strip"))
+        {
         int stripIndex = stripXml->getIntAttribute("index");
         if (stripIndex < 0 || stripIndex >= maxStrips)
             continue;
@@ -409,46 +443,89 @@ void loadPreset(int presetIndex,
                 loadedStripAudio = decodeWavBase64ToStrip(embeddedSample, *strip);
         }
 
-        strip->setVolume(static_cast<float>(stripXml->getDoubleAttribute("volume", 1.0)));
-        strip->setPan(static_cast<float>(stripXml->getDoubleAttribute("pan", 0.0)));
-        strip->setPlaybackSpeed(static_cast<float>(stripXml->getDoubleAttribute("speed", 1.0)));
-        strip->setLoop(stripXml->getIntAttribute("loopStart", 0),
-                       stripXml->getIntAttribute("loopEnd", 16));
+        auto finiteFloat = [](double value, float fallback)
+        {
+            return std::isfinite(value) ? static_cast<float>(value) : fallback;
+        };
+        auto clampedFloat = [&](double value, float fallback, float minV, float maxV)
+        {
+            return juce::jlimit(minV, maxV, finiteFloat(value, fallback));
+        };
+        auto clampedInt = [](int value, int minV, int maxV, int fallback)
+        {
+            if (value < minV || value > maxV)
+                return fallback;
+            return value;
+        };
+
+        strip->setVolume(clampedFloat(stripXml->getDoubleAttribute("volume", 1.0), 1.0f, 0.0f, 1.0f));
+        strip->setPan(clampedFloat(stripXml->getDoubleAttribute("pan", 0.0), 0.0f, -1.0f, 1.0f));
+        strip->setPlaybackSpeed(clampedFloat(stripXml->getDoubleAttribute("speed", 1.0), 1.0f, 0.0f, 4.0f));
+        const int safeLoopStart = clampedInt(stripXml->getIntAttribute("loopStart", 0), 0, 15, 0);
+        const int safeLoopEnd = clampedInt(stripXml->getIntAttribute("loopEnd", 16), 1, 16, 16);
+        strip->setLoop(safeLoopStart, safeLoopEnd);
         strip->setPlayMode(static_cast<EnhancedAudioStrip::PlayMode>(
-            stripXml->getIntAttribute("playMode", 1)));
+            clampedInt(stripXml->getIntAttribute("playMode", 1), 0, 4, 1)));
         strip->setDirectionMode(static_cast<EnhancedAudioStrip::DirectionMode>(
-            stripXml->getIntAttribute("directionMode", 0)));
+            clampedInt(stripXml->getIntAttribute("directionMode", 0), 0, 5, 0)));
         strip->setReverse(stripXml->getBoolAttribute("reversed", false));
 
         int groupId = stripXml->getIntAttribute("group", -1);
         audioEngine->assignStripToGroup(stripIndex, groupId);
 
-        float beats = static_cast<float>(stripXml->getDoubleAttribute("beatsPerLoop", -1.0));
-        strip->setBeatsPerLoop(beats);
-        strip->setScratchAmount(static_cast<float>(stripXml->getDoubleAttribute("scratchAmount", 0.0)));
-        strip->setTransientSliceMode(stripXml->getBoolAttribute("transientSliceMode", false));
-        strip->setPitchShift(static_cast<float>(stripXml->getDoubleAttribute("pitchShift", 0.0)));
-        strip->setRecordingBars(stripXml->getIntAttribute("recordingBars", 1));
-        strip->setFilterEnabled(stripXml->getBoolAttribute("filterEnabled", false));
-        strip->setFilterFrequency(static_cast<float>(stripXml->getDoubleAttribute("filterFrequency", 20000.0)));
-        strip->setFilterResonance(static_cast<float>(stripXml->getDoubleAttribute("filterResonance", 0.707)));
-        strip->setFilterType(static_cast<EnhancedAudioStrip::FilterType>(
-            stripXml->getIntAttribute("filterType", 0)));
-        strip->setSwingAmount(static_cast<float>(stripXml->getDoubleAttribute("swingAmount", 0.0)));
-        strip->setGateAmount(static_cast<float>(stripXml->getDoubleAttribute("gateAmount", 0.0)));
-        strip->setGateSpeed(static_cast<float>(stripXml->getDoubleAttribute("gateSpeed", 4.0)));
-        strip->setGateEnvelope(static_cast<float>(stripXml->getDoubleAttribute("gateEnvelope", 0.5)));
-        strip->setGateShape(static_cast<EnhancedAudioStrip::GateShape>(
-            stripXml->getIntAttribute("gateShape", 0)));
+        const bool restorePlaying = stripXml->getBoolAttribute("isPlaying", false);
+        const int restoreMarkerColumn = clampedInt(stripXml->getIntAttribute("playbackColumn", safeLoopStart),
+                                                   0, ModernAudioEngine::MaxColumns - 1, safeLoopStart);
+        const bool restorePpqAnchored = stripXml->getBoolAttribute("ppqTimelineAnchored", false);
+        const double restorePpqOffsetBeats = stripXml->getDoubleAttribute("ppqTimelineOffsetBeats", 0.0);
+        const int64_t restoreGlobalSample = audioEngine->getGlobalSampleCount();
+        const double restoreTimelineBeat = audioEngine->getTimelineBeat();
+        const double restoreTempo = audioEngine->getCurrentTempo();
 
-        strip->setStepPatternBars(stripXml->getIntAttribute("stepPatternBars", 1));
-        strip->setStepPage(stripXml->getIntAttribute("stepViewPage", 0));
+        if (strip->hasAudio())
+        {
+            if (restorePlaying)
+                audioEngine->enforceGroupExclusivity(stripIndex, false);
+
+            strip->restorePresetPpqState(restorePlaying,
+                                         restorePpqAnchored,
+                                         restorePpqOffsetBeats,
+                                         restoreMarkerColumn,
+                                         restoreTempo,
+                                         restoreTimelineBeat,
+                                         restoreGlobalSample);
+        }
+        else
+        {
+            strip->stop(true);
+        }
+
+        float beats = finiteFloat(stripXml->getDoubleAttribute("beatsPerLoop", -1.0), -1.0f);
+        strip->setBeatsPerLoop(beats);
+        strip->setScratchAmount(clampedFloat(stripXml->getDoubleAttribute("scratchAmount", 0.0), 0.0f, 0.0f, 100.0f));
+        strip->setTransientSliceMode(stripXml->getBoolAttribute("transientSliceMode", false));
+        strip->setPitchShift(clampedFloat(stripXml->getDoubleAttribute("pitchShift", 0.0), 0.0f, -12.0f, 12.0f));
+        strip->setRecordingBars(clampedInt(stripXml->getIntAttribute("recordingBars", 1), 1, 8, 1));
+        strip->setFilterEnabled(stripXml->getBoolAttribute("filterEnabled", false));
+        strip->setFilterFrequency(clampedFloat(stripXml->getDoubleAttribute("filterFrequency", 20000.0), 20000.0f, 20.0f, 20000.0f));
+        strip->setFilterResonance(clampedFloat(stripXml->getDoubleAttribute("filterResonance", 0.707), 0.707f, 0.1f, 10.0f));
+        strip->setFilterType(static_cast<EnhancedAudioStrip::FilterType>(
+            clampedInt(stripXml->getIntAttribute("filterType", 0), 0, 2, 0)));
+        strip->setSwingAmount(clampedFloat(stripXml->getDoubleAttribute("swingAmount", 0.0), 0.0f, 0.0f, 1.0f));
+        strip->setGateAmount(clampedFloat(stripXml->getDoubleAttribute("gateAmount", 0.0), 0.0f, 0.0f, 1.0f));
+        strip->setGateSpeed(clampedFloat(stripXml->getDoubleAttribute("gateSpeed", 4.0), 4.0f, 0.25f, 16.0f));
+        strip->setGateEnvelope(clampedFloat(stripXml->getDoubleAttribute("gateEnvelope", 0.5), 0.5f, 0.0f, 1.0f));
+        strip->setGateShape(static_cast<EnhancedAudioStrip::GateShape>(
+            clampedInt(stripXml->getIntAttribute("gateShape", 0), 0, 2, 0)));
+
+        strip->setStepPatternBars(clampedInt(stripXml->getIntAttribute("stepPatternBars", 1), 1, 4, 1));
+        strip->setStepPage(clampedInt(stripXml->getIntAttribute("stepViewPage", 0), 0, 3, 0));
         strip->currentStep = juce::jmax(0, stripXml->getIntAttribute("stepCurrent", 0));
         decodeStepPatternBits(stripXml->getStringAttribute("stepPatternBits"), strip->stepPattern);
 
         strip->setGrainSizeMs(static_cast<float>(stripXml->getDoubleAttribute("grainSizeMs", strip->getGrainSizeMs())));
         strip->setGrainDensity(static_cast<float>(stripXml->getDoubleAttribute("grainDensity", strip->getGrainDensity())));
-        strip->setGrainPitch(static_cast<float>(stripXml->getDoubleAttribute("grainPitch", strip->getGrainPitch())));
+        strip->setGrainPitch(clampedFloat(stripXml->getDoubleAttribute("grainPitch", strip->getGrainPitch()), strip->getGrainPitch(), -48.0f, 48.0f));
         strip->setGrainPitchJitter(static_cast<float>(stripXml->getDoubleAttribute("grainPitchJitter", strip->getGrainPitchJitter())));
         strip->setGrainSpread(static_cast<float>(stripXml->getDoubleAttribute("grainSpread", strip->getGrainSpread())));
         strip->setGrainJitter(static_cast<float>(stripXml->getDoubleAttribute("grainJitter", strip->getGrainJitter())));
@@ -457,15 +534,15 @@ void loadPreset(int presetIndex,
         strip->setGrainCloudDepth(static_cast<float>(stripXml->getDoubleAttribute("grainCloudDepth", strip->getGrainCloudDepth())));
         strip->setGrainEmitterDepth(static_cast<float>(stripXml->getDoubleAttribute("grainEmitterDepth", strip->getGrainEmitterDepth())));
         strip->setGrainEnvelope(static_cast<float>(stripXml->getDoubleAttribute("grainEnvelope", strip->getGrainEnvelope())));
-        strip->setGrainArpMode(stripXml->getIntAttribute("grainArpMode", strip->getGrainArpMode()));
+        strip->setGrainArpMode(clampedInt(stripXml->getIntAttribute("grainArpMode", strip->getGrainArpMode()), 0, 5, strip->getGrainArpMode()));
         strip->setGrainTempoSyncEnabled(stripXml->getBoolAttribute("grainTempoSync", strip->isGrainTempoSyncEnabled()));
 
         audioEngine->setModTarget(stripIndex,
-            static_cast<ModernAudioEngine::ModTarget>(stripXml->getIntAttribute("modTarget", 0)));
+            static_cast<ModernAudioEngine::ModTarget>(clampedInt(stripXml->getIntAttribute("modTarget", 0), 0, 17, 0)));
         audioEngine->setModBipolar(stripIndex, stripXml->getBoolAttribute("modBipolar", false));
         audioEngine->setModCurveMode(stripIndex, stripXml->getBoolAttribute("modCurveMode", false));
-        audioEngine->setModDepth(stripIndex, static_cast<float>(stripXml->getDoubleAttribute("modDepth", 1.0)));
-        audioEngine->setModOffset(stripIndex, stripXml->getIntAttribute("modOffset", 0));
+        audioEngine->setModDepth(stripIndex, clampedFloat(stripXml->getDoubleAttribute("modDepth", 1.0), 1.0f, 0.0f, 1.0f));
+        audioEngine->setModOffset(stripIndex, clampedInt(stripXml->getIntAttribute("modOffset", 0), -15, 15, 0));
         std::array<float, ModernAudioEngine::ModSteps> modSteps{};
         decodeModSteps(stripXml->getStringAttribute("modSteps"), modSteps);
         for (int s = 0; s < ModernAudioEngine::ModSteps; ++s)
@@ -551,7 +628,16 @@ void loadPreset(int presetIndex,
         }
     }
 
-    DBG("Preset " << (presetIndex + 1) << " loaded");
+        DBG("Preset " << (presetIndex + 1) << " loaded");
+    }
+    catch (const std::exception& e)
+    {
+        DBG("Preset load failed for slot " << (presetIndex + 1) << ": " << e.what());
+    }
+    catch (...)
+    {
+        DBG("Preset load failed for slot " << (presetIndex + 1) << ": unknown exception");
+    }
 }
 
 juce::String getPresetName(int presetIndex)
@@ -577,22 +663,32 @@ bool setPresetName(int presetIndex, const juce::String& presetName)
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots)
         return false;
 
-    auto presetDir = getPresetDirectory();
-    auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
-    if (!presetFile.existsAsFile())
+    try
+    {
+        auto presetDir = getPresetDirectory();
+        auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+        if (!presetFile.existsAsFile())
+        {
+            if (!writeDefaultPresetFile(presetFile, presetIndex))
+                return false;
+        }
+
+        auto preset = juce::XmlDocument::parse(presetFile);
+        if (!preset || preset->getTagName() != "mlrVSTPreset")
+            return false;
+
+        const auto trimmed = presetName.trim();
+        if (trimmed.isNotEmpty())
+            preset->setAttribute("name", trimmed);
+        else
+            preset->removeAttribute("name");
+
+        return preset->writeTo(presetFile);
+    }
+    catch (...)
+    {
         return false;
-
-    auto preset = juce::XmlDocument::parse(presetFile);
-    if (!preset || preset->getTagName() != "mlrVSTPreset")
-        return false;
-
-    const auto trimmed = presetName.trim();
-    if (trimmed.isNotEmpty())
-        preset->setAttribute("name", trimmed);
-    else
-        preset->removeAttribute("name");
-
-    return preset->writeTo(presetFile);
+    }
 }
 
 bool presetExists(int presetIndex)
@@ -610,11 +706,18 @@ bool deletePreset(int presetIndex)
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots)
         return false;
 
-    auto presetDir = getPresetDirectory();
-    auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
-    if (!presetFile.existsAsFile())
-        return false;
+    try
+    {
+        auto presetDir = getPresetDirectory();
+        auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+        if (!presetFile.existsAsFile())
+            return false;
 
-    return presetFile.deleteFile();
+        return presetFile.deleteFile();
+    }
+    catch (...)
+    {
+        return false;
+    }
 }
 } // namespace PresetStore

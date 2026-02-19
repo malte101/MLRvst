@@ -437,6 +437,8 @@ private:
     // Loop crossfade control
     juce::Slider crossfadeLengthSlider;
     juce::Label crossfadeLengthLabel;
+    juce::Slider triggerFadeInSlider;
+    juce::Label triggerFadeInLabel;
     juce::ToggleButton tooltipsToggle;
     
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterVolumeAttachment;
@@ -444,6 +446,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> grainQualityAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> inputMonitorAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> crossfadeLengthAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> triggerFadeInAttachment;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GlobalControlPanel)
 };

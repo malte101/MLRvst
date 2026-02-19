@@ -73,7 +73,7 @@ public:
     Crossfader();
     
     void reset(int sampleRate);
-    void startFade(bool fadeIn, int numSamples = -1);
+    void startFade(bool fadeIn, int numSamples = -1, bool forceRestartFromEdge = false);
     float getNextValue();
     bool isActive() const { return active; }
     
@@ -400,6 +400,13 @@ public:
     void setLoop(int startColumn, int endColumn);
     void clearLoop();
     void setPlaybackMarkerColumn(int column, int64_t currentGlobalSample);
+    void restorePresetPpqState(bool shouldPlay,
+                               bool timelineAnchored,
+                               double timelineOffsetBeats,
+                               int fallbackColumn,
+                               double tempo,
+                               double currentTimelineBeat,
+                               int64_t currentGlobalSample);
     
     // Step sequencer control
     void startStepSequencer();  // Start step sequencer playback (auto-runs with clock)
@@ -439,6 +446,8 @@ public:
     void setTransientSliceMode(bool enabled);
     bool isTransientSliceMode() const { return transientSliceMode.load(std::memory_order_acquire); }
     std::array<int, 16> getSliceStartSamples(bool transientMode) const;
+    void setTriggerFadeInMs(float ms) { triggerFadeInMs.store(juce::jlimit(0.1f, 120.0f, ms), std::memory_order_release); }
+    float getTriggerFadeInMs() const { return triggerFadeInMs.load(std::memory_order_acquire); }
     
     // Musical scratching - button hold behaviors
     void onButtonPress(int column, int64_t globalSample);    // Called when Monome button pressed
@@ -585,6 +594,8 @@ public:
     bool isPlaying() const { return playing; }
     double getPlaybackPosition() const { return playbackPosition; }
     double getNormalizedPosition() const;
+    bool isPpqTimelineAnchored() const { return ppqTimelineAnchored; }
+    double getPpqTimelineOffsetBeats() const { return ppqTimelineOffsetBeats; }
     bool hasAudio() const { return sampleBuffer.getNumSamples() > 0; }
     const juce::AudioBuffer<float>* getAudioBuffer() const { return &sampleBuffer; }
     double getSourceSampleRate() const { return sourceSampleRate; }
@@ -671,6 +682,7 @@ private:
     std::atomic<bool> pendingTrigger{false};
     std::atomic<float> scratchAmount{0.0f};  // Per-strip scratch: 0-100%
     std::atomic<float> loopCrossfadeLengthMs{10.0f};
+    std::atomic<float> triggerFadeInMs{12.0f};
     std::atomic<bool> transientSliceMode{false};
     GrainParams grainParams;
     GrainGestureState grainGesture;
@@ -727,6 +739,18 @@ private:
     double stopLoopPosition = 0.0;    // Position in loop when stopped (for visual sync)
     bool lastHostPlayingState = true; // Track host transport state changes (start true to detect first stop)
     bool wasPlayingBeforeStop = false; // Track if strip was playing when host stopped (for auto-resume)
+    bool stopAfterFade = false; // Defer hard stop until fade-out reaches zero.
+    bool retriggerBlendActive = false;
+    int retriggerBlendSamplesRemaining = 0;
+    int retriggerBlendTotalSamples = 0;
+    double retriggerBlendOldPosition = 0.0;
+    bool triggerOutputBlendActive = false;
+    int triggerOutputBlendSamplesRemaining = 0;
+    int triggerOutputBlendTotalSamples = 0;
+    float triggerOutputBlendStartL = 0.0f;
+    float triggerOutputBlendStartR = 0.0f;
+    float lastOutputSampleL = 0.0f;
+    float lastOutputSampleR = 0.0f;
     int64_t playheadSample = 0;      // Samples since trigger (playhead position)
     
     // Key-press smoothing / scratching (clock-locked approach)
@@ -874,6 +898,7 @@ public:
     float getPanGain(int channel) const; // 0=left, 1=right
     void rebuildTransientSliceMap();
     double getTriggerTargetPositionForColumn(int column, double loopStartSamples, double loopLengthSamples) const;
+    double snapToNearestZeroCrossing(double targetPos, int radiusSamples) const;
     double getWrappedSamplePosition(double samplePos, double loopStartSamples, double loopLengthSamples) const;
     void resetGrainState();
     void setGrainCenterTarget(double targetSamplePos, bool proportionalRamp);
@@ -970,6 +995,7 @@ public:
     // Groups
     StripGroup* getGroup(int index);
     void assignStripToGroup(int stripIndex, int groupIndex);
+    void enforceGroupExclusivity(int activeStripIndex, bool immediateStop = false);
     
     // Quantization
     void setQuantization(int division);
@@ -1026,6 +1052,8 @@ public:
     float getInputMonitorVolume() const { return inputMonitorVolume; }
     void setCrossfadeLengthMs(float ms);
     float getCrossfadeLengthMs() const { return crossfadeLengthMs.load(std::memory_order_acquire); }
+    void setTriggerFadeInMs(float ms);
+    float getTriggerFadeInMs() const { return triggerFadeInMs.load(std::memory_order_acquire); }
     void setGlobalSwingDivision(EnhancedAudioStrip::SwingDivision division);
     EnhancedAudioStrip::SwingDivision getGlobalSwingDivision() const;
     
@@ -1065,6 +1093,7 @@ private:
     std::atomic<float> inputLevelL{0.0f};  // Input meter level left (0-1)
     std::atomic<float> inputLevelR{0.0f};  // Input meter level right (0-1)
     std::atomic<float> crossfadeLengthMs{10.0f}; // Inner-loop and capture-loop crossfade (ms)
+    std::atomic<float> triggerFadeInMs{12.0f}; // Trigger fade-in de-click time (ms)
     
     std::atomic<double> currentTempo{120.0};
     std::atomic<double> currentBeat{0.0};
