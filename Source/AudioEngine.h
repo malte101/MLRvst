@@ -423,10 +423,18 @@ public:
     void toggleStepAtIndex(int absoluteStep);
     
     void setBeatsPerLoop(float beats);  // Manual override: how many beats is this loop?
+    void setBeatsPerLoopAtPpq(float beats, double hostPpqNow);
     float getBeatsPerLoop() const { return beatsPerLoop.load(); }
     
     // Recording length per strip
-    void setRecordingBars(int bars) { recordingBars = juce::jlimit(1, 8, bars); }
+    void setRecordingBars(int bars)
+    {
+        const int clamped = juce::jlimit(1, 8, bars);
+        if (clamped <= 1) recordingBars = 1;
+        else if (clamped <= 2) recordingBars = 2;
+        else if (clamped <= 4) recordingBars = 4;
+        else recordingBars = 8;
+    }
     int getRecordingBars() const { return recordingBars; }
     
     // Parameters

@@ -183,6 +183,7 @@ public:
     void loadSampleToStrip(int stripIndex, const juce::File& file);
     void loadAdjacentFile(int stripIndex, int direction);  // Browse files
     void captureRecentAudioToStrip(int stripIndex);
+    void requestBarLengthChange(int stripIndex, int bars);
     void setPendingBarLengthApply(int stripIndex, bool pending);
     void triggerStrip(int stripIndex, int column);
     void stopStrip(int stripIndex);
@@ -271,6 +272,15 @@ private:
         double targetPpq = 0.0;
     };
 
+    struct PendingBarChange
+    {
+        bool active = false;
+        int bars = 1;
+        bool quantized = false;
+        double targetPpq = 0.0;
+        int quantizeDivision = 8;
+    };
+
     // Cached parameter pointers to avoid string lookups in processBlock
     std::atomic<float>* masterVolumeParam = nullptr;
     std::atomic<float>* quantizeParam = nullptr;
@@ -285,6 +295,8 @@ private:
     std::array<std::atomic<float>*, MaxStrips> stripPitchParams{};
     juce::CriticalSection pendingLoopChangeLock;
     std::array<PendingLoopChange, MaxStrips> pendingLoopChanges{};
+    juce::CriticalSection pendingBarChangeLock;
+    std::array<PendingBarChange, MaxStrips> pendingBarChanges{};
     std::array<bool, MaxStrips> pendingBarLengthApply{};
     
     double currentSampleRate = 44100.0;
@@ -342,6 +354,7 @@ private:
     int getQuantizeDivision() const;
     void queueLoopChange(int stripIndex, bool clearLoop, int startColumn, int endColumn, bool reverseDirection, int markerColumn = -1);
     void applyPendingLoopChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
+    void applyPendingBarChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
 
     // Row 0, col 8: global momentary scratch modifier.
     bool momentaryScratchHoldActive = false;

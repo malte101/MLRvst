@@ -5720,6 +5720,12 @@ void EnhancedAudioStrip::setLoop(int startColumn, int endColumn)
 
 void EnhancedAudioStrip::setBeatsPerLoop(float beats)
 {
+    const double hostPpqNow = lastObservedPpqValid ? lastObservedPPQ : std::numeric_limits<double>::quiet_NaN();
+    setBeatsPerLoopAtPpq(beats, hostPpqNow);
+}
+
+void EnhancedAudioStrip::setBeatsPerLoopAtPpq(float beats, double hostPpqNow)
+{
     juce::ScopedLock lock(bufferLock);
 
     const float previousManual = beatsPerLoop.load(std::memory_order_acquire);
@@ -5732,29 +5738,28 @@ void EnhancedAudioStrip::setBeatsPerLoop(float beats)
     beatsPerLoop.store(nextManual, std::memory_order_release);
 
     const double nextBeats = (nextManual >= 0.0f) ? static_cast<double>(nextManual) : 4.0;
-    if (!ppqTimelineAnchored || sampleLength <= 0.0 || nextBeats <= 0.0 || previousBeats <= 0.0 || !lastObservedPpqValid)
+    if (!ppqTimelineAnchored || sampleLength <= 0.0 || nextBeats <= 0.0 || previousBeats <= 0.0 || !std::isfinite(hostPpqNow))
         return;
 
-    int loopCols = loopEnd - loopStart;
-    if (loopCols <= 0)
-        loopCols = ModernAudioEngine::MaxColumns;
+    // Preserve phase from the PPQ anchor itself (same principle as preset restore),
+    // not from instantaneous playbackPosition which can be block-late.
+    double oldBeatInLoop = std::fmod(hostPpqNow + ppqTimelineOffsetBeats, previousBeats);
+    if (oldBeatInLoop < 0.0)
+        oldBeatInLoop += previousBeats;
+    const double normalizedPhase = oldBeatInLoop / previousBeats;
+    const double beatInLoopNew = normalizedPhase * nextBeats;
 
-    const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
-    const double loopLength = (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
-    if (loopLength <= 0.0)
-        return;
-
-    double posInLoop = playbackPosition.load(std::memory_order_acquire) - loopStartSamples;
-    posInLoop = std::fmod(posInLoop, loopLength);
-    if (posInLoop < 0.0)
-        posInLoop += loopLength;
-
-    const double beatInLoopNew = (posInLoop / loopLength) * nextBeats;
-    const double hostPpqNow = lastObservedPPQ;
     double newOffset = std::fmod(beatInLoopNew - hostPpqNow, nextBeats);
     if (newOffset < 0.0)
         newOffset += nextBeats;
     ppqTimelineOffsetBeats = newOffset;
+
+    // Keep fallback (non-PPQ) timing coherent with the remapped phase so
+    // temporary host-PPQ dropouts cannot introduce phase drift after bar changes.
+    triggerPpqPosition = hostPpqNow;
+    if (lastObservedPpqValid)
+        triggerSample = lastObservedGlobalSample;
+    triggerOffsetRatio = juce::jlimit(0.0, 0.999999, beatInLoopNew / nextBeats);
 }
 
 void EnhancedAudioStrip::clearLoop()
@@ -6891,7 +6896,12 @@ void ModernAudioEngine::loadSampleToStrip(int stripIndex, const juce::File& file
         const double sampleSeconds = static_cast<double>(loadedBuffer->getNumSamples()) / sourceRate;
         // Simple 4/4 detection: bars = seconds * BPM / (60 * 4).
         const double estimatedBars = (sampleSeconds * hostTempoNow) / 240.0;
-        const int detectedBars = juce::jlimit(1, 8, static_cast<int>(std::round(estimatedBars)));
+        int detectedBars = static_cast<int>(std::round(estimatedBars));
+        detectedBars = juce::jlimit(1, 8, detectedBars);
+        if (detectedBars <= 1) detectedBars = 1;
+        else if (detectedBars <= 2) detectedBars = 2;
+        else if (detectedBars <= 4) detectedBars = 4;
+        else detectedBars = 8;
 
         DBG("Bar detect strip " << stripIndex
             << " hostBpm=" << hostTempoNow

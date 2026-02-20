@@ -17,17 +17,7 @@ void handleButtonPress(MlrVSTAudioProcessor& processor, EnhancedAudioStrip& stri
         else if (x == 13) bars = 4;
         else if (x == 14) bars = 8;
 
-        strip.setRecordingBars(bars);
-
-        if (strip.hasAudio() && !strip.isPlaying())
-        {
-            strip.setBeatsPerLoop(static_cast<float>(bars * 4));
-            processor.setPendingBarLengthApply(stripIndex, false);
-        }
-        else if (strip.hasAudio())
-        {
-            processor.setPendingBarLengthApply(stripIndex, true);
-        }
+        processor.requestBarLengthChange(stripIndex, bars);
     }
     else if (x == 15)
     {

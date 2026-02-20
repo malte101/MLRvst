@@ -13,6 +13,15 @@
 
 namespace
 {
+int normalizeBarCountToSupported(int bars)
+{
+    const int clamped = juce::jlimit(1, 8, bars);
+    if (clamped <= 1) return 1;
+    if (clamped <= 2) return 2;
+    if (clamped <= 4) return 4;
+    return 8;
+}
+
 juce::String controlModeToKey(MlrVSTAudioProcessor::ControlMode mode)
 {
     switch (mode)
@@ -1056,6 +1065,7 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
 
     // Apply any pending loop enter/exit actions that were quantized to timeline.
     applyPendingLoopChanges(posInfo);
+    applyPendingBarChanges(posInfo);
 
     // Update strip parameters
     for (int i = 0; i < MaxStrips; ++i)
@@ -1179,6 +1189,79 @@ void MlrVSTAudioProcessor::setPendingBarLengthApply(int stripIndex, bool pending
         return;
 
     pendingBarLengthApply[static_cast<size_t>(stripIndex)] = pending;
+}
+
+void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
+{
+    if (!audioEngine || stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    auto* strip = audioEngine->getStrip(stripIndex);
+    if (!strip)
+        return;
+
+    const int clampedBars = normalizeBarCountToSupported(bars);
+    setPendingBarLengthApply(stripIndex, false);
+
+    if (!strip->hasAudio())
+    {
+        strip->setRecordingBars(clampedBars);
+        const juce::ScopedLock lock(pendingBarChangeLock);
+        pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
+        return;
+    }
+
+    if (!strip->isPlaying())
+    {
+        strip->setRecordingBars(clampedBars);
+        strip->setBeatsPerLoop(static_cast<float>(clampedBars * 4));
+        const juce::ScopedLock lock(pendingBarChangeLock);
+        pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
+        return;
+    }
+
+    const int quantizeDivision = getQuantizeDivision();
+    // Bar-change timing follows the global quantize grid selection directly.
+    const bool useQuantize = (quantizeDivision > 1);
+
+    double currentPpq = audioEngine->getTimelineBeat();
+    if (auto* playHead = getPlayHead())
+    {
+        if (auto position = playHead->getPosition())
+        {
+            if (position->getPpqPosition().hasValue())
+                currentPpq = *position->getPpqPosition();
+        }
+    }
+
+    // Strict PPQ safety: only accept live bar-change requests when we have a
+    // valid current PPQ and the strip is timeline-anchored.
+    if (!std::isfinite(currentPpq) || !strip->isPpqTimelineAnchored())
+    {
+        const juce::ScopedLock lock(pendingBarChangeLock);
+        pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
+        return;
+    }
+
+    const juce::ScopedLock lock(pendingBarChangeLock);
+    auto& pending = pendingBarChanges[static_cast<size_t>(stripIndex)];
+    pending.active = true;
+    pending.bars = clampedBars;
+    pending.quantized = useQuantize;
+    pending.quantizeDivision = quantizeDivision;
+    pending.targetPpq = std::numeric_limits<double>::quiet_NaN();
+
+    if (!pending.quantized)
+        return;
+
+    if (!std::isfinite(currentPpq))
+        return;
+
+    const double quantBeats = 4.0 / static_cast<double>(pending.quantizeDivision);
+    double targetPpq = std::ceil(currentPpq / quantBeats) * quantBeats;
+    if (targetPpq <= (currentPpq + 1.0e-6))
+        targetPpq += quantBeats;
+    pending.targetPpq = std::round(targetPpq / quantBeats) * quantBeats;
 }
 
 int MlrVSTAudioProcessor::getQuantizeDivision() const
@@ -1336,6 +1419,77 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
         const bool markerApplied = (change.clear && change.markerColumn >= 0);
         if (!markerApplied && strip->isPlaying() && strip->hasAudio())
             strip->snapToTimeline(currentGlobalSample);
+    }
+}
+
+void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::PositionInfo& posInfo)
+{
+    if (!audioEngine)
+        return;
+
+    double currentPpq = audioEngine->getTimelineBeat();
+    if (posInfo.getPpqPosition().hasValue())
+        currentPpq = *posInfo.getPpqPosition();
+
+    std::array<PendingBarChange, MaxStrips> readyChanges{};
+    {
+        const juce::ScopedLock lock(pendingBarChangeLock);
+        for (int i = 0; i < MaxStrips; ++i)
+        {
+            auto& pending = pendingBarChanges[static_cast<size_t>(i)];
+            if (!pending.active)
+                continue;
+
+            if (pending.quantized && !std::isfinite(pending.targetPpq))
+            {
+                if (!std::isfinite(currentPpq))
+                    continue;
+
+                const int division = juce::jmax(1, pending.quantizeDivision);
+                const double quantBeats = 4.0 / static_cast<double>(division);
+                double targetPpq = std::ceil(currentPpq / quantBeats) * quantBeats;
+                if (targetPpq <= (currentPpq + 1.0e-6))
+                    targetPpq += quantBeats;
+                pending.targetPpq = std::round(targetPpq / quantBeats) * quantBeats;
+            }
+
+            bool canApplyNow = false;
+            if (!pending.quantized)
+            {
+                canApplyNow = std::isfinite(currentPpq);
+            }
+            else if (std::isfinite(currentPpq) && std::isfinite(pending.targetPpq))
+            {
+                canApplyNow = (currentPpq + 1.0e-6 >= pending.targetPpq);
+            }
+
+            if (!canApplyNow)
+                continue;
+
+            readyChanges[static_cast<size_t>(i)] = pending;
+            pending.active = false;
+        }
+    }
+
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        const auto& change = readyChanges[static_cast<size_t>(i)];
+        if (!change.active)
+            continue;
+
+        auto* strip = audioEngine->getStrip(i);
+        if (!strip || !strip->hasAudio() || !strip->isPlaying())
+            continue;
+
+        // Strict PPQ safety: if we cannot prove a stable PPQ anchor now, reject
+        // this pending change and require an explicit retry.
+        if (!std::isfinite(currentPpq) || !strip->isPpqTimelineAnchored())
+            continue;
+
+        const int bars = normalizeBarCountToSupported(change.bars);
+        const double applyPpq = currentPpq;
+        strip->setRecordingBars(bars);
+        strip->setBeatsPerLoopAtPpq(static_cast<float>(bars * 4), applyPpq);
     }
 }
 
@@ -1631,14 +1785,9 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     auto* strip = audioEngine->getStrip(stripIndex);
     if (!strip) return;
 
-    // If bar length was changed while playing, apply it on the next row trigger.
+    // If bar length was changed while playing, apply it only when this press
+    // actually results in a trigger (not on gate-closed ignores / loop-clear path).
     const auto stripIdx = static_cast<size_t>(stripIndex);
-    if (pendingBarLengthApply[stripIdx] && strip->hasAudio())
-    {
-        const int bars = juce::jlimit(1, 8, strip->getRecordingBars());
-        strip->setBeatsPerLoop(static_cast<float>(bars * 4));
-        pendingBarLengthApply[stripIdx] = false;
-    }
     
     // CHECK: If inner loop is active, clear it and return to full loop
     if (strip->getLoopStart() != 0 || strip->getLoopEnd() != MaxColumns)
@@ -1729,6 +1878,21 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
         stream.writeText(msg, false, false, nullptr);
     }
     
+    // Strict gate behavior: ignore extra presses while quantized trigger is pending.
+    if (useQuantize && gateClosed)
+    {
+        updateMonomeLEDs();
+        return;
+    }
+
+    // Trigger will be accepted now, so apply pending bar mapping exactly once.
+    if (pendingBarLengthApply[stripIdx] && strip->hasAudio())
+    {
+        const int bars = normalizeBarCountToSupported(strip->getRecordingBars());
+        strip->setBeatsPerLoop(static_cast<float>(bars * 4));
+        pendingBarLengthApply[stripIdx] = false;
+    }
+
     if (useQuantize)
     {
         // Schedule for next quantize point - group choke handled in batch execution
@@ -1746,13 +1910,6 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
         int64_t triggerGlobalSample = audioEngine->getGlobalSampleCount();
         
         strip->triggerAtSample(column, audioEngine->getCurrentTempo(), triggerGlobalSample, posInfo);
-    }
-
-    // Strict gate behavior: ignore extra presses while quantized trigger is pending.
-    if (useQuantize && gateClosed)
-    {
-        updateMonomeLEDs();
-        return;
     }
 
     // Record pattern events at the exact trigger timeline position.

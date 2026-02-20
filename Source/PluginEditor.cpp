@@ -1226,35 +1226,14 @@ void StripControl::setupComponents()
 
     recordBarsBox.addItem("1", 1);
     recordBarsBox.addItem("2", 2);
-    recordBarsBox.addItem("3", 3);
     recordBarsBox.addItem("4", 4);
-    recordBarsBox.addItem("5", 5);
-    recordBarsBox.addItem("6", 6);
-    recordBarsBox.addItem("7", 7);
     recordBarsBox.addItem("8", 8);
     recordBarsBox.setJustificationType(juce::Justification::centredLeft);
     recordBarsBox.setSelectedId(1, juce::dontSendNotification);
     recordBarsBox.setTooltip("Loop bars per strip (capture + loaded sample mapping).");
     recordBarsBox.onChange = [this]()
     {
-        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-        {
-            const int bars = recordBarsBox.getSelectedId();
-            strip->setRecordingBars(bars);
-
-            // Keep GUI behavior consistent with monome buffer-length buttons:
-            // changing input buffer bars on an existing strip also updates loop tempo mapping.
-            // Never retime while actively playing; that can disturb PPQ-locked phase.
-            if (strip->hasAudio() && !strip->isPlaying())
-            {
-                strip->setBeatsPerLoop(static_cast<float>(bars * 4));
-                processor.setPendingBarLengthApply(stripIndex, false);
-            }
-            else if (strip->hasAudio())
-            {
-                processor.setPendingBarLengthApply(stripIndex, true);
-            }
-        }
+        processor.requestBarLengthChange(stripIndex, recordBarsBox.getSelectedId());
     };
     addAndMakeVisible(recordBarsBox);
 
@@ -2258,7 +2237,14 @@ void StripControl::updateFromEngine()
     // Sync scratch slider from engine
     scratchSlider.setValue(strip->getScratchAmount(), juce::dontSendNotification);
     patternLengthBox.setSelectedId(strip->getStepPatternBars(), juce::dontSendNotification);
-    recordBarsBox.setSelectedId(strip->getRecordingBars(), juce::dontSendNotification);
+    {
+        int bars = strip->getRecordingBars();
+        if (bars <= 1) bars = 1;
+        else if (bars <= 2) bars = 2;
+        else if (bars <= 4) bars = 4;
+        else bars = 8;
+        recordBarsBox.setSelectedId(bars, juce::dontSendNotification);
+    }
     const bool recordArmed = !strip->hasAudio();
     const bool blinkOn = processor.getAudioEngine()->shouldBlinkRecordLED();
     recordButton.setButtonText(recordArmed ? "ARM" : "REC");
