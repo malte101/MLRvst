@@ -1149,22 +1149,21 @@ void StripControl::setupComponents()
     };
     addAndMakeVisible(grainArpModeSlider);
 
-    grainSizeSyncToggle.setButtonText("SYNC");
+    grainSizeSyncToggle.setButtonText("S");
     grainSizeSyncToggle.setClickingTogglesState(true);
     grainSizeSyncToggle.setToggleState(false, juce::dontSendNotification);
     grainSizeSyncToggle.setColour(juce::ToggleButton::textColourId, stripColor.withAlpha(0.72f));
     grainSizeSyncToggle.setColour(juce::ToggleButton::tickColourId, stripColor.withAlpha(0.72f));
     grainSizeSyncToggle.setColour(juce::ToggleButton::tickDisabledColourId, stripColor.withAlpha(0.28f));
+    grainSizeSyncToggle.setTooltip("Tempo-sync grain size.");
     grainSizeSyncToggle.onClick = [this]()
     {
         const bool enabled = grainSizeSyncToggle.getToggleState();
-        grainSizeSyncToggle.setButtonText(enabled ? "SYNC*" : "SYNC");
         grainSizeSyncToggle.setColour(juce::ToggleButton::textColourId, enabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
         grainSizeSyncToggle.setColour(juce::ToggleButton::tickColourId, enabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
             strip->setGrainTempoSyncEnabled(enabled);
     };
-    grainSizeSyncToggle.setButtonText(grainSizeSyncToggle.getToggleState() ? "SYNC*" : "SYNC");
     addAndMakeVisible(grainSizeSyncToggle);
 
     patternLengthBox.addItem("16", 1);
@@ -1975,7 +1974,12 @@ void StripControl::resized()
     auto labelsRow = controlsArea.removeFromTop(isGrainMode ? 8 : 9);
     if (isGrainMode)
     {
-        grainSizeLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
+        auto sizeLabelArea = labelsRow.removeFromLeft(mainKnobWidth);
+        const int syncToggleW = 14;
+        const int labelW = juce::jmax(0, sizeLabelArea.getWidth() - syncToggleW - 1);
+        grainSizeLabel.setBounds(sizeLabelArea.removeFromLeft(labelW));
+        sizeLabelArea.removeFromLeft(1);
+        grainSizeSyncToggle.setBounds(sizeLabelArea.removeFromLeft(syncToggleW));
         grainDensityLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
         speedLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
     }
@@ -2005,8 +2009,7 @@ void StripControl::resized()
     const int rowH = juce::jlimit(6, 10, miniRowsTotal / 4);
 
     auto syncRow = controlsArea.removeFromTop(syncRowH);
-    auto envArea = syncRow.removeFromRight(96);
-    grainSizeSyncToggle.setBounds(syncRow.removeFromLeft(40));
+    auto envArea = syncRow.removeFromRight(128);
     grainEnvelopeLabel.setBounds(envArea.removeFromLeft(30));
     grainEnvelopeSlider.setBounds(envArea);
 
@@ -2305,7 +2308,6 @@ void StripControl::updateFromEngine()
     }
     const bool grainSyncEnabled = strip->isGrainTempoSyncEnabled();
     grainSizeSyncToggle.setToggleState(grainSyncEnabled, juce::dontSendNotification);
-    grainSizeSyncToggle.setButtonText(grainSyncEnabled ? "SYNC*" : "SYNC");
     grainSizeSyncToggle.setColour(juce::ToggleButton::textColourId, grainSyncEnabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
     grainSizeSyncToggle.setColour(juce::ToggleButton::tickColourId, grainSyncEnabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
     {
@@ -3279,8 +3281,9 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     saveButton.setButtonText("Save");
     saveButton.onClick = [this]()
     {
+        auto safePanel = juce::Component::SafePointer<PresetControlPanel>(this);
         // Defer one message tick so in-flight text edits are committed first.
-        juce::MessageManager::callAsync([safe = juce::Component::SafePointer<PresetControlPanel>(this)]()
+        juce::MessageManager::callAsync([safe = safePanel]()
         {
             if (safe == nullptr)
                 return;
@@ -3317,12 +3320,15 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
         button.onClick = [this, i]()
         {
             if (juce::ModifierKeys::getCurrentModifiersRealtime().isShiftDown())
-                juce::MessageManager::callAsync([safe = juce::Component::SafePointer<PresetControlPanel>(this), i]()
+            {
+                auto safePanel = juce::Component::SafePointer<PresetControlPanel>(this);
+                juce::MessageManager::callAsync([safe = safePanel, i]()
                 {
                     if (safe == nullptr)
                         return;
                     safe->savePresetClicked(i, safe->presetNameEditor.getText());
                 });
+            }
             else
                 loadPresetClicked(i);
         };
