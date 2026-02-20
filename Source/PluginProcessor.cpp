@@ -1135,6 +1135,7 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     const bool separateStripRouting = (outputRoutingParam != nullptr && *outputRoutingParam > 0.5f);
     if (separateStripRouting && getBusCount(false) > 1)
     {
+        std::array<std::array<float*, 2>, MaxStrips> stripBusChannels{};
         std::array<juce::AudioBuffer<float>, MaxStrips> stripBusViews;
         std::array<juce::AudioBuffer<float>*, MaxStrips> stripBusTargets{};
         stripBusTargets.fill(nullptr);
@@ -1149,7 +1150,15 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
             if (busBuffer.getNumChannels() <= 0 || busBuffer.getNumSamples() <= 0)
                 continue;
 
-            stripBusViews[static_cast<size_t>(stripIndex)] = busBuffer;
+            auto& channelPtrs = stripBusChannels[static_cast<size_t>(stripIndex)];
+            channelPtrs.fill(nullptr);
+            channelPtrs[0] = busBuffer.getWritePointer(0);
+            channelPtrs[1] = (busBuffer.getNumChannels() > 1)
+                                 ? busBuffer.getWritePointer(1)
+                                 : busBuffer.getWritePointer(0);
+
+            stripBusViews[static_cast<size_t>(stripIndex)].setDataToReferTo(
+                channelPtrs.data(), 2, busBuffer.getNumSamples());
             stripBusTargets[static_cast<size_t>(stripIndex)] = &stripBusViews[static_cast<size_t>(stripIndex)];
         }
 
