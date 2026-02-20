@@ -724,7 +724,14 @@ void MonomeConnection::handleTiltMessage(const juce::OSCMessage& message)
 MlrVSTAudioProcessor::MlrVSTAudioProcessor()
      : AudioProcessor(BusesProperties()
                       .withInput("Input", juce::AudioChannelSet::stereo(), true)
-                      .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+                      .withOutput("Strip 1", juce::AudioChannelSet::stereo(), true)
+                      .withOutput("Strip 2", juce::AudioChannelSet::stereo(), false)
+                      .withOutput("Strip 3", juce::AudioChannelSet::stereo(), false)
+                      .withOutput("Strip 4", juce::AudioChannelSet::stereo(), false)
+                      .withOutput("Strip 5", juce::AudioChannelSet::stereo(), false)
+                      .withOutput("Strip 6", juce::AudioChannelSet::stereo(), false)
+                      .withOutput("Strip 7", juce::AudioChannelSet::stereo(), false)
+                      .withOutput("Strip 8", juce::AudioChannelSet::stereo(), false)),
        parameters(*this, nullptr, juce::Identifier("MlrVST"), createParameterLayout())
 {
     // Initialize audio engine
@@ -766,6 +773,7 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
     inputMonitorParam = parameters.getRawParameterValue("inputMonitor");
     crossfadeLengthParam = parameters.getRawParameterValue("crossfadeLength");
     triggerFadeInParam = parameters.getRawParameterValue("triggerFadeIn");
+    outputRoutingParam = parameters.getRawParameterValue("outputRouting");
 
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -923,6 +931,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         "Trigger Fade In (ms)",
         juce::NormalisableRange<float>(0.1f, 120.0f, 0.1f),
         12.0f));
+
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "outputRouting",
+        "Output Routing",
+        juce::StringArray{"Stereo Mix", "Separate Strip Outs"},
+        0));
     
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -990,11 +1004,20 @@ void MlrVSTAudioProcessor::releaseResources()
 
 bool MlrVSTAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
-    // Check output
-    auto outputChannels = layouts.getMainOutputChannelSet();
-    if (outputChannels != juce::AudioChannelSet::mono()
-     && outputChannels != juce::AudioChannelSet::stereo())
+    // Check main output
+    auto mainOutput = layouts.getMainOutputChannelSet();
+    if (mainOutput != juce::AudioChannelSet::mono()
+     && mainOutput != juce::AudioChannelSet::stereo())
         return false;
+
+    // Aux outputs are either disabled or match main output channel set.
+    const int outputBusCount = layouts.outputBuses.size();
+    for (int bus = 1; bus < outputBusCount; ++bus)
+    {
+        const auto busSet = layouts.getChannelSet(false, bus);
+        if (busSet != juce::AudioChannelSet::disabled() && busSet != mainOutput)
+            return false;
+    }
 
     // Check input (we accept mono or stereo input, or disabled)
     auto inputChannels = layouts.getMainInputChannelSet();
@@ -1109,8 +1132,44 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         }
     }
     
-    // Process audio
-    audioEngine->processBlock(buffer, midiMessages, posInfo);
+    const bool separateStripRouting = (outputRoutingParam != nullptr && *outputRoutingParam > 0.5f);
+    if (separateStripRouting && getBusCount(false) > 1)
+    {
+        std::array<juce::AudioBuffer<float>, MaxStrips> stripBusViews;
+        std::array<juce::AudioBuffer<float>*, MaxStrips> stripBusTargets{};
+        stripBusTargets.fill(nullptr);
+
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+        {
+            const int busIndex = stripIndex; // Strip 1 => main bus, others => aux buses.
+            if (busIndex >= getBusCount(false))
+                continue;
+
+            auto busBuffer = getBusBuffer(buffer, false, busIndex);
+            if (busBuffer.getNumChannels() <= 0 || busBuffer.getNumSamples() <= 0)
+                continue;
+
+            stripBusViews[static_cast<size_t>(stripIndex)] = busBuffer;
+            stripBusTargets[static_cast<size_t>(stripIndex)] = &stripBusViews[static_cast<size_t>(stripIndex)];
+        }
+
+        // Keep playback robust if some aux buses are disabled in host: fallback to main bus.
+        auto* mainTarget = stripBusTargets[0];
+        if (mainTarget == nullptr)
+            mainTarget = &buffer;
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+        {
+            if (stripBusTargets[static_cast<size_t>(stripIndex)] == nullptr)
+                stripBusTargets[static_cast<size_t>(stripIndex)] = mainTarget;
+        }
+
+        audioEngine->processBlock(buffer, midiMessages, posInfo, &stripBusTargets);
+    }
+    else
+    {
+        // Process audio
+        audioEngine->processBlock(buffer, midiMessages, posInfo, nullptr);
+    }
 }
 
 //==============================================================================

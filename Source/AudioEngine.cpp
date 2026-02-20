@@ -6501,7 +6501,8 @@ void ModernAudioEngine::prepareToPlay(double sampleRate, int maxBlockSize)
 
 void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer, 
                                      juce::MidiBuffer& /*midi*/,
-                                     const juce::AudioPlayHead::PositionInfo& positionInfo)
+                                     const juce::AudioPlayHead::PositionInfo& positionInfo,
+                                     const std::array<juce::AudioBuffer<float>*, MaxStrips>* stripOutputs)
 {
     juce::ScopedNoDenormals noDenormals;
     
@@ -6695,6 +6696,14 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 }
             }
 
+            juce::AudioBuffer<float>* targetBuffer = &buffer;
+            if (stripOutputs != nullptr)
+            {
+                auto* requested = (*stripOutputs)[i];
+                if (requested != nullptr && requested->getNumChannels() > 0)
+                    targetBuffer = requested;
+            }
+
             int groupId = strip->getGroup();
             if (groupId >= 0 && groupId < MaxGroups && groups[static_cast<size_t>(groupId)])
             {
@@ -6704,13 +6713,13 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     float groupVol = group->getVolume();
                     float preGroupVol = strip->getVolume();
                     strip->setVolume(preGroupVol * groupVol);
-                    strip->process(buffer, startSample, segmentSamples, segmentPosInfo, segmentGlobalSample, tempoNow, quantizeBeatsNow);
+                    strip->process(*targetBuffer, startSample, segmentSamples, segmentPosInfo, segmentGlobalSample, tempoNow, quantizeBeatsNow);
                     strip->setVolume(preGroupVol);
                 }
             }
             else
             {
-                strip->process(buffer, startSample, segmentSamples, segmentPosInfo, segmentGlobalSample, tempoNow, quantizeBeatsNow);
+                strip->process(*targetBuffer, startSample, segmentSamples, segmentPosInfo, segmentGlobalSample, tempoNow, quantizeBeatsNow);
             }
 
             if (applyMod)
@@ -6819,19 +6828,46 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
     // Render remaining tail after the last event
     processStripsSegment(processedSamples, numSamples - processedSamples);
 
-    // Protect downstream audio path from a single invalid strip sample.
-    for (int ch = 0; ch < numChannels; ++ch)
+    std::array<juce::AudioBuffer<float>*, MaxStrips + 1> buffersToPostProcess{};
+    size_t buffersToPostProcessCount = 0;
+    auto pushUniqueBuffer = [&](juce::AudioBuffer<float>* candidate)
     {
-        auto* write = buffer.getWritePointer(ch);
-        for (int i = 0; i < numSamples; ++i)
+        if (candidate == nullptr || candidate->getNumChannels() <= 0)
+            return;
+        for (size_t i = 0; i < buffersToPostProcessCount; ++i)
         {
-            if (!std::isfinite(write[i]))
-                write[i] = 0.0f;
+            if (buffersToPostProcess[i] == candidate)
+                return;
         }
+        buffersToPostProcess[buffersToPostProcessCount++] = candidate;
+    };
+
+    pushUniqueBuffer(&buffer);
+    if (stripOutputs != nullptr)
+    {
+        for (size_t i = 0; i < static_cast<size_t>(MaxStrips); ++i)
+            pushUniqueBuffer((*stripOutputs)[i]);
     }
-    
-    // Apply master volume
-    buffer.applyGain(masterVolume.load());
+
+    // Protect downstream audio path from a single invalid strip sample.
+    for (size_t b = 0; b < buffersToPostProcessCount; ++b)
+    {
+        auto* target = buffersToPostProcess[b];
+        const int targetChannels = target->getNumChannels();
+        const int targetSamples = target->getNumSamples();
+        for (int ch = 0; ch < targetChannels; ++ch)
+        {
+            auto* write = target->getWritePointer(ch);
+            for (int i = 0; i < targetSamples; ++i)
+            {
+                if (!std::isfinite(write[i]))
+                    write[i] = 0.0f;
+            }
+        }
+
+        // Apply master volume to all active output destinations.
+        target->applyGain(masterVolume.load());
+    }
     
     // Mix in input monitoring if enabled
     if (inputMonitorVol > 0.0f && inputCopy.getNumChannels() > 0 && inputCopy.getNumSamples() > 0)

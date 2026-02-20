@@ -1022,7 +1022,8 @@ public:
     void prepareToPlay(double sampleRate, int maxBlockSize);
     void processBlock(juce::AudioBuffer<float>& buffer, 
                      juce::MidiBuffer& midi,
-                     const juce::AudioPlayHead::PositionInfo& positionInfo);
+                     const juce::AudioPlayHead::PositionInfo& positionInfo,
+                     const std::array<juce::AudioBuffer<float>*, MaxStrips>* stripOutputs = nullptr);
     
     // Strip access
     EnhancedAudioStrip* getStrip(int index);

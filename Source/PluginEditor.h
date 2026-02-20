@@ -424,6 +424,8 @@ private:
     juce::Label qualityLabel;
     juce::ComboBox swingDivisionBox;
     juce::Label swingDivisionLabel;
+    juce::ComboBox outputRoutingBox;
+    juce::Label outputRoutingLabel;
     
     // Input monitoring controls
     juce::Slider inputMonitorSlider;
@@ -446,6 +448,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> inputMonitorAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> crossfadeLengthAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> triggerFadeInAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> outputRoutingAttachment;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GlobalControlPanel)
 };

@@ -3137,6 +3137,19 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     };
     addAndMakeVisible(swingDivisionBox);
     styleUiCombo(swingDivisionBox);
+
+    outputRoutingLabel.setText("Outputs", juce::dontSendNotification);
+    outputRoutingLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(outputRoutingLabel);
+
+    outputRoutingBox.addItem("Stereo Mix", 1);
+    outputRoutingBox.addItem("Separate Strip Outs", 2);
+    outputRoutingBox.setSelectedId(1, juce::dontSendNotification);
+    addAndMakeVisible(outputRoutingBox);
+    styleUiCombo(outputRoutingBox);
+    outputRoutingBox.setTooltip("Route strip audio to separate DAW outputs (requires multi-output plugin instance).");
+    outputRoutingAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "outputRouting", outputRoutingBox);
     
     // Grain quality (global for all strips in Grain mode)
     qualityLabel.setText("Grain Q", juce::dontSendNotification);
@@ -3727,6 +3740,12 @@ void GlobalControlPanel::resized()
     swingDivisionLabel.setBounds(swingArea.removeFromTop(16));
     swingArea.removeFromTop(2);
     swingDivisionBox.setBounds(swingArea.removeFromTop(28));
+    controlsArea.removeFromLeft(spacing);
+
+    auto outputRoutingArea = controlsArea.removeFromLeft(132);
+    outputRoutingLabel.setBounds(outputRoutingArea.removeFromTop(16));
+    outputRoutingArea.removeFromTop(2);
+    outputRoutingBox.setBounds(outputRoutingArea.removeFromTop(28));
 }
 
 void GlobalControlPanel::updateMeters(float leftLevel, float rightLevel)

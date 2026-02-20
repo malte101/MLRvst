@@ -290,6 +290,7 @@ private:
     std::atomic<float>* inputMonitorParam = nullptr;
     std::atomic<float>* crossfadeLengthParam = nullptr;
     std::atomic<float>* triggerFadeInParam = nullptr;
+    std::atomic<float>* outputRoutingParam = nullptr;
     std::array<std::atomic<float>*, MaxStrips> stripVolumeParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPanParams{};
     std::array<std::atomic<float>*, MaxStrips> stripSpeedParams{};
