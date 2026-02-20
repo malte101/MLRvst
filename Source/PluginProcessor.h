@@ -183,6 +183,7 @@ public:
     void loadSampleToStrip(int stripIndex, const juce::File& file);
     void loadAdjacentFile(int stripIndex, int direction);  // Browse files
     void captureRecentAudioToStrip(int stripIndex);
+    void setPendingBarLengthApply(int stripIndex, bool pending);
     void triggerStrip(int stripIndex, int column);
     void stopStrip(int stripIndex);
     
@@ -284,6 +285,7 @@ private:
     std::array<std::atomic<float>*, MaxStrips> stripPitchParams{};
     juce::CriticalSection pendingLoopChangeLock;
     std::array<PendingLoopChange, MaxStrips> pendingLoopChanges{};
+    std::array<bool, MaxStrips> pendingBarLengthApply{};
     
     double currentSampleRate = 44100.0;
     ControlMode currentControlMode = ControlMode::Normal;

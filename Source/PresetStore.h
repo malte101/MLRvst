@@ -17,7 +17,9 @@ void loadPreset(int presetIndex,
                 int maxStrips,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,
-                const std::function<void(int, const juce::File&)>& loadSampleToStrip);
+                const std::function<void(int, const juce::File&)>& loadSampleToStrip,
+                double hostPpqSnapshot,
+                double hostTempoSnapshot);
 juce::String getPresetName(int presetIndex);
 bool setPresetName(int presetIndex, const juce::String& presetName);
 bool presetExists(int presetIndex);

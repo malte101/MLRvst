@@ -10,6 +10,10 @@ static constexpr int kMaxPresetSlots = 16 * 7;
 namespace
 {
 constexpr const char* kEmbeddedSampleAttr = "embeddedSampleWavBase64";
+constexpr const char* kAnalysisTransientAttr = "analysisTransientSlices";
+constexpr const char* kAnalysisRmsAttr = "analysisRmsMap";
+constexpr const char* kAnalysisZeroCrossAttr = "analysisZeroCrossMap";
+constexpr const char* kAnalysisSampleCountAttr = "analysisSampleCount";
 constexpr int kMaxEmbeddedBase64Chars = 64 * 1024 * 1024;
 constexpr size_t kMaxEmbeddedWavBytes = 48 * 1024 * 1024;
 
@@ -95,6 +99,64 @@ void decodeModSteps(const juce::String& text, std::array<float, ModernAudioEngin
     const int len = juce::jmin(ModernAudioEngine::ModSteps, text.length());
     for (int i = 0; i < len; ++i)
         steps[static_cast<size_t>(i)] = (text[i] == '1') ? 1.0f : 0.0f;
+}
+
+template <size_t N>
+juce::String encodeIntArrayCsv(const std::array<int, N>& values)
+{
+    juce::String out;
+    out.preallocateBytes(static_cast<int>(N * 8));
+    for (size_t i = 0; i < N; ++i)
+    {
+        if (i > 0)
+            out << ",";
+        out << values[i];
+    }
+    return out;
+}
+
+template <size_t N>
+juce::String encodeFloatArrayCsv(const std::array<float, N>& values)
+{
+    juce::String out;
+    out.preallocateBytes(static_cast<int>(N * 8));
+    for (size_t i = 0; i < N; ++i)
+    {
+        if (i > 0)
+            out << ",";
+        out << juce::String(values[i], 6);
+    }
+    return out;
+}
+
+template <size_t N>
+void decodeIntArrayCsv(const juce::String& csvText, std::array<int, N>& outValues)
+{
+    juce::StringArray tokens;
+    tokens.addTokens(csvText, ",", "");
+    tokens.trim();
+    tokens.removeEmptyStrings();
+
+    for (size_t i = 0; i < N; ++i)
+    {
+        if (static_cast<int>(i) < tokens.size())
+            outValues[i] = tokens[static_cast<int>(i)].getIntValue();
+    }
+}
+
+template <size_t N>
+void decodeFloatArrayCsv(const juce::String& csvText, std::array<float, N>& outValues)
+{
+    juce::StringArray tokens;
+    tokens.addTokens(csvText, ",", "");
+    tokens.trim();
+    tokens.removeEmptyStrings();
+
+    for (size_t i = 0; i < N; ++i)
+    {
+        if (static_cast<int>(i) < tokens.size())
+            outValues[i] = tokens[static_cast<int>(i)].getFloatValue();
+    }
 }
 
 bool writeDefaultPresetFile(const juce::File& presetFile, int presetIndex)
@@ -221,6 +283,15 @@ void savePreset(int presetIndex,
         juce::XmlElement preset("mlrVSTPreset");
         preset.setAttribute("version", "1.0");
         preset.setAttribute("index", presetIndex);
+        if (presetFile.existsAsFile())
+        {
+            if (auto existing = juce::XmlDocument::parse(presetFile))
+            {
+                const auto existingName = existing->getStringAttribute("name").trim();
+                if (existingName.isNotEmpty())
+                    preset.setAttribute("name", existingName);
+            }
+        }
 
     for (int i = 0; i < maxStrips; ++i)
     {
@@ -261,6 +332,13 @@ void savePreset(int presetIndex,
         stripXml->setAttribute("beatsPerLoop", strip->getBeatsPerLoop());
         stripXml->setAttribute("scratchAmount", strip->getScratchAmount());
         stripXml->setAttribute("transientSliceMode", strip->isTransientSliceMode());
+        if (strip->hasSampleAnalysisCache())
+        {
+            stripXml->setAttribute(kAnalysisSampleCountAttr, strip->getAnalysisSampleCount());
+            stripXml->setAttribute(kAnalysisTransientAttr, encodeIntArrayCsv(strip->getCachedTransientSliceSamples()));
+            stripXml->setAttribute(kAnalysisRmsAttr, encodeFloatArrayCsv(strip->getCachedRmsMap()));
+            stripXml->setAttribute(kAnalysisZeroCrossAttr, encodeIntArrayCsv(strip->getCachedZeroCrossMap()));
+        }
         stripXml->setAttribute("pitchShift", strip->getPitchShift());
         stripXml->setAttribute("recordingBars", strip->getRecordingBars());
         stripXml->setAttribute("filterEnabled", strip->isFilterEnabled());
@@ -364,7 +442,9 @@ void loadPreset(int presetIndex,
                 int maxStrips,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,
-                const std::function<void(int, const juce::File&)>& loadSampleToStrip)
+                const std::function<void(int, const juce::File&)>& loadSampleToStrip,
+                double hostPpqSnapshot,
+                double hostTempoSnapshot)
 {
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots || audioEngine == nullptr)
         return;
@@ -414,12 +494,21 @@ void loadPreset(int presetIndex,
         // Preset recall should not overwrite global controls.
         restoreGlobalParameters(parameters, globalSnapshot);
 
+        const double recallPpq = std::isfinite(hostPpqSnapshot)
+            ? hostPpqSnapshot
+            : audioEngine->getTimelineBeat();
+        const double recallTempo = (std::isfinite(hostTempoSnapshot) && hostTempoSnapshot > 0.0)
+            ? hostTempoSnapshot
+            : audioEngine->getCurrentTempo();
+
+        std::vector<bool> stripSeen(static_cast<size_t>(juce::jmax(0, maxStrips)), false);
         for (auto* stripXml : preset->getChildWithTagNameIterator("Strip"))
         {
         int stripIndex = stripXml->getIntAttribute("index");
         if (stripIndex < 0 || stripIndex >= maxStrips)
             continue;
 
+        stripSeen[static_cast<size_t>(stripIndex)] = true;
         auto* strip = audioEngine->getStrip(stripIndex);
         if (strip == nullptr)
             continue;
@@ -442,6 +531,9 @@ void loadPreset(int presetIndex,
             if (embeddedSample.isNotEmpty())
                 loadedStripAudio = decodeWavBase64ToStrip(embeddedSample, *strip);
         }
+
+        if (!loadedStripAudio)
+            strip->clearSample();
 
         auto finiteFloat = [](double value, float fallback)
         {
@@ -479,8 +571,8 @@ void loadPreset(int presetIndex,
         const bool restorePpqAnchored = stripXml->getBoolAttribute("ppqTimelineAnchored", false);
         const double restorePpqOffsetBeats = stripXml->getDoubleAttribute("ppqTimelineOffsetBeats", 0.0);
         const int64_t restoreGlobalSample = audioEngine->getGlobalSampleCount();
-        const double restoreTimelineBeat = audioEngine->getTimelineBeat();
-        const double restoreTempo = audioEngine->getCurrentTempo();
+        const double restoreTimelineBeat = recallPpq;
+        const double restoreTempo = recallTempo;
 
         if (strip->hasAudio())
         {
@@ -503,6 +595,24 @@ void loadPreset(int presetIndex,
         float beats = finiteFloat(stripXml->getDoubleAttribute("beatsPerLoop", -1.0), -1.0f);
         strip->setBeatsPerLoop(beats);
         strip->setScratchAmount(clampedFloat(stripXml->getDoubleAttribute("scratchAmount", 0.0), 0.0f, 0.0f, 100.0f));
+        const int analysisSampleCount = juce::jmax(0, stripXml->getIntAttribute(kAnalysisSampleCountAttr, 0));
+        const juce::String analysisTransientCsv = stripXml->getStringAttribute(kAnalysisTransientAttr);
+        const juce::String analysisRmsCsv = stripXml->getStringAttribute(kAnalysisRmsAttr);
+        const juce::String analysisZeroCsv = stripXml->getStringAttribute(kAnalysisZeroCrossAttr);
+        if (strip->hasAudio()
+            && analysisSampleCount > 0
+            && analysisTransientCsv.isNotEmpty()
+            && analysisRmsCsv.isNotEmpty()
+            && analysisZeroCsv.isNotEmpty())
+        {
+            std::array<int, 16> cachedTransient{};
+            std::array<float, 128> cachedRms{};
+            std::array<int, 128> cachedZeroCross{};
+            decodeIntArrayCsv(analysisTransientCsv, cachedTransient);
+            decodeFloatArrayCsv(analysisRmsCsv, cachedRms);
+            decodeIntArrayCsv(analysisZeroCsv, cachedZeroCross);
+            strip->restoreSampleAnalysisCache(cachedTransient, cachedRms, cachedZeroCross, analysisSampleCount);
+        }
         strip->setTransientSliceMode(stripXml->getBoolAttribute("transientSliceMode", false));
         strip->setPitchShift(clampedFloat(stripXml->getDoubleAttribute("pitchShift", 0.0), 0.0f, -12.0f, 12.0f));
         strip->setRecordingBars(clampedInt(stripXml->getIntAttribute("recordingBars", 1), 1, 8, 1));
@@ -574,7 +684,29 @@ void loadPreset(int presetIndex,
             {
                 pitchParam->setValueNotifyingHost(
                     juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(pitchValue)));
-            }
+                }
+        }
+    }
+
+    for (int i = 0; i < maxStrips; ++i)
+    {
+        if (stripSeen[static_cast<size_t>(i)])
+            continue;
+
+        if (auto* strip = audioEngine->getStrip(i))
+        {
+            strip->clearSample();
+            strip->stop(true);
+            audioEngine->assignStripToGroup(i, -1);
+        }
+    }
+
+    for (int i = 0; i < ModernAudioEngine::MaxGroups; ++i)
+    {
+        if (auto* group = audioEngine->getGroup(i))
+        {
+            group->setVolume(1.0f);
+            group->setMuted(false);
         }
     }
 
@@ -593,12 +725,12 @@ void loadPreset(int presetIndex,
         }
     }
 
+    for (int i = 0; i < ModernAudioEngine::MaxPatterns; ++i)
+        audioEngine->clearPattern(i);
+
     if (auto* patternsXml = preset->getChildByName("Patterns"))
     {
         const double nowBeat = audioEngine->getTimelineBeat();
-        for (int i = 0; i < ModernAudioEngine::MaxPatterns; ++i)
-            audioEngine->clearPattern(i);
-
         for (auto* patternXml : patternsXml->getChildIterator())
         {
             if (patternXml->getTagName() != "Pattern")

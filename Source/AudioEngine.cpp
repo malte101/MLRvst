@@ -1096,6 +1096,7 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     for (auto& p : grainPreviewPitchNorms)
         p.store(0.0f, std::memory_order_release);
     grainArpStep = 0;
+    grainNeutralBlendState = 1.0f;
     grainPreviewDecimationCounter = 0;
     grainSizeJitterBeatGroup = std::numeric_limits<int64_t>::min();
     grainSizeJitterMul = grainParams.sizeMs;
@@ -1173,6 +1174,8 @@ void EnhancedAudioStrip::loadSample(const juce::AudioBuffer<float>& buffer, doub
         rebuildTransientSliceMap();
     else
         transientSliceMapDirty = true;
+
+    rebuildSampleAnalysisCacheLocked();
 }
 
 void EnhancedAudioStrip::setTransientSliceMode(bool enabled)
@@ -1205,6 +1208,60 @@ std::array<int, 16> EnhancedAudioStrip::getSliceStartSamples(bool transientMode)
     for (int i = 0; i < 16; ++i)
         out[static_cast<size_t>(i)] = juce::jlimit(0, total - 1, (i * total) / 16);
     return out;
+}
+
+std::array<int, 16> EnhancedAudioStrip::getCachedTransientSliceSamples() const
+{
+    std::array<int, 16> out{};
+    for (int i = 0; i < 16; ++i)
+        out[static_cast<size_t>(i)] = transientSliceSamples[static_cast<size_t>(i)];
+    return out;
+}
+
+std::array<float, 128> EnhancedAudioStrip::getCachedRmsMap() const
+{
+    return analysisRmsMap;
+}
+
+std::array<int, 128> EnhancedAudioStrip::getCachedZeroCrossMap() const
+{
+    return analysisZeroCrossMap;
+}
+
+void EnhancedAudioStrip::restoreSampleAnalysisCache(const std::array<int, 16>& transientSlices,
+                                                    const std::array<float, 128>& rmsMap,
+                                                    const std::array<int, 128>& zeroCrossMap,
+                                                    int sourceSampleCount)
+{
+    juce::ScopedLock lock(bufferLock);
+
+    const int totalSamples = sampleBuffer.getNumSamples();
+    if (totalSamples <= 0)
+        return;
+
+    const int safeSampleCount = juce::jmax(1, sourceSampleCount);
+    const float scale = static_cast<float>(totalSamples) / static_cast<float>(safeSampleCount);
+
+    for (int i = 0; i < ModernAudioEngine::MaxColumns; ++i)
+    {
+        const int src = transientSlices[static_cast<size_t>(i)];
+        const int scaled = static_cast<int>(std::round(static_cast<float>(src) * scale));
+        transientSliceSamples[static_cast<size_t>(i)] = juce::jlimit(0, totalSamples - 1, scaled);
+    }
+
+    for (size_t i = 0; i < analysisRmsMap.size(); ++i)
+        analysisRmsMap[i] = juce::jlimit(0.0f, 1.0f, std::isfinite(rmsMap[i]) ? rmsMap[i] : 0.0f);
+
+    for (size_t i = 0; i < analysisZeroCrossMap.size(); ++i)
+    {
+        const int src = zeroCrossMap[i];
+        const int scaled = static_cast<int>(std::round(static_cast<float>(src) * scale));
+        analysisZeroCrossMap[i] = juce::jlimit(0, totalSamples - 1, scaled);
+    }
+
+    analysisSampleCount = totalSamples;
+    analysisCacheValid = true;
+    transientSliceMapDirty = false;
 }
 
 void EnhancedAudioStrip::rebuildTransientSliceMap()
@@ -1405,6 +1462,69 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
         transientSliceSamples[static_cast<size_t>(i)] = positions[static_cast<size_t>(i)];
 
     transientSliceMapDirty = false;
+    rebuildSampleAnalysisCacheLocked();
+}
+
+void EnhancedAudioStrip::rebuildSampleAnalysisCacheLocked()
+{
+    analysisSampleCount = 0;
+    analysisCacheValid = false;
+    analysisRmsMap.fill(0.0f);
+    analysisZeroCrossMap.fill(0);
+
+    const int totalSamples = sampleBuffer.getNumSamples();
+    const int channels = juce::jmax(1, sampleBuffer.getNumChannels());
+    if (totalSamples <= 0)
+        return;
+
+    const int bins = static_cast<int>(analysisRmsMap.size());
+    std::vector<float> monoSamples(static_cast<size_t>(totalSamples), 0.0f);
+    for (int i = 0; i < totalSamples; ++i)
+    {
+        float mono = 0.0f;
+        for (int ch = 0; ch < channels; ++ch)
+            mono += sampleBuffer.getSample(ch, i);
+        monoSamples[static_cast<size_t>(i)] = mono / static_cast<float>(channels);
+    }
+
+    float maxRms = 1.0e-6f;
+    for (int b = 0; b < bins; ++b)
+    {
+        const int start = (b * totalSamples) / bins;
+        const int end = juce::jmax(start + 1, ((b + 1) * totalSamples) / bins);
+        const int count = juce::jmax(1, end - start);
+
+        double energy = 0.0;
+        for (int i = start; i < end; ++i)
+        {
+            const float s = monoSamples[static_cast<size_t>(juce::jlimit(0, totalSamples - 1, i))];
+            energy += static_cast<double>(s * s);
+        }
+        const float rms = static_cast<float>(std::sqrt(energy / static_cast<double>(count)));
+        analysisRmsMap[static_cast<size_t>(b)] = rms;
+        if (rms > maxRms)
+            maxRms = rms;
+
+        int zeroIdx = juce::jlimit(0, totalSamples - 1, start);
+        for (int i = juce::jmax(start + 1, 1); i < juce::jmin(end, totalSamples); ++i)
+        {
+            const float prev = monoSamples[static_cast<size_t>(i - 1)];
+            const float curr = monoSamples[static_cast<size_t>(i)];
+            if ((prev <= 0.0f && curr > 0.0f) || (prev >= 0.0f && curr < 0.0f))
+            {
+                zeroIdx = i;
+                break;
+            }
+        }
+        analysisZeroCrossMap[static_cast<size_t>(b)] = zeroIdx;
+    }
+
+    const float invMax = (maxRms > 1.0e-6f) ? (1.0f / maxRms) : 1.0f;
+    for (auto& v : analysisRmsMap)
+        v = juce::jlimit(0.0f, 1.0f, v * invMax);
+
+    analysisSampleCount = totalSamples;
+    analysisCacheValid = true;
 }
 
 double EnhancedAudioStrip::getTriggerTargetPositionForColumn(int column, double loopStartSamples, double loopLengthSamplesArg) const
@@ -1496,6 +1616,7 @@ void EnhancedAudioStrip::resetGrainState()
     grainSchedulerNoise = 0.0;
     grainSchedulerNoiseTarget = 0.0;
     grainSchedulerNoiseCountdown = 0;
+    grainNeutralBlendState = 1.0f;
     grainParamsSnapshotValid = false;
     for (auto& p : grainPreviewPositions)
         p.store(-1.0f, std::memory_order_release);
@@ -1503,6 +1624,8 @@ void EnhancedAudioStrip::resetGrainState()
         p.store(0.0f, std::memory_order_release);
     grainArpStep = 0;
     grainPreviewDecimationCounter = 0;
+    grainPreviewRequestCountdown.store(0, std::memory_order_release);
+    grainVoiceSearchStart = 0;
     grainSizeJitterBeatGroup = std::numeric_limits<int64_t>::min();
     grainSizeJitterMul = grainParams.sizeMs;
     grainCloudDelayWritePos = 0;
@@ -1953,29 +2076,44 @@ void EnhancedAudioStrip::updateGrainGestureOnRelease(int column, int64_t globalS
     updateGrainHeldLedState();
 }
 
-void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, float density, float spread, float pitchOffsetSemitones)
+void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, float density, float spread, float pitchOffsetSemitones, double playbackStepBase)
 {
     if (sampleLength <= 0.0)
         return;
 
+    const int voiceCount = static_cast<int>(grainVoices.size());
     int voiceIndex = -1;
-    int oldestAge = -1;
-    for (int i = 0; i < static_cast<int>(grainVoices.size()); ++i)
+
+    // Fast path: cyclic search for an inactive voice slot.
+    const int searchStart = juce::jlimit(0, juce::jmax(0, voiceCount - 1), grainVoiceSearchStart);
+    for (int n = 0; n < voiceCount; ++n)
     {
+        const int i = (searchStart + n) % juce::jmax(1, voiceCount);
         if (!grainVoices[static_cast<size_t>(i)].active)
         {
             voiceIndex = i;
+            grainVoiceSearchStart = (i + 1) % juce::jmax(1, voiceCount);
             break;
-        }
-        if (grainVoices[static_cast<size_t>(i)].ageSamples > oldestAge)
-        {
-            oldestAge = grainVoices[static_cast<size_t>(i)].ageSamples;
-            voiceIndex = i;
         }
     }
 
+    // Fallback: steal oldest active voice (same policy as before).
     if (voiceIndex < 0)
-        return;
+    {
+        int oldestAge = -1;
+        for (int i = 0; i < voiceCount; ++i)
+        {
+            if (grainVoices[static_cast<size_t>(i)].ageSamples > oldestAge)
+            {
+                oldestAge = grainVoices[static_cast<size_t>(i)].ageSamples;
+                voiceIndex = i;
+            }
+        }
+        if (voiceIndex < 0)
+            return;
+
+        grainVoiceSearchStart = (voiceIndex + 1) % juce::jmax(1, voiceCount);
+    }
 
     const int maxSizeSamplesByRange = juce::jmax(kMinGrainWindowSamples,
         static_cast<int>(std::round((kGrainMaxSizeMs * 0.001f) * static_cast<float>(currentSampleRate))));
@@ -2001,7 +2139,6 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
     auto& voice = grainVoices[static_cast<size_t>(voiceIndex)];
     voice.active = true;
     voice.ageSamples = 0;
-    voice.lengthSamples = sizeSamples;
     voice.readPos = getWrappedSamplePosition(centerSamplePos + offset, loopStartSamples, loopLength);
     const float pitchBase = grainPitchAtomic.load(std::memory_order_acquire);
     const float pitchJitterSpan = grainPitchJitterAtomic.load(std::memory_order_acquire);
@@ -2173,8 +2310,10 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
         pitchSemi = juce::jlimit(-arpRangeSemis, arpRangeSemis, pitchSemi);
     }
 
+    voice.lengthSamples = juce::jlimit(kMinGrainWindowSamples, maxSizeSamplesByRange, sizeSamples);
     voice.pitchSemitones = juce::jlimit(-48.0f, 48.0f, pitchSemi);
     const double pitchRatio = std::pow(2.0, static_cast<double>(voice.pitchSemitones) / 12.0);
+    const double transportStep = juce::jlimit(0.01, 8.0, std::abs(playbackStepBase));
     bool reverseVoice = grainParams.reverse;
     if (!reverseVoice)
     {
@@ -2182,11 +2321,11 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
         const float reverseChance = juce::jlimit(0.0f, 0.92f, randomDepth * 0.88f);
         reverseVoice = (reverseDist(randomGenerator) < reverseChance);
     }
-    voice.step = (reverseVoice ? -1.0 : 1.0) * pitchRatio;
+    voice.step = (reverseVoice ? -1.0 : 1.0) * pitchRatio * transportStep;
     if (!reverseVoice && pitchRatio > 1.0)
     {
         // Keep forward, pitched-up grains from reading past the playhead anchor.
-        const double headroomSamples = (pitchRatio - 1.0) * static_cast<double>(sizeSamples);
+        const double headroomSamples = (pitchRatio - 1.0) * static_cast<double>(voice.lengthSamples);
         voice.readPos = getWrappedSamplePosition(voice.readPos - headroomSamples, loopStartSamples, loopLength);
     }
     std::uniform_real_distribution<float> panDist(-juce::jlimit(0.0f, 1.0f, spread),
@@ -2225,11 +2364,15 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     const double beatNow = getGrainBeatPositionAtSample(globalSample);
     const float targetBloom = (heldCount > 0) ? juce::jlimit(0.0f, 1.0f, 0.5f + (0.18f * static_cast<float>(heldCount - 1))) : 0.0f;
     grainBloomAmount += (targetBloom - grainBloomAmount) * 0.0025f;
+    const float pitchNow = grainPitchAtomic.load(std::memory_order_acquire);
+    const float pitchJitterNow = grainPitchJitterAtomic.load(std::memory_order_acquire);
     const float arpDepth = grainArpDepthAtomic.load(std::memory_order_acquire);
     float jitterAmount = grainJitterAtomic.load(std::memory_order_acquire);
     float randomDepth = grainRandomDepthAtomic.load(std::memory_order_acquire);
+    const float spreadBaseNow = grainSpreadAtomic.load(std::memory_order_acquire);
     const float cloudDepth = grainCloudDepthAtomic.load(std::memory_order_acquire);
     const float emitterDepth = grainEmitterDepthAtomic.load(std::memory_order_acquire);
+    const float envelopeNow = grainEnvelopeAtomic.load(std::memory_order_acquire);
     const double bloomHz = 1.2 + (2.3 * static_cast<double>(juce::jmax(0, heldCount)));
     grainBloomPhase += (juce::MathConstants<double>::twoPi * bloomHz) / juce::jmax(1.0, currentSampleRate);
     if (grainBloomPhase > juce::MathConstants<double>::twoPi)
@@ -2382,7 +2525,7 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     float effectiveSizeMs = juce::jlimit(kGrainMinSizeMs, kGrainMaxSizeMs, sjtrSizeMs * sizeWobble);
     const float baseDensity = grainDensitySmoother.getNextValue();
     float effectiveDensity = juce::jlimit(kGrainMinDensity, 0.82f, baseDensity + (grainBloomAmount * 0.14f));
-    float effectiveSpread = juce::jlimit(0.0f, 1.0f, grainSpreadAtomic.load(std::memory_order_acquire)
+    float effectiveSpread = juce::jlimit(0.0f, 1.0f, spreadBaseNow
                                          + (grainBloomAmount * jitterAmount * 0.2f));
     float effectiveEmitterDepth = emitterDepth;
     float scenePitchOffset = 0.0f;
@@ -2481,6 +2624,48 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     const double emitterReferenceCenter = blendedCenter;
     double bloomCenter = blendedCenter + jitterSamples + markerJitterSamples;
 
+    const double sizeSamplesD = juce::jmax(1.0, static_cast<double>(effectiveSizeMs * 0.001f * static_cast<float>(currentSampleRate)));
+    constexpr float kNeutralSizeMs = 1240.0f;
+    constexpr float kNeutralDensity = 0.05f;
+    const bool neutralContext = heldCount == 0
+        && !grainGesture.anyHeld
+        && !grainGesture.freeze
+        && !grainGesture.returningToTimeline
+        && !tempoSyncEnabled;
+    const double neutralReadPos = getWrappedSamplePosition(centerSamplePos, loopStartSamples, loopLengthSamplesLocal);
+    const double neutralStep = juce::jlimit(0.01, 8.0, std::abs(effectiveSpeed));
+    const float neutralSampleL = grainResampler.getSample(sampleBuffer, 0, neutralReadPos, neutralStep);
+    const float neutralSampleR = (sampleBuffer.getNumChannels() > 1)
+        ? grainResampler.getSample(sampleBuffer, 1, neutralReadPos, neutralStep)
+        : neutralSampleL;
+
+    float neutralTargetBlend = 0.0f;
+    if (neutralContext)
+    {
+        const float dSize = std::abs(baseSizeMs - kNeutralSizeMs) / 900.0f;
+        const float dDensity = std::abs(baseDensity - kNeutralDensity) / 0.08f;
+        const float dPitch = std::abs(pitchNow) / 2.0f;
+        const float dPitchJitter = pitchJitterNow / 2.0f;
+        const float dSpread = spreadBaseNow / 0.2f;
+        const float dJitter = jitterAmount / 0.2f;
+        const float dRandom = randomDepth / 0.2f;
+        const float dArp = arpDepth / 0.15f;
+        const float dCloud = cloudDepth / 0.12f;
+        const float dEmitter = emitterDepth / 0.12f;
+        const float dEnv = envelopeNow / 0.2f;
+        const float dScene = std::abs(sceneMix) / 0.1f;
+        const float deviation = juce::jlimit(0.0f, 1.0f, std::max({
+            dSize, dDensity, dPitch, dPitchJitter, dSpread, dJitter,
+            dRandom, dArp, dCloud, dEmitter, dEnv, dScene
+        }));
+        neutralTargetBlend = 1.0f - deviation;
+        neutralTargetBlend *= neutralTargetBlend;
+    }
+
+    grainNeutralBlendState += (neutralTargetBlend - grainNeutralBlendState) * 0.01f;
+    const float neutralBlend = juce::jlimit(0.0f, 1.0f, grainNeutralBlendState);
+    const float granularBlend = 1.0f - neutralBlend;
+
     if (grainSchedulerNoiseCountdown <= 0)
     {
         std::uniform_real_distribution<double> schedNoiseDist(-1.0, 1.0);
@@ -2493,7 +2678,6 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     }
     grainSchedulerNoise += (grainSchedulerNoiseTarget - grainSchedulerNoise) * 0.02;
 
-    const double sizeSamplesD = juce::jmax(1.0, static_cast<double>(effectiveSizeMs * 0.001f * static_cast<float>(currentSampleRate)));
     if (effectiveEmitterDepth > 0.0f && sampleLength > 0.0)
     {
         const double step = juce::jmax(1.0, sizeSamplesD);
@@ -2511,11 +2695,14 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     const double baseSpawnRate = overlapFactor / sizeSamplesD; // grains per output sample
     const double jitterRateMul = 1.0 + (grainSchedulerNoise * static_cast<double>(0.35f + (0.65f * randomDepth)) * 0.45);
     const double emitterRateMul = 1.0 + (2.0 * emitShape);
-    const double spawnRate = juce::jlimit(0.00005, 0.24, baseSpawnRate * jitterRateMul * emitterRateMul);
+    const double effectedSpawnRate = juce::jlimit(0.00005, 0.24, baseSpawnRate * jitterRateMul * emitterRateMul);
+    const double spawnRate = effectedSpawnRate * static_cast<double>(granularBlend);
     grainSpawnAccumulator = juce::jlimit(0.0, 2.5, grainSpawnAccumulator + spawnRate);
 
     int spawnSafety = 0;
-    const int maxSpawnsPerSample = juce::jlimit(1, 6, 1 + static_cast<int>(std::round(5.0 * emitShape)));
+    const int effectedMaxSpawns = juce::jlimit(1, 6, 1 + static_cast<int>(std::round(5.0 * emitShape)));
+    const int maxSpawnsPerSample = juce::jlimit(1, 6, static_cast<int>(std::round(
+        1.0f + ((static_cast<float>(effectedMaxSpawns) - 1.0f) * granularBlend))));
     while (grainSpawnAccumulator >= 1.0 && spawnSafety < maxSpawnsPerSample)
     {
         grainSpawnAccumulator -= 1.0;
@@ -2539,11 +2726,17 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
             spawnCenter = loopStartSamples + distributed;
         }
 
-        spawnGrainVoice(spawnCenter, effectiveSizeMs, effectiveDensity, effectiveSpread, scenePitchOffset);
+        spawnGrainVoice(spawnCenter,
+                        effectiveSizeMs,
+                        effectiveDensity,
+                        effectiveSpread,
+                        scenePitchOffset,
+                        effectiveSpeed);
         ++spawnSafety;
     }
 
-    const bool refreshPreview = ((++grainPreviewDecimationCounter & 0x3) == 0);
+    const bool previewRequested = grainPreviewRequestCountdown.load(std::memory_order_relaxed) > 0;
+    const bool refreshPreview = previewRequested && ((++grainPreviewDecimationCounter & 0x3) == 0);
     if (refreshPreview)
     {
         for (auto& p : grainPreviewPositions)
@@ -2582,37 +2775,49 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
             static_cast<int>(std::round(normPos * static_cast<float>(grainWindow.size() - 1))));
         const float window = grainWindow[static_cast<size_t>(windowIdx)];
         float env = 1.0f;
-        switch (grainQuality)
+        if (neutralBlend < 0.9999f)
         {
-            case Resampler::Quality::Linear:
+            float qualityEnv = 1.0f;
+            switch (grainQuality)
             {
-                const float tri = 1.0f - std::abs((normPos * 2.0f) - 1.0f);
-                env = juce::jlimit(0.0f, 1.0f, tri);
-                break;
+                case Resampler::Quality::Linear:
+                {
+                    const float tri = 1.0f - std::abs((normPos * 2.0f) - 1.0f);
+                    qualityEnv = juce::jlimit(0.0f, 1.0f, tri);
+                    break;
+                }
+                case Resampler::Quality::Cubic:
+                    break;
+                case Resampler::Quality::Sinc:
+                    qualityEnv = 0.72f + (0.28f * std::sqrt(juce::jmax(0.0f, window)));
+                    break;
+                case Resampler::Quality::SincHQ:
+                    qualityEnv = 0.66f + (0.34f * window);
+                    break;
             }
-            case Resampler::Quality::Cubic:
-                break;
-            case Resampler::Quality::Sinc:
-                env = 0.72f + (0.28f * std::sqrt(juce::jmax(0.0f, window)));
-                break;
-            case Resampler::Quality::SincHQ:
-                env = 0.66f + (0.34f * window);
-                break;
+            const float qualityMix = 1.0f - neutralBlend;
+            env *= 1.0f + ((qualityEnv - 1.0f) * qualityMix);
         }
-        // ENV: higher values shorten perceived grain body and emphasize the center.
+        // ENV controls how much window/envelope shaping is applied.
+        // At ENV=0, keep grains as neutral as possible (flat gain).
         const float fade = juce::jlimit(0.0f, 1.0f, voice.envelopeFade);
-        const float fadeWidth = juce::jlimit(0.02f, 0.30f, 0.28f - (fade * 0.24f));
-        const float edgeDistance = juce::jmin(normPos, 1.0f - normPos);
-        const float fadeNorm = juce::jlimit(0.0f, 1.0f, edgeDistance / fadeWidth);
-        const float edgeExponent = 1.0f + (3.2f * fade);
-        const float shapedFade = std::pow(fadeNorm, edgeExponent);
-        env *= juce::jlimit(0.0f, 1.0f, shapedFade);
+        const float windowMix = juce::jlimit(0.0f, 1.0f, fade);
+        const float shapedWindow = 1.0f + ((window - 1.0f) * windowMix);
+        if (fade > 1.0e-4f)
+        {
+            const float fadeWidth = juce::jlimit(0.02f, 0.30f, 0.28f - (fade * 0.24f));
+            const float edgeDistance = juce::jmin(normPos, 1.0f - normPos);
+            const float fadeNorm = juce::jlimit(0.0f, 1.0f, edgeDistance / fadeWidth);
+            const float edgeExponent = 1.0f + (3.2f * fade);
+            const float shapedFade = std::pow(fadeNorm, edgeExponent);
+            env *= juce::jlimit(0.0f, 1.0f, shapedFade);
 
-        const float centerTri = juce::jlimit(0.0f, 1.0f, 1.0f - std::abs((normPos * 2.0f) - 1.0f));
-        const float centerExponent = 1.0f + (4.5f * fade);
-        const float centerFocus = std::pow(centerTri, centerExponent);
-        env *= juce::jlimit(0.10f, 1.0f, 0.18f + (0.82f * centerFocus));
-        const float amp = window * env;
+            const float centerTri = juce::jlimit(0.0f, 1.0f, 1.0f - std::abs((normPos * 2.0f) - 1.0f));
+            const float centerExponent = 1.0f + (4.5f * fade);
+            const float centerFocus = std::pow(centerTri, centerExponent);
+            env *= juce::jlimit(0.10f, 1.0f, 0.18f + (0.82f * centerFocus));
+        }
+        const float amp = shapedWindow * env;
 
         float l = grainResampler.getSample(sampleBuffer, 0, voice.readPos, 1.0);
         float r = (sampleBuffer.getNumChannels() > 1)
@@ -2667,20 +2872,37 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         outR = (outR * (1.0f - mix)) + (delayedR * mix);
     }
 
-    // Grain mode loudness compensation to better match normal loop playback.
+    // Grain mode loudness compensation.
+    // Keep neutral defaults close to unity and only add compensation as effects increase.
     const float densityNow = juce::jlimit(kGrainMinDensity, kGrainMaxDensity, grainDensitySmoother.getCurrentValue());
     const float sizeNow = juce::jlimit(kGrainMinSizeMs, kGrainMaxSizeMs, grainSizeSmoother.getCurrentValue());
     const float sizeNorm = juce::jlimit(0.0f, 1.0f, (sizeNow - kGrainMinSizeMs) / (kGrainMaxSizeMs - kGrainMinSizeMs));
-    const float envelopeNow = grainEnvelopeAtomic.load(std::memory_order_acquire);
-    const float loudnessComp = juce::jlimit(1.35f, 3.2f,
-        1.72f
-        + (0.48f * (1.0f - densityNow))
-        + (0.26f * sizeNorm)
-        + (0.20f * emitterDepth)
-        + (0.22f * cloudBoost)
-        + (0.40f * envelopeNow));
+    const float densityDelta = std::abs(densityNow - kNeutralDensity) / (kGrainMaxDensity - kGrainMinDensity);
+    const float sizeDelta = std::abs(sizeNow - kNeutralSizeMs) / (kGrainMaxSizeMs - kGrainMinSizeMs);
+    const float activity = juce::jlimit(0.0f, 1.0f,
+        std::max({
+            std::abs(grainPitchAtomic.load(std::memory_order_acquire)) / 48.0f,
+            juce::jlimit(0.0f, 1.0f, grainPitchJitterAtomic.load(std::memory_order_acquire) / 48.0f),
+            juce::jlimit(0.0f, 1.0f, grainSpreadAtomic.load(std::memory_order_acquire)),
+            juce::jlimit(0.0f, 1.0f, grainJitterAtomic.load(std::memory_order_acquire)),
+            juce::jlimit(0.0f, 1.0f, grainRandomDepthAtomic.load(std::memory_order_acquire)),
+            juce::jlimit(0.0f, 1.0f, grainArpDepthAtomic.load(std::memory_order_acquire)),
+            cloudBoost,
+            emitterDepth,
+            juce::jlimit(0.0f, 1.0f, envelopeNow),
+            densityDelta,
+            sizeDelta
+        }));
+    const float loudnessComp = juce::jlimit(0.9f, 2.2f,
+        1.0f + (activity * (0.42f + (0.20f * (1.0f - densityNow)) + (0.10f * sizeNorm))));
     outL *= loudnessComp;
     outR *= loudnessComp;
+
+    if (neutralBlend > 1.0e-4f)
+    {
+        outL = (outL * granularBlend) + (neutralSampleL * neutralBlend);
+        outR = (outR * granularBlend) + (neutralSampleR * neutralBlend);
+    }
 }
 
 void EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
@@ -2792,6 +3014,44 @@ void EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
     }
 }
 
+void EnhancedAudioStrip::clearSample()
+{
+    juce::ScopedLock lock(bufferLock);
+
+    sampleBuffer.setSize(0, 0, false, true, false);
+    sampleLength = 0.0;
+    sourceSampleRate = currentSampleRate;
+    playbackPosition = 0.0;
+    triggerSample = 0;
+    triggerColumn = 0;
+    triggerOffsetRatio = 0.0;
+    triggerPpqPosition = -1.0;
+    lastTriggerPPQ = -1.0;
+    ppqTimelineAnchored = false;
+    ppqTimelineOffsetBeats = 0.0;
+    playing = false;
+    wasPlayingBeforeStop = false;
+    stopAfterFade = false;
+    playheadSample = 0;
+    loopLengthSamples = 0.0;
+    stopLoopPosition = 0.0;
+    transientSliceMode.store(false, std::memory_order_release);
+    transientSliceMapDirty = true;
+    analysisSampleCount = 0;
+    analysisCacheValid = false;
+    analysisRmsMap.fill(0.0f);
+    analysisZeroCrossMap.fill(0);
+    for (int i = 0; i < ModernAudioEngine::MaxColumns; ++i)
+        transientSliceSamples[static_cast<size_t>(i)] = i;
+
+    stepSampler.allNotesOff();
+    lastStepTime = -1.0;
+    stepSamplePlaying = false;
+    currentStep = 0;
+    resetGrainState();
+    resetPitchShifter();
+}
+
 void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output, 
                                 int startSample, 
                                 int numSamples,
@@ -2801,6 +3061,11 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                                 double quantizeBeats)
 {
     juce::ScopedLock lock(bufferLock);
+
+    // UI preview demand decay (message thread bumps this via preview getters).
+    const int previewCountdown = grainPreviewRequestCountdown.load(std::memory_order_acquire);
+    if (previewCountdown > 0)
+        grainPreviewRequestCountdown.store(previewCountdown - 1, std::memory_order_release);
 
     // Auto-start step sequencer when DAW is playing
     bool hostIsPlaying = positionInfo.getIsPlaying();
@@ -5455,11 +5720,41 @@ void EnhancedAudioStrip::setLoop(int startColumn, int endColumn)
 
 void EnhancedAudioStrip::setBeatsPerLoop(float beats)
 {
+    juce::ScopedLock lock(bufferLock);
+
+    const float previousManual = beatsPerLoop.load(std::memory_order_acquire);
+    const double previousBeats = (previousManual >= 0.0f) ? static_cast<double>(previousManual) : 4.0;
+
     // -1 = auto-detect, otherwise manual override (0.25 to 64 beats)
-    if (beats < 0)
-        beatsPerLoop = -1.0f;  // Reset to auto
-    else
-        beatsPerLoop = juce::jlimit(0.25f, 64.0f, beats);
+    const float nextManual = (beats < 0.0f)
+        ? -1.0f
+        : juce::jlimit(0.25f, 64.0f, beats);
+    beatsPerLoop.store(nextManual, std::memory_order_release);
+
+    const double nextBeats = (nextManual >= 0.0f) ? static_cast<double>(nextManual) : 4.0;
+    if (!ppqTimelineAnchored || sampleLength <= 0.0 || nextBeats <= 0.0 || previousBeats <= 0.0 || !lastObservedPpqValid)
+        return;
+
+    int loopCols = loopEnd - loopStart;
+    if (loopCols <= 0)
+        loopCols = ModernAudioEngine::MaxColumns;
+
+    const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
+    const double loopLength = (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
+    if (loopLength <= 0.0)
+        return;
+
+    double posInLoop = playbackPosition.load(std::memory_order_acquire) - loopStartSamples;
+    posInLoop = std::fmod(posInLoop, loopLength);
+    if (posInLoop < 0.0)
+        posInLoop += loopLength;
+
+    const double beatInLoopNew = (posInLoop / loopLength) * nextBeats;
+    const double hostPpqNow = lastObservedPPQ;
+    double newOffset = std::fmod(beatInLoopNew - hostPpqNow, nextBeats);
+    if (newOffset < 0.0)
+        newOffset += nextBeats;
+    ppqTimelineOffsetBeats = newOffset;
 }
 
 void EnhancedAudioStrip::clearLoop()
@@ -5939,6 +6234,7 @@ bool EnhancedAudioStrip::isGrainTempoSyncEnabled() const
 
 std::array<float, 8> EnhancedAudioStrip::getGrainPreviewPositions() const
 {
+    grainPreviewRequestCountdown.store(8, std::memory_order_release);
     std::array<float, 8> out{};
     for (size_t i = 0; i < out.size(); ++i)
         out[i] = grainPreviewPositions[i].load(std::memory_order_acquire);
@@ -5947,6 +6243,7 @@ std::array<float, 8> EnhancedAudioStrip::getGrainPreviewPositions() const
 
 std::array<float, 8> EnhancedAudioStrip::getGrainPreviewPitchNorms() const
 {
+    grainPreviewRequestCountdown.store(8, std::memory_order_release);
     std::array<float, 8> out{};
     for (size_t i = 0; i < out.size(); ++i)
         out[i] = grainPreviewPitchNorms[i].load(std::memory_order_acquire);
@@ -6580,7 +6877,35 @@ void ModernAudioEngine::loadSampleToStrip(int stripIndex, const juce::File& file
 {
     if (auto* strip = getStrip(stripIndex))
     {
+        const bool wasPlaying = strip->isPlaying();
         strip->loadSampleFromFile(file);
+        if (!strip->hasAudio())
+            return;
+
+        const auto* loadedBuffer = strip->getAudioBuffer();
+        const double sourceRate = strip->getSourceSampleRate();
+        if (loadedBuffer == nullptr || loadedBuffer->getNumSamples() <= 0 || sourceRate <= 0.0)
+            return;
+
+        const double hostTempoNow = juce::jlimit(20.0, 320.0, currentTempo.load());
+        const double sampleSeconds = static_cast<double>(loadedBuffer->getNumSamples()) / sourceRate;
+        // Simple 4/4 detection: bars = seconds * BPM / (60 * 4).
+        const double estimatedBars = (sampleSeconds * hostTempoNow) / 240.0;
+        const int detectedBars = juce::jlimit(1, 8, static_cast<int>(std::round(estimatedBars)));
+
+        DBG("Bar detect strip " << stripIndex
+            << " hostBpm=" << hostTempoNow
+            << " frames=" << loadedBuffer->getNumSamples()
+            << " srcRate=" << sourceRate
+            << " durSec=" << sampleSeconds
+            << " barsExact=" << estimatedBars
+            << " barsDetected=" << detectedBars);
+
+        strip->setRecordingBars(detectedBars);
+        // Never retime an actively playing strip during browse/load; that can break
+        // PPQ phase continuity. Apply detected beat mapping only when not playing.
+        if (!wasPlaying)
+            strip->setBeatsPerLoop(static_cast<float>(detectedBars * 4));
     }
 }
 
@@ -6773,6 +7098,13 @@ void ModernAudioEngine::updateTempo(const juce::AudioPlayHead::PositionInfo& pos
             // Calculate beat phase (0.0 to 1.0 within current beat)
             double wholeBeat = std::floor(hostPpq);
             beatPhase = hostPpq - wholeBeat;
+        }
+
+        if (positionInfo.getTimeSignature().hasValue())
+        {
+            const auto ts = *positionInfo.getTimeSignature();
+            currentTimeSigNumerator.store(juce::jlimit(1, 32, ts.numerator), std::memory_order_release);
+            currentTimeSigDenominator.store(juce::jlimit(1, 32, ts.denominator), std::memory_order_release);
         }
     }
 }

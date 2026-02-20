@@ -196,6 +196,37 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                                 strip->stop(false);
                         }
                     }
+                    else // Was muted, now unmuted: resume group strips in PPQ sync
+                    {
+                        const double restartTimelineBeat = audioEngine->getTimelineBeat();
+                        const double restartTempo = audioEngine->getCurrentTempo();
+                        const int64_t restartGlobalSample = audioEngine->getGlobalSampleCount();
+                        const auto& strips = group->getStrips();
+                        for (int stripIdx : strips)
+                        {
+                            if (auto* strip = audioEngine->getStrip(stripIdx))
+                            {
+                                if (!strip->hasAudio())
+                                    continue;
+
+                                const int restartColumn = juce::jlimit(0, 15, strip->getCurrentColumn());
+                                if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+                                {
+                                    // Step mode follows global clock directly.
+                                    strip->startStepSequencer();
+                                    continue;
+                                }
+
+                                strip->restorePresetPpqState(true,
+                                                             strip->isPpqTimelineAnchored(),
+                                                             strip->getPpqTimelineOffsetBeats(),
+                                                             restartColumn,
+                                                             restartTempo,
+                                                             restartTimelineBeat,
+                                                             restartGlobalSample);
+                            }
+                        }
+                    }
                 }
             }
             // Columns 4-7: Pattern recorders (manual stop with auto-quantized length)

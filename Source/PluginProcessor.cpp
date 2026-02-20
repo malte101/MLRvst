@@ -871,7 +871,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         "quality",
         "Grain Quality",
         juce::StringArray{"Linear", "Cubic", "Sinc", "Sinc HQ"},
-        2));
+        1));
     
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         "pitchSmoothing",
@@ -1148,7 +1148,7 @@ void MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& f
         
         // Remember this file for this strip
         currentStripFiles[stripIndex] = file;
-        
+
         audioEngine->loadSampleToStrip(stripIndex, file);
     }
 }
@@ -1171,6 +1171,14 @@ void MlrVSTAudioProcessor::captureRecentAudioToStrip(int stripIndex)
         audioEngine->triggerStripWithQuantization(stripIndex, 0, false);
         updateMonomeLEDs();
     }
+}
+
+void MlrVSTAudioProcessor::setPendingBarLengthApply(int stripIndex, bool pending)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    pendingBarLengthApply[static_cast<size_t>(stripIndex)] = pending;
 }
 
 int MlrVSTAudioProcessor::getQuantizeDivision() const
@@ -1622,6 +1630,15 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     
     auto* strip = audioEngine->getStrip(stripIndex);
     if (!strip) return;
+
+    // If bar length was changed while playing, apply it on the next row trigger.
+    const auto stripIdx = static_cast<size_t>(stripIndex);
+    if (pendingBarLengthApply[stripIdx] && strip->hasAudio())
+    {
+        const int bars = juce::jlimit(1, 8, strip->getRecordingBars());
+        strip->setBeatsPerLoop(static_cast<float>(bars * 4));
+        pendingBarLengthApply[stripIdx] = false;
+    }
     
     // CHECK: If inner loop is active, clear it and return to full loop
     if (strip->getLoopStart() != 0 || strip->getLoopEnd() != MaxColumns)
@@ -1862,6 +1879,10 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
     int savedGroup = strip->getGroup();
     int savedLoopStart = strip->getLoopStart();
     int savedLoopEnd = strip->getLoopEnd();
+    int savedColumn = strip->getCurrentColumn();
+    const double hostPpqBeforeLoad = audioEngine->getTimelineBeat();
+    if (wasPlaying)
+        strip->captureMomentaryPhaseReference(hostPpqBeforeLoad);
     
     try
     {
@@ -1875,11 +1896,11 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
         strip->setGroup(savedGroup);
         strip->setLoop(savedLoopStart, savedLoopEnd);
         
-        // Resume playback if was playing (without retriggering - just continue)
+        // If browsing while playing, enforce phase guard only (no retime trigger).
         if (wasPlaying)
         {
-            // Don't trigger - that resets position. Just ensure it's playing.
-            // The strip should keep its playback state through the sample change
+            strip->enforceMomentaryPhaseReference(audioEngine->getTimelineBeat(),
+                                                  audioEngine->getGlobalSampleCount());
         }
     }
     catch (...)
@@ -1912,6 +1933,26 @@ void MlrVSTAudioProcessor::loadPreset(int presetIndex)
 {
     try
     {
+        struct ScopedSuspendProcessing
+        {
+            explicit ScopedSuspendProcessing(MlrVSTAudioProcessor& p) : processor(p) { processor.suspendProcessing(true); }
+            ~ScopedSuspendProcessing() { processor.suspendProcessing(false); }
+            MlrVSTAudioProcessor& processor;
+        } scopedSuspend(*this);
+
+        double hostPpqSnapshot = audioEngine ? audioEngine->getTimelineBeat() : 0.0;
+        double hostTempoSnapshot = audioEngine ? audioEngine->getCurrentTempo() : 120.0;
+        if (auto* playHead = getPlayHead())
+        {
+            if (auto position = playHead->getPosition())
+            {
+                if (position->getPpqPosition().hasValue() && std::isfinite(*position->getPpqPosition()))
+                    hostPpqSnapshot = *position->getPpqPosition();
+                if (position->getBpm().hasValue() && std::isfinite(*position->getBpm()) && *position->getBpm() > 0.0)
+                    hostTempoSnapshot = *position->getBpm();
+            }
+        }
+
         // Clear stale file references; preset load repopulates file-backed strips.
         for (auto& f : currentStripFiles)
             f = juce::File();
@@ -1924,7 +1965,9 @@ void MlrVSTAudioProcessor::loadPreset(int presetIndex)
             [this](int stripIndex, const juce::File& sampleFile)
             {
                 loadSampleToStrip(stripIndex, sampleFile);
-            });
+            },
+            hostPpqSnapshot,
+            hostTempoSnapshot);
 
         if (PresetStore::presetExists(presetIndex))
             loadedPresetIndex = presetIndex;

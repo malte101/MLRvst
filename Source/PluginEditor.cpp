@@ -946,7 +946,7 @@ void StripControl::setupComponents()
     setupGrainKnob(grainEmitterSlider, grainEmitterLabel, "EMIT", 0.0, 1.0, 0.01);
     setupGrainKnob(grainEnvelopeSlider, grainEnvelopeLabel, "ENV", 0.0, 1.0, 0.01);
     enableAltClickReset(grainSizeSlider, 1240.0);
-    enableAltClickReset(grainDensitySlider, 0.22);
+    enableAltClickReset(grainDensitySlider, 0.05);
     enableAltClickReset(grainPitchSlider, 0.0);
     enableAltClickReset(grainPitchJitterSlider, 0.0);
     enableAltClickReset(grainSpreadSlider, 0.0);
@@ -955,7 +955,7 @@ void StripControl::setupComponents()
     enableAltClickReset(grainArpSlider, 0.0);
     enableAltClickReset(grainCloudSlider, 0.0);
     enableAltClickReset(grainEmitterSlider, 0.0);
-    enableAltClickReset(grainEnvelopeSlider, 0.2);
+    enableAltClickReset(grainEnvelopeSlider, 0.0);
     auto setupMini = [](juce::Slider& slider)
     {
         slider.setSliderStyle(juce::Slider::LinearHorizontal);
@@ -1009,11 +1009,17 @@ void StripControl::setupComponents()
         const int percent = static_cast<int>(std::round(juce::jlimit(0.0, 1.0, value) * 100.0));
         return juce::String(percent) + "% size jitter";
     };
+    grainRandomSlider.textFromValueFunction = [](double value)
+    {
+        const int percent = static_cast<int>(std::round(juce::jlimit(0.0, 1.0, value) * 100.0));
+        return juce::String(percent) + "% macro rand";
+    };
     grainEnvelopeSlider.textFromValueFunction = [](double value)
     {
         const int percent = static_cast<int>(std::round(juce::jlimit(0.0, 1.0, value) * 100.0));
         return juce::String(percent) + "% Fade";
     };
+    grainRandomSlider.setTooltip("RAND: macro random depth (position, pitch, size, reverse), not just position jitter.");
 
     grainSizeSlider.onValueChange = [this]()
     {
@@ -1117,12 +1123,20 @@ void StripControl::setupComponents()
 
     grainSizeSyncToggle.setButtonText("SYNC");
     grainSizeSyncToggle.setClickingTogglesState(true);
-    grainSizeSyncToggle.setToggleState(true, juce::dontSendNotification);
+    grainSizeSyncToggle.setToggleState(false, juce::dontSendNotification);
+    grainSizeSyncToggle.setColour(juce::ToggleButton::textColourId, stripColor.withAlpha(0.72f));
+    grainSizeSyncToggle.setColour(juce::ToggleButton::tickColourId, stripColor.withAlpha(0.72f));
+    grainSizeSyncToggle.setColour(juce::ToggleButton::tickDisabledColourId, stripColor.withAlpha(0.28f));
     grainSizeSyncToggle.onClick = [this]()
     {
+        const bool enabled = grainSizeSyncToggle.getToggleState();
+        grainSizeSyncToggle.setButtonText(enabled ? "SYNC*" : "SYNC");
+        grainSizeSyncToggle.setColour(juce::ToggleButton::textColourId, enabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
+        grainSizeSyncToggle.setColour(juce::ToggleButton::tickColourId, enabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-            strip->setGrainTempoSyncEnabled(grainSizeSyncToggle.getToggleState());
+            strip->setGrainTempoSyncEnabled(enabled);
     };
+    grainSizeSyncToggle.setButtonText(grainSizeSyncToggle.getToggleState() ? "SYNC*" : "SYNC");
     addAndMakeVisible(grainSizeSyncToggle);
 
     patternLengthBox.addItem("16", 1);
@@ -1169,7 +1183,7 @@ void StripControl::setupComponents()
     patternLengthLabel.setJustificationType(juce::Justification::centred);
     patternLengthLabel.setColour(juce::Label::textColourId, stripColor.brighter(0.3f));
     addAndMakeVisible(patternLengthLabel);
-    
+
     // Tempo adjustment buttons (÷2 and ×2)
     tempoHalfButton.setButtonText("-");
     tempoHalfButton.setTooltip("Slower (double beats per loop)");
@@ -1203,20 +1217,24 @@ void StripControl::setupComponents()
     addAndMakeVisible(tempoLabel);
     tempoLabel.setTooltip("Beats per loop (auto or manual).");
 
-    recordBarsLabel.setText("IN", juce::dontSendNotification);
+    recordBarsLabel.setText("BAR", juce::dontSendNotification);
     recordBarsLabel.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
     recordBarsLabel.setJustificationType(juce::Justification::centredLeft);
     recordBarsLabel.setColour(juce::Label::textColourId, kTextMuted);
     addAndMakeVisible(recordBarsLabel);
-    recordBarsLabel.setTooltip("Input buffer bars for live capture.");
+    recordBarsLabel.setTooltip("Unified loop bars: used for live capture and loaded sample tempo mapping.");
 
     recordBarsBox.addItem("1", 1);
     recordBarsBox.addItem("2", 2);
+    recordBarsBox.addItem("3", 3);
     recordBarsBox.addItem("4", 4);
+    recordBarsBox.addItem("5", 5);
+    recordBarsBox.addItem("6", 6);
+    recordBarsBox.addItem("7", 7);
     recordBarsBox.addItem("8", 8);
     recordBarsBox.setJustificationType(juce::Justification::centredLeft);
     recordBarsBox.setSelectedId(1, juce::dontSendNotification);
-    recordBarsBox.setTooltip("Input recording buffer bars (per strip)");
+    recordBarsBox.setTooltip("Loop bars per strip (capture + loaded sample mapping).");
     recordBarsBox.onChange = [this]()
     {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
@@ -1226,8 +1244,16 @@ void StripControl::setupComponents()
 
             // Keep GUI behavior consistent with monome buffer-length buttons:
             // changing input buffer bars on an existing strip also updates loop tempo mapping.
-            if (strip->hasAudio())
+            // Never retime while actively playing; that can disturb PPQ-locked phase.
+            if (strip->hasAudio() && !strip->isPlaying())
+            {
                 strip->setBeatsPerLoop(static_cast<float>(bars * 4));
+                processor.setPendingBarLengthApply(stripIndex, false);
+            }
+            else if (strip->hasAudio())
+            {
+                processor.setPendingBarLengthApply(stripIndex, true);
+            }
         }
     };
     addAndMakeVisible(recordBarsBox);
@@ -2282,7 +2308,11 @@ void StripControl::updateFromEngine()
         const int arpMode = juce::jlimit(0, 5, static_cast<int>(std::round(grainArpModeSlider.getValue())));
         grainArpModeLabel.setText(getGrainArpModeName(arpMode), juce::dontSendNotification);
     }
-    grainSizeSyncToggle.setToggleState(strip->isGrainTempoSyncEnabled(), juce::dontSendNotification);
+    const bool grainSyncEnabled = strip->isGrainTempoSyncEnabled();
+    grainSizeSyncToggle.setToggleState(grainSyncEnabled, juce::dontSendNotification);
+    grainSizeSyncToggle.setButtonText(grainSyncEnabled ? "SYNC*" : "SYNC");
+    grainSizeSyncToggle.setColour(juce::ToggleButton::textColourId, grainSyncEnabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
+    grainSizeSyncToggle.setColour(juce::ToggleButton::tickColourId, grainSyncEnabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
     {
         const bool arpActive = strip->getGrainArpDepth() > 0.001f;
         grainPitchLabel.setText(arpActive ? "RANGE" : "PITCH", juce::dontSendNotification);

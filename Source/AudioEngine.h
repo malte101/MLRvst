@@ -348,7 +348,7 @@ public:
     bool reverse = false;
     
     std::atomic<float> beatsPerLoop{-1.0f};  // -1 = auto-detect, otherwise manual override
-    int recordingBars = 1;  // Per-strip recording length: 1, 2 or 4 bars
+    int recordingBars = 1;  // Unified per-strip bars for capture + loaded sample mapping (1..8)
     
     std::atomic<float> volume{1.0f};
     std::atomic<float> pan{0.0f};
@@ -381,6 +381,7 @@ public:
     void prepareToPlay(double sampleRate, int maxBlockSize);
     void loadSample(const juce::AudioBuffer<float>& buffer, double sourceRate);
     void loadSampleFromFile(const juce::File& file);
+    void clearSample();
     
     void process(juce::AudioBuffer<float>& output, 
                 int startSample, 
@@ -446,6 +447,15 @@ public:
     void setTransientSliceMode(bool enabled);
     bool isTransientSliceMode() const { return transientSliceMode.load(std::memory_order_acquire); }
     std::array<int, 16> getSliceStartSamples(bool transientMode) const;
+    std::array<int, 16> getCachedTransientSliceSamples() const;
+    std::array<float, 128> getCachedRmsMap() const;
+    std::array<int, 128> getCachedZeroCrossMap() const;
+    bool hasSampleAnalysisCache() const { return analysisCacheValid && analysisSampleCount > 0; }
+    int getAnalysisSampleCount() const { return analysisSampleCount; }
+    void restoreSampleAnalysisCache(const std::array<int, 16>& transientSlices,
+                                    const std::array<float, 128>& rmsMap,
+                                    const std::array<int, 128>& zeroCrossMap,
+                                    int sourceSampleCount);
     void setTriggerFadeInMs(float ms) { triggerFadeInMs.store(juce::jlimit(0.1f, 120.0f, ms), std::memory_order_release); }
     float getTriggerFadeInMs() const { return triggerFadeInMs.load(std::memory_order_acquire); }
     
@@ -567,6 +577,16 @@ public:
             resetGrainState();
             if (sampleLength > 0.0)
                 grainCenterSmoother.setCurrentAndTargetValue(playbackPosition.load());
+            // Force immediate first grain spawn when entering grain mode.
+            grainSpawnAccumulator = 1.0;
+
+            // Short output blend from previous sample to prevent mode-switch crackle.
+            const float modeFadeMs = juce::jlimit(0.2f, 8.0f, triggerFadeInMs.load(std::memory_order_acquire));
+            triggerOutputBlendTotalSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * modeFadeMs));
+            triggerOutputBlendSamplesRemaining = triggerOutputBlendTotalSamples;
+            triggerOutputBlendStartL = lastOutputSampleL;
+            triggerOutputBlendStartR = lastOutputSampleR;
+            triggerOutputBlendActive = true;
             playing = true;
         }
         else if (oldMode == PlayMode::Step && mode != PlayMode::Step)
@@ -621,7 +641,7 @@ private:
     {
         // Tuned for cleaner "near-normal" default grain playback.
         float sizeMs = 1240.0f;    // 5..2400
-        float density = 0.22f;     // 0..1
+        float density = 0.05f;     // 0..1
         float pitchSemitones = 0.0f;
         float pitchJitterSemitones = 0.0f;
         float spread = 0.0f;       // 0..1
@@ -630,7 +650,7 @@ private:
         float arpDepth = 0.0f;     // 0..1 arpeggiation depth
         float cloudDepth = 0.0f;   // 0..1 cloud delay mix/feedback
         float emitterDepth = 0.0f; // 0..1 quantized emitter around playhead
-        float envelope = 0.2f;     // 0..1 edge fade length (higher = longer fades)
+        float envelope = 0.0f;     // 0..1 edge fade length (higher = longer fades)
         int arpMode = 0;           // 0=Octave, 1=Power, 2=Zigzag
         bool reverse = false;
     };
@@ -698,11 +718,12 @@ private:
     int grainSchedulerNoiseCountdown = 0;
     juce::SmoothedValue<double> grainCenterSmoother{0.0};
     juce::SmoothedValue<float> grainSizeSmoother{1240.0f};
-    juce::SmoothedValue<float> grainDensitySmoother{0.22f};
+    juce::SmoothedValue<float> grainDensitySmoother{0.05f};
     juce::SmoothedValue<float> grainFreezeBlendSmoother{0.0f};
     juce::SmoothedValue<float> grainScratchSceneMix{0.0f};
     double grainBloomPhase = 0.0;
     float grainBloomAmount = 0.0f;
+    float grainNeutralBlendState = 1.0f;
     
     // Smoothed parameters
     juce::SmoothedValue<float> smoothedVolume{0.7f};
@@ -797,6 +818,10 @@ private:
     int randomSliceWindowLengthSlices = 1;
     std::array<int, 16> transientSliceSamples = {};
     bool transientSliceMapDirty = true;
+    std::array<float, 128> analysisRmsMap = {};
+    std::array<int, 128> analysisZeroCrossMap = {};
+    int analysisSampleCount = 0;
+    bool analysisCacheValid = false;
     
     // Proportional scratch timing
     int64_t scratchStartTime = 0;     // When scratch started (for duration tracking)
@@ -821,7 +846,7 @@ private:
     std::atomic<int> grainLedSizeControl{-1};
     std::atomic<bool> grainLedFreeze{false};
     std::atomic<float> grainSizeMsAtomic{1240.0f};
-    std::atomic<float> grainDensityAtomic{0.22f};
+    std::atomic<float> grainDensityAtomic{0.05f};
     std::atomic<float> grainPitchAtomic{0.0f};
     std::atomic<float> grainPitchJitterAtomic{0.0f};
     std::atomic<float> grainSpreadAtomic{0.0f};
@@ -830,9 +855,9 @@ private:
     std::atomic<float> grainArpDepthAtomic{0.0f};
     std::atomic<float> grainCloudDepthAtomic{0.0f};
     std::atomic<float> grainEmitterDepthAtomic{0.0f};
-    std::atomic<float> grainEnvelopeAtomic{0.2f};
+    std::atomic<float> grainEnvelopeAtomic{0.0f};
     std::atomic<int> grainArpModeAtomic{0};
-    std::atomic<bool> grainTempoSyncAtomic{true};
+    std::atomic<bool> grainTempoSyncAtomic{false};
     std::array<std::atomic<float>, 8> grainPreviewPositions {
         std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f},
         std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f}
@@ -841,7 +866,9 @@ private:
         std::atomic<float>{0.0f}, std::atomic<float>{0.0f}, std::atomic<float>{0.0f}, std::atomic<float>{0.0f},
         std::atomic<float>{0.0f}, std::atomic<float>{0.0f}, std::atomic<float>{0.0f}, std::atomic<float>{0.0f}
     };
+    mutable std::atomic<int> grainPreviewRequestCountdown{0};
     int grainPreviewDecimationCounter = 0;
+    int grainVoiceSearchStart = 0;
     int64_t grainSizeJitterBeatGroup = std::numeric_limits<int64_t>::min();
     float grainSizeJitterMul = 1.0f;
     GrainParams grainParamsBeforeGesture;
@@ -897,6 +924,7 @@ public:
     void handleLooping();
     float getPanGain(int channel) const; // 0=left, 1=right
     void rebuildTransientSliceMap();
+    void rebuildSampleAnalysisCacheLocked();
     double getTriggerTargetPositionForColumn(int column, double loopStartSamples, double loopLengthSamples) const;
     double snapToNearestZeroCrossing(double targetPos, int radiusSamples) const;
     double getWrappedSamplePosition(double samplePos, double loopStartSamples, double loopLengthSamples) const;
@@ -913,7 +941,7 @@ public:
     double getGrainBeatPositionAtSample(int64_t globalSample) const;
     double getGrainColumnCenterPosition(int column) const;
     void setGrainScratchSceneTarget(float targetMix, int heldCount, double tempoBpm);
-    void spawnGrainVoice(double centerSamplePos, float sizeMs, float density, float spread, float pitchOffsetSemitones);
+    void spawnGrainVoice(double centerSamplePos, float sizeMs, float density, float spread, float pitchOffsetSemitones, double playbackStepBase);
     void renderGrainAtSample(float& outL, float& outR, double centerSamplePos, double effectiveSpeed, int64_t globalSample);
     
     // Musical scratching helpers
@@ -1096,6 +1124,8 @@ private:
     std::atomic<float> triggerFadeInMs{12.0f}; // Trigger fade-in de-click time (ms)
     
     std::atomic<double> currentTempo{120.0};
+    std::atomic<int> currentTimeSigNumerator{4};
+    std::atomic<int> currentTimeSigDenominator{4};
     std::atomic<double> currentBeat{0.0};
     std::atomic<double> beatPhase{0.0};  // 0.0-1.0 within current beat for sync
     std::atomic<double> lastKnownPPQ{0.0};  // Last PPQ from processBlock (for quantize outside audio thread)
