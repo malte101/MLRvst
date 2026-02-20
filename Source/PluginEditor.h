@@ -437,6 +437,7 @@ private:
     juce::Label crossfadeLengthLabel;
     juce::Slider triggerFadeInSlider;
     juce::Label triggerFadeInLabel;
+    juce::ToggleButton momentaryToggle;
     juce::ToggleButton tooltipsToggle;
     
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterVolumeAttachment;
@@ -469,7 +470,6 @@ private:
 
     juce::Label titleLabel;
     juce::Label modeLabel;
-    juce::ToggleButton momentaryToggle;
 
     struct PageRow
     {
@@ -766,10 +766,6 @@ private:
     std::unique_ptr<juce::TooltipWindow> tooltipWindow;
     bool tooltipsEnabled = true;
     uint32_t lastPresetRefreshToken = 0;
-    bool monomePagesAutoOpenActive = false;
-    int topTabIndexBeforeMonomeAutoOpen = 0;
-    bool monomePagesAutoRestoreArmed = false;
-
     void createUIComponents();
     void setupLookAndFeel();
     void layoutComponents();

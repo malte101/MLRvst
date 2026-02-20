@@ -13,11 +13,11 @@
 
 namespace
 {
-const auto kBgTop = juce::Colour(0xff222222);
-const auto kBgBottom = juce::Colour(0xff171717);
-const auto kPanelTop = juce::Colour(0xff343434);
-const auto kPanelBottom = juce::Colour(0xff2a2a2a);
-const auto kPanelStroke = juce::Colour(0xff666666);
+const auto kBgTop = juce::Colour(0xff232629);
+const auto kBgBottom = juce::Colour(0xff16181a);
+const auto kPanelTop = juce::Colour(0xff36393d);
+const auto kPanelBottom = juce::Colour(0xff272a2d);
+const auto kPanelStroke = juce::Colour(0xff70757a);
 const auto kPanelInnerStroke = juce::Colour(0xff242424);
 const auto kAccent = juce::Colour(0xffffb347);
 const auto kTextPrimary = juce::Colour(0xffefefef);
@@ -27,10 +27,18 @@ const auto kSurfaceDark = juce::Colour(0xff1a1a1a);
 
 void drawPanel(juce::Graphics& g, juce::Rectangle<float> bounds, juce::Colour accent, float radius = 8.0f)
 {
+    g.setColour(juce::Colours::black.withAlpha(0.2f));
+    g.fillRoundedRectangle(bounds.translated(0.0f, 1.5f), radius);
+
     juce::ColourGradient fill(kPanelTop, bounds.getX(), bounds.getY(),
                               kPanelBottom, bounds.getX(), bounds.getBottom(), false);
     g.setGradientFill(fill);
     g.fillRoundedRectangle(bounds, radius);
+
+    juce::ColourGradient topSheen(juce::Colours::white.withAlpha(0.06f), bounds.getX(), bounds.getY(),
+                                  juce::Colours::transparentWhite, bounds.getX(), bounds.getY() + (bounds.getHeight() * 0.33f), false);
+    g.setGradientFill(topSheen);
+    g.fillRoundedRectangle(bounds.reduced(1.0f), juce::jmax(2.0f, radius - 1.0f));
 
     g.setColour(kPanelStroke);
     g.drawRoundedRectangle(bounds.reduced(0.5f), radius, 1.0f);
@@ -46,6 +54,26 @@ void enableAltClickReset(juce::Slider& slider, double defaultValue)
 {
     // JUCE supports modifier-click reset when a double-click return value is set.
     slider.setDoubleClickReturnValue(true, defaultValue);
+}
+
+void styleUiButton(juce::Button& button, bool primary = false)
+{
+    button.setColour(juce::TextButton::buttonColourId,
+                     primary ? kAccent.withAlpha(0.9f) : juce::Colour(0xff3b4146));
+    button.setColour(juce::TextButton::buttonOnColourId,
+                     primary ? kAccent.brighter(0.12f) : juce::Colour(0xff4a5258));
+    button.setColour(juce::TextButton::textColourOffId,
+                     primary ? juce::Colour(0xff141414) : kTextPrimary);
+    button.setColour(juce::TextButton::textColourOnId,
+                     primary ? juce::Colour(0xff101010) : juce::Colour(0xfff5f5f5));
+}
+
+void styleUiCombo(juce::ComboBox& combo)
+{
+    combo.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff32363a));
+    combo.setColour(juce::ComboBox::outlineColourId, juce::Colour(0xff5a5f64));
+    combo.setColour(juce::ComboBox::textColourId, kTextPrimary);
+    combo.setColour(juce::ComboBox::arrowColourId, kTextSecondary);
 }
 
 juce::String getGrainArpModeName(int mode)
@@ -1344,7 +1372,7 @@ void StripControl::updateGrainOverlayVisibility()
     grainCloudSlider.setVisible(isGrainMode);
     grainEmitterSlider.setVisible(isGrainMode);
     grainEnvelopeSlider.setVisible(isGrainMode);
-    grainArpModeSlider.setVisible(isGrainMode);
+    grainArpModeSlider.setVisible(false);
     grainSizeSyncToggle.setVisible(isGrainMode);
     grainSizeDivLabel.setVisible(false);
     grainSizeLabel.setVisible(isGrainMode);
@@ -1358,7 +1386,7 @@ void StripControl::updateGrainOverlayVisibility()
     grainCloudLabel.setVisible(isGrainMode);
     grainEmitterLabel.setVisible(isGrainMode);
     grainEnvelopeLabel.setVisible(isGrainMode);
-    grainArpModeLabel.setVisible(isGrainMode);
+    grainArpModeLabel.setVisible(false);
     grainArpModeBox.setVisible(false);
 }
 
@@ -1867,22 +1895,24 @@ void StripControl::resized()
     
     const bool isGrainMode = grainOverlayVisible;
 
+    const int rowGap = isGrainMode ? 1 : 2;
+
     // Top row: Load + slice mode
-    auto topRow = controlsArea.removeFromTop(isGrainMode ? 18 : 20);
+    auto topRow = controlsArea.removeFromTop(isGrainMode ? 16 : 20);
     const int half = topRow.getWidth() / 2;
     auto loadArea = topRow.removeFromLeft(half);
     loadButton.setBounds(loadArea.reduced(0, 0));
     topRow.removeFromLeft(2);
     transientSliceButton.setBounds(topRow);
-    controlsArea.removeFromTop(2);
+    controlsArea.removeFromTop(rowGap);
     
     // Second row: Play mode and Direction mode (2/3 width each), Group (1/3 width)
-    auto modesRow = controlsArea.removeFromTop(isGrainMode ? 18 : 20);
+    auto modesRow = controlsArea.removeFromTop(isGrainMode ? 16 : 20);
     int thirdWidth = modesRow.getWidth() / 3;
     playModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
     directionModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
     groupSelector.setBounds(modesRow.reduced(1, 0));  // Remaining space
-    controlsArea.removeFromTop(2);
+    controlsArea.removeFromTop(rowGap);
     
     // Check if we have enough height for compact transport + record controls.
     const int requiredTopControlsHeight = 22 + 2 + 20 + 2 + 30 + 10 + 10;
@@ -1918,7 +1948,7 @@ void StripControl::resized()
     }
     
     // Rotary knobs row.
-    auto knobsRow = controlsArea.removeFromTop(isGrainMode ? 22 : 26);
+    auto knobsRow = controlsArea.removeFromTop(isGrainMode ? 18 : 26);
     int totalWidth = knobsRow.getWidth();
     int mainKnobsWidth = (totalWidth * 7) / 10;
     int mainKnobWidth = mainKnobsWidth / 3;
@@ -1942,7 +1972,7 @@ void StripControl::resized()
     else
         scratchSlider.setBounds(knobsRow.reduced(2));
 
-    auto labelsRow = controlsArea.removeFromTop(isGrainMode ? 9 : 9);
+    auto labelsRow = controlsArea.removeFromTop(isGrainMode ? 8 : 9);
     if (isGrainMode)
     {
         grainSizeLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
@@ -1960,7 +1990,6 @@ void StripControl::resized()
         patternLengthLabel.setBounds(labelsRow);
     else
         scratchLabel.setBounds(labelsRow);
-
     if (!isGrainMode)
     {
         // Recording loop length label (small, at bottom)
@@ -1970,15 +1999,15 @@ void StripControl::resized()
     }
 
     // Dynamic compact grain layout to keep all controls visible.
-    const int remainingH = juce::jmax(46, controlsArea.getHeight());
-    const int syncRowH = juce::jlimit(9, 11, remainingH / 8);
-    const int rowH = juce::jlimit(8, 11, (remainingH - syncRowH) / 5);
-    const int modeRowH = juce::jlimit(9, 13, remainingH - syncRowH - (rowH * 4));
+    const int remainingH = juce::jmax(0, controlsArea.getHeight());
+    const int syncRowH = juce::jlimit(6, 9, remainingH / 5);
+    const int miniRowsTotal = juce::jmax(0, remainingH - syncRowH);
+    const int rowH = juce::jlimit(6, 10, miniRowsTotal / 4);
 
     auto syncRow = controlsArea.removeFromTop(syncRowH);
     auto envArea = syncRow.removeFromRight(96);
-    grainSizeSyncToggle.setBounds(syncRow.removeFromLeft(44));
-    grainEnvelopeLabel.setBounds(envArea.removeFromLeft(28));
+    grainSizeSyncToggle.setBounds(syncRow.removeFromLeft(40));
+    grainEnvelopeLabel.setBounds(envArea.removeFromLeft(30));
     grainEnvelopeSlider.setBounds(envArea);
 
     auto layoutGrainMiniRow = [&](int height, juce::Label& labelA, juce::Slider& sliderA,
@@ -1988,13 +2017,13 @@ void StripControl::resized()
             return;
         auto row = controlsArea.removeFromTop(height);
         auto left = row.removeFromLeft(row.getWidth() / 2);
-        labelA.setBounds(left.removeFromLeft(28));
+        labelA.setBounds(left.removeFromLeft(30));
         sliderA.setBounds(left);
 
         if (labelB != nullptr && sliderB != nullptr)
         {
             row.removeFromLeft(2);
-            labelB->setBounds(row.removeFromLeft(28));
+            labelB->setBounds(row.removeFromLeft(30));
             sliderB->setBounds(row);
         }
     };
@@ -2003,9 +2032,6 @@ void StripControl::resized()
     layoutGrainMiniRow(rowH, grainSpreadLabel, grainSpreadSlider, &grainJitterLabel, &grainJitterSlider);
     layoutGrainMiniRow(rowH, grainRandomLabel, grainRandomSlider, &grainArpLabel, &grainArpSlider);
     layoutGrainMiniRow(rowH, grainCloudLabel, grainCloudSlider, &grainEmitterLabel, &grainEmitterSlider);
-    auto modeRow = controlsArea.removeFromTop(juce::jmax(modeRowH, 8));
-    grainArpModeLabel.setBounds(modeRow.removeFromLeft(52));
-    grainArpModeSlider.setBounds(modeRow);
 }
 
 
@@ -3053,8 +3079,8 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
 {
     // Title - compact
     titleLabel.setText("GLOBAL CONTROLS", juce::dontSendNotification);  // Uppercase, compact
-    titleLabel.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));  // Smaller (was 14)
-    titleLabel.setColour(juce::Label::textColourId, kTextMuted);
+    titleLabel.setFont(juce::Font(juce::FontOptions(12.0f, juce::Font::bold)));
+    titleLabel.setColour(juce::Label::textColourId, kTextPrimary);
     addAndMakeVisible(titleLabel);
     titleLabel.setTooltip("Master timing, quality, monitoring, and UI help settings.");
     
@@ -3091,6 +3117,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     quantizeSelector.addItem("1/32", 10);
     quantizeSelector.setSelectedId(6);  // Default to 1/8
     addAndMakeVisible(quantizeSelector);
+    styleUiCombo(quantizeSelector);
     quantizeSelector.setTooltip("Global trigger quantization grid.");
     
     quantizeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
@@ -3109,6 +3136,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
         processor.setSwingDivisionSelection(swingDivisionBox.getSelectedId() - 1);
     };
     addAndMakeVisible(swingDivisionBox);
+    styleUiCombo(swingDivisionBox);
     
     // Grain quality (global for all strips in Grain mode)
     qualityLabel.setText("Grain Q", juce::dontSendNotification);
@@ -3121,6 +3149,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     resamplingQualityBox.addItem("Sinc HQ", 4);
     resamplingQualityBox.setSelectedId(3);
     addAndMakeVisible(resamplingQualityBox);
+    styleUiCombo(resamplingQualityBox);
     resamplingQualityBox.setTooltip("Global grain interpolation quality for all strips.");
     grainQualityAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
         processor.parameters, "quality", resamplingQualityBox);
@@ -3188,6 +3217,17 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
             onTooltipsToggled(tooltipsToggle.getToggleState());
     };
     addAndMakeVisible(tooltipsToggle);
+    styleUiButton(tooltipsToggle);
+
+    momentaryToggle.setButtonText("Momentary");
+    momentaryToggle.setClickingTogglesState(true);
+    momentaryToggle.onClick = [this]()
+    {
+        processor.setControlPageMomentary(momentaryToggle.getToggleState());
+    };
+    momentaryToggle.setTooltip("Monome page buttons are hold-to-temporary when enabled.");
+    addAndMakeVisible(momentaryToggle);
+    styleUiButton(momentaryToggle);
     
     crossfadeLengthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
         processor.parameters, "crossfadeLength", crossfadeLengthSlider);
@@ -3204,12 +3244,8 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
 PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     : processor(p)
 {
-    // Instructions - very compact
-    instructionsLabel.setText("Click=Load  Shift+Click=Save name  Save/Delete use selected slot", juce::dontSendNotification);
-    instructionsLabel.setFont(juce::Font(juce::FontOptions(9.0f)));  // Smaller
-    instructionsLabel.setColour(juce::Label::textColourId, kTextMuted);
-    instructionsLabel.setJustificationType(juce::Justification::centredLeft);
-    addAndMakeVisible(instructionsLabel);
+    // Reduce visual density; use tooltips and control labels for guidance.
+    instructionsLabel.setVisible(false);
 
     presetNameEditor.setTextToShowWhenEmpty("Preset name", kTextMuted);
     presetNameEditor.setMultiLine(false);
@@ -3217,6 +3253,10 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     presetNameEditor.setSelectAllWhenFocused(true);
     presetNameEditor.setMouseClickGrabsKeyboardFocus(true);
     presetNameEditor.onTextChange = [this]() { presetNameDraft = presetNameEditor.getText(); };
+    presetNameEditor.onFocusLost = [this]()
+    {
+        presetNameDraft = presetNameEditor.getText();
+    };
     presetNameEditor.onReturnKey = [this]()
     {
         savePresetClicked(selectedPresetIndex, presetNameEditor.getText());
@@ -3226,9 +3266,16 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     saveButton.setButtonText("Save");
     saveButton.onClick = [this]()
     {
-        savePresetClicked(selectedPresetIndex, presetNameEditor.getText());
+        // Defer one message tick so in-flight text edits are committed first.
+        juce::MessageManager::callAsync([safe = juce::Component::SafePointer<PresetControlPanel>(this)]()
+        {
+            if (safe == nullptr)
+                return;
+            safe->savePresetClicked(safe->selectedPresetIndex, safe->presetNameEditor.getText());
+        });
     };
     addAndMakeVisible(saveButton);
+    styleUiButton(saveButton, true);
 
     deleteButton.setButtonText("Delete");
     deleteButton.onClick = [this]()
@@ -3237,6 +3284,7 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
             updatePresetButtons();
     };
     addAndMakeVisible(deleteButton);
+    styleUiButton(deleteButton);
 
     presetViewport.setViewedComponent(&presetGridContent, false);
     presetViewport.setScrollBarsShown(true, true, true, true);
@@ -3251,11 +3299,17 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
         auto& button = presetButtons[static_cast<size_t>(i)];
         button.setButtonText(juce::String(x) + "," + juce::String(y));
         button.setClickingTogglesState(false);
+        styleUiButton(button);
 
         button.onClick = [this, i]()
         {
             if (juce::ModifierKeys::getCurrentModifiersRealtime().isShiftDown())
-                savePresetClicked(i, presetNameEditor.getText());
+                juce::MessageManager::callAsync([safe = juce::Component::SafePointer<PresetControlPanel>(this), i]()
+                {
+                    if (safe == nullptr)
+                        return;
+                    safe->savePresetClicked(i, safe->presetNameEditor.getText());
+                });
             else
                 loadPresetClicked(i);
         };
@@ -3279,12 +3333,8 @@ void PresetControlPanel::resized()
 {
     auto bounds = getLocalBounds().reduced(8);
 
-    auto instructionsArea = bounds.removeFromTop(12);
-    instructionsLabel.setBounds(instructionsArea);
-    bounds.removeFromTop(2);
-
-    auto editorArea = bounds.removeFromTop(22);
-    const int buttonW = 58;
+    auto editorArea = bounds.removeFromTop(26);
+    const int buttonW = 68;
     deleteButton.setBounds(editorArea.removeFromRight(buttonW));
     editorArea.removeFromRight(4);
     saveButton.setBounds(editorArea.removeFromRight(buttonW));
@@ -3605,6 +3655,8 @@ void GlobalControlPanel::resized()
     auto titleRow = bounds.removeFromTop(20);  // Smaller title (was 24)
     tooltipsToggle.setBounds(titleRow.removeFromRight(86));
     titleRow.removeFromRight(6);
+    momentaryToggle.setBounds(titleRow.removeFromRight(92));
+    titleRow.removeFromRight(6);
     titleLabel.setBounds(titleRow);
     
     bounds.removeFromTop(4);  // Less gap (was 8)
@@ -3660,21 +3712,21 @@ void GlobalControlPanel::resized()
     auto quantizeArea = controlsArea.removeFromLeft(dropdownWidth);
     quantizeLabel.setBounds(quantizeArea.removeFromTop(16));
     quantizeArea.removeFromTop(2);
-    quantizeSelector.setBounds(quantizeArea.removeFromTop(24));
+    quantizeSelector.setBounds(quantizeArea.removeFromTop(28));
     controlsArea.removeFromLeft(spacing);
 
     // Quality - compact dropdown
     auto qualityArea = controlsArea.removeFromLeft(dropdownWidth);
     qualityLabel.setBounds(qualityArea.removeFromTop(16));
     qualityArea.removeFromTop(2);
-    resamplingQualityBox.setBounds(qualityArea.removeFromTop(24));
+    resamplingQualityBox.setBounds(qualityArea.removeFromTop(28));
     controlsArea.removeFromLeft(spacing);
 
     // Swing grid - compact dropdown
     auto swingArea = controlsArea.removeFromLeft(dropdownWidth);
     swingDivisionLabel.setBounds(swingArea.removeFromTop(16));
     swingArea.removeFromTop(2);
-    swingDivisionBox.setBounds(swingArea.removeFromTop(24));
+    swingDivisionBox.setBounds(swingArea.removeFromTop(28));
 }
 
 void GlobalControlPanel::updateMeters(float leftLevel, float rightLevel)
@@ -3686,6 +3738,7 @@ void GlobalControlPanel::updateMeters(float leftLevel, float rightLevel)
 void GlobalControlPanel::refreshFromProcessor()
 {
     swingDivisionBox.setSelectedId(processor.getSwingDivisionSelection() + 1, juce::dontSendNotification);
+    momentaryToggle.setToggleState(processor.isControlPageMomentary(), juce::dontSendNotification);
 }
 
 //==============================================================================
@@ -3695,24 +3748,6 @@ void GlobalControlPanel::refreshFromProcessor()
 MonomePagesPanel::MonomePagesPanel(MlrVSTAudioProcessor& p)
     : processor(p)
 {
-    titleLabel.setText("MONOME PAGES", juce::dontSendNotification);
-    titleLabel.setFont(juce::Font(juce::FontOptions(12.5f, juce::Font::bold)));
-    titleLabel.setColour(juce::Label::textColourId, kTextPrimary);
-    addAndMakeVisible(titleLabel);
-
-    modeLabel.setText("Button behavior:", juce::dontSendNotification);
-    modeLabel.setFont(juce::Font(juce::FontOptions(10.5f, juce::Font::bold)));
-    modeLabel.setColour(juce::Label::textColourId, kTextSecondary);
-    addAndMakeVisible(modeLabel);
-
-    momentaryToggle.setButtonText("Momentary hold");
-    momentaryToggle.setClickingTogglesState(true);
-    momentaryToggle.onClick = [this]()
-    {
-        processor.setControlPageMomentary(momentaryToggle.getToggleState());
-    };
-    addAndMakeVisible(momentaryToggle);
-
     for (int i = 0; i < MlrVSTAudioProcessor::NumControlRowPages; ++i)
     {
         auto& row = rows[static_cast<size_t>(i)];
@@ -3723,8 +3758,7 @@ MonomePagesPanel::MonomePagesPanel(MlrVSTAudioProcessor& p)
 
         row.modeButton.setClickingTogglesState(false);
         row.modeButton.setTriggeredOnMouseDown(true);
-        row.modeButton.setColour(juce::TextButton::textColourOnId, juce::Colour(0xff111111));
-        row.modeButton.setColour(juce::TextButton::textColourOffId, juce::Colour(0xfff3f3f3));
+        styleUiButton(row.modeButton);
         row.modeButton.setTooltip("Click to activate this page");
         row.modeButton.onStateChange = [this, i]()
         {
@@ -3758,6 +3792,7 @@ MonomePagesPanel::MonomePagesPanel(MlrVSTAudioProcessor& p)
             refreshFromProcessor();
         };
         addAndMakeVisible(row.upButton);
+        styleUiButton(row.upButton);
 
         row.downButton.setButtonText("v");
         row.downButton.setTooltip("Move page right");
@@ -3767,6 +3802,7 @@ MonomePagesPanel::MonomePagesPanel(MlrVSTAudioProcessor& p)
             refreshFromProcessor();
         };
         addAndMakeVisible(row.downButton);
+        styleUiButton(row.downButton);
     }
 
     refreshFromProcessor();
@@ -3778,7 +3814,7 @@ void MonomePagesPanel::paint(juce::Graphics& g)
     drawPanel(g, getLocalBounds().toFloat(), kAccent, 8.0f);
 
     auto bounds = getLocalBounds().reduced(8);
-    bounds.removeFromTop(18 + 3 + 24 + 8);
+    bounds.removeFromTop(4);
 
     auto pageOrderArea = bounds.removeFromTop(58);
     const int numSlots = MlrVSTAudioProcessor::NumControlRowPages;
@@ -3803,15 +3839,7 @@ void MonomePagesPanel::paint(juce::Graphics& g)
 void MonomePagesPanel::resized()
 {
     auto bounds = getLocalBounds().reduced(8);
-
-    titleLabel.setBounds(bounds.removeFromTop(18));
-    bounds.removeFromTop(3);
-
-    auto modeRow = bounds.removeFromTop(24);
-    modeLabel.setBounds(modeRow.removeFromLeft(130));
-    modeRow.removeFromLeft(6);
-    momentaryToggle.setBounds(modeRow.removeFromLeft(160));
-    bounds.removeFromTop(8);
+    bounds.removeFromTop(4);
 
     auto pageOrderArea = bounds.removeFromTop(58);
     const int numSlots = MlrVSTAudioProcessor::NumControlRowPages;
@@ -3830,11 +3858,11 @@ void MonomePagesPanel::resized()
         row.positionLabel.setBounds(header.removeFromLeft(18));
         slotBounds.removeFromTop(1);
 
-        auto arrows = slotBounds.removeFromRight(11);
-        row.modeButton.setBounds(slotBounds);
+        auto arrows = slotBounds.removeFromRight(16);
+        row.modeButton.setBounds(slotBounds.reduced(0, 2));
 
-        const int arrowW = 9;
-        const int arrowH = 5;
+        const int arrowW = 13;
+        const int arrowH = 9;
         row.upButton.setBounds(arrows.getCentreX() - (arrowW / 2), arrows.getY() + 1, arrowW, arrowH);
         row.downButton.setBounds(arrows.getCentreX() - (arrowW / 2), arrows.getBottom() - arrowH - 1, arrowW, arrowH);
     }
@@ -3849,7 +3877,6 @@ void MonomePagesPanel::timerCallback()
 void MonomePagesPanel::refreshFromProcessor()
 {
     const auto order = processor.getControlPageOrder();
-    momentaryToggle.setToggleState(processor.isControlPageMomentary(), juce::dontSendNotification);
     const auto activeMode = processor.getCurrentControlMode();
 
     for (int i = 0; i < MlrVSTAudioProcessor::NumControlRowPages; ++i)
@@ -3956,12 +3983,7 @@ PatternControlPanel::PatternControlPanel(MlrVSTAudioProcessor& p)
     titleLabel.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(titleLabel);
 
-    instructionsLabel.setText("REC start/stop (rounds to bars, max 8 bars) • PLAY start/stop • STOP halt • CLEAR erase",
-                              juce::dontSendNotification);
-    instructionsLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
-    instructionsLabel.setColour(juce::Label::textColourId, kTextSecondary);
-    instructionsLabel.setJustificationType(juce::Justification::centredLeft);
-    addAndMakeVisible(instructionsLabel);
+    instructionsLabel.setVisible(false);
 
     timingLabel.setText("Beat: --", juce::dontSendNotification);
     timingLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
@@ -4001,6 +4023,7 @@ PatternControlPanel::PatternControlPanel(MlrVSTAudioProcessor& p)
             }
         };
         addAndMakeVisible(pattern.recordButton);
+        styleUiButton(pattern.recordButton, true);
         
         pattern.playButton.setButtonText("Play");
         pattern.playButton.setToggleable(true);
@@ -4013,6 +4036,7 @@ PatternControlPanel::PatternControlPanel(MlrVSTAudioProcessor& p)
                 processor.getAudioEngine()->stopPatternPlayback(i);
         };
         addAndMakeVisible(pattern.playButton);
+        styleUiButton(pattern.playButton);
         
         pattern.stopButton.setButtonText("Stop");
         pattern.stopButton.setTooltip("Stop pattern playback.");
@@ -4022,6 +4046,7 @@ PatternControlPanel::PatternControlPanel(MlrVSTAudioProcessor& p)
             patterns[i].playButton.setToggleState(false, juce::dontSendNotification);
         };
         addAndMakeVisible(pattern.stopButton);
+        styleUiButton(pattern.stopButton);
         
         pattern.clearButton.setButtonText("Clear");
         pattern.clearButton.setTooltip("Erase all events in this pattern.");
@@ -4030,6 +4055,7 @@ PatternControlPanel::PatternControlPanel(MlrVSTAudioProcessor& p)
             processor.getAudioEngine()->clearPattern(i);
         };
         addAndMakeVisible(pattern.clearButton);
+        styleUiButton(pattern.clearButton);
         
         pattern.statusLabel.setText("EMPTY", juce::dontSendNotification);
         pattern.statusLabel.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
@@ -4084,12 +4110,9 @@ void PatternControlPanel::resized()
     timingLabel.setBounds(topRow.removeFromRight(130));
     quantizeLabel.setBounds(topRow.removeFromRight(140));
 
-    instructionsLabel.setBounds(bounds.removeFromTop(16));
-    bounds.removeFromTop(6);
-
     bounds.removeFromTop(8);
 
-    const int rowHeight = 58;
+    const int rowHeight = 60;
     const int rowGap = 6;
 
     for (int i = 0; i < 4; ++i)
@@ -4103,14 +4126,14 @@ void PatternControlPanel::resized()
         pattern.nameLabel.setBounds(header.removeFromLeft(130));
         pattern.statusLabel.setBounds(header.removeFromRight(120));
 
-        auto controls = patternBounds.removeFromTop(22);
-        pattern.recordButton.setBounds(controls.removeFromLeft(58));
+        auto controls = patternBounds.removeFromTop(26);
+        pattern.recordButton.setBounds(controls.removeFromLeft(64));
         controls.removeFromLeft(4);
-        pattern.playButton.setBounds(controls.removeFromLeft(58));
+        pattern.playButton.setBounds(controls.removeFromLeft(64));
         controls.removeFromLeft(4);
-        pattern.stopButton.setBounds(controls.removeFromLeft(58));
+        pattern.stopButton.setBounds(controls.removeFromLeft(64));
         controls.removeFromLeft(4);
-        pattern.clearButton.setBounds(controls.removeFromLeft(58));
+        pattern.clearButton.setBounds(controls.removeFromLeft(64));
 
         pattern.detailLabel.setBounds(patternBounds);
     }
@@ -4221,6 +4244,7 @@ GroupControlPanel::GroupControlPanel(MlrVSTAudioProcessor& p)
             }
         };
         addAndMakeVisible(group.muteButton);
+        styleUiButton(group.muteButton, true);
         
         group.volumeSlider.setSliderStyle(juce::Slider::LinearHorizontal);
         group.volumeSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 20);
@@ -4320,7 +4344,7 @@ void GroupControlPanel::resized()
         
         // Control row
         auto controlRow = groupBounds.removeFromTop(28);
-        group.muteButton.setBounds(controlRow.removeFromLeft(70));
+        group.muteButton.setBounds(controlRow.removeFromLeft(82));
         controlRow.removeFromLeft(6);
         group.volumeSlider.setBounds(controlRow.removeFromLeft(140));
         controlRow.removeFromLeft(10);
@@ -4708,6 +4732,7 @@ MlrVSTAudioProcessorEditor::MlrVSTAudioProcessorEditor(MlrVSTAudioProcessor& p)
 
 void MlrVSTAudioProcessorEditor::createUIComponents()
 {
+    constexpr int kVisibleSampleStrips = 6;
     // Monome grid hidden to save space - use physical monome instead
     monomeGrid = std::make_unique<MonomeGridDisplay>(audioProcessor);
     // Don't add to view - saves space
@@ -4728,11 +4753,11 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     topTabs->addTab("Global Controls", juce::Colour(0xff2c2c2c), globalControl.get(), false);
     topTabs->addTab("Presets", juce::Colour(0xff2c2c2c), presetControl.get(), false);
     topTabs->addTab("Monome Device", juce::Colour(0xff2c2c2c), monomeControl.get(), false);
-    topTabs->addTab("Monome Pages", juce::Colour(0xff2c2c2c), monomePagesControl.get(), false);
     topTabs->addTab("Paths", juce::Colour(0xff2c2c2c), pathsControl.get(), false);
-    topTabs->setTabBarDepth(30);
+    topTabs->setTabBarDepth(28);
     topTabs->setCurrentTabIndex(0);  // Global Controls visible by default
     addAndMakeVisible(*topTabs);
+    addAndMakeVisible(*monomePagesControl);
     
     // Helper panel classes for main tabs
     struct PlayPanel : public juce::Component
@@ -4745,9 +4770,9 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
         void resized() override
         {
             auto bounds = getLocalBounds();
-            const int gap = 2;
+            const int gap = 1;
             int stripHeight = (bounds.getHeight() - (gap * (strips.size() - 1))) / strips.size();
-            stripHeight = juce::jmax(130, stripHeight);  // Minimum 130px for all controls
+            stripHeight = juce::jmax(122, stripHeight);  // Larger controls while keeping strip 6 visible
             
             for (int i = 0; i < strips.size(); ++i)
             {
@@ -4767,9 +4792,9 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
         void resized() override
         {
             auto bounds = getLocalBounds();
-            const int gap = 2;
+            const int gap = 1;
             int stripHeight = (bounds.getHeight() - (gap * (strips.size() - 1))) / strips.size();
-            stripHeight = juce::jmax(130, stripHeight);  // Minimum 130px
+            stripHeight = juce::jmax(122, stripHeight);  // Match strip height policy for FX tab
             
             for (int i = 0; i < strips.size(); ++i)
             {
@@ -4783,8 +4808,8 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     mainTabs = std::make_unique<juce::TabbedComponent>(juce::TabbedButtonBar::TabsAtTop);
     
     // PLAY TAB - regular strip controls
-    auto* playPanel = new PlayPanel(stripControls, audioProcessor.MaxStrips);
-    for (int i = 0; i < audioProcessor.MaxStrips; ++i)
+    auto* playPanel = new PlayPanel(stripControls, kVisibleSampleStrips);
+    for (int i = 0; i < kVisibleSampleStrips; ++i)
     {
         auto* strip = new StripControl(i, audioProcessor);
         stripControls.add(strip);
@@ -4792,8 +4817,8 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     }
     
     // FX TAB - filter controls for each strip
-    auto* fxPanel = new FXPanel(fxStripControls, audioProcessor.MaxStrips);
-    for (int i = 0; i < audioProcessor.MaxStrips; ++i)
+    auto* fxPanel = new FXPanel(fxStripControls, kVisibleSampleStrips);
+    for (int i = 0; i < kVisibleSampleStrips; ++i)
     {
         auto* fxStrip = new FXStripControl(i, audioProcessor);
         fxStripControls.add(fxStrip);
@@ -4811,7 +4836,7 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     mainTabs->addTab("FX", juce::Colour(0xff282828), fxPanel, true);
     mainTabs->addTab("Patterns", juce::Colour(0xff282828), patternControl.get(), false);
     mainTabs->addTab("Groups", juce::Colour(0xff282828), groupControl.get(), false);
-    mainTabs->setTabBarDepth(32);
+    mainTabs->setTabBarDepth(28);
     mainTabs->setCurrentTabIndex(0);  // Start on Play tab
     addAndMakeVisible(*mainTabs);
 }
@@ -4827,7 +4852,7 @@ void MlrVSTAudioProcessorEditor::setupLookAndFeel()
 
     darkLookAndFeel.setColour(juce::ResizableWindow::backgroundColourId, kBgBottom);
 
-    darkLookAndFeel.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff3b3b3b));
+    darkLookAndFeel.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff404448));
     darkLookAndFeel.setColour(juce::TextButton::buttonOnColourId, kAccent);
     darkLookAndFeel.setColour(juce::TextButton::textColourOffId, kTextPrimary);
     darkLookAndFeel.setColour(juce::TextButton::textColourOnId, juce::Colour(0xff151515));
@@ -4838,7 +4863,7 @@ void MlrVSTAudioProcessorEditor::setupLookAndFeel()
     darkLookAndFeel.setColour(juce::Slider::rotarySliderFillColourId, kAccent.withAlpha(0.9f));
     darkLookAndFeel.setColour(juce::Slider::rotarySliderOutlineColourId, juce::Colour(0xff525252));
 
-    darkLookAndFeel.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff2e2e2e));
+    darkLookAndFeel.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff32363a));
     darkLookAndFeel.setColour(juce::ComboBox::textColourId, kTextPrimary);
     darkLookAndFeel.setColour(juce::ComboBox::outlineColourId, juce::Colour(0xff545454));
     darkLookAndFeel.setColour(juce::ComboBox::arrowColourId, kTextSecondary);
@@ -4849,11 +4874,11 @@ void MlrVSTAudioProcessorEditor::setupLookAndFeel()
 
     darkLookAndFeel.setColour(juce::Label::textColourId, kTextPrimary);
 
-    darkLookAndFeel.setColour(juce::TabbedComponent::backgroundColourId, juce::Colour(0xff242424));
-    darkLookAndFeel.setColour(juce::TabbedComponent::outlineColourId, juce::Colour(0xff4a4a4a));
-    darkLookAndFeel.setColour(juce::TabbedButtonBar::tabOutlineColourId, juce::Colour(0xff4a4a4a));
-    darkLookAndFeel.setColour(juce::TabbedButtonBar::tabTextColourId, kTextMuted);
-    darkLookAndFeel.setColour(juce::TabbedButtonBar::frontTextColourId, kTextPrimary);
+    darkLookAndFeel.setColour(juce::TabbedComponent::backgroundColourId, juce::Colour(0xff23262a));
+    darkLookAndFeel.setColour(juce::TabbedComponent::outlineColourId, juce::Colour(0xff575c61));
+    darkLookAndFeel.setColour(juce::TabbedButtonBar::tabOutlineColourId, juce::Colour(0xff575c61));
+    darkLookAndFeel.setColour(juce::TabbedButtonBar::tabTextColourId, kTextSecondary);
+    darkLookAndFeel.setColour(juce::TabbedButtonBar::frontTextColourId, juce::Colour(0xfff7f7f7));
     
     setLookAndFeel(&darkLookAndFeel);
 }
@@ -4881,8 +4906,8 @@ void MlrVSTAudioProcessorEditor::paint(juce::Graphics& g)
     g.fillAll();
 
     auto titleBar = getLocalBounds().removeFromTop(40).toFloat();
-    juce::ColourGradient titleFill(juce::Colour(0xff3a3a3a), 0.0f, titleBar.getY(),
-                                   juce::Colour(0xff2f2f2f), 0.0f, titleBar.getBottom(), false);
+    juce::ColourGradient titleFill(juce::Colour(0xff3a3d41), 0.0f, titleBar.getY(),
+                                   juce::Colour(0xff2e3135), 0.0f, titleBar.getBottom(), false);
     g.setGradientFill(titleFill);
     g.fillRect(titleBar);
     g.setColour(juce::Colour(0xff565656));
@@ -4892,9 +4917,9 @@ void MlrVSTAudioProcessorEditor::paint(juce::Graphics& g)
     g.setFont(juce::Font(juce::FontOptions(23.0f, juce::Font::bold)));
     g.drawText("mlrVST", 16, 7, 220, 30, juce::Justification::centredLeft);
 
-    g.setColour(kTextSecondary);
+    g.setColour(kTextSecondary.brighter(0.1f));
     g.setFont(juce::Font(juce::FontOptions(11.0f)));
-    g.drawText("Performance Slicer", 150, 10, 170, 20, juce::Justification::centredLeft);
+    g.drawText("Performance Slicer", 152, 10, 170, 20, juce::Justification::centredLeft);
 
     g.setColour(kTextMuted);
     g.setFont(juce::Font(juce::FontOptions(10.0f)));
@@ -4925,12 +4950,15 @@ void MlrVSTAudioProcessorEditor::resized()
     bounds.reduce(margin, margin);
     
     // Top section: TABBED controls (Global/Presets/Monome)
-    auto topBar = bounds.removeFromTop(140);
+    auto topBar = bounds.removeFromTop(124);
     topTabs->setBounds(topBar);
     
     bounds.removeFromTop(margin);
     
     // MAIN AREA: Unified tabs (Play/FX/Patterns/Groups)
+    auto monomePagesArea = bounds.removeFromBottom(50);
+    monomePagesControl->setBounds(monomePagesArea);
+    bounds.removeFromBottom(margin);
     mainTabs->setBounds(bounds);
 }
 
@@ -4940,53 +4968,6 @@ void MlrVSTAudioProcessorEditor::timerCallback()
 {
     if (!audioProcessor.getAudioEngine())
         return;
-
-    if (topTabs)
-    {
-        const bool monomePageHeld = audioProcessor.isControlPageMomentary()
-            && audioProcessor.isControlModeActive()
-            && audioProcessor.getCurrentControlMode() != MlrVSTAudioProcessor::ControlMode::Normal;
-        const int monomePagesTabIndex = [&]() -> int
-        {
-            for (int i = 0; i < topTabs->getNumTabs(); ++i)
-            {
-                if (topTabs->getTabNames()[i] == "Monome Pages")
-                    return i;
-            }
-            return -1;
-        }();
-
-        if (monomePagesTabIndex >= 0 && monomePageHeld && !monomePagesAutoOpenActive)
-        {
-            topTabIndexBeforeMonomeAutoOpen = topTabs->getCurrentTabIndex();
-            monomePagesAutoOpenActive = true;
-            monomePagesAutoRestoreArmed = (topTabIndexBeforeMonomeAutoOpen != monomePagesTabIndex);
-            if (monomePagesAutoRestoreArmed)
-                topTabs->setCurrentTabIndex(monomePagesTabIndex);
-        }
-        else if (monomePagesAutoOpenActive)
-        {
-            // If user manually changed tabs while held, disarm restore.
-            if (monomePageHeld && monomePagesAutoRestoreArmed
-                && topTabs->getCurrentTabIndex() != monomePagesTabIndex)
-            {
-                monomePagesAutoRestoreArmed = false;
-            }
-
-            if (!monomePageHeld)
-            {
-                if (monomePagesAutoRestoreArmed
-                    && topTabIndexBeforeMonomeAutoOpen >= 0
-                    && topTabIndexBeforeMonomeAutoOpen < topTabs->getNumTabs())
-                {
-                    topTabs->setCurrentTabIndex(topTabIndexBeforeMonomeAutoOpen);
-                }
-
-                monomePagesAutoOpenActive = false;
-                monomePagesAutoRestoreArmed = false;
-            }
-        }
-    }
     
     // Update input meters
     if (globalControl)

@@ -6920,15 +6920,28 @@ void ModernAudioEngine::loadSampleToStrip(int stripIndex, const juce::File& file
             << " barsExact=" << estimatedBars
             << " barsDetected=" << detectedBars);
 
-        strip->setRecordingBars(detectedBars);
-        // Keep detected dropdown value and active beat mapping in lock-step on load.
-        // If timeline anchor + PPQ are available, remap at current PPQ; otherwise
-        // still set manual beats so speed is correct on first playback.
-        const double hostPpqNow = getTimelineBeat();
-        if (strip->isPpqTimelineAnchored() && std::isfinite(hostPpqNow))
-            strip->setBeatsPerLoopAtPpq(static_cast<float>(detectedBars * 4), hostPpqNow);
-        else
+        // Strict PPQ safety:
+        // - If not playing, apply detected mapping immediately.
+        // - If playing, only apply when PPQ-anchor remap is provably safe.
+        if (!strip->isPlaying())
+        {
+            strip->setRecordingBars(detectedBars);
             strip->setBeatsPerLoop(static_cast<float>(detectedBars * 4));
+        }
+        else
+        {
+            const double hostPpqNow = getTimelineBeat();
+            if (strip->isPpqTimelineAnchored() && std::isfinite(hostPpqNow))
+            {
+                strip->setRecordingBars(detectedBars);
+                strip->setBeatsPerLoopAtPpq(static_cast<float>(detectedBars * 4), hostPpqNow);
+            }
+            else
+            {
+                DBG("Skipped live detected bar remap on strip " << stripIndex
+                    << " because PPQ anchor is not stable; retry when timeline is anchored.");
+            }
+        }
     }
 }
 

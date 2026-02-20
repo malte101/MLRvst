@@ -356,6 +356,8 @@ private:
     void queueLoopChange(int stripIndex, bool clearLoop, int startColumn, int endColumn, bool reverseDirection, int markerColumn = -1);
     void applyPendingLoopChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
     void applyPendingBarChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
+    bool getHostSyncSnapshot(double& outPpq, double& outTempo) const;
+    void performPresetLoad(int presetIndex, double hostPpqSnapshot, double hostTempoSnapshot);
 
     // Row 0, col 8: global momentary scratch modifier.
     bool momentaryScratchHoldActive = false;
@@ -373,6 +375,7 @@ private:
     std::array<uint32_t, MaxPresetSlots> presetPadLastTapMs{};
     static constexpr uint32_t presetHoldSaveMs = 3000;
     static constexpr uint32_t presetDoubleTapMs = 350;
+    std::atomic<int> pendingPresetLoadIndex{-1};
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MlrVSTAudioProcessor)
 };

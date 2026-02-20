@@ -85,15 +85,6 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         // GROUP ROW (y=0): Groups 0-3 + Pattern Recorders 4-7
         if (y == GROUP_ROW)
         {
-            // In Monome control-page modes, top row is reserved/disabled except Modulation.
-            // This prevents accidental access to group/pattern/scratch/transient controls.
-            if (controlModeActive
-                && currentControlMode != ControlMode::Normal
-                && currentControlMode != ControlMode::Modulation)
-            {
-                return;
-            }
-
             if (presetModeActive && isPresetCell(x, y))
             {
                 const int presetIndex = toPresetIndex(x, y);
@@ -118,6 +109,15 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 }
 
                 updateMonomeLEDs();
+                return;
+            }
+
+            // In Monome control-page modes, top row is reserved/disabled except Modulation.
+            // This prevents accidental access to group/pattern/scratch/transient controls.
+            if (controlModeActive
+                && currentControlMode != ControlMode::Normal
+                && currentControlMode != ControlMode::Modulation)
+            {
                 return;
             }
 

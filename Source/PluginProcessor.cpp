@@ -13,6 +13,8 @@
 
 namespace
 {
+constexpr bool kEnableTriggerDebugLogging = false;
+
 struct BarSelection
 {
     int recordingBars = 1;
@@ -1343,22 +1345,7 @@ void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int s
 
     if (!std::isfinite(currentPpq))
     {
-        // If host PPQ is unavailable, apply immediately to avoid stuck requests.
-        if (clearLoop)
-        {
-            strip->clearLoop();
-            strip->setReverse(false);
-            if (markerColumn >= 0)
-                strip->setPlaybackMarkerColumn(markerColumn, audioEngine->getGlobalSampleCount());
-        }
-        else
-        {
-            strip->setLoop(startColumn, endColumn);
-            strip->setReverse(reverseDirection);
-        }
-
-        if (strip->isPlaying() && strip->hasAudio())
-            strip->snapToTimeline(audioEngine->getGlobalSampleCount());
+        // Strict PPQ safety: reject quantized loop changes until PPQ is valid.
         return;
     }
 
@@ -1398,9 +1385,15 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
             if (!pending.active)
                 continue;
 
-            const bool canApplyNow = !pending.quantized
-                || !std::isfinite(currentPpq)
-                || (currentPpq + 1.0e-6 >= pending.targetPpq);
+            bool canApplyNow = false;
+            if (!pending.quantized)
+            {
+                canApplyNow = std::isfinite(currentPpq);
+            }
+            else if (std::isfinite(currentPpq))
+            {
+                canApplyNow = (currentPpq + 1.0e-6 >= pending.targetPpq);
+            }
 
             if (!canApplyNow)
                 continue;
@@ -1802,10 +1795,6 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     auto* strip = audioEngine->getStrip(stripIndex);
     if (!strip) return;
 
-    // If bar length was changed while playing, apply it only when this press
-    // actually results in a trigger (not on gate-closed ignores / loop-clear path).
-    const auto stripIdx = static_cast<size_t>(stripIndex);
-    
     // CHECK: If inner loop is active, clear it and return to full loop
     if (strip->getLoopStart() != 0 || strip->getLoopEnd() != MaxColumns)
     {
@@ -1858,41 +1847,44 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     // ============================================================
     // COMPREHENSIVE DEBUG LOGGING
     // ============================================================
-    juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                           .getChildFile("mlrVST_COMPREHENSIVE_DEBUG.txt");
-    juce::FileOutputStream stream(logFile, 1024);
-    if (stream.openedOk())
+    if (kEnableTriggerDebugLogging)
     {
-        juce::String timestamp = juce::Time::getCurrentTime().toString(true, true, true, true);
-        juce::String msg = 
-            "═══════════════════════════════════════════════════════\n"
-            "BUTTON PRESS: " + timestamp + "\n"
-            "───────────────────────────────────────────────────────\n"
-            "Strip: " + juce::String(stripIndex) + " | Column: " + juce::String(column) + "\n"
-            "───────────────────────────────────────────────────────\n"
-            "PLAYHEAD POSITION:\n"
-            "  currentPPQ:     " + juce::String(currentPPQ, 6) + "\n"
-            "  currentBeat:    " + juce::String(timelineBeat, 6) + "\n"
-            "  globalSample:   " + juce::String(globalSample) + "\n"
-            "───────────────────────────────────────────────────────\n"
-            "QUANTIZATION SETTINGS:\n"
-            "  quantizeEnabled: " + juce::String(quantizeEnabled ? "YES" : "NO") + "\n"
-            "  quantizeChoice:  " + juce::String(quantizeChoice) + " (UI selection)\n"
-            "  quantizeValue:   " + juce::String(quantizeValue) + " (divisions per bar)\n"
-            "  quantBeats:      " + juce::String(quantBeats, 4) + " beats per division\n"
-            "  useQuantize:     " + juce::String(useQuantize ? "YES" : "NO") + "\n"
-            "───────────────────────────────────────────────────────\n"
-            "GRID CALCULATION:\n"
-            "  nextGridPPQ:    " + juce::String(nextGridPPQ, 6) + "\n"
-            "  beatsToWait:    " + juce::String(nextGridPPQ - currentPPQ, 6) + "\n"
-            "───────────────────────────────────────────────────────\n"
-            "GATE STATUS:\n"
-            "  gateClosed:     " + juce::String(gateClosed ? "YES (trigger pending)" : "NO (ready)") + "\n"
-            "  ACTION:         " + juce::String(gateClosed ? "IGNORE THIS PRESS" : "SCHEDULE TRIGGER") + "\n"
-            "───────────────────────────────────────────────────────\n"
-            "PATH: " + juce::String(useQuantize ? "QUANTIZED" : "IMMEDIATE") + "\n"
-            "═══════════════════════════════════════════════════════\n\n";
-        stream.writeText(msg, false, false, nullptr);
+        juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
+                               .getChildFile("mlrVST_COMPREHENSIVE_DEBUG.txt");
+        juce::FileOutputStream stream(logFile, 1024);
+        if (stream.openedOk())
+        {
+            juce::String timestamp = juce::Time::getCurrentTime().toString(true, true, true, true);
+            juce::String msg =
+                "═══════════════════════════════════════════════════════\n"
+                "BUTTON PRESS: " + timestamp + "\n"
+                "───────────────────────────────────────────────────────\n"
+                "Strip: " + juce::String(stripIndex) + " | Column: " + juce::String(column) + "\n"
+                "───────────────────────────────────────────────────────\n"
+                "PLAYHEAD POSITION:\n"
+                "  currentPPQ:     " + juce::String(currentPPQ, 6) + "\n"
+                "  currentBeat:    " + juce::String(timelineBeat, 6) + "\n"
+                "  globalSample:   " + juce::String(globalSample) + "\n"
+                "───────────────────────────────────────────────────────\n"
+                "QUANTIZATION SETTINGS:\n"
+                "  quantizeEnabled: " + juce::String(quantizeEnabled ? "YES" : "NO") + "\n"
+                "  quantizeChoice:  " + juce::String(quantizeChoice) + " (UI selection)\n"
+                "  quantizeValue:   " + juce::String(quantizeValue) + " (divisions per bar)\n"
+                "  quantBeats:      " + juce::String(quantBeats, 4) + " beats per division\n"
+                "  useQuantize:     " + juce::String(useQuantize ? "YES" : "NO") + "\n"
+                "───────────────────────────────────────────────────────\n"
+                "GRID CALCULATION:\n"
+                "  nextGridPPQ:    " + juce::String(nextGridPPQ, 6) + "\n"
+                "  beatsToWait:    " + juce::String(nextGridPPQ - currentPPQ, 6) + "\n"
+                "───────────────────────────────────────────────────────\n"
+                "GATE STATUS:\n"
+                "  gateClosed:     " + juce::String(gateClosed ? "YES (trigger pending)" : "NO (ready)") + "\n"
+                "  ACTION:         " + juce::String(gateClosed ? "IGNORE THIS PRESS" : "SCHEDULE TRIGGER") + "\n"
+                "───────────────────────────────────────────────────────\n"
+                "PATH: " + juce::String(useQuantize ? "QUANTIZED" : "IMMEDIATE") + "\n"
+                "═══════════════════════════════════════════════════════\n\n";
+            stream.writeText(msg, false, false, nullptr);
+        }
     }
     
     // Strict gate behavior: ignore extra presses while quantized trigger is pending.
@@ -1900,14 +1892,6 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     {
         updateMonomeLEDs();
         return;
-    }
-
-    // Trigger will be accepted now, so apply pending bar mapping exactly once.
-    if (pendingBarLengthApply[stripIdx] && strip->hasAudio())
-    {
-        const int bars = juce::jlimit(1, 8, strip->getRecordingBars());
-        strip->setBeatsPerLoop(static_cast<float>(bars * 4));
-        pendingBarLengthApply[stripIdx] = false;
     }
 
     if (useQuantize)
@@ -1973,6 +1957,18 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 
 void MlrVSTAudioProcessor::timerCallback()
 {
+    const int pendingPreset = pendingPresetLoadIndex.load(std::memory_order_acquire);
+    if (pendingPreset >= 0)
+    {
+        double hostPpqSnapshot = 0.0;
+        double hostTempoSnapshot = 0.0;
+        if (getHostSyncSnapshot(hostPpqSnapshot, hostTempoSnapshot))
+        {
+            pendingPresetLoadIndex.store(-1, std::memory_order_release);
+            performPresetLoad(pendingPreset, hostPpqSnapshot, hostTempoSnapshot);
+        }
+    }
+
     // Update monome LEDs regularly for smooth playhead
     if (monomeConnection.isConnected() && audioEngine)
     {
@@ -2086,6 +2082,58 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
 // Preset Management
 //==============================================================================
 
+bool MlrVSTAudioProcessor::getHostSyncSnapshot(double& outPpq, double& outTempo) const
+{
+    if (auto* playHead = getPlayHead())
+    {
+        if (auto position = playHead->getPosition())
+        {
+            if (position->getPpqPosition().hasValue()
+                && position->getBpm().hasValue()
+                && std::isfinite(*position->getPpqPosition())
+                && std::isfinite(*position->getBpm())
+                && *position->getBpm() > 0.0)
+            {
+                outPpq = *position->getPpqPosition();
+                outTempo = *position->getBpm();
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+void MlrVSTAudioProcessor::performPresetLoad(int presetIndex, double hostPpqSnapshot, double hostTempoSnapshot)
+{
+    struct ScopedSuspendProcessing
+    {
+        explicit ScopedSuspendProcessing(MlrVSTAudioProcessor& p) : processor(p) { processor.suspendProcessing(true); }
+        ~ScopedSuspendProcessing() { processor.suspendProcessing(false); }
+        MlrVSTAudioProcessor& processor;
+    } scopedSuspend(*this);
+
+    // Clear stale file references; preset load repopulates file-backed strips.
+    for (auto& f : currentStripFiles)
+        f = juce::File();
+
+    PresetStore::loadPreset(
+        presetIndex,
+        MaxStrips,
+        audioEngine.get(),
+        parameters,
+        [this](int stripIndex, const juce::File& sampleFile)
+        {
+            loadSampleToStrip(stripIndex, sampleFile);
+        },
+        hostPpqSnapshot,
+        hostTempoSnapshot);
+
+    if (PresetStore::presetExists(presetIndex))
+        loadedPresetIndex = presetIndex;
+    presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+}
+
 void MlrVSTAudioProcessor::savePreset(int presetIndex)
 {
     try
@@ -2107,45 +2155,18 @@ void MlrVSTAudioProcessor::loadPreset(int presetIndex)
 {
     try
     {
-        struct ScopedSuspendProcessing
+        double hostPpqSnapshot = 0.0;
+        double hostTempoSnapshot = 0.0;
+        if (!getHostSyncSnapshot(hostPpqSnapshot, hostTempoSnapshot))
         {
-            explicit ScopedSuspendProcessing(MlrVSTAudioProcessor& p) : processor(p) { processor.suspendProcessing(true); }
-            ~ScopedSuspendProcessing() { processor.suspendProcessing(false); }
-            MlrVSTAudioProcessor& processor;
-        } scopedSuspend(*this);
-
-        double hostPpqSnapshot = audioEngine ? audioEngine->getTimelineBeat() : 0.0;
-        double hostTempoSnapshot = audioEngine ? audioEngine->getCurrentTempo() : 120.0;
-        if (auto* playHead = getPlayHead())
-        {
-            if (auto position = playHead->getPosition())
-            {
-                if (position->getPpqPosition().hasValue() && std::isfinite(*position->getPpqPosition()))
-                    hostPpqSnapshot = *position->getPpqPosition();
-                if (position->getBpm().hasValue() && std::isfinite(*position->getBpm()) && *position->getBpm() > 0.0)
-                    hostTempoSnapshot = *position->getBpm();
-            }
+            pendingPresetLoadIndex.store(presetIndex, std::memory_order_release);
+            DBG("Preset " << (presetIndex + 1)
+                << " deferred: waiting for valid host PPQ+BPM for strict PPQ-safe recall.");
+            return;
         }
 
-        // Clear stale file references; preset load repopulates file-backed strips.
-        for (auto& f : currentStripFiles)
-            f = juce::File();
-
-        PresetStore::loadPreset(
-            presetIndex,
-            MaxStrips,
-            audioEngine.get(),
-            parameters,
-            [this](int stripIndex, const juce::File& sampleFile)
-            {
-                loadSampleToStrip(stripIndex, sampleFile);
-            },
-            hostPpqSnapshot,
-            hostTempoSnapshot);
-
-        if (PresetStore::presetExists(presetIndex))
-            loadedPresetIndex = presetIndex;
-        presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+        pendingPresetLoadIndex.store(-1, std::memory_order_release);
+        performPresetLoad(presetIndex, hostPpqSnapshot, hostTempoSnapshot);
     }
     catch (const std::exception& e)
     {
