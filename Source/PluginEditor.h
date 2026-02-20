@@ -207,8 +207,6 @@ private:
     juce::Slider speedSlider;       // Compact rotary
     juce::Slider scratchSlider;     // Compact rotary - scratch amount
     juce::ComboBox patternLengthBox; // Step mode pattern length (16..64)
-    juce::TextButton tempoHalfButton;   // ÷2 tempo (double beats)
-    juce::TextButton tempoDoubleButton; // ×2 tempo (half beats)
     juce::Label tempoLabel;         // Shows current beats setting
     juce::ComboBox recordBarsBox;   // Selects input recording buffer bars for this strip
     juce::TextButton recordButton;  // Captures recent input into this strip

@@ -1184,31 +1184,6 @@ void StripControl::setupComponents()
     patternLengthLabel.setColour(juce::Label::textColourId, stripColor.brighter(0.3f));
     addAndMakeVisible(patternLengthLabel);
 
-    // Tempo adjustment buttons (÷2 and ×2)
-    tempoHalfButton.setButtonText("-");
-    tempoHalfButton.setTooltip("Slower (double beats per loop)");
-    tempoHalfButton.onClick = [this]() {
-        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-        {
-            float current = strip->getBeatsPerLoop();
-            if (current < 0) current = 4.0f;  // Auto was 4 beats
-            strip->setBeatsPerLoop(current * 2.0f);  // Double beats = half speed
-        }
-    };
-    addAndMakeVisible(tempoHalfButton);
-    
-    tempoDoubleButton.setButtonText("+");
-    tempoDoubleButton.setTooltip("Faster (half beats per loop)");
-    tempoDoubleButton.onClick = [this]() {
-        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-        {
-            float current = strip->getBeatsPerLoop();
-            if (current < 0) current = 4.0f;  // Auto was 4 beats
-            strip->setBeatsPerLoop(current / 2.0f);  // Half beats = double speed
-        }
-    };
-    addAndMakeVisible(tempoDoubleButton);
-    
     // Label showing current beats setting
     tempoLabel.setText("AUTO", juce::dontSendNotification);
     tempoLabel.setFont(juce::Font(juce::FontOptions(9.0f)));
@@ -1217,19 +1192,21 @@ void StripControl::setupComponents()
     addAndMakeVisible(tempoLabel);
     tempoLabel.setTooltip("Beats per loop (auto or manual).");
 
-    recordBarsLabel.setText("BAR", juce::dontSendNotification);
+    recordBarsLabel.setText("", juce::dontSendNotification);
     recordBarsLabel.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
     recordBarsLabel.setJustificationType(juce::Justification::centredLeft);
     recordBarsLabel.setColour(juce::Label::textColourId, kTextMuted);
     addAndMakeVisible(recordBarsLabel);
     recordBarsLabel.setTooltip("Unified loop bars: used for live capture and loaded sample tempo mapping.");
 
-    recordBarsBox.addItem("1", 1);
-    recordBarsBox.addItem("2", 2);
-    recordBarsBox.addItem("4", 4);
-    recordBarsBox.addItem("8", 8);
+    recordBarsBox.addItem("1/4", 25);
+    recordBarsBox.addItem("1/2", 50);
+    recordBarsBox.addItem("1", 100);
+    recordBarsBox.addItem("2", 200);
+    recordBarsBox.addItem("4", 400);
+    recordBarsBox.addItem("8", 800);
     recordBarsBox.setJustificationType(juce::Justification::centredLeft);
-    recordBarsBox.setSelectedId(1, juce::dontSendNotification);
+    recordBarsBox.setSelectedId(100, juce::dontSendNotification);
     recordBarsBox.setTooltip("Loop bars per strip (capture + loaded sample mapping).");
     recordBarsBox.onChange = [this]()
     {
@@ -1730,7 +1707,7 @@ void StripControl::hideAllPrimaryControls()
     auto hide = [](juce::Component& c){ c.setVisible(false); };
     hide(loadButton); hide(transientSliceButton); hide(playModeBox); hide(directionModeBox); hide(groupSelector);
     hide(volumeSlider); hide(panSlider); hide(speedSlider); hide(scratchSlider); hide(patternLengthBox);
-    hide(tempoHalfButton); hide(tempoDoubleButton); hide(tempoLabel); hide(recordBarsBox); hide(recordButton); hide(recordBarsLabel);
+    hide(tempoLabel); hide(recordBarsBox); hide(recordButton); hide(recordBarsLabel);
     hide(volumeLabel); hide(panLabel); hide(speedLabel); hide(scratchLabel); hide(patternLengthLabel);
     hide(recordLengthLabel);
 }
@@ -1912,40 +1889,30 @@ void StripControl::resized()
     bool showTempoControls = (!isGrainMode) && (controlsArea.getHeight() >= requiredTopControlsHeight);
 
     // Update visibility
-    tempoHalfButton.setVisible(showTempoControls);
-    tempoDoubleButton.setVisible(showTempoControls);
-    tempoLabel.setVisible(showTempoControls);
     const bool showRecordBars = (!isGrainMode) && controlsArea.getHeight() >= 18;
+    tempoLabel.setVisible(showTempoControls);
     recordBarsBox.setVisible(showRecordBars);
     recordButton.setVisible(showRecordBars);
-    recordBarsLabel.setVisible(showRecordBars);
+    recordBarsLabel.setVisible(false);
 
     // Tempo controls row - only if we have space
     if (showTempoControls)
     {
         auto tempoRow = controlsArea.removeFromTop(22);
-        tempoHalfButton.setBounds(tempoRow.removeFromLeft(28));
-        tempoRow.removeFromLeft(2);
-        tempoDoubleButton.setBounds(tempoRow.removeFromLeft(28));
-        tempoRow.removeFromLeft(2);
         tempoLabel.setBounds(tempoRow.removeFromLeft(44));
         controlsArea.removeFromTop(2);
 
         auto recBarsRow = controlsArea.removeFromTop(18);
-        recordBarsLabel.setBounds(recBarsRow.removeFromLeft(20));
-        recBarsRow.removeFromLeft(2);
-        recordBarsBox.setBounds(recBarsRow.removeFromLeft(50));
-        recBarsRow.removeFromLeft(2);
+        recordBarsBox.setBounds(recBarsRow.removeFromLeft(70));
+        recBarsRow.removeFromLeft(8);
         recordButton.setBounds(recBarsRow.removeFromLeft(46));
         controlsArea.removeFromTop(2);
     }
     else if (showRecordBars)
     {
         auto recBarsRow = controlsArea.removeFromTop(16);
-        recordBarsLabel.setBounds(recBarsRow.removeFromLeft(18));
-        recBarsRow.removeFromLeft(2);
-        recordBarsBox.setBounds(recBarsRow.removeFromLeft(46));
-        recBarsRow.removeFromLeft(2);
+        recordBarsBox.setBounds(recBarsRow.removeFromLeft(66));
+        recBarsRow.removeFromLeft(8);
         recordButton.setBounds(recBarsRow.removeFromLeft(42));
         controlsArea.removeFromTop(2);
     }
@@ -2238,12 +2205,28 @@ void StripControl::updateFromEngine()
     scratchSlider.setValue(strip->getScratchAmount(), juce::dontSendNotification);
     patternLengthBox.setSelectedId(strip->getStepPatternBars(), juce::dontSendNotification);
     {
-        int bars = strip->getRecordingBars();
-        if (bars <= 1) bars = 1;
-        else if (bars <= 2) bars = 2;
-        else if (bars <= 4) bars = 4;
-        else bars = 8;
-        recordBarsBox.setSelectedId(bars, juce::dontSendNotification);
+        float beats = strip->getBeatsPerLoop();
+        if (!(beats > 0.0f && std::isfinite(beats)))
+            beats = static_cast<float>(juce::jlimit(1, 8, strip->getRecordingBars()) * 4);
+
+        struct BeatChoice { float beats; int id; };
+        static constexpr BeatChoice choices[] {
+            { 1.0f, 25 }, { 2.0f, 50 }, { 4.0f, 100 },
+            { 8.0f, 200 }, { 16.0f, 400 }, { 32.0f, 800 }
+        };
+
+        int selectedId = 100;
+        float best = std::numeric_limits<float>::max();
+        for (const auto& c : choices)
+        {
+            const float d = std::abs(beats - c.beats);
+            if (d < best)
+            {
+                best = d;
+                selectedId = c.id;
+            }
+        }
+        recordBarsBox.setSelectedId(selectedId, juce::dontSendNotification);
     }
     const bool recordArmed = !strip->hasAudio();
     const bool blinkOn = processor.getAudioEngine()->shouldBlinkRecordLED();

@@ -6882,7 +6882,6 @@ void ModernAudioEngine::loadSampleToStrip(int stripIndex, const juce::File& file
 {
     if (auto* strip = getStrip(stripIndex))
     {
-        const bool wasPlaying = strip->isPlaying();
         strip->loadSampleFromFile(file);
         if (!strip->hasAudio())
             return;
@@ -6896,12 +6895,22 @@ void ModernAudioEngine::loadSampleToStrip(int stripIndex, const juce::File& file
         const double sampleSeconds = static_cast<double>(loadedBuffer->getNumSamples()) / sourceRate;
         // Simple 4/4 detection: bars = seconds * BPM / (60 * 4).
         const double estimatedBars = (sampleSeconds * hostTempoNow) / 240.0;
-        int detectedBars = static_cast<int>(std::round(estimatedBars));
-        detectedBars = juce::jlimit(1, 8, detectedBars);
-        if (detectedBars <= 1) detectedBars = 1;
-        else if (detectedBars <= 2) detectedBars = 2;
-        else if (detectedBars <= 4) detectedBars = 4;
-        else detectedBars = 8;
+        // Snap directly to nearest supported bar count (1/2/4/8).
+        // This avoids round-then-bucket misclassification (e.g. ~2.6 bars -> 4).
+        int detectedBars = 1;
+        {
+            static constexpr int supportedBars[] = {1, 2, 4, 8};
+            double bestDistance = std::numeric_limits<double>::max();
+            for (int candidate : supportedBars)
+            {
+                const double d = std::abs(estimatedBars - static_cast<double>(candidate));
+                if (d < bestDistance)
+                {
+                    bestDistance = d;
+                    detectedBars = candidate;
+                }
+            }
+        }
 
         DBG("Bar detect strip " << stripIndex
             << " hostBpm=" << hostTempoNow
@@ -6912,9 +6921,13 @@ void ModernAudioEngine::loadSampleToStrip(int stripIndex, const juce::File& file
             << " barsDetected=" << detectedBars);
 
         strip->setRecordingBars(detectedBars);
-        // Never retime an actively playing strip during browse/load; that can break
-        // PPQ phase continuity. Apply detected beat mapping only when not playing.
-        if (!wasPlaying)
+        // Keep detected dropdown value and active beat mapping in lock-step on load.
+        // If timeline anchor + PPQ are available, remap at current PPQ; otherwise
+        // still set manual beats so speed is correct on first playback.
+        const double hostPpqNow = getTimelineBeat();
+        if (strip->isPpqTimelineAnchored() && std::isfinite(hostPpqNow))
+            strip->setBeatsPerLoopAtPpq(static_cast<float>(detectedBars * 4), hostPpqNow);
+        else
             strip->setBeatsPerLoop(static_cast<float>(detectedBars * 4));
     }
 }

@@ -275,7 +275,8 @@ private:
     struct PendingBarChange
     {
         bool active = false;
-        int bars = 1;
+        int recordingBars = 1;
+        float beatsPerLoop = 4.0f;
         bool quantized = false;
         double targetPpq = 0.0;
         int quantizeDivision = 8;

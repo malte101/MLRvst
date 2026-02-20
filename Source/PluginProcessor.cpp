@@ -13,13 +13,29 @@
 
 namespace
 {
-int normalizeBarCountToSupported(int bars)
+struct BarSelection
 {
-    const int clamped = juce::jlimit(1, 8, bars);
-    if (clamped <= 1) return 1;
-    if (clamped <= 2) return 2;
-    if (clamped <= 4) return 4;
-    return 8;
+    int recordingBars = 1;
+    float beatsPerLoop = 4.0f;
+};
+
+BarSelection decodeBarSelection(int value)
+{
+    switch (value)
+    {
+        case 25:  return { 1, 1.0f };   // 1/4 bar
+        case 50:  return { 1, 2.0f };   // 1/2 bar
+        case 100: return { 1, 4.0f };   // 1 bar
+        case 200: return { 2, 8.0f };   // 2 bars
+        case 400: return { 4, 16.0f };  // 4 bars
+        case 800: return { 8, 32.0f };  // 8 bars
+        // Backward compatibility (monome and legacy callers)
+        case 1:   return { 1, 4.0f };
+        case 2:   return { 2, 8.0f };
+        case 4:   return { 4, 16.0f };
+        case 8:   return { 8, 32.0f };
+        default:  return { 1, 4.0f };
+    }
 }
 
 juce::String controlModeToKey(MlrVSTAudioProcessor::ControlMode mode)
@@ -1200,12 +1216,13 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
     if (!strip)
         return;
 
-    const int clampedBars = normalizeBarCountToSupported(bars);
+    const auto selection = decodeBarSelection(bars);
     setPendingBarLengthApply(stripIndex, false);
 
     if (!strip->hasAudio())
     {
-        strip->setRecordingBars(clampedBars);
+        strip->setRecordingBars(selection.recordingBars);
+        strip->setBeatsPerLoop(selection.beatsPerLoop);
         const juce::ScopedLock lock(pendingBarChangeLock);
         pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
         return;
@@ -1213,8 +1230,8 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
 
     if (!strip->isPlaying())
     {
-        strip->setRecordingBars(clampedBars);
-        strip->setBeatsPerLoop(static_cast<float>(clampedBars * 4));
+        strip->setRecordingBars(selection.recordingBars);
+        strip->setBeatsPerLoop(selection.beatsPerLoop);
         const juce::ScopedLock lock(pendingBarChangeLock);
         pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
         return;
@@ -1246,7 +1263,8 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
     const juce::ScopedLock lock(pendingBarChangeLock);
     auto& pending = pendingBarChanges[static_cast<size_t>(stripIndex)];
     pending.active = true;
-    pending.bars = clampedBars;
+    pending.recordingBars = selection.recordingBars;
+    pending.beatsPerLoop = selection.beatsPerLoop;
     pending.quantized = useQuantize;
     pending.quantizeDivision = quantizeDivision;
     pending.targetPpq = std::numeric_limits<double>::quiet_NaN();
@@ -1486,10 +1504,9 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
         if (!std::isfinite(currentPpq) || !strip->isPpqTimelineAnchored())
             continue;
 
-        const int bars = normalizeBarCountToSupported(change.bars);
         const double applyPpq = currentPpq;
-        strip->setRecordingBars(bars);
-        strip->setBeatsPerLoopAtPpq(static_cast<float>(bars * 4), applyPpq);
+        strip->setRecordingBars(change.recordingBars);
+        strip->setBeatsPerLoopAtPpq(change.beatsPerLoop, applyPpq);
     }
 }
 
@@ -1888,7 +1905,7 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     // Trigger will be accepted now, so apply pending bar mapping exactly once.
     if (pendingBarLengthApply[stripIdx] && strip->hasAudio())
     {
-        const int bars = normalizeBarCountToSupported(strip->getRecordingBars());
+        const int bars = juce::jlimit(1, 8, strip->getRecordingBars());
         strip->setBeatsPerLoop(static_cast<float>(bars * 4));
         pendingBarLengthApply[stripIdx] = false;
     }
