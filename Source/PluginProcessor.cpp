@@ -2117,7 +2117,6 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
     int savedGroup = strip->getGroup();
     int savedLoopStart = strip->getLoopStart();
     int savedLoopEnd = strip->getLoopEnd();
-    int savedColumn = strip->getCurrentColumn();
     const double hostPpqBeforeLoad = audioEngine->getTimelineBeat();
     if (wasPlaying)
         strip->captureMomentaryPhaseReference(hostPpqBeforeLoad);

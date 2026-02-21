@@ -186,6 +186,102 @@ ModernAudioEngine::ModTarget comboIdToModTarget(int id)
     }
 }
 
+bool modTargetAllowsBipolar(ModernAudioEngine::ModTarget target)
+{
+    return target == ModernAudioEngine::ModTarget::Pan
+        || target == ModernAudioEngine::ModTarget::Pitch
+        || target == ModernAudioEngine::ModTarget::Speed
+        || target == ModernAudioEngine::ModTarget::GrainPitch;
+}
+
+int pitchScaleToComboId(ModernAudioEngine::PitchScale scale)
+{
+    switch (scale)
+    {
+        case ModernAudioEngine::PitchScale::Chromatic: return 1;
+        case ModernAudioEngine::PitchScale::Major: return 2;
+        case ModernAudioEngine::PitchScale::Minor: return 3;
+        case ModernAudioEngine::PitchScale::Dorian: return 4;
+        case ModernAudioEngine::PitchScale::PentatonicMinor: return 5;
+        default: return 1;
+    }
+}
+
+ModernAudioEngine::PitchScale comboIdToPitchScale(int id)
+{
+    switch (id)
+    {
+        case 2: return ModernAudioEngine::PitchScale::Major;
+        case 3: return ModernAudioEngine::PitchScale::Minor;
+        case 4: return ModernAudioEngine::PitchScale::Dorian;
+        case 5: return ModernAudioEngine::PitchScale::PentatonicMinor;
+        case 1:
+        default: return ModernAudioEngine::PitchScale::Chromatic;
+    }
+}
+
+int curveShapeToComboId(ModernAudioEngine::ModCurveShape shape)
+{
+    switch (shape)
+    {
+        case ModernAudioEngine::ModCurveShape::Power: return 1;
+        case ModernAudioEngine::ModCurveShape::SCurve: return 2;
+        case ModernAudioEngine::ModCurveShape::Snap: return 3;
+        case ModernAudioEngine::ModCurveShape::Stair: return 4;
+        default: return 1;
+    }
+}
+
+ModernAudioEngine::ModCurveShape comboIdToCurveShape(int id)
+{
+    switch (id)
+    {
+        case 2: return ModernAudioEngine::ModCurveShape::SCurve;
+        case 3: return ModernAudioEngine::ModCurveShape::Snap;
+        case 4: return ModernAudioEngine::ModCurveShape::Stair;
+        case 1:
+        default: return ModernAudioEngine::ModCurveShape::Power;
+    }
+}
+
+float shapeCurvePhaseUi(float phase01, float bend, ModernAudioEngine::ModCurveShape shape)
+{
+    const float t = juce::jlimit(0.0f, 1.0f, phase01);
+    const float b = juce::jlimit(-1.0f, 1.0f, bend);
+    const float amount = std::abs(b);
+
+    switch (shape)
+    {
+        case ModernAudioEngine::ModCurveShape::SCurve:
+        {
+            const float blend = juce::jmap(amount, 0.0f, 0.95f);
+            float s = (t * t) * (3.0f - (2.0f * t));
+            if (b >= 0.0f)
+                s = std::pow(s, juce::jmap(amount, 1.0f, 5.5f));
+            else
+                s = 1.0f - std::pow(1.0f - s, juce::jmap(amount, 1.0f, 5.5f));
+            return juce::jlimit(0.0f, 1.0f, juce::jmap(blend, t, s));
+        }
+        case ModernAudioEngine::ModCurveShape::Snap:
+        {
+            const float exp = juce::jmap(amount, 1.0f, 10.0f);
+            return b >= 0.0f ? std::pow(t, exp) : (1.0f - std::pow(1.0f - t, exp));
+        }
+        case ModernAudioEngine::ModCurveShape::Stair:
+        {
+            const int steps = juce::jlimit(3, 24, static_cast<int>(std::round(3.0f + (amount * 21.0f))));
+            const float q = std::round(t * static_cast<float>(steps)) / static_cast<float>(steps);
+            return b >= 0.0f ? q : (1.0f - q);
+        }
+        case ModernAudioEngine::ModCurveShape::Power:
+        default:
+        {
+            const float exp = juce::jmap(amount, 1.0f, 7.0f);
+            return b >= 0.0f ? std::pow(t, exp) : (1.0f - std::pow(1.0f - t, exp));
+        }
+    }
+}
+
 struct GateRateEntry
 {
     float cyclesPerBeat;
@@ -1150,7 +1246,7 @@ void StripControl::setupComponents()
     };
     addAndMakeVisible(grainArpModeSlider);
 
-    grainSizeSyncToggle.setButtonText("S");
+    grainSizeSyncToggle.setButtonText("");
     grainSizeSyncToggle.setClickingTogglesState(true);
     grainSizeSyncToggle.setToggleState(false, juce::dontSendNotification);
     grainSizeSyncToggle.setColour(juce::ToggleButton::textColourId, stripColor.withAlpha(0.72f));
@@ -1160,12 +1256,20 @@ void StripControl::setupComponents()
     grainSizeSyncToggle.onClick = [this]()
     {
         const bool enabled = grainSizeSyncToggle.getToggleState();
+        grainSizeDivLabel.setText(enabled ? "SYNC" : "FREE", juce::dontSendNotification);
         grainSizeSyncToggle.setColour(juce::ToggleButton::textColourId, enabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
         grainSizeSyncToggle.setColour(juce::ToggleButton::tickColourId, enabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
             strip->setGrainTempoSyncEnabled(enabled);
     };
     addAndMakeVisible(grainSizeSyncToggle);
+
+    grainSizeDivLabel.setText("FREE", juce::dontSendNotification);
+    grainSizeDivLabel.setJustificationType(juce::Justification::centredRight);
+    grainSizeDivLabel.setColour(juce::Label::textColourId, stripColor.withAlpha(0.78f));
+    grainSizeDivLabel.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+    addAndMakeVisible(grainSizeDivLabel);
+    grainSizeLabel.setJustificationType(juce::Justification::centredLeft);
 
     patternLengthBox.addItem("16", 1);
     patternLengthBox.addItem("32", 2);
@@ -1304,20 +1408,75 @@ void StripControl::setupComponents()
     };
     addAndMakeVisible(modDepthSlider);
 
-    modOffsetLabel.setText("OFFS", juce::dontSendNotification);
+    modOffsetLabel.setText("SMTH", juce::dontSendNotification);
     modOffsetLabel.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
     modOffsetLabel.setColour(juce::Label::textColourId, kTextMuted);
     addAndMakeVisible(modOffsetLabel);
 
     modOffsetSlider.setSliderStyle(juce::Slider::LinearHorizontal);
     modOffsetSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-    modOffsetSlider.setRange(-15, 15, 1);
+    modOffsetSlider.setRange(0.0, 250.0, 1.0);
+    modOffsetSlider.setSkewFactorFromMidPoint(40.0);
     modOffsetSlider.onValueChange = [this]()
     {
         if (auto* engine = processor.getAudioEngine())
-            engine->setModOffset(stripIndex, static_cast<int>(modOffsetSlider.getValue()));
+            engine->setModSmoothingMs(stripIndex, static_cast<float>(modOffsetSlider.getValue()));
     };
     addAndMakeVisible(modOffsetSlider);
+
+    modCurveBendLabel.setText("BEND", juce::dontSendNotification);
+    modCurveBendLabel.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+    modCurveBendLabel.setColour(juce::Label::textColourId, kTextMuted);
+    addAndMakeVisible(modCurveBendLabel);
+
+    modCurveBendSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    modCurveBendSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+    modCurveBendSlider.setRange(-1.0, 1.0, 0.01);
+    modCurveBendSlider.setValue(0.0, juce::dontSendNotification);
+    modCurveBendSlider.onValueChange = [this]()
+    {
+        if (auto* engine = processor.getAudioEngine())
+            engine->setModCurveBend(stripIndex, static_cast<float>(modCurveBendSlider.getValue()));
+    };
+    addAndMakeVisible(modCurveBendSlider);
+
+    modLengthLabel.setText("LEN", juce::dontSendNotification);
+    modLengthLabel.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+    modLengthLabel.setColour(juce::Label::textColourId, kTextMuted);
+    addAndMakeVisible(modLengthLabel);
+
+    modLengthBox.addItem("1", 1);
+    modLengthBox.addItem("2", 2);
+    modLengthBox.addItem("4", 4);
+    modLengthBox.addItem("8", 8);
+    modLengthBox.setSelectedId(1, juce::dontSendNotification);
+    modLengthBox.onChange = [this]()
+    {
+        if (auto* engine = processor.getAudioEngine())
+            engine->setModLengthBars(stripIndex, modLengthBox.getSelectedId());
+    };
+    addAndMakeVisible(modLengthBox);
+
+    modPitchQuantToggle.setButtonText("P.Quant");
+    modPitchQuantToggle.onClick = [this]()
+    {
+        if (auto* engine = processor.getAudioEngine())
+            engine->setModPitchScaleQuantize(stripIndex, modPitchQuantToggle.getToggleState());
+    };
+    addAndMakeVisible(modPitchQuantToggle);
+
+    modPitchScaleBox.addItem("Chrom", 1);
+    modPitchScaleBox.addItem("Maj", 2);
+    modPitchScaleBox.addItem("Min", 3);
+    modPitchScaleBox.addItem("Dor", 4);
+    modPitchScaleBox.addItem("Pent", 5);
+    modPitchScaleBox.setSelectedId(1, juce::dontSendNotification);
+    modPitchScaleBox.onChange = [this]()
+    {
+        if (auto* engine = processor.getAudioEngine())
+            engine->setModPitchScale(stripIndex, comboIdToPitchScale(modPitchScaleBox.getSelectedId()));
+    };
+    addAndMakeVisible(modPitchScaleBox);
 
     modShapeLabel.setText("SHAPE", juce::dontSendNotification);
     modShapeLabel.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
@@ -1329,10 +1488,30 @@ void StripControl::setupComponents()
     modShapeBox.setSelectedId(1, juce::dontSendNotification);
     modShapeBox.onChange = [this]()
     {
+        const bool curveMode = (modShapeBox.getSelectedId() == 1);
+        modCurveBendSlider.setEnabled(curveMode);
+        modCurveTypeBox.setEnabled(curveMode);
         if (auto* engine = processor.getAudioEngine())
-            engine->setModCurveMode(stripIndex, modShapeBox.getSelectedId() == 1);
+            engine->setModCurveMode(stripIndex, curveMode);
     };
     addAndMakeVisible(modShapeBox);
+
+    modCurveTypeLabel.setText("CTYPE", juce::dontSendNotification);
+    modCurveTypeLabel.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+    modCurveTypeLabel.setColour(juce::Label::textColourId, kTextMuted);
+    addAndMakeVisible(modCurveTypeLabel);
+
+    modCurveTypeBox.addItem("Pow", 1);
+    modCurveTypeBox.addItem("S", 2);
+    modCurveTypeBox.addItem("Snap", 3);
+    modCurveTypeBox.addItem("Stair", 4);
+    modCurveTypeBox.setSelectedId(1, juce::dontSendNotification);
+    modCurveTypeBox.onChange = [this]()
+    {
+        if (auto* engine = processor.getAudioEngine())
+            engine->setModCurveShape(stripIndex, comboIdToCurveShape(modCurveTypeBox.getSelectedId()));
+    };
+    addAndMakeVisible(modCurveTypeBox);
     
     // Legacy readout removed from strip UI (kept as hidden component for compatibility).
     recordLengthLabel.setVisible(false);
@@ -1374,7 +1553,7 @@ void StripControl::updateGrainOverlayVisibility()
     grainEnvelopeSlider.setVisible(isGrainMode);
     grainArpModeSlider.setVisible(false);
     grainSizeSyncToggle.setVisible(isGrainMode);
-    grainSizeDivLabel.setVisible(false);
+    grainSizeDivLabel.setVisible(isGrainMode);
     grainSizeLabel.setVisible(isGrainMode);
     grainDensityLabel.setVisible(isGrainMode);
     grainPitchLabel.setVisible(isGrainMode);
@@ -1449,20 +1628,25 @@ void StripControl::paintModulationLane(juce::Graphics& g)
         return;
 
     const auto seq = engine->getModSequencerState(stripIndex);
-    const int activeStep = engine->getModCurrentStep(stripIndex);
+    const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, engine->getModLengthBars(stripIndex));
+    const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
+    const int activeStep = juce::jlimit(0, totalSteps - 1, engine->getModCurrentGlobalStep(stripIndex));
 
     g.setColour(juce::Colour(0xff1f1f1f));
     g.fillRoundedRectangle(lane.toFloat(), 6.0f);
     g.setColour(stripColor.withAlpha(0.35f));
     g.drawRoundedRectangle(lane.toFloat().reduced(0.5f), 6.0f, 1.0f);
 
-    const float left = static_cast<float>(lane.getX()) + 1.0f;
-    const float right = static_cast<float>(lane.getRight()) - 1.0f;
-    const float top = static_cast<float>(lane.getY()) + 2.0f;
-    const float bottom = static_cast<float>(lane.getBottom()) - 2.0f;
+    const auto drawLane = lane.reduced(12, 2);
+    const float dotSize = (totalSteps > 32) ? 4.0f : 6.0f;
+    const float dotPad = dotSize * 0.6f;
+    const float left = static_cast<float>(drawLane.getX()) + dotPad;
+    const float right = juce::jmax(left, static_cast<float>(drawLane.getRight() - 1) - dotPad);
+    const float top = static_cast<float>(drawLane.getY()) + 2.0f;
+    const float bottom = static_cast<float>(drawLane.getBottom()) - 2.0f;
     const float width = right - left;
     const float height = bottom - top;
-    const float xStep = juce::jmax(1.0f, width / static_cast<float>(ModernAudioEngine::ModSteps - 1));
+    const float xStep = juce::jmax(0.25f, width / static_cast<float>(juce::jmax(1, totalSteps - 1)));
     const float centerY = top + (height * 0.5f);
 
     if (seq.bipolar)
@@ -1471,10 +1655,14 @@ void StripControl::paintModulationLane(juce::Graphics& g)
         g.drawLine(left, centerY, right, centerY, 1.0f);
     }
 
-    std::array<juce::Point<float>, ModernAudioEngine::ModSteps> points;
-    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+    std::vector<float> displayVals(static_cast<size_t>(totalSteps));
+    for (int i = 0; i < totalSteps; ++i)
+        displayVals[static_cast<size_t>(i)] = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(stripIndex, i));
+
+    std::vector<juce::Point<float>> points(static_cast<size_t>(totalSteps));
+    for (int i = 0; i < totalSteps; ++i)
     {
-        const float v = juce::jlimit(0.0f, 1.0f, seq.steps[static_cast<size_t>(i)]);
+        const float v = displayVals[static_cast<size_t>(i)];
         const float n = seq.bipolar ? ((v * 2.0f) - 1.0f) : v;
         const float y = seq.bipolar
             ? (centerY - (n * (height * 0.48f)))
@@ -1486,12 +1674,27 @@ void StripControl::paintModulationLane(juce::Graphics& g)
     {
         juce::Path p;
         p.startNewSubPath(points[0]);
-        for (int i = 1; i < ModernAudioEngine::ModSteps; ++i)
+        const float bend = juce::jlimit(-1.0f, 1.0f, seq.curveBend);
+        const auto curveShape = static_cast<ModernAudioEngine::ModCurveShape>(
+            juce::jlimit(0, static_cast<int>(ModernAudioEngine::ModCurveShape::Stair), seq.curveShape));
+        constexpr int segmentsPerStep = 8;
+        for (int i = 0; i < (totalSteps - 1); ++i)
         {
-            const auto prev = points[static_cast<size_t>(i - 1)];
-            const auto cur = points[static_cast<size_t>(i)];
-            const float cx = 0.5f * (prev.x + cur.x);
-            p.quadraticTo(cx, prev.y, cur.x, cur.y);
+            const float a = displayVals[static_cast<size_t>(i)];
+            const float b = displayVals[static_cast<size_t>(i + 1)];
+            const float x0 = points[static_cast<size_t>(i)].x;
+            for (int s = 1; s <= segmentsPerStep; ++s)
+            {
+                const float t = static_cast<float>(s) / static_cast<float>(segmentsPerStep);
+                const float shapedT = shapeCurvePhaseUi(t, bend, curveShape);
+                const float v = juce::jlimit(0.0f, 1.0f, a + ((b - a) * shapedT));
+                const float n = seq.bipolar ? ((v * 2.0f) - 1.0f) : v;
+                const float y = seq.bipolar
+                    ? (centerY - (n * (height * 0.48f)))
+                    : (bottom - (n * height));
+                const float x = x0 + (xStep * t);
+                p.lineTo(x, y);
+            }
         }
 
         g.setColour(stripColor.withAlpha(0.9f));
@@ -1500,7 +1703,7 @@ void StripControl::paintModulationLane(juce::Graphics& g)
     else
     {
         const float barWidth = juce::jmax(2.0f, xStep * 0.68f);
-        for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+        for (int i = 0; i < totalSteps; ++i)
         {
             const auto point = points[static_cast<size_t>(i)];
             const float x = point.x - (barWidth * 0.5f);
@@ -1518,12 +1721,12 @@ void StripControl::paintModulationLane(juce::Graphics& g)
         }
     }
 
-    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+    for (int i = 0; i < totalSteps; ++i)
     {
         const auto point = points[static_cast<size_t>(i)];
         const bool isActive = (i == activeStep);
         g.setColour(isActive ? kAccent : stripColor.withMultipliedBrightness(0.8f));
-        g.fillEllipse(point.x - 3.0f, point.y - 3.0f, 6.0f, 6.0f);
+        g.fillEllipse(point.x - (dotSize * 0.5f), point.y - (dotSize * 0.5f), dotSize, dotSize);
     }
 }
 
@@ -1533,18 +1736,26 @@ void StripControl::applyModulationPoint(juce::Point<int> p)
     if (!engine || stripIndex >= 6)
         return;
 
-    auto lane = getModulationLaneBounds();
-    if (!lane.contains(p))
+    auto lane = getModulationLaneBounds().reduced(12, 2);
+    auto hitLane = lane.expanded(1, 0);
+    if (!hitLane.contains(p))
         return;
 
-    const float nx = juce::jlimit(0.0f, 1.0f, (static_cast<float>(p.x - lane.getX())) / juce::jmax(1.0f, static_cast<float>(lane.getWidth())));
+    const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, engine->getModLengthBars(stripIndex));
+    const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
+    if (modulationLastDrawStep >= totalSteps)
+        modulationLastDrawStep = -1;
+    const float x = juce::jlimit(static_cast<float>(lane.getX()),
+                                 static_cast<float>(lane.getRight() - 1),
+                                 static_cast<float>(p.x));
+    const float nx = juce::jlimit(0.0f, 1.0f, (x - static_cast<float>(lane.getX())) / juce::jmax(1.0f, static_cast<float>(lane.getWidth() - 1)));
     const float ny = juce::jlimit(0.0f, 1.0f, (static_cast<float>(p.y - lane.getY())) / juce::jmax(1.0f, static_cast<float>(lane.getHeight())));
-    const int step = juce::jlimit(0, ModernAudioEngine::ModSteps - 1,
-                                  static_cast<int>(std::round(nx * static_cast<float>(ModernAudioEngine::ModSteps - 1))));
+    const int step = juce::jlimit(0, totalSteps - 1,
+                                  static_cast<int>(std::round(nx * static_cast<float>(juce::jmax(1, totalSteps - 1)))));
     const float value = juce::jlimit(0.0f, 1.0f, 1.0f - ny);
     if (modulationLastDrawStep < 0)
     {
-        engine->setModStepValue(stripIndex, step, value);
+        engine->setModStepValueAbsolute(stripIndex, step, value);
         modulationLastDrawStep = step;
         modulationLastDrawValue = value;
         return;
@@ -1556,7 +1767,7 @@ void StripControl::applyModulationPoint(juce::Point<int> p)
     {
         const float t = (to == from) ? 1.0f : (static_cast<float>(s - from) / static_cast<float>(to - from));
         const float v = modulationLastDrawValue + ((value - modulationLastDrawValue) * t);
-        engine->setModStepValue(stripIndex, s, v);
+        engine->setModStepValueAbsolute(stripIndex, s, v);
     }
     modulationLastDrawStep = step;
     modulationLastDrawValue = value;
@@ -1564,46 +1775,55 @@ void StripControl::applyModulationPoint(juce::Point<int> p)
 
 int StripControl::getModulationStepFromPoint(juce::Point<int> p) const
 {
-    auto lane = getModulationLaneBounds();
+    auto* engine = processor.getAudioEngine();
+    if (!engine)
+        return -1;
+    auto lane = getModulationLaneBounds().reduced(12, 2);
     if (lane.isEmpty())
         return -1;
-    if (!lane.contains(p))
+    if (!lane.expanded(1, 0).contains(p))
         return -1;
 
+    const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, engine->getModLengthBars(stripIndex));
+    const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
+    const float x = juce::jlimit(static_cast<float>(lane.getX()),
+                                 static_cast<float>(lane.getRight() - 1),
+                                 static_cast<float>(p.x));
     const float nx = juce::jlimit(0.0f, 1.0f,
-                                  (static_cast<float>(p.x - lane.getX()))
-                                  / juce::jmax(1.0f, static_cast<float>(lane.getWidth())));
-    return juce::jlimit(0, ModernAudioEngine::ModSteps - 1,
-                        static_cast<int>(std::round(nx * static_cast<float>(ModernAudioEngine::ModSteps - 1))));
+                                  (x - static_cast<float>(lane.getX()))
+                                  / juce::jmax(1.0f, static_cast<float>(lane.getWidth() - 1)));
+    return juce::jlimit(0, totalSteps - 1,
+                        static_cast<int>(std::round(nx * static_cast<float>(juce::jmax(1, totalSteps - 1)))));
 }
 
 void StripControl::applyModulationCellDuplicateFromDrag(int deltaY)
 {
     auto* engine = processor.getAudioEngine();
-    if (!engine || stripIndex >= 6 || modTransformStep < 0 || modTransformStep >= ModernAudioEngine::ModSteps)
+    if (!engine || stripIndex >= 6 || modTransformStep < 0 || modTransformStep >= modTransformStepCount)
         return;
 
     // Cmd/Ctrl drag edits local virtual density while keeping the cycle duration fixed.
     // Drag up: more virtual steps around the selected cell.
     // Drag down: fewer virtual steps around the selected cell.
-    const int stepDelta = juce::jlimit(-(ModernAudioEngine::ModSteps - 2), 32, (-deltaY) / 14);
-    const int targetCount = juce::jlimit(2, ModernAudioEngine::ModSteps + 32, ModernAudioEngine::ModSteps + stepDelta);
-    if (targetCount == ModernAudioEngine::ModSteps)
+    const int sourceCount = juce::jmax(2, modTransformStepCount);
+    const int stepDelta = juce::jlimit(-(sourceCount - 2), 32, (-deltaY) / 14);
+    const int targetCount = juce::jlimit(2, sourceCount + 32, sourceCount + stepDelta);
+    if (targetCount == sourceCount)
     {
-        for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
-            engine->setModStepValue(stripIndex, i, modTransformSourceSteps[static_cast<size_t>(i)]);
+        for (int i = 0; i < sourceCount; ++i)
+            engine->setModStepValueAbsolute(stripIndex, i, modTransformSourceSteps[static_cast<size_t>(i)]);
         return;
     }
 
     std::vector<float> expanded;
-    expanded.reserve(static_cast<size_t>(juce::jmax(ModernAudioEngine::ModSteps, targetCount)));
-    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+    expanded.reserve(static_cast<size_t>(juce::jmax(sourceCount, targetCount)));
+    for (int i = 0; i < sourceCount; ++i)
         expanded.push_back(modTransformSourceSteps[static_cast<size_t>(i)]);
 
     int pivot = juce::jlimit(0, static_cast<int>(expanded.size()) - 1, modTransformStep);
-    if (targetCount > ModernAudioEngine::ModSteps)
+    if (targetCount > sourceCount)
     {
-        const int extraNodes = targetCount - ModernAudioEngine::ModSteps;
+        const int extraNodes = targetCount - sourceCount;
         for (int n = 0; n < extraNodes; ++n)
         {
             const float v = expanded[static_cast<size_t>(pivot)];
@@ -1613,7 +1833,7 @@ void StripControl::applyModulationCellDuplicateFromDrag(int deltaY)
     }
     else
     {
-        const int removeNodes = ModernAudioEngine::ModSteps - targetCount;
+        const int removeNodes = sourceCount - targetCount;
         for (int n = 0; n < removeNodes && expanded.size() > 2; ++n)
         {
             const int left = pivot - 1;
@@ -1637,23 +1857,23 @@ void StripControl::applyModulationCellDuplicateFromDrag(int deltaY)
     if (expandedCount <= 0)
         return;
 
-    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
+    for (int i = 0; i < sourceCount; ++i)
     {
         const double phase = (static_cast<double>(i) * static_cast<double>(expandedCount))
-                           / static_cast<double>(ModernAudioEngine::ModSteps);
+                           / static_cast<double>(sourceCount);
         const int idxA = juce::jlimit(0, expandedCount - 1, static_cast<int>(std::floor(phase)));
         const int idxB = (idxA + 1) % expandedCount;
         const float frac = static_cast<float>(phase - static_cast<double>(idxA));
         const float v = expanded[static_cast<size_t>(idxA)]
                       + ((expanded[static_cast<size_t>(idxB)] - expanded[static_cast<size_t>(idxA)]) * frac);
-        engine->setModStepValue(stripIndex, i, juce::jlimit(0.0f, 1.0f, v));
+        engine->setModStepValueAbsolute(stripIndex, i, juce::jlimit(0.0f, 1.0f, v));
     }
 }
 
 void StripControl::applyModulationCellCurveFromDrag(int deltaY)
 {
     auto* engine = processor.getAudioEngine();
-    if (!engine || stripIndex >= 6 || modTransformStep < 0 || modTransformStep >= ModernAudioEngine::ModSteps)
+    if (!engine || stripIndex >= 6 || modTransformStep < 0 || modTransformStep >= modTransformStepCount)
         return;
 
     const float srcV = modTransformSourceSteps[static_cast<size_t>(modTransformStep)];
@@ -1672,7 +1892,7 @@ void StripControl::applyModulationCellCurveFromDrag(int deltaY)
 
     const float shaped = juce::jlimit(0.0f, 1.0f,
                                       std::pow(juce::jlimit(0.0f, 1.0f, srcV), exponent));
-    engine->setModStepValue(stripIndex, modTransformStep, shaped);
+    engine->setModStepValueAbsolute(stripIndex, modTransformStep, shaped);
 }
 
 void StripControl::mouseDown(const juce::MouseEvent& e)
@@ -1683,14 +1903,29 @@ void StripControl::mouseDown(const juce::MouseEvent& e)
         if (!engine || stripIndex >= 6)
             return;
 
+        const auto state = engine->getModSequencerState(stripIndex);
+        const bool neutralBipolar = modTargetAllowsBipolar(state.target) && state.bipolar;
+        const float neutralValue = neutralBipolar ? 0.5f : 0.0f;
+        const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, engine->getModLengthBars(stripIndex));
+        const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
+
+        if (e.mods.isRightButtonDown())
+        {
+            for (int i = 0; i < totalSteps; ++i)
+                engine->setModStepValueAbsolute(stripIndex, i, neutralValue);
+            modulationLastDrawStep = -1;
+            return;
+        }
+
         const auto mods = e.mods;
         const int clickedStep = getModulationStepFromPoint(e.getPosition());
         const bool duplicateGesture = mods.isCommandDown() || mods.isCtrlDown();
         const bool shapeGesture = mods.isAltDown();
         if ((duplicateGesture || shapeGesture) && clickedStep >= 0)
         {
-            const auto seq = engine->getModSequencerState(stripIndex);
-            modTransformSourceSteps = seq.steps;
+            modTransformStepCount = totalSteps;
+            for (int i = 0; i < modTransformStepCount; ++i)
+                modTransformSourceSteps[static_cast<size_t>(i)] = engine->getModStepValueAbsolute(stripIndex, i);
             modTransformStartY = e.y;
             modTransformStep = clickedStep;
             modTransformMode = duplicateGesture
@@ -1704,6 +1939,26 @@ void StripControl::mouseDown(const juce::MouseEvent& e)
         modulationLastDrawStep = -1;
         applyModulationPoint(e.getPosition());
     }
+}
+
+void StripControl::mouseDoubleClick(const juce::MouseEvent& e)
+{
+    if (!modulationLaneView)
+        return;
+
+    auto* engine = processor.getAudioEngine();
+    if (!engine || stripIndex >= 6)
+        return;
+
+    const int step = getModulationStepFromPoint(e.getPosition());
+    if (step < 0)
+        return;
+
+    const auto state = engine->getModSequencerState(stripIndex);
+    const bool neutralBipolar = modTargetAllowsBipolar(state.target) && state.bipolar;
+    const float neutralValue = neutralBipolar ? 0.5f : 0.0f;
+    engine->setModStepValueAbsolute(stripIndex, step, neutralValue);
+    modulationLastDrawStep = -1;
 }
 
 void StripControl::mouseDrag(const juce::MouseEvent& e)
@@ -1835,7 +2090,7 @@ void StripControl::resized()
     // Waveform OR step display gets all remaining space
     waveform.setBounds(bounds);
     stepDisplay.setBounds(bounds);  // Same position, visibility toggled
-    modulationLaneBounds = bounds.reduced(1, 0);
+    modulationLaneBounds = bounds.reduced(8, 0);
     
     if (modulationLaneView)
     {
@@ -1851,27 +2106,65 @@ void StripControl::resized()
         modDepthSlider.setVisible(true);
         modOffsetLabel.setVisible(true);
         modOffsetSlider.setVisible(true);
+        modCurveBendLabel.setVisible(true);
+        modCurveBendSlider.setVisible(true);
+        modLengthLabel.setVisible(true);
+        modLengthBox.setVisible(true);
+        modPitchQuantToggle.setVisible(true);
+        modPitchScaleBox.setVisible(true);
         modShapeLabel.setVisible(true);
         modShapeBox.setVisible(true);
+        modCurveTypeLabel.setVisible(true);
+        modCurveTypeBox.setVisible(true);
 
         controlsArea.reduce(4, 0);
+        const int gap = 4;
+        const int columnWidth = juce::jmax(88, (controlsArea.getWidth() - gap) / 2);
+        auto splitRow = [columnWidth](juce::Rectangle<int> row)
+        {
+            auto left = row.removeFromLeft(columnWidth);
+            row.removeFromLeft(gap);
+            return std::pair<juce::Rectangle<int>, juce::Rectangle<int>>(left, row);
+        };
+
         auto row0 = controlsArea.removeFromTop(18);
-        modTargetLabel.setBounds(row0.removeFromLeft(44));
-        modTargetBox.setBounds(row0);
+        auto cols0 = splitRow(row0);
+        auto row0Left = cols0.first;
+        modTargetLabel.setBounds(row0Left.removeFromLeft(42));
+        modTargetBox.setBounds(row0Left);
+        modLengthLabel.setBounds(cols0.second.removeFromLeft(24));
+        modLengthBox.setBounds(cols0.second.removeFromLeft(60));
+
         controlsArea.removeFromTop(2);
         auto row1 = controlsArea.removeFromTop(18);
-        modBipolarToggle.setBounds(row1.removeFromLeft(50));
-        row1.removeFromLeft(4);
-        modShapeLabel.setBounds(row1.removeFromLeft(34));
-        modShapeBox.setBounds(row1);
+        auto cols1 = splitRow(row1);
+        auto row1Left = cols1.first;
+        modDepthLabel.setBounds(row1Left.removeFromLeft(42));
+        modDepthSlider.setBounds(row1Left);
+        modBipolarToggle.setBounds(cols1.second);
+
         controlsArea.removeFromTop(2);
-        auto row2 = controlsArea.removeFromTop(16);
-        modDepthLabel.setBounds(row2.removeFromLeft(44));
-        modDepthSlider.setBounds(row2);
+        auto row2 = controlsArea.removeFromTop(18);
+        auto cols2 = splitRow(row2);
+        auto row2Left = cols2.first;
+        modOffsetLabel.setBounds(row2Left.removeFromLeft(42));
+        modOffsetSlider.setBounds(row2Left);
+        modCurveBendLabel.setBounds(cols2.second.removeFromLeft(34));
+        modCurveBendSlider.setBounds(cols2.second);
+
         controlsArea.removeFromTop(2);
-        auto row3 = controlsArea.removeFromTop(16);
-        modOffsetLabel.setBounds(row3.removeFromLeft(44));
-        modOffsetSlider.setBounds(row3);
+        auto row3 = controlsArea.removeFromTop(18);
+        auto cols3 = splitRow(row3);
+        modPitchQuantToggle.setBounds(cols3.first);
+        modPitchScaleBox.setBounds(cols3.second);
+
+        controlsArea.removeFromTop(2);
+        auto row4 = controlsArea.removeFromTop(18);
+        auto cols4 = splitRow(row4);
+        modCurveTypeLabel.setBounds(cols4.first.removeFromLeft(34));
+        modCurveTypeBox.setBounds(cols4.first);
+        modShapeLabel.setBounds(cols4.second.removeFromLeft(34));
+        modShapeBox.setBounds(cols4.second);
         return;
     }
 
@@ -1887,18 +2180,26 @@ void StripControl::resized()
     modDepthSlider.setVisible(false);
     modOffsetLabel.setVisible(false);
     modOffsetSlider.setVisible(false);
+    modCurveBendLabel.setVisible(false);
+    modCurveBendSlider.setVisible(false);
+    modLengthLabel.setVisible(false);
+    modLengthBox.setVisible(false);
+    modPitchQuantToggle.setVisible(false);
+    modPitchScaleBox.setVisible(false);
     modShapeLabel.setVisible(false);
     modShapeBox.setVisible(false);
+    modCurveTypeLabel.setVisible(false);
+    modCurveTypeBox.setVisible(false);
     
     // Controls column on right
     controlsArea.reduce(4, 0);
     
     const bool isGrainMode = grainOverlayVisible;
 
-    const int rowGap = isGrainMode ? 1 : 2;
+    const int rowGap = isGrainMode ? 0 : 1;
 
     // Top row: Load + slice mode
-    auto topRow = controlsArea.removeFromTop(isGrainMode ? 16 : 20);
+    auto topRow = controlsArea.removeFromTop(isGrainMode ? 14 : 18);
     const int half = topRow.getWidth() / 2;
     auto loadArea = topRow.removeFromLeft(half);
     loadButton.setBounds(loadArea.reduced(0, 0));
@@ -1907,7 +2208,7 @@ void StripControl::resized()
     controlsArea.removeFromTop(rowGap);
     
     // Second row: Play mode and Direction mode (2/3 width each), Group (1/3 width)
-    auto modesRow = controlsArea.removeFromTop(isGrainMode ? 16 : 20);
+    auto modesRow = controlsArea.removeFromTop(isGrainMode ? 14 : 18);
     int thirdWidth = modesRow.getWidth() / 3;
     playModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
     directionModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
@@ -1948,7 +2249,7 @@ void StripControl::resized()
     }
     
     // Rotary knobs row.
-    auto knobsRow = controlsArea.removeFromTop(isGrainMode ? 18 : 26);
+    auto knobsRow = controlsArea.removeFromTop(isGrainMode ? 22 : 30);
     int totalWidth = knobsRow.getWidth();
     int mainKnobsWidth = (totalWidth * 7) / 10;
     int mainKnobWidth = mainKnobsWidth / 3;
@@ -1972,15 +2273,18 @@ void StripControl::resized()
     else
         scratchSlider.setBounds(knobsRow.reduced(2));
 
-    auto labelsRow = controlsArea.removeFromTop(isGrainMode ? 8 : 9);
+    auto labelsRow = controlsArea.removeFromTop(isGrainMode ? 10 : 9);
     if (isGrainMode)
     {
         auto sizeLabelArea = labelsRow.removeFromLeft(mainKnobWidth);
         const int syncToggleW = 14;
-        const int labelW = juce::jmax(0, sizeLabelArea.getWidth() - syncToggleW - 1);
+        const int syncModeW = 30;
+        const int labelW = juce::jmax(0, sizeLabelArea.getWidth() - syncToggleW - syncModeW - 4);
         grainSizeLabel.setBounds(sizeLabelArea.removeFromLeft(labelW));
-        sizeLabelArea.removeFromLeft(1);
+        sizeLabelArea.removeFromLeft(2);
         grainSizeSyncToggle.setBounds(sizeLabelArea.removeFromLeft(syncToggleW));
+        sizeLabelArea.removeFromLeft(2);
+        grainSizeDivLabel.setBounds(sizeLabelArea.removeFromLeft(syncModeW));
         grainDensityLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
         speedLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
     }
@@ -2117,9 +2421,19 @@ void StripControl::updateFromEngine()
         const auto mod = processor.getAudioEngine()->getModSequencerState(stripIndex);
         modTargetBox.setSelectedId(modTargetToComboId(mod.target), juce::dontSendNotification);
         modBipolarToggle.setToggleState(mod.bipolar, juce::dontSendNotification);
+        modBipolarToggle.setEnabled(modTargetAllowsBipolar(mod.target));
         modDepthSlider.setValue(mod.depth, juce::dontSendNotification);
-        modOffsetSlider.setValue(mod.offset, juce::dontSendNotification);
+        modOffsetSlider.setValue(mod.smoothingMs, juce::dontSendNotification);
+        modCurveBendSlider.setValue(mod.curveBend, juce::dontSendNotification);
+        modLengthBox.setSelectedId(mod.lengthBars, juce::dontSendNotification);
+        modPitchQuantToggle.setToggleState(mod.pitchScaleQuantize, juce::dontSendNotification);
+        modPitchScaleBox.setSelectedId(pitchScaleToComboId(static_cast<ModernAudioEngine::PitchScale>(mod.pitchScale)), juce::dontSendNotification);
+        modPitchScaleBox.setEnabled(mod.pitchScaleQuantize);
         modShapeBox.setSelectedId(mod.curveMode ? 1 : 2, juce::dontSendNotification);
+        modCurveTypeBox.setSelectedId(curveShapeToComboId(static_cast<ModernAudioEngine::ModCurveShape>(mod.curveShape)),
+                                      juce::dontSendNotification);
+        modCurveBendSlider.setEnabled(mod.curveMode);
+        modCurveTypeBox.setEnabled(mod.curveMode);
         repaint();
         return;
     }
@@ -2309,6 +2623,7 @@ void StripControl::updateFromEngine()
     }
     const bool grainSyncEnabled = strip->isGrainTempoSyncEnabled();
     grainSizeSyncToggle.setToggleState(grainSyncEnabled, juce::dontSendNotification);
+    grainSizeDivLabel.setText(grainSyncEnabled ? "SYNC" : "FREE", juce::dontSendNotification);
     grainSizeSyncToggle.setColour(juce::ToggleButton::textColourId, grainSyncEnabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
     grainSizeSyncToggle.setColour(juce::ToggleButton::tickColourId, grainSyncEnabled ? stripColor.brighter(0.35f) : stripColor.withAlpha(0.72f));
     {
@@ -2331,6 +2646,128 @@ void StripControl::updateFromEngine()
     if (groupSelector.getSelectedId() != selectedId)
     {
         groupSelector.setSelectedId(selectedId, juce::dontSendNotification);
+    }
+
+    // Mod target pulse indication on actual control colours (not label text).
+    auto tintSlider = [](juce::Slider& s, juce::Colour c, float pulseAmount)
+    {
+        const float pulse = juce::jlimit(0.0f, 1.0f, pulseAmount);
+        const auto fill = c.interpolatedWith(kAccent.brighter(0.5f), 0.25f * pulse);
+        s.setColour(juce::Slider::rotarySliderFillColourId, fill);
+        s.setColour(juce::Slider::trackColourId, fill.withAlpha(0.78f + (0.2f * pulse)));
+        s.setColour(juce::Slider::thumbColourId, fill.brighter(0.18f + (0.42f * pulse)));
+        s.setColour(juce::Slider::rotarySliderOutlineColourId,
+                    juce::Colour(0xff4a4a4a).interpolatedWith(fill.brighter(0.55f), 0.7f * pulse));
+    };
+    auto setModIndicator = [](juce::Slider& s, bool active, float depth, float signedPos, juce::Colour colour)
+    {
+        auto& props = s.getProperties();
+        props.set("modActive", active);
+        props.set("modDepth", juce::jlimit(0.0f, 1.0f, depth));
+        props.set("modSigned", juce::jlimit(-1.0f, 1.0f, signedPos));
+        props.set("modColour", static_cast<int>(colour.getARGB()));
+    };
+    auto pickVisibleModColour = [](const juce::Slider& s)
+    {
+        const auto base = s.findColour(juce::Slider::rotarySliderFillColourId);
+        const float hue = base.getHue();
+        const bool nearYellowHue = (hue > 0.10f && hue < 0.18f) && base.getSaturation() > 0.25f;
+        const auto ref = juce::Colour(0xffffd24a);
+        const float dr = base.getFloatRed() - ref.getFloatRed();
+        const float dg = base.getFloatGreen() - ref.getFloatGreen();
+        const float db = base.getFloatBlue() - ref.getFloatBlue();
+        const float rgbDist = std::sqrt((dr * dr) + (dg * dg) + (db * db));
+        const bool nearAccent = base.getPerceivedBrightness() > 0.45f
+                             && rgbDist < 0.34f;
+        if (nearYellowHue || nearAccent)
+            return juce::Colour(0xff3bd5ff); // cyan contrast for yellow/orange controls
+        return juce::Colour(0xffffd24a);     // default warm modulation color
+    };
+    const auto baseControl = stripColor.withAlpha(0.72f);
+    tintSlider(volumeSlider, baseControl, 0.0f);
+    tintSlider(panSlider, baseControl, 0.0f);
+    tintSlider(speedSlider, baseControl, 0.0f);
+    tintSlider(scratchSlider, baseControl, 0.0f);
+    tintSlider(grainSizeSlider, baseControl, 0.0f);
+    tintSlider(grainDensitySlider, baseControl, 0.0f);
+    tintSlider(grainPitchSlider, baseControl, 0.0f);
+    tintSlider(grainPitchJitterSlider, baseControl, 0.0f);
+    tintSlider(grainSpreadSlider, baseControl, 0.0f);
+    tintSlider(grainJitterSlider, baseControl, 0.0f);
+    tintSlider(grainRandomSlider, baseControl, 0.0f);
+    tintSlider(grainArpSlider, baseControl, 0.0f);
+    tintSlider(grainCloudSlider, baseControl, 0.0f);
+    tintSlider(grainEmitterSlider, baseControl, 0.0f);
+    tintSlider(grainEnvelopeSlider, baseControl, 0.0f);
+    setModIndicator(volumeSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(panSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(speedSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(scratchSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainSizeSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainDensitySlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainPitchSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainPitchJitterSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainSpreadSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainJitterSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainRandomSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainArpSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainCloudSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainEmitterSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainEnvelopeSlider, false, 0.0f, 0.0f, kAccent);
+
+    if (auto* engine = processor.getAudioEngine())
+    {
+        const auto mod = engine->getModSequencerState(stripIndex);
+        if (mod.target != ModernAudioEngine::ModTarget::None)
+        {
+            const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, engine->getModLengthBars(stripIndex));
+            const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
+            const int activeStep = juce::jlimit(0, totalSteps - 1, engine->getModCurrentGlobalStep(stripIndex));
+            const float raw = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(stripIndex, activeStep));
+            const bool bipolar = mod.bipolar && modTargetAllowsBipolar(mod.target);
+            const float depth = juce::jlimit(0.0f, 1.0f, mod.depth);
+            const float modNorm = juce::jlimit(0.0f, 1.0f, raw * depth);
+            const float modBi = juce::jlimit(-1.0f, 1.0f, ((raw * 2.0f) - 1.0f) * depth);
+            const float intensity = bipolar ? std::abs(modBi) : modNorm;
+            const float signedPos = juce::jlimit(-1.0f, 1.0f, (raw * 2.0f) - 1.0f);
+
+            const float stepPulse = ((activeStep & 1) == 0) ? 1.0f : 0.65f;
+            const float pulseAmount = juce::jlimit(0.0f, 1.0f,
+                                                   (0.35f + (0.65f * juce::jmax(0.2f, intensity))) * stepPulse);
+
+            auto* targetSlider = [&]() -> juce::Slider*
+            {
+                switch (mod.target)
+                {
+                    case ModernAudioEngine::ModTarget::None: return nullptr;
+                    case ModernAudioEngine::ModTarget::Volume: return &volumeSlider;
+                    case ModernAudioEngine::ModTarget::Pan: return &panSlider;
+                    case ModernAudioEngine::ModTarget::Pitch: return nullptr;
+                    case ModernAudioEngine::ModTarget::Speed: return &speedSlider;
+                    case ModernAudioEngine::ModTarget::Cutoff: return nullptr;
+                    case ModernAudioEngine::ModTarget::Resonance: return nullptr;
+                    case ModernAudioEngine::ModTarget::GrainSize: return &grainSizeSlider;
+                    case ModernAudioEngine::ModTarget::GrainDensity: return &grainDensitySlider;
+                    case ModernAudioEngine::ModTarget::GrainPitch: return &grainPitchSlider;
+                    case ModernAudioEngine::ModTarget::GrainPitchJitter: return &grainPitchJitterSlider;
+                    case ModernAudioEngine::ModTarget::GrainSpread: return &grainSpreadSlider;
+                    case ModernAudioEngine::ModTarget::GrainJitter: return &grainJitterSlider;
+                    case ModernAudioEngine::ModTarget::GrainRandom: return &grainRandomSlider;
+                    case ModernAudioEngine::ModTarget::GrainArp: return &grainArpSlider;
+                    case ModernAudioEngine::ModTarget::GrainCloud: return &grainCloudSlider;
+                    case ModernAudioEngine::ModTarget::GrainEmitter: return &grainEmitterSlider;
+                    case ModernAudioEngine::ModTarget::GrainEnvelope: return &grainEnvelopeSlider;
+                    default: return nullptr;
+                }
+            }();
+            if (targetSlider != nullptr)
+            {
+                const auto targetColour = pickVisibleModColour(*targetSlider);
+                const auto pulseColour = targetColour.withAlpha(0.82f + (0.18f * pulseAmount));
+                tintSlider(*targetSlider, pulseColour, pulseAmount);
+                setModIndicator(*targetSlider, true, depth, signedPos, targetColour);
+            }
+        }
     }
     
     repaint();  // For LED overlay
@@ -2401,7 +2838,7 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     addAndMakeVisible(filterResSlider);
     
     // Filter Type
-    filterTypeLabel.setText("Type", juce::dontSendNotification);
+    filterTypeLabel.setText("Alg", juce::dontSendNotification);
     filterTypeLabel.setJustificationType(juce::Justification::centred);
     filterTypeLabel.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
     filterTypeLabel.setColour(juce::Label::textColourId, stripColor);
@@ -2411,6 +2848,7 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     filterTypeBox.addItem("Band Pass", 2);
     filterTypeBox.addItem("High Pass", 3);
     filterTypeBox.setSelectedId(1);
+    styleUiCombo(filterTypeBox);
     filterTypeBox.onChange = [this]() {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
         {
@@ -2526,26 +2964,24 @@ void FXStripControl::resized()
     
     // All three controls in ONE ROW: Freq | Res | Type
     // Freq and Res get rotary knobs, Type gets dropdown
-    auto controlsRow = field1.removeFromTop(75);
-    
-    // Divide into thirds
-    int controlWidth = controlsRow.getWidth() / 3;
-    
-    // Frequency (left)
-    auto freqCol = controlsRow.removeFromLeft(controlWidth).reduced(1, 0);
+    auto controlsRow = field1.removeFromTop(64);
+
+    // Frequency + Resonance (top row)
+    int controlWidth = controlsRow.getWidth() / 2;
+    auto freqCol = controlsRow.removeFromLeft(controlWidth).reduced(2, 0);
     filterFreqLabel.setBounds(freqCol.removeFromTop(12));
     filterFreqSlider.setBounds(freqCol);
-    
-    // Resonance (middle)
-    auto resCol = controlsRow.removeFromLeft(controlWidth).reduced(1, 0);
+
+    auto resCol = controlsRow.reduced(2, 0);
     filterResLabel.setBounds(resCol.removeFromTop(12));
     filterResSlider.setBounds(resCol);
-    
-    // Type (right) - dropdown instead of rotary
-    auto typeCol = controlsRow.reduced(1, 0);
-    filterTypeLabel.setBounds(typeCol.removeFromTop(12));
-    typeCol.removeFromTop(15);  // Gap to align with knobs visually
-    filterTypeBox.setBounds(typeCol.removeFromTop(22));
+
+    // Type row beneath knobs so it stays visible on narrower widths
+    field1.removeFromTop(6);
+    auto typeRow = field1.removeFromTop(22);
+    filterTypeLabel.setBounds(typeRow.removeFromLeft(34));
+    typeRow.removeFromLeft(4);
+    filterTypeBox.setBounds(typeRow);
     
     // === FIELD 2: GATE CONTROLS ===
     auto rateRow = field2.removeFromTop(20);
@@ -3201,11 +3637,12 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     crossfadeLengthLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(crossfadeLengthLabel);
     
-    crossfadeLengthSlider.setSliderStyle(juce::Slider::Rotary);
-    crossfadeLengthSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 50, 18);
+    crossfadeLengthSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+    crossfadeLengthSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     crossfadeLengthSlider.setRange(1.0, 50.0, 0.1);
     crossfadeLengthSlider.setValue(10.0);
     enableAltClickReset(crossfadeLengthSlider, 10.0);
+    crossfadeLengthSlider.setPopupDisplayEnabled(true, false, this);
     crossfadeLengthSlider.setTextValueSuffix(" ms");
     addAndMakeVisible(crossfadeLengthSlider);
     crossfadeLengthSlider.setTooltip("Loop/capture crossfade time in milliseconds.");
@@ -3214,11 +3651,12 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     triggerFadeInLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(triggerFadeInLabel);
 
-    triggerFadeInSlider.setSliderStyle(juce::Slider::Rotary);
-    triggerFadeInSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 50, 18);
+    triggerFadeInSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+    triggerFadeInSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     triggerFadeInSlider.setRange(0.1, 120.0, 0.1);
     triggerFadeInSlider.setValue(12.0);
     enableAltClickReset(triggerFadeInSlider, 12.0);
+    triggerFadeInSlider.setPopupDisplayEnabled(true, false, this);
     triggerFadeInSlider.setTextValueSuffix(" ms");
     addAndMakeVisible(triggerFadeInSlider);
     triggerFadeInSlider.setTooltip("Fade-in time for Monome row strip triggers.");
@@ -3260,8 +3698,10 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
 PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     : processor(p)
 {
-    // Reduce visual density; use tooltips and control labels for guidance.
-    instructionsLabel.setVisible(false);
+    instructionsLabel.setText("Click=load  Shift+Click=save  Delete removes selected slot", juce::dontSendNotification);
+    instructionsLabel.setJustificationType(juce::Justification::centredLeft);
+    instructionsLabel.setColour(juce::Label::textColourId, kTextMuted);
+    addAndMakeVisible(instructionsLabel);
 
     presetNameEditor.setTextToShowWhenEmpty("Preset name", kTextMuted);
     presetNameEditor.setMultiLine(false);
@@ -3370,9 +3810,11 @@ void PresetControlPanel::resized()
     editorArea.removeFromRight(6);
 
     // Keep name input compact to protect button layout on narrow widths.
-    constexpr int kNameFieldMaxW = 220;
+    constexpr int kNameFieldMaxW = 180;
     const int nameW = juce::jmin(kNameFieldMaxW, editorArea.getWidth());
     presetNameEditor.setBounds(editorArea.removeFromLeft(nameW));
+    editorArea.removeFromLeft(6);
+    instructionsLabel.setBounds(editorArea);
     bounds.removeFromTop(2);
 
     presetViewport.setBounds(bounds);
@@ -3395,6 +3837,9 @@ void PresetControlPanel::savePresetClicked(int index, juce::String typedName)
 
 void PresetControlPanel::loadPresetClicked(int index)
 {
+    if (!processor.presetExists(index))
+        return;
+
     processor.loadPreset(index);
     selectedPresetIndex = index;
     const auto name = processor.getPresetName(index);
@@ -3444,13 +3889,14 @@ void PresetControlPanel::exportRecordingsAsWav()
             continue;
         }
 
+        auto writerStream = std::unique_ptr<juce::OutputStream>(outStream.release());
+        const auto writerOptions = juce::AudioFormatWriter::Options{}
+            .withSampleRate(sampleRate)
+            .withNumChannels(audioBuffer->getNumChannels())
+            .withBitsPerSample(24)
+            .withQualityOptionIndex(0);
         std::unique_ptr<juce::AudioFormatWriter> writer(
-            wavFormat.createWriterFor(outStream.release(),
-                                      sampleRate,
-                                      static_cast<unsigned int>(audioBuffer->getNumChannels()),
-                                      24,
-                                      {},
-                                      0));
+            wavFormat.createWriterFor(writerStream, writerOptions));
 
         if (writer == nullptr || !writer->writeFromAudioSampleBuffer(*audioBuffer, 0, audioBuffer->getNumSamples()))
         {
@@ -3766,7 +4212,7 @@ void GlobalControlPanel::resized()
     // Calculate based on actual needs rather than equal division
     const int sliderWidth = 50;      // Vertical sliders
     const int meterWidth = 30;       // L/R meters
-    const int knobWidth = 78;        // Rotary knobs
+    const int knobWidth = 112;       // Larger rotary fade controls
     const int dropdownWidth = 92;    // Dropdowns
     const int spacing = 8;           // Between controls
     
@@ -3797,14 +4243,14 @@ void GlobalControlPanel::resized()
     auto crossfadeArea = controlsArea.removeFromLeft(knobWidth);
     crossfadeLengthLabel.setBounds(crossfadeArea.removeFromTop(16));
     crossfadeArea.removeFromTop(2);
-    crossfadeLengthSlider.setBounds(crossfadeArea.removeFromTop(78));
-    controlsArea.removeFromLeft(spacing);
+    crossfadeLengthSlider.setBounds(crossfadeArea.removeFromTop(104));
+    controlsArea.removeFromLeft(2);
 
     // Trigger fade-in - compact knob
     auto triggerFadeArea = controlsArea.removeFromLeft(knobWidth);
     triggerFadeInLabel.setBounds(triggerFadeArea.removeFromTop(16));
     triggerFadeArea.removeFromTop(2);
-    triggerFadeInSlider.setBounds(triggerFadeArea.removeFromTop(78));
+    triggerFadeInSlider.setBounds(triggerFadeArea.removeFromTop(104));
     controlsArea.removeFromLeft(spacing);
     
     // Quantize - compact dropdown
@@ -4551,7 +4997,7 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(depthLabel);
 
     depthSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-    depthSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 48, 18);
+    depthSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 34, 16);
     depthSlider.setRange(0.0, 1.0, 0.01);
     depthSlider.onValueChange = [this]()
     {
@@ -4560,19 +5006,86 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
     };
     addAndMakeVisible(depthSlider);
 
-    offsetLabel.setText("Offset", juce::dontSendNotification);
-    offsetLabel.setColour(juce::Label::textColourId, kTextMuted);
-    addAndMakeVisible(offsetLabel);
+    offsetLabel.setVisible(false);
+    offsetSlider.setVisible(false);
 
-    offsetSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-    offsetSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 48, 18);
-    offsetSlider.setRange(-15, 15, 1);
-    offsetSlider.onValueChange = [this]()
+    lengthLabel.setText("Length", juce::dontSendNotification);
+    lengthLabel.setColour(juce::Label::textColourId, kTextMuted);
+    addAndMakeVisible(lengthLabel);
+
+    lengthBox.addItem("1", 1);
+    lengthBox.addItem("2", 2);
+    lengthBox.addItem("4", 4);
+    lengthBox.addItem("8", 8);
+    lengthBox.onChange = [this]()
     {
         if (auto* engine = processor.getAudioEngine())
-            engine->setModOffset(selectedStrip, static_cast<int>(offsetSlider.getValue()));
+        {
+            const int bars = lengthBox.getSelectedId();
+            engine->setModLengthBars(selectedStrip, bars);
+            const int currentPage = juce::jlimit(0, bars - 1, engine->getModCurrentPage(selectedStrip));
+            engine->setModEditPage(selectedStrip, currentPage);
+        }
     };
-    addAndMakeVisible(offsetSlider);
+    addAndMakeVisible(lengthBox);
+
+    pageLabel.setText("Page", juce::dontSendNotification);
+    pageLabel.setColour(juce::Label::textColourId, kTextMuted);
+    addAndMakeVisible(pageLabel);
+
+    pageBox.addItem("1", 1);
+    pageBox.addItem("2", 2);
+    pageBox.addItem("3", 3);
+    pageBox.addItem("4", 4);
+    pageBox.addItem("5", 5);
+    pageBox.addItem("6", 6);
+    pageBox.addItem("7", 7);
+    pageBox.addItem("8", 8);
+    pageBox.onChange = [this]()
+    {
+        if (auto* engine = processor.getAudioEngine())
+            engine->setModEditPage(selectedStrip, juce::jlimit(0, 7, pageBox.getSelectedId() - 1));
+    };
+    addAndMakeVisible(pageBox);
+
+    smoothLabel.setText("Smooth", juce::dontSendNotification);
+    smoothLabel.setColour(juce::Label::textColourId, kTextMuted);
+    addAndMakeVisible(smoothLabel);
+
+    smoothSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    smoothSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 34, 16);
+    smoothSlider.setRange(0.0, 250.0, 1.0);
+    smoothSlider.setSkewFactorFromMidPoint(40.0);
+    smoothSlider.onValueChange = [this]()
+    {
+        if (auto* engine = processor.getAudioEngine())
+            engine->setModSmoothingMs(selectedStrip, static_cast<float>(smoothSlider.getValue()));
+    };
+    addAndMakeVisible(smoothSlider);
+
+    pitchScaleToggle.setButtonText("Pitch Quantize");
+    pitchScaleToggle.onClick = [this]()
+    {
+        if (auto* engine = processor.getAudioEngine())
+            engine->setModPitchScaleQuantize(selectedStrip, pitchScaleToggle.getToggleState());
+    };
+    addAndMakeVisible(pitchScaleToggle);
+
+    pitchScaleLabel.setText("Scale", juce::dontSendNotification);
+    pitchScaleLabel.setColour(juce::Label::textColourId, kTextMuted);
+    addAndMakeVisible(pitchScaleLabel);
+
+    pitchScaleBox.addItem("Chromatic", 1);
+    pitchScaleBox.addItem("Major", 2);
+    pitchScaleBox.addItem("Minor", 3);
+    pitchScaleBox.addItem("Dorian", 4);
+    pitchScaleBox.addItem("Pentatonic", 5);
+    pitchScaleBox.onChange = [this]()
+    {
+        if (auto* engine = processor.getAudioEngine())
+            engine->setModPitchScale(selectedStrip, comboIdToPitchScale(pitchScaleBox.getSelectedId()));
+    };
+    addAndMakeVisible(pitchScaleBox);
 
     for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
     {
@@ -4609,23 +5122,37 @@ void ModulationControlPanel::resized()
     stripLabel.setBounds(bounds.removeFromTop(18));
     bounds.removeFromTop(4);
 
-    auto top = bounds.removeFromTop(24);
-    targetLabel.setBounds(top.removeFromLeft(52));
-    targetBox.setBounds(top.removeFromLeft(150));
-    top.removeFromLeft(8);
-    bipolarToggle.setBounds(top.removeFromLeft(100));
+    auto top = bounds.removeFromTop(22);
+    targetLabel.setBounds(top.removeFromLeft(40));
+    targetBox.setBounds(top.removeFromLeft(98));
+    top.removeFromLeft(4);
+    lengthLabel.setBounds(top.removeFromLeft(38));
+    lengthBox.setBounds(top.removeFromLeft(56));
+    top.removeFromLeft(4);
+    pageLabel.setBounds(top.removeFromLeft(28));
+    pageBox.setBounds(top.removeFromLeft(46));
 
-    bounds.removeFromTop(4);
+    bounds.removeFromTop(3);
     auto depthRow = bounds.removeFromTop(22);
-    depthLabel.setBounds(depthRow.removeFromLeft(52));
-    depthSlider.setBounds(depthRow);
+    depthLabel.setBounds(depthRow.removeFromLeft(44));
+    depthSlider.setBounds(depthRow.removeFromLeft(120));
+    depthRow.removeFromLeft(4);
+    bipolarToggle.setBounds(depthRow.removeFromLeft(70));
+    depthRow.removeFromLeft(4);
+    pitchScaleToggle.setBounds(depthRow);
 
-    bounds.removeFromTop(4);
-    auto offsetRow = bounds.removeFromTop(22);
-    offsetLabel.setBounds(offsetRow.removeFromLeft(52));
-    offsetSlider.setBounds(offsetRow);
+    bounds.removeFromTop(3);
+    auto smoothRow = bounds.removeFromTop(22);
+    smoothLabel.setBounds(smoothRow.removeFromLeft(44));
+    smoothSlider.setBounds(smoothRow.removeFromLeft(120));
 
-    bounds.removeFromTop(8);
+    bounds.removeFromTop(3);
+    auto scaleRow = bounds.removeFromTop(22);
+    pitchScaleLabel.setBounds(scaleRow.removeFromLeft(44));
+    pitchScaleBox.setBounds(scaleRow.removeFromLeft(112));
+    scaleRow.removeFromLeft(4);
+
+    bounds.removeFromTop(6);
     const int gap = 4;
     const int w = juce::jmax(20, (bounds.getWidth() - (gap * (ModernAudioEngine::ModSteps - 1))) / ModernAudioEngine::ModSteps);
     const int h = juce::jmax(24, bounds.getHeight());
@@ -4790,8 +5317,16 @@ void ModulationControlPanel::refreshFromEngine()
     const auto state = engine->getModSequencerState(selectedStrip);
     targetBox.setSelectedId(modTargetToComboId(state.target), juce::dontSendNotification);
     bipolarToggle.setToggleState(state.bipolar, juce::dontSendNotification);
+    bipolarToggle.setEnabled(modTargetAllowsBipolar(state.target));
     depthSlider.setValue(state.depth, juce::dontSendNotification);
-    offsetSlider.setValue(state.offset, juce::dontSendNotification);
+    lengthBox.setSelectedId(state.lengthBars, juce::dontSendNotification);
+    pageBox.setSelectedId(juce::jlimit(1, 8, state.editPage + 1), juce::dontSendNotification);
+    pageBox.setEnabled(state.lengthBars > 1);
+    smoothSlider.setValue(state.smoothingMs, juce::dontSendNotification);
+    pitchScaleToggle.setToggleState(state.pitchScaleQuantize, juce::dontSendNotification);
+    pitchScaleBox.setSelectedId(pitchScaleToComboId(static_cast<ModernAudioEngine::PitchScale>(state.pitchScale)), juce::dontSendNotification);
+    pitchScaleLabel.setEnabled(state.pitchScaleQuantize);
+    pitchScaleBox.setEnabled(state.pitchScaleQuantize);
 
     const int activeStep = engine->getModCurrentStep(selectedStrip);
     for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)

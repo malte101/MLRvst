@@ -162,6 +162,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 auto* engine = getAudioEngine();
                 if (!engine)
                     return;
+                const int activePage = engine->getModCurrentPage(targetStrip);
+                engine->setModEditPage(targetStrip, activePage);
                 const bool bipolar = engine->isModBipolar(targetStrip);
                 const float normalizedY = 1.0f; // y=0 is highest value
                 float value = normalizedY;
@@ -402,6 +404,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     else if (currentControlMode == ControlMode::Modulation)
                     {
                         const int targetStrip = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+                        const int activePage = audioEngine->getModCurrentPage(targetStrip);
+                        audioEngine->setModEditPage(targetStrip, activePage);
                         const bool bipolar = audioEngine->isModBipolar(targetStrip);
                         const float normalizedY = juce::jlimit(0.0f, 1.0f, (6.0f - static_cast<float>(y)) / 6.0f);
                         float value = normalizedY;
@@ -612,6 +616,8 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     else if (currentControlMode == ControlMode::Modulation && controlModeActive)
     {
         const int targetStrip = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+        const int activePage = audioEngine->getModCurrentPage(targetStrip);
+        audioEngine->setModEditPage(targetStrip, activePage);
         const auto seq = audioEngine->getModSequencerState(targetStrip);
         const int activeStep = audioEngine->getModCurrentStep(targetStrip);
         const bool stripPlaying = audioEngine->getStrip(targetStrip) && audioEngine->getStrip(targetStrip)->isPlaying();
@@ -807,6 +813,8 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         else if (controlModeActive && currentControlMode == ControlMode::Modulation)
         {
             const int selectedStrip = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+            const int activePage = audioEngine->getModCurrentPage(selectedStrip);
+            audioEngine->setModEditPage(selectedStrip, activePage);
             const auto seq = audioEngine->getModSequencerState(selectedStrip);
             const int activeStep = audioEngine->getModCurrentStep(selectedStrip);
             const bool stripPlaying = audioEngine->getStrip(selectedStrip) && audioEngine->getStrip(selectedStrip)->isPlaying();

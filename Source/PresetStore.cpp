@@ -83,22 +83,43 @@ void decodeStepPatternBits(const juce::String& text, std::array<bool, 64>& bits)
         bits[static_cast<size_t>(i)] = (text[i] == '1');
 }
 
-juce::String encodeModSteps(const std::array<float, ModernAudioEngine::ModSteps>& steps)
+juce::String encodeModSteps(const std::array<float, ModernAudioEngine::ModTotalSteps>& steps)
 {
     juce::String out;
-    out.preallocateBytes(ModernAudioEngine::ModSteps);
-    for (float v : steps)
-        out += (v >= 0.5f ? "1" : "0");
+    out.preallocateBytes(ModernAudioEngine::ModTotalSteps * 8);
+    for (size_t i = 0; i < steps.size(); ++i)
+    {
+        if (i > 0)
+            out << ",";
+        out << juce::String(juce::jlimit(0.0f, 1.0f, steps[i]), 6);
+    }
     return out;
 }
 
-void decodeModSteps(const juce::String& text, std::array<float, ModernAudioEngine::ModSteps>& steps)
+void decodeModStepsLegacyBits(const juce::String& text, std::array<float, ModernAudioEngine::ModTotalSteps>& steps)
 {
-    for (auto& v : steps)
-        v = 0.0f;
+    steps.fill(0.0f);
     const int len = juce::jmin(ModernAudioEngine::ModSteps, text.length());
     for (int i = 0; i < len; ++i)
         steps[static_cast<size_t>(i)] = (text[i] == '1') ? 1.0f : 0.0f;
+}
+
+void decodeModSteps(const juce::String& text, std::array<float, ModernAudioEngine::ModTotalSteps>& steps)
+{
+    steps.fill(0.0f);
+    if (!text.containsChar(','))
+    {
+        decodeModStepsLegacyBits(text, steps);
+        return;
+    }
+
+    juce::StringArray tokens;
+    tokens.addTokens(text, ",", "");
+    tokens.trim();
+    tokens.removeEmptyStrings();
+    const int len = juce::jmin(ModernAudioEngine::ModTotalSteps, tokens.size());
+    for (int i = 0; i < len; ++i)
+        steps[static_cast<size_t>(i)] = juce::jlimit(0.0f, 1.0f, static_cast<float>(tokens[i].getDoubleValue()));
 }
 
 template <size_t N>
@@ -195,19 +216,17 @@ bool encodeBufferAsWavBase64(const juce::AudioBuffer<float>& buffer,
     auto wavBytes = std::make_unique<juce::MemoryOutputStream>();
     auto* wavBytesRaw = wavBytes.get();
     juce::WavAudioFormat wavFormat;
+    auto writerStream = std::unique_ptr<juce::OutputStream>(wavBytes.release());
+    const auto writerOptions = juce::AudioFormatWriter::Options{}
+        .withSampleRate(sampleRate)
+        .withNumChannels(buffer.getNumChannels())
+        .withBitsPerSample(24)
+        .withQualityOptionIndex(0);
     std::unique_ptr<juce::AudioFormatWriter> writer(
-        wavFormat.createWriterFor(wavBytesRaw,
-                                  sampleRate,
-                                  static_cast<unsigned int>(buffer.getNumChannels()),
-                                  24,
-                                  {},
-                                  0));
+        wavFormat.createWriterFor(writerStream, writerOptions));
 
     if (!writer)
         return false;
-
-    // createWriterFor transfers stream ownership to the writer on success.
-    wavBytes.release();
 
     if (!writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples()))
         return false;
@@ -370,12 +389,22 @@ void savePreset(int presetIndex,
         stripXml->setAttribute("grainTempoSync", strip->isGrainTempoSyncEnabled());
 
         const auto mod = audioEngine->getModSequencerState(i);
+        std::array<float, ModernAudioEngine::ModTotalSteps> modSteps{};
+        for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
+            modSteps[static_cast<size_t>(s)] = audioEngine->getModStepValueAbsolute(i, s);
         stripXml->setAttribute("modTarget", static_cast<int>(mod.target));
         stripXml->setAttribute("modBipolar", mod.bipolar);
         stripXml->setAttribute("modCurveMode", mod.curveMode);
         stripXml->setAttribute("modDepth", mod.depth);
         stripXml->setAttribute("modOffset", mod.offset);
-        stripXml->setAttribute("modSteps", encodeModSteps(mod.steps));
+        stripXml->setAttribute("modLengthBars", mod.lengthBars);
+        stripXml->setAttribute("modEditPage", mod.editPage);
+        stripXml->setAttribute("modSmoothMs", mod.smoothingMs);
+        stripXml->setAttribute("modCurveBend", mod.curveBend);
+        stripXml->setAttribute("modCurveShape", mod.curveShape);
+        stripXml->setAttribute("modPitchScaleQuantize", mod.pitchScaleQuantize);
+        stripXml->setAttribute("modPitchScale", mod.pitchScale);
+        stripXml->setAttribute("modSteps", encodeModSteps(modSteps));
     }
 
     auto* groupsXml = preset.createNewChildElement("Groups");
@@ -652,11 +681,20 @@ void loadPreset(int presetIndex,
         audioEngine->setModBipolar(stripIndex, stripXml->getBoolAttribute("modBipolar", false));
         audioEngine->setModCurveMode(stripIndex, stripXml->getBoolAttribute("modCurveMode", false));
         audioEngine->setModDepth(stripIndex, clampedFloat(stripXml->getDoubleAttribute("modDepth", 1.0), 1.0f, 0.0f, 1.0f));
-        audioEngine->setModOffset(stripIndex, clampedInt(stripXml->getIntAttribute("modOffset", 0), -15, 15, 0));
-        std::array<float, ModernAudioEngine::ModSteps> modSteps{};
+        audioEngine->setModOffset(stripIndex, clampedInt(stripXml->getIntAttribute("modOffset", 0), -127, 127, 0));
+        audioEngine->setModLengthBars(stripIndex, clampedInt(stripXml->getIntAttribute("modLengthBars", 1), 1, 8, 1));
+        audioEngine->setModEditPage(stripIndex, clampedInt(stripXml->getIntAttribute("modEditPage", 0), 0, 7, 0));
+        audioEngine->setModSmoothingMs(stripIndex, clampedFloat(stripXml->getDoubleAttribute("modSmoothMs", 0.0), 0.0f, 0.0f, 250.0f));
+        audioEngine->setModCurveBend(stripIndex, clampedFloat(stripXml->getDoubleAttribute("modCurveBend", 0.0), 0.0f, -1.0f, 1.0f));
+        audioEngine->setModCurveShape(stripIndex, static_cast<ModernAudioEngine::ModCurveShape>(
+            clampedInt(stripXml->getIntAttribute("modCurveShape", 0), 0, 3, 0)));
+        audioEngine->setModPitchScaleQuantize(stripIndex, stripXml->getBoolAttribute("modPitchScaleQuantize", false));
+        audioEngine->setModPitchScale(stripIndex, static_cast<ModernAudioEngine::PitchScale>(
+            clampedInt(stripXml->getIntAttribute("modPitchScale", 0), 0, 4, 0)));
+        std::array<float, ModernAudioEngine::ModTotalSteps> modSteps{};
         decodeModSteps(stripXml->getStringAttribute("modSteps"), modSteps);
-        for (int s = 0; s < ModernAudioEngine::ModSteps; ++s)
-            audioEngine->setModStepValue(stripIndex, s, modSteps[static_cast<size_t>(s)]);
+        for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
+            audioEngine->setModStepValueAbsolute(stripIndex, s, modSteps[static_cast<size_t>(s)]);
 
         if (auto* volParam = parameters.getParameter("stripVolume" + juce::String(stripIndex)))
             volParam->setValueNotifyingHost(static_cast<float>(stripXml->getDoubleAttribute("volume", 1.0)));

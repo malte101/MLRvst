@@ -443,6 +443,7 @@ public:
     void setPan(float panValue); // -1.0 (left) to 1.0 (right)
     float getPan() const { return pan.load(); }
     void setPlaybackSpeed(float speed);
+    void setPlaybackSpeedImmediate(float speed);
     void setPitchSmoothingTime(float seconds);  // Update speed smoothing ramp time (0-1 seconds)
     float getPlaybackSpeed() const { return static_cast<float>(playbackSpeed.load()); }
     float getDisplaySpeed() const { return displaySpeedAtomic.load(std::memory_order_acquire); }
@@ -737,6 +738,7 @@ private:
     juce::SmoothedValue<float> smoothedVolume{0.7f};
     juce::SmoothedValue<float> smoothedPan{0.0f};
     juce::SmoothedValue<float> smoothedSpeed{1.0f};
+    juce::SmoothedValue<float> smoothedPitchShift{0.0f};
     std::atomic<float> pitchShiftSemitones{0.0f};
     juce::AudioBuffer<float> pitchShiftDelayBuffer;
     int pitchShiftWritePos = 0;
@@ -983,6 +985,8 @@ public:
     static constexpr int MaxGroups = 4;
     static constexpr int MaxPatterns = 4;
     static constexpr int ModSteps = 16;
+    static constexpr int MaxModBars = 8;
+    static constexpr int ModTotalSteps = ModSteps * MaxModBars;
 
     enum class ModTarget
     {
@@ -1014,7 +1018,31 @@ public:
         bool curveMode = true;
         float depth = 1.0f;
         int offset = 0;
+        int lengthBars = 1;
+        int editPage = 0;
+        float smoothingMs = 0.0f;
+        float curveBend = 0.0f;
+        int curveShape = 0;
+        bool pitchScaleQuantize = false;
+        int pitchScale = 0;
         std::array<float, ModSteps> steps{};
+    };
+
+    enum class PitchScale
+    {
+        Chromatic = 0,
+        Major,
+        Minor,
+        Dorian,
+        PentatonicMinor
+    };
+
+    enum class ModCurveShape
+    {
+        Power = 0,
+        SCurve,
+        Snap,
+        Stair
     };
     
     ModernAudioEngine();
@@ -1064,9 +1092,27 @@ public:
     int getModOffset(int stripIndex) const;
     void setModStepValue(int stripIndex, int step, float value01);
     float getModStepValue(int stripIndex, int step) const;
+    void setModStepValueAbsolute(int stripIndex, int absoluteStep, float value01);
+    float getModStepValueAbsolute(int stripIndex, int absoluteStep) const;
     void toggleModStep(int stripIndex, int step);
     void clearModSteps(int stripIndex);
     int getModCurrentStep(int stripIndex) const;
+    int getModCurrentPage(int stripIndex) const;
+    int getModCurrentGlobalStep(int stripIndex) const;
+    void setModLengthBars(int stripIndex, int bars);
+    int getModLengthBars(int stripIndex) const;
+    void setModEditPage(int stripIndex, int page);
+    int getModEditPage(int stripIndex) const;
+    void setModSmoothingMs(int stripIndex, float ms);
+    float getModSmoothingMs(int stripIndex) const;
+    void setModCurveBend(int stripIndex, float bend);
+    float getModCurveBend(int stripIndex) const;
+    void setModCurveShape(int stripIndex, ModCurveShape shape);
+    ModCurveShape getModCurveShape(int stripIndex) const;
+    void setModPitchScaleQuantize(int stripIndex, bool enabled);
+    bool isModPitchScaleQuantize(int stripIndex) const;
+    void setModPitchScale(int stripIndex, PitchScale scale);
+    PitchScale getModPitchScale(int stripIndex) const;
     
     // Live recording - Continuous buffer
     void setRecordingLoopLength(int bars);  // Legacy - now per-strip
@@ -1113,7 +1159,16 @@ private:
         std::atomic<int> curveMode{0};
         std::atomic<float> depth{1.0f};
         std::atomic<int> offset{0};
-        std::array<std::atomic<float>, ModSteps> steps;
+        std::atomic<int> lengthBars{1};
+        std::atomic<int> editPage{0};
+        std::atomic<float> smoothingMs{0.0f};
+        std::atomic<float> curveBend{0.0f};
+        std::atomic<int> curveShape{static_cast<int>(ModCurveShape::Power)};
+        std::atomic<int> pitchScaleQuantize{0};
+        std::atomic<int> pitchScale{static_cast<int>(PitchScale::Chromatic)};
+        std::array<std::atomic<float>, ModTotalSteps> steps;
+        float smoothedRaw = 0.0f;
+        std::atomic<int> lastGlobalStep{0};
     };
 
     std::array<std::unique_ptr<EnhancedAudioStrip>, MaxStrips> strips;

@@ -5,6 +5,7 @@ namespace MonomeFileBrowserActions
 {
 void handleButtonPress(MlrVSTAudioProcessor& processor, EnhancedAudioStrip& strip, int stripIndex, int x)
 {
+    juce::ignoreUnused(strip);
     if (x == 0)
         processor.loadAdjacentFile(stripIndex, -1);  // Prev
     else if (x == 1)

@@ -133,6 +133,7 @@ public:
     void resized() override;
     void timerCallback() override;
     void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDoubleClick(const juce::MouseEvent& e) override;
     void mouseDrag(const juce::MouseEvent& e) override;
     void mouseUp(const juce::MouseEvent& e) override;
     bool isInterestedInFileDrag(const juce::StringArray& files) override;
@@ -148,7 +149,7 @@ public:
         
         void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height,
                             float sliderPos, float rotaryStartAngle, float rotaryEndAngle,
-                            juce::Slider& /*slider*/) override
+                            juce::Slider& slider) override
         {
             auto radius = juce::jmin(width / 2, height / 2) - 4.0f;
             auto centreX = x + width * 0.5f;
@@ -165,8 +166,53 @@ public:
             g.setColour(juce::Colour(0xff515151));
             g.drawEllipse(rx, ry, rw, rw, 1.0f);
             
-            g.setColour(knobColor.withAlpha(0.85f));
+            const auto ringColour = slider.findColour(juce::Slider::rotarySliderFillColourId)
+                .interpolatedWith(knobColor, 0.25f);
+            g.setColour(ringColour.withAlpha(0.9f));
             g.drawEllipse(rx + 1.5f, ry + 1.5f, rw - 3.0f, rw - 3.0f, 1.0f);
+
+            // Modulation indicator (synth-style): bipolar range around current knob position.
+            const auto& props = slider.getProperties();
+            const bool modActive = static_cast<bool>(props.getWithDefault("modActive", false));
+            if (modActive)
+            {
+                const float depth = juce::jlimit(0.0f, 1.0f, static_cast<float>(props.getWithDefault("modDepth", 0.0)));
+                const float signedPos = juce::jlimit(-1.0f, 1.0f, static_cast<float>(props.getWithDefault("modSigned", 0.0)));
+                const auto modColour = juce::Colour(static_cast<juce::uint32>(
+                    static_cast<int>(props.getWithDefault("modColour", static_cast<int>(0xffffd24a)))));
+
+                if (depth > 0.0001f)
+                {
+                    const float spanNorm = depth * 0.5f; // bipolar span: +/- half range at full depth
+                    const float baseNorm = juce::jlimit(0.0f, 1.0f, sliderPos);
+                    const float startNorm = juce::jlimit(0.0f, 1.0f, baseNorm - spanNorm);
+                    const float endNorm = juce::jlimit(0.0f, 1.0f, baseNorm + spanNorm);
+
+                    const float startA = rotaryStartAngle + (startNorm * (rotaryEndAngle - rotaryStartAngle));
+                    const float endA = rotaryStartAngle + (endNorm * (rotaryEndAngle - rotaryStartAngle));
+                    const float markerNorm = juce::jlimit(0.0f, 1.0f, baseNorm + (signedPos * spanNorm));
+                    const float markerA = rotaryStartAngle + (markerNorm * (rotaryEndAngle - rotaryStartAngle));
+
+                    // Draw a dark underlay first so modulation remains visible over bright/yellow fills.
+                    juce::Path arc;
+                    arc.addArc(rx + 2.0f, ry + 2.0f, rw - 4.0f, rw - 4.0f,
+                               startA - juce::MathConstants<float>::halfPi,
+                               endA - juce::MathConstants<float>::halfPi,
+                               true);
+                    g.setColour(juce::Colour(0xff101010).withAlpha(0.85f));
+                    g.strokePath(arc, juce::PathStrokeType(3.2f));
+                    g.setColour(modColour.withAlpha(0.95f));
+                    g.strokePath(arc, juce::PathStrokeType(2.1f));
+
+                    const float markerRadius = radius - 1.5f;
+                    const float mx = centreX + (std::cos(markerA - juce::MathConstants<float>::halfPi) * markerRadius);
+                    const float my = centreY + (std::sin(markerA - juce::MathConstants<float>::halfPi) * markerRadius);
+                    g.setColour(juce::Colour(0xff0f0f0f).withAlpha(0.9f));
+                    g.fillEllipse(mx - 3.2f, my - 3.2f, 6.4f, 6.4f);
+                    g.setColour(modColour.brighter(0.45f));
+                    g.fillEllipse(mx - 2.2f, my - 2.2f, 4.4f, 4.4f);
+                }
+            }
 
             // Pointer line
             juce::Path p;
@@ -177,6 +223,62 @@ public:
             
             g.setColour(juce::Colour(0xfff2f2f2));
             g.fillPath(p);
+        }
+
+        void drawLinearSlider(juce::Graphics& g, int x, int y, int width, int height,
+                              float sliderPos, float minSliderPos, float maxSliderPos,
+                              const juce::Slider::SliderStyle style, juce::Slider& slider) override
+        {
+            juce::LookAndFeel_V4::drawLinearSlider(g, x, y, width, height,
+                                                   sliderPos, minSliderPos, maxSliderPos, style, slider);
+
+            const auto& props = slider.getProperties();
+            const bool modActive = static_cast<bool>(props.getWithDefault("modActive", false));
+            if (!modActive)
+                return;
+
+            const float depth = juce::jlimit(0.0f, 1.0f, static_cast<float>(props.getWithDefault("modDepth", 0.0)));
+            if (depth <= 0.0001f)
+                return;
+
+            const float signedPos = juce::jlimit(-1.0f, 1.0f, static_cast<float>(props.getWithDefault("modSigned", 0.0)));
+            const auto modColour = juce::Colour(static_cast<juce::uint32>(
+                static_cast<int>(props.getWithDefault("modColour", static_cast<int>(0xffffd24a)))));
+
+            g.setColour(juce::Colour(0xff101010).withAlpha(0.85f));
+
+            if (style == juce::Slider::LinearVertical || style == juce::Slider::LinearBarVertical)
+            {
+                const float spanPx = depth * 0.5f * static_cast<float>(height);
+                const float start = juce::jlimit(static_cast<float>(y), static_cast<float>(y + height), sliderPos - spanPx);
+                const float end = juce::jlimit(static_cast<float>(y), static_cast<float>(y + height), sliderPos + spanPx);
+                const float marker = juce::jlimit(static_cast<float>(y), static_cast<float>(y + height),
+                                                  sliderPos + (signedPos * spanPx));
+                const float cx = static_cast<float>(x + (width / 2));
+                g.drawLine(cx, start, cx, end, 3.0f);
+                g.setColour(modColour.withAlpha(0.95f));
+                g.drawLine(cx, start, cx, end, 2.0f);
+                g.setColour(juce::Colour(0xff0f0f0f).withAlpha(0.9f));
+                g.fillEllipse(cx - 3.0f, marker - 3.0f, 6.0f, 6.0f);
+                g.setColour(modColour.brighter(0.45f));
+                g.fillEllipse(cx - 2.0f, marker - 2.0f, 4.0f, 4.0f);
+            }
+            else
+            {
+                const float spanPx = depth * 0.5f * static_cast<float>(width);
+                const float start = juce::jlimit(static_cast<float>(x), static_cast<float>(x + width), sliderPos - spanPx);
+                const float end = juce::jlimit(static_cast<float>(x), static_cast<float>(x + width), sliderPos + spanPx);
+                const float marker = juce::jlimit(static_cast<float>(x), static_cast<float>(x + width),
+                                                  sliderPos + (signedPos * spanPx));
+                const float cy = static_cast<float>(y + (height / 2));
+                g.drawLine(start, cy, end, cy, 3.0f);
+                g.setColour(modColour.withAlpha(0.95f));
+                g.drawLine(start, cy, end, cy, 2.0f);
+                g.setColour(juce::Colour(0xff0f0f0f).withAlpha(0.9f));
+                g.fillEllipse(marker - 3.0f, cy - 3.0f, 6.0f, 6.0f);
+                g.setColour(modColour.brighter(0.45f));
+                g.fillEllipse(marker - 2.0f, cy - 2.0f, 4.0f, 4.0f);
+            }
         }
         
     private:
@@ -254,8 +356,16 @@ private:
     juce::Slider modDepthSlider;
     juce::Label modOffsetLabel;
     juce::Slider modOffsetSlider;
+    juce::Label modCurveBendLabel;
+    juce::Slider modCurveBendSlider;
+    juce::Label modLengthLabel;
+    juce::ComboBox modLengthBox;
+    juce::ToggleButton modPitchQuantToggle;
+    juce::ComboBox modPitchScaleBox;
     juce::Label modShapeLabel;
     juce::ComboBox modShapeBox;
+    juce::Label modCurveTypeLabel;
+    juce::ComboBox modCurveTypeBox;
     bool grainOverlayVisible = false;
     juce::TextButton loadButton;    // Small
     juce::ComboBox groupSelector;   // Compact
@@ -290,7 +400,8 @@ private:
     ModTransformMode modTransformMode = ModTransformMode::None;
     int modTransformStartY = 0;
     int modTransformStep = -1;
-    std::array<float, ModernAudioEngine::ModSteps> modTransformSourceSteps{};
+    int modTransformStepCount = ModernAudioEngine::ModSteps;
+    std::array<float, ModernAudioEngine::ModTotalSteps> modTransformSourceSteps{};
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(StripControl)
 };
@@ -607,6 +718,15 @@ private:
     juce::Slider depthSlider;
     juce::Label offsetLabel;
     juce::Slider offsetSlider;
+    juce::Label lengthLabel;
+    juce::ComboBox lengthBox;
+    juce::Label pageLabel;
+    juce::ComboBox pageBox;
+    juce::Label smoothLabel;
+    juce::Slider smoothSlider;
+    juce::ToggleButton pitchScaleToggle;
+    juce::Label pitchScaleLabel;
+    juce::ComboBox pitchScaleBox;
     std::array<juce::TextButton, ModernAudioEngine::ModSteps> stepButtons;
     EditGestureMode gestureMode = EditGestureMode::None;
     bool gestureActive = false;
