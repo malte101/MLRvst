@@ -6637,10 +6637,11 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 switch (target)
                 {
                     case ModTarget::Volume:
-                        strip->setVolume(juce::jlimit(0.0f, 1.0f, originalVol + (0.7f * mod)));
+                        strip->setVolume(juce::jlimit(0.0f, 1.0f, originalVol * (1.0f + mod)));
                         break;
                     case ModTarget::Pan:
-                        strip->setPan(juce::jlimit(-1.0f, 1.0f, originalPan + mod));
+                        // Mod lane polarity: up = left, down = right.
+                        strip->setPan(juce::jlimit(-1.0f, 1.0f, originalPan - mod));
                         break;
                     case ModTarget::Pitch:
                         strip->setPitchShift(juce::jlimit(-12.0f, 12.0f, originalPitch + (12.0f * mod)));
@@ -6655,7 +6656,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                         break;
                     }
                     case ModTarget::Resonance:
-                        strip->setFilterResonance(juce::jlimit(0.1f, 10.0f, strip->getFilterResonance() + (2.0f * mod)));
+                        strip->setFilterResonance(juce::jlimit(0.1f, 10.0f, originalFilterRes + (2.0f * mod)));
                         break;
                     case ModTarget::GrainSize:
                         strip->setGrainSizeMs(juce::jlimit(5.0f, 2400.0f, strip->getGrainSizeMs() + (600.0f * mod)));
@@ -7288,9 +7289,12 @@ void ModernAudioEngine::setModTarget(int stripIndex, ModTarget target)
     seq.target.store(static_cast<int>(target), std::memory_order_release);
 
     const bool bipolarDefault = (target == ModTarget::Pan
+        || target == ModTarget::Volume
         || target == ModTarget::Pitch
         || target == ModTarget::GrainPitch
-        || target == ModTarget::Speed);
+        || target == ModTarget::Speed
+        || target == ModTarget::Cutoff
+        || target == ModTarget::Resonance);
     seq.bipolar.store(bipolarDefault ? 1 : 0, std::memory_order_release);
 }
 

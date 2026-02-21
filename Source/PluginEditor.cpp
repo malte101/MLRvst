@@ -10,6 +10,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include <cmath>
+#include <juce_audio_formats/juce_audio_formats.h>
 
 namespace
 {
@@ -1834,7 +1835,7 @@ void StripControl::resized()
     // Waveform OR step display gets all remaining space
     waveform.setBounds(bounds);
     stepDisplay.setBounds(bounds);  // Same position, visibility toggled
-    modulationLaneBounds = bounds;
+    modulationLaneBounds = bounds.reduced(1, 0);
     
     if (modulationLaneView)
     {
@@ -3302,6 +3303,12 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(deleteButton);
     styleUiButton(deleteButton);
 
+    exportWavButton.setButtonText("Export");
+    exportWavButton.onClick = [this]() { exportRecordingsAsWav(); };
+    exportWavButton.setTooltip("Export current strip recordings to WAV files.");
+    addAndMakeVisible(exportWavButton);
+    styleUiButton(exportWavButton);
+
     presetViewport.setViewedComponent(&presetGridContent, false);
     presetViewport.setScrollBarsShown(true, true, true, true);
     presetViewport.setScrollOnDragMode(juce::Viewport::ScrollOnDragMode::all);
@@ -3353,12 +3360,19 @@ void PresetControlPanel::resized()
     auto bounds = getLocalBounds().reduced(8);
 
     auto editorArea = bounds.removeFromTop(26);
-    const int buttonW = 68;
-    deleteButton.setBounds(editorArea.removeFromRight(buttonW));
+    const int saveDeleteButtonW = 60;
+    const int exportButtonW = 78;
+    deleteButton.setBounds(editorArea.removeFromRight(saveDeleteButtonW));
     editorArea.removeFromRight(4);
-    saveButton.setBounds(editorArea.removeFromRight(buttonW));
+    exportWavButton.setBounds(editorArea.removeFromRight(exportButtonW));
+    editorArea.removeFromRight(4);
+    saveButton.setBounds(editorArea.removeFromRight(saveDeleteButtonW));
     editorArea.removeFromRight(6);
-    presetNameEditor.setBounds(editorArea);
+
+    // Keep name input compact to protect button layout on narrow widths.
+    constexpr int kNameFieldMaxW = 220;
+    const int nameW = juce::jmin(kNameFieldMaxW, editorArea.getWidth());
+    presetNameEditor.setBounds(editorArea.removeFromLeft(nameW));
     bounds.removeFromTop(2);
 
     presetViewport.setBounds(bounds);
@@ -3386,6 +3400,72 @@ void PresetControlPanel::loadPresetClicked(int index)
     const auto name = processor.getPresetName(index);
     presetNameDraft = name;
     presetNameEditor.setText(name, juce::dontSendNotification);
+}
+
+void PresetControlPanel::exportRecordingsAsWav()
+{
+    auto startDir = lastExportDirectory;
+    if (!startDir.exists() || !startDir.isDirectory())
+        startDir = juce::File::getSpecialLocation(juce::File::userHomeDirectory);
+
+    juce::FileChooser chooser("Export strip recordings to folder", startDir, "*");
+    if (!chooser.browseForDirectory())
+        return;
+
+    auto targetDir = chooser.getResult();
+    if (!targetDir.exists())
+        targetDir.createDirectory();
+    lastExportDirectory = targetDir;
+
+    auto* engine = processor.getAudioEngine();
+    if (engine == nullptr)
+        return;
+
+    int exportedCount = 0;
+    int failedCount = 0;
+    juce::WavAudioFormat wavFormat;
+
+    for (int i = 0; i < MlrVSTAudioProcessor::MaxStrips; ++i)
+    {
+        auto* strip = engine->getStrip(i);
+        if (strip == nullptr || !strip->hasAudio())
+            continue;
+
+        const auto* audioBuffer = strip->getAudioBuffer();
+        const double sampleRate = strip->getSourceSampleRate();
+        if (audioBuffer == nullptr || audioBuffer->getNumSamples() <= 0 || sampleRate <= 1000.0)
+            continue;
+
+        auto outFile = targetDir.getChildFile("Strip_" + juce::String(i + 1) + ".wav");
+        std::unique_ptr<juce::FileOutputStream> outStream(outFile.createOutputStream());
+        if (outStream == nullptr)
+        {
+            ++failedCount;
+            continue;
+        }
+
+        std::unique_ptr<juce::AudioFormatWriter> writer(
+            wavFormat.createWriterFor(outStream.release(),
+                                      sampleRate,
+                                      static_cast<unsigned int>(audioBuffer->getNumChannels()),
+                                      24,
+                                      {},
+                                      0));
+
+        if (writer == nullptr || !writer->writeFromAudioSampleBuffer(*audioBuffer, 0, audioBuffer->getNumSamples()))
+        {
+            ++failedCount;
+            continue;
+        }
+
+        writer->flush();
+        ++exportedCount;
+    }
+
+    const juce::String message = "Exported " + juce::String(exportedCount)
+        + " strip recording(s) to:\n" + targetDir.getFullPathName()
+        + (failedCount > 0 ? "\nFailed: " + juce::String(failedCount) : "");
+    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon, "Export WAV", message);
 }
 
 void PresetControlPanel::updatePresetButtons()
@@ -3686,7 +3766,7 @@ void GlobalControlPanel::resized()
     // Calculate based on actual needs rather than equal division
     const int sliderWidth = 50;      // Vertical sliders
     const int meterWidth = 30;       // L/R meters
-    const int knobWidth = 70;        // Rotary knobs  
+    const int knobWidth = 78;        // Rotary knobs
     const int dropdownWidth = 92;    // Dropdowns
     const int spacing = 8;           // Between controls
     
@@ -3717,14 +3797,14 @@ void GlobalControlPanel::resized()
     auto crossfadeArea = controlsArea.removeFromLeft(knobWidth);
     crossfadeLengthLabel.setBounds(crossfadeArea.removeFromTop(16));
     crossfadeArea.removeFromTop(2);
-    crossfadeLengthSlider.setBounds(crossfadeArea.removeFromTop(70));
+    crossfadeLengthSlider.setBounds(crossfadeArea.removeFromTop(78));
     controlsArea.removeFromLeft(spacing);
 
     // Trigger fade-in - compact knob
     auto triggerFadeArea = controlsArea.removeFromLeft(knobWidth);
     triggerFadeInLabel.setBounds(triggerFadeArea.removeFromTop(16));
     triggerFadeArea.removeFromTop(2);
-    triggerFadeInSlider.setBounds(triggerFadeArea.removeFromTop(70));
+    triggerFadeInSlider.setBounds(triggerFadeArea.removeFromTop(78));
     controlsArea.removeFromLeft(spacing);
     
     // Quantize - compact dropdown

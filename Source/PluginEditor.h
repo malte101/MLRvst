@@ -645,14 +645,17 @@ private:
     juce::TextEditor presetNameEditor;
     juce::TextButton saveButton;
     juce::TextButton deleteButton;
+    juce::TextButton exportWavButton;
     juce::Viewport presetViewport;
     juce::Component presetGridContent;
     std::array<juce::TextButton, MlrVSTAudioProcessor::MaxPresetSlots> presetButtons;
     int selectedPresetIndex = 0;
     juce::String presetNameDraft;
+    juce::File lastExportDirectory;
     
     void savePresetClicked(int index, juce::String typedName = {});
     void loadPresetClicked(int index);
+    void exportRecordingsAsWav();
     void updatePresetButtons();
     void layoutPresetButtons();
     
