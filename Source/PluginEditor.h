@@ -104,10 +104,12 @@ private:
     juce::ToggleButton filterEnableButton;
     juce::Slider filterFreqSlider;
     juce::Slider filterResSlider;
-    juce::ComboBox filterTypeBox;
+    juce::Slider filterMorphSlider;
+    juce::ComboBox filterAlgoBox;
     juce::Label filterFreqLabel;
     juce::Label filterResLabel;
-    juce::Label filterTypeLabel;
+    juce::Label filterMorphLabel;
+    juce::Label filterAlgoLabel;
     juce::Label gateSpeedLabel;
     juce::Label gateEnvLabel;
     juce::Label gateShapeLabel;

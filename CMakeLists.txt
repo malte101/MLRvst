@@ -163,6 +163,7 @@ endif()
 target_include_directories(mlrVST
     PRIVATE
         Source
+        third_party/MoogLadders-main/src
 )
 
 # Installation

@@ -28,6 +28,7 @@
 #include <random>
 
 #include "StepSampler.h"
+#include "LadderFilterBase.h"
 
 //==============================================================================
 /**
@@ -299,6 +300,11 @@ private:
 class EnhancedAudioStrip
 {
 public:
+    struct ExposedLadderFilter : juce::dsp::LadderFilter<float>
+    {
+        using juce::dsp::LadderFilter<float>::processSample;
+    };
+
     // Enums must be declared first (used as member types below)
     enum class PlayMode
     {
@@ -324,6 +330,16 @@ public:
         LowPass,
         BandPass,
         HighPass
+    };
+
+    enum class FilterAlgorithm
+    {
+        Tpt12 = 0,    // 12 dB/oct TPT SVF
+        Tpt24,        // 24 dB/oct (cascaded TPT SVF)
+        Ladder12,     // JUCE ladder, 12 dB morph bank
+        Ladder24,     // JUCE ladder, 24 dB morph bank
+        MoogStilson,  // MoogLadders Stilson LP model
+        MoogHuov      // MoogLadders Huovilainen LP model
     };
 
     enum class GateShape
@@ -362,10 +378,27 @@ public:
     PlayMode playMode = PlayMode::Loop;
     DirectionMode directionMode = DirectionMode::Normal;
     
-    // ZDF State Variable Filter (per strip)
-    juce::dsp::StateVariableTPTFilter<float> filter;
+    // Morphing filter core (phase-coherent LP/BP/HP from matched TPT sections).
+    juce::dsp::StateVariableTPTFilter<float> filterLp;
+    juce::dsp::StateVariableTPTFilter<float> filterBp;
+    juce::dsp::StateVariableTPTFilter<float> filterHp;
+    juce::dsp::StateVariableTPTFilter<float> filterLpStage2;
+    juce::dsp::StateVariableTPTFilter<float> filterBpStage2;
+    juce::dsp::StateVariableTPTFilter<float> filterHpStage2;
+    ExposedLadderFilter ladderLp;
+    ExposedLadderFilter ladderBp;
+    ExposedLadderFilter ladderHp;
     std::atomic<float> filterFrequency{20000.0f};  // Default fully open (20kHz)
     std::atomic<float> filterResonance{0.707f};    // Q = 0.707 (butterworth)
+    std::atomic<float> filterMorph{0.0f};          // 0.0=LP, 0.5=BP, 1.0=HP
+    std::atomic<int> filterAlgorithm{static_cast<int>(FilterAlgorithm::Tpt12)};
+    int cachedLadderMode = -1;
+    float cachedMoogCutoff = -1.0f;
+    float cachedMoogResonance = -1.0f;
+    int cachedMoogModel = -1;
+    float cachedMoogSampleRate = -1.0f;
+    std::unique_ptr<LadderFilterBase> moogLpL;
+    std::unique_ptr<LadderFilterBase> moogLpR;
     FilterType filterType = FilterType::LowPass;
     bool filterEnabled = false;  // Disabled by default, auto-enables on use
     std::atomic<float> swingAmount{0.0f};   // 0..1 transport swing depth
@@ -523,8 +556,15 @@ public:
     float getFilterFrequency() const { return filterFrequency.load(); }
     void setFilterResonance(float res);
     float getFilterResonance() const { return filterResonance.load(); }
+    void setFilterMorph(float morph);
+    float getFilterMorph() const { return filterMorph.load(std::memory_order_acquire); }
     void setFilterType(FilterType type);
     FilterType getFilterType() const { return filterType; }
+    void setFilterAlgorithm(FilterAlgorithm algorithm);
+    FilterAlgorithm getFilterAlgorithm() const
+    {
+        return static_cast<FilterAlgorithm>(juce::jlimit(0, 5, filterAlgorithm.load(std::memory_order_acquire)));
+    }
     void setSwingAmount(float amount) { swingAmount = juce::jlimit(0.0f, 1.0f, amount); }
     float getSwingAmount() const { return swingAmount.load(std::memory_order_acquire); }
     void setSwingDivision(SwingDivision division) { swingDivision.store(static_cast<int>(division), std::memory_order_release); }
@@ -739,6 +779,9 @@ private:
     juce::SmoothedValue<float> smoothedPan{0.0f};
     juce::SmoothedValue<float> smoothedSpeed{1.0f};
     juce::SmoothedValue<float> smoothedPitchShift{0.0f};
+    juce::SmoothedValue<float> smoothedFilterFrequency{20000.0f};
+    juce::SmoothedValue<float> smoothedFilterResonance{0.707f};
+    juce::SmoothedValue<float> smoothedFilterMorph{0.0f};
     std::atomic<float> pitchShiftSemitones{0.0f};
     juce::AudioBuffer<float> pitchShiftDelayBuffer;
     int pitchShiftWritePos = 0;
@@ -929,6 +972,9 @@ public:
     juce::CriticalSection bufferLock;
     
     void updatePlaybackDirection();
+    void ensureAnalogFiltersInitialized(FilterAlgorithm algorithm);
+    void updateFilterCoefficients(float frequency, float resonance);
+    void processFilterSample(float& left, float& right, float frequency, float resonance, float morph);
     double applySwingToPpq(double ppq) const;
     float computeGateModulation(double ppq) const;
     void handleLooping();

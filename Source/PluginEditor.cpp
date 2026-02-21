@@ -2837,26 +2837,72 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     };
     addAndMakeVisible(filterResSlider);
     
-    // Filter Type
-    filterTypeLabel.setText("Alg", juce::dontSendNotification);
-    filterTypeLabel.setJustificationType(juce::Justification::centred);
-    filterTypeLabel.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
-    filterTypeLabel.setColour(juce::Label::textColourId, stripColor);
-    addAndMakeVisible(filterTypeLabel);
-    
-    filterTypeBox.addItem("Low Pass", 1);
-    filterTypeBox.addItem("Band Pass", 2);
-    filterTypeBox.addItem("High Pass", 3);
-    filterTypeBox.setSelectedId(1);
-    styleUiCombo(filterTypeBox);
-    filterTypeBox.onChange = [this]() {
+    // Filter Morph
+    filterMorphLabel.setText("Morph", juce::dontSendNotification);
+    filterMorphLabel.setJustificationType(juce::Justification::centred);
+    filterMorphLabel.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+    filterMorphLabel.setColour(juce::Label::textColourId, stripColor);
+    addAndMakeVisible(filterMorphLabel);
+
+    filterMorphSlider.setSliderStyle(juce::Slider::Rotary);
+    filterMorphSlider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 38, 12);
+    filterMorphSlider.setRange(0.0, 1.0, 0.001);
+    filterMorphSlider.setValue(0.0);
+    filterMorphSlider.setDoubleClickReturnValue(true, 0.0);
+    filterMorphSlider.textFromValueFunction = [](double value)
+    {
+        const double v = juce::jlimit(0.0, 1.0, value);
+        if (v < 0.25) return juce::String("LP");
+        if (v < 0.75) return juce::String("BP");
+        return juce::String("HP");
+    };
+    filterMorphSlider.valueFromTextFunction = [](const juce::String& text)
+    {
+        const auto t = text.trim().toUpperCase();
+        if (t.contains("LP")) return 0.0;
+        if (t.contains("BP")) return 0.5;
+        if (t.contains("HP")) return 1.0;
+        return 0.0;
+    };
+    filterMorphSlider.onValueChange = [this]()
+    {
+        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
+            strip->setFilterMorph(static_cast<float>(filterMorphSlider.getValue()));
+    };
+    addAndMakeVisible(filterMorphSlider);
+
+    // Filter Algorithm selector
+    filterAlgoLabel.setText("Alg", juce::dontSendNotification);
+    filterAlgoLabel.setJustificationType(juce::Justification::centred);
+    filterAlgoLabel.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+    filterAlgoLabel.setColour(juce::Label::textColourId, stripColor);
+    addAndMakeVisible(filterAlgoLabel);
+
+    filterAlgoBox.addItem("SVF12", 1);
+    filterAlgoBox.addItem("SVF24", 2);
+    filterAlgoBox.addItem("LAD12", 3);
+    filterAlgoBox.addItem("LAD24", 4);
+    filterAlgoBox.addItem("MOOG S", 5);
+    filterAlgoBox.addItem("MOOG H", 6);
+    filterAlgoBox.setSelectedId(1);
+    styleUiCombo(filterAlgoBox);
+    filterAlgoBox.setJustificationType(juce::Justification::centred);
+    filterAlgoBox.setTooltip("Filter algorithm: SVF12, SVF24, Ladder12, Ladder24, Moog Stilson LP, Moog Huovilainen LP");
+    filterAlgoBox.onChange = [this]()
+    {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
         {
-            int type = filterTypeBox.getSelectedId() - 1;
-            strip->setFilterType(static_cast<EnhancedAudioStrip::FilterType>(type));
+            const int id = filterAlgoBox.getSelectedId();
+            auto algo = EnhancedAudioStrip::FilterAlgorithm::Tpt12;
+            if (id == 2) algo = EnhancedAudioStrip::FilterAlgorithm::Tpt24;
+            else if (id == 3) algo = EnhancedAudioStrip::FilterAlgorithm::Ladder12;
+            else if (id == 4) algo = EnhancedAudioStrip::FilterAlgorithm::Ladder24;
+            else if (id == 5) algo = EnhancedAudioStrip::FilterAlgorithm::MoogStilson;
+            else if (id == 6) algo = EnhancedAudioStrip::FilterAlgorithm::MoogHuov;
+            strip->setFilterAlgorithm(algo);
         }
     };
-    addAndMakeVisible(filterTypeBox);
+    addAndMakeVisible(filterAlgoBox);
 
     gateSpeedLabel.setText("Rate", juce::dontSendNotification);
     gateSpeedLabel.setJustificationType(juce::Justification::centredLeft);
@@ -2958,31 +3004,31 @@ void FXStripControl::resized()
     
     // === FIELD 1: FILTER CONTROLS (ALL IN ONE ROW) ===
     
-    // Enable button at top (full width)
-    filterEnableButton.setBounds(field1.removeFromTop(22));
+    // Top row: Filter enable + compact algorithm selector
+    auto topRow = field1.removeFromTop(22);
+    filterEnableButton.setBounds(topRow.removeFromLeft(56));
+    topRow.removeFromLeft(4);
+    filterAlgoLabel.setBounds(topRow.removeFromLeft(24));
+    topRow.removeFromLeft(3);
+    filterAlgoBox.setBounds(topRow.removeFromLeft(92));
     field1.removeFromTop(4);
     
-    // All three controls in ONE ROW: Freq | Res | Type
-    // Freq and Res get rotary knobs, Type gets dropdown
+    // Three rotary controls: Freq | Res | Morph
     auto controlsRow = field1.removeFromTop(64);
 
-    // Frequency + Resonance (top row)
-    int controlWidth = controlsRow.getWidth() / 2;
+    int controlWidth = controlsRow.getWidth() / 3;
     auto freqCol = controlsRow.removeFromLeft(controlWidth).reduced(2, 0);
     filterFreqLabel.setBounds(freqCol.removeFromTop(12));
     filterFreqSlider.setBounds(freqCol);
 
-    auto resCol = controlsRow.reduced(2, 0);
+    auto resCol = controlsRow.removeFromLeft(controlWidth).reduced(2, 0);
     filterResLabel.setBounds(resCol.removeFromTop(12));
     filterResSlider.setBounds(resCol);
 
-    // Type row beneath knobs so it stays visible on narrower widths
-    field1.removeFromTop(6);
-    auto typeRow = field1.removeFromTop(22);
-    filterTypeLabel.setBounds(typeRow.removeFromLeft(34));
-    typeRow.removeFromLeft(4);
-    filterTypeBox.setBounds(typeRow);
-    
+    auto morphCol = controlsRow.reduced(2, 0);
+    filterMorphLabel.setBounds(morphCol.removeFromTop(12));
+    filterMorphSlider.setBounds(morphCol);
+
     // === FIELD 2: GATE CONTROLS ===
     auto rateRow = field2.removeFromTop(20);
     gateSpeedLabel.setBounds(rateRow.removeFromLeft(38));
@@ -3013,11 +3059,18 @@ void FXStripControl::updateFromEngine()
     filterEnableButton.setToggleState(strip->isFilterEnabled(), juce::dontSendNotification);
     filterFreqSlider.setValue(strip->getFilterFrequency(), juce::dontSendNotification);
     filterResSlider.setValue(strip->getFilterResonance(), juce::dontSendNotification);
+    filterMorphSlider.setValue(strip->getFilterMorph(), juce::dontSendNotification);
     gateSpeedBox.setSelectedId(gateRateIdFromCycles(strip->getGateSpeed()), juce::dontSendNotification);
     gateEnvSlider.setValue(strip->getGateEnvelope(), juce::dontSendNotification);
 
-    int typeId = static_cast<int>(strip->getFilterType()) + 1;
-    filterTypeBox.setSelectedId(typeId, juce::dontSendNotification);
+    const auto algo = strip->getFilterAlgorithm();
+    int algoId = 1;
+    if (algo == EnhancedAudioStrip::FilterAlgorithm::Tpt24) algoId = 2;
+    else if (algo == EnhancedAudioStrip::FilterAlgorithm::Ladder12) algoId = 3;
+    else if (algo == EnhancedAudioStrip::FilterAlgorithm::Ladder24) algoId = 4;
+    else if (algo == EnhancedAudioStrip::FilterAlgorithm::MoogStilson) algoId = 5;
+    else if (algo == EnhancedAudioStrip::FilterAlgorithm::MoogHuov) algoId = 6;
+    filterAlgoBox.setSelectedId(algoId, juce::dontSendNotification);
     int gateShapeId = 1;
     switch (strip->getGateShape())
     {

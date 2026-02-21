@@ -363,6 +363,8 @@ void savePreset(int presetIndex,
         stripXml->setAttribute("filterEnabled", strip->isFilterEnabled());
         stripXml->setAttribute("filterFrequency", strip->getFilterFrequency());
         stripXml->setAttribute("filterResonance", strip->getFilterResonance());
+        stripXml->setAttribute("filterMorph", strip->getFilterMorph());
+        stripXml->setAttribute("filterAlgorithm", static_cast<int>(strip->getFilterAlgorithm()));
         stripXml->setAttribute("filterType", static_cast<int>(strip->getFilterType()));
         stripXml->setAttribute("swingAmount", strip->getSwingAmount());
         stripXml->setAttribute("gateAmount", strip->getGateAmount());
@@ -648,8 +650,14 @@ void loadPreset(int presetIndex,
         strip->setFilterEnabled(stripXml->getBoolAttribute("filterEnabled", false));
         strip->setFilterFrequency(clampedFloat(stripXml->getDoubleAttribute("filterFrequency", 20000.0), 20000.0f, 20.0f, 20000.0f));
         strip->setFilterResonance(clampedFloat(stripXml->getDoubleAttribute("filterResonance", 0.707), 0.707f, 0.1f, 10.0f));
-        strip->setFilterType(static_cast<EnhancedAudioStrip::FilterType>(
-            clampedInt(stripXml->getIntAttribute("filterType", 0), 0, 2, 0)));
+        if (stripXml->hasAttribute("filterMorph"))
+            strip->setFilterMorph(clampedFloat(stripXml->getDoubleAttribute("filterMorph", 0.0), 0.0f, 0.0f, 1.0f));
+        else
+            strip->setFilterType(static_cast<EnhancedAudioStrip::FilterType>(
+                clampedInt(stripXml->getIntAttribute("filterType", 0), 0, 2, 0)));
+
+        strip->setFilterAlgorithm(static_cast<EnhancedAudioStrip::FilterAlgorithm>(
+            clampedInt(stripXml->getIntAttribute("filterAlgorithm", 0), 0, 5, 0)));
         strip->setSwingAmount(clampedFloat(stripXml->getDoubleAttribute("swingAmount", 0.0), 0.0f, 0.0f, 1.0f));
         strip->setGateAmount(clampedFloat(stripXml->getDoubleAttribute("gateAmount", 0.0), 0.0f, 0.0f, 1.0f));
         strip->setGateSpeed(clampedFloat(stripXml->getDoubleAttribute("gateSpeed", 4.0), 4.0f, 0.25f, 16.0f));

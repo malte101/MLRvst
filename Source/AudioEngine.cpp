@@ -8,6 +8,8 @@
 */
 
 #include "AudioEngine.h"
+#include "StilsonModel.h"
+#include "HuovilainenModel.h"
 #include <random>
 #include <map>
 #include <cmath>
@@ -147,6 +149,11 @@ float shapeModCurvePhase(float phase01, float bend, ModernAudioEngine::ModCurveS
             return b >= 0.0f ? std::pow(t, exp) : (1.0f - std::pow(1.0f - t, exp));
         }
     }
+}
+
+inline float safetyClip0dB(float sample)
+{
+    return juce::jlimit(-1.0f, 1.0f, sample);
 }
 
 }
@@ -1157,6 +1164,9 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     smoothedPan.reset(sampleRate, 0.05);
     smoothedSpeed.reset(sampleRate, 0.05);
     smoothedPitchShift.reset(sampleRate, 0.02);
+    smoothedFilterFrequency.reset(sampleRate, 0.01);
+    smoothedFilterResonance.reset(sampleRate, 0.01);
+    smoothedFilterMorph.reset(sampleRate, 0.01);
     rateSmoother.reset(sampleRate, 0.05);  // For clock-locked scratching
     grainCenterSmoother.reset(sampleRate, 0.01);
     grainSizeSmoother.reset(sampleRate, 0.015);
@@ -1167,6 +1177,9 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     smoothedPan.setCurrentAndTargetValue(pan.load());
     smoothedSpeed.setCurrentAndTargetValue(static_cast<float>(playbackSpeed.load()));
     smoothedPitchShift.setCurrentAndTargetValue(pitchShiftSemitones.load(std::memory_order_acquire));
+    smoothedFilterFrequency.setCurrentAndTargetValue(filterFrequency.load(std::memory_order_acquire));
+    smoothedFilterResonance.setCurrentAndTargetValue(filterResonance.load(std::memory_order_acquire));
+    smoothedFilterMorph.setCurrentAndTargetValue(filterMorph.load(std::memory_order_acquire));
     rateSmoother.setCurrentAndTargetValue(1.0);
     grainCenterSmoother.setCurrentAndTargetValue(0.0);
     grainSizeSmoother.setCurrentAndTargetValue(grainParams.sizeMs);
@@ -1221,15 +1234,35 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     grainCloudDelayBuffer.clear();
     resetPitchShifter();
     
-    // Prepare ZDF filter
+    // Prepare morphing TPT filter bank
     juce::dsp::ProcessSpec spec;
     spec.sampleRate = sampleRate;
     spec.maximumBlockSize = static_cast<juce::uint32>(maxBlockSize);
     spec.numChannels = 2;
-    filter.prepare(spec);
-    filter.setCutoffFrequency(filterFrequency.load());
-    filter.setResonance(filterResonance.load());
-    filter.setType(juce::dsp::StateVariableTPTFilterType::lowpass);  // Default LP
+    filterLp.prepare(spec);
+    filterBp.prepare(spec);
+    filterHp.prepare(spec);
+    filterLpStage2.prepare(spec);
+    filterBpStage2.prepare(spec);
+    filterHpStage2.prepare(spec);
+    ladderLp.prepare(spec);
+    ladderBp.prepare(spec);
+    ladderHp.prepare(spec);
+    filterLp.setType(juce::dsp::StateVariableTPTFilterType::lowpass);
+    filterBp.setType(juce::dsp::StateVariableTPTFilterType::bandpass);
+    filterHp.setType(juce::dsp::StateVariableTPTFilterType::highpass);
+    filterLpStage2.setType(juce::dsp::StateVariableTPTFilterType::lowpass);
+    filterBpStage2.setType(juce::dsp::StateVariableTPTFilterType::bandpass);
+    filterHpStage2.setType(juce::dsp::StateVariableTPTFilterType::highpass);
+    ladderLp.setMode(juce::dsp::LadderFilterMode::LPF12);
+    ladderBp.setMode(juce::dsp::LadderFilterMode::BPF12);
+    ladderHp.setMode(juce::dsp::LadderFilterMode::HPF12);
+    cachedLadderMode = 12;
+    ladderLp.setDrive(1.0f);
+    ladderBp.setDrive(1.0f);
+    ladderHp.setDrive(1.0f);
+    updateFilterCoefficients(filterFrequency.load(std::memory_order_acquire),
+                             filterResonance.load(std::memory_order_acquire));
     
     for (auto& interp : interpolators)
         interp.reset();
@@ -3297,6 +3330,9 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     smoothedVolume.setTargetValue(volume.load());
     smoothedPan.setTargetValue(pan.load());
     smoothedSpeed.setTargetValue(static_cast<float>(playbackSpeed.load()));
+    smoothedFilterFrequency.setTargetValue(filterFrequency.load(std::memory_order_acquire));
+    smoothedFilterResonance.setTargetValue(filterResonance.load(std::memory_order_acquire));
+    smoothedFilterMorph.setTargetValue(filterMorph.load(std::memory_order_acquire));
     
     // Check if scratching (disable inner loop during scratch for full sample access)
     float stripScratch = scratchAmount.load();
@@ -4550,8 +4586,10 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         // Apply filter if enabled
         if (filterEnabled)
         {
-            leftSample = filter.processSample(0, leftSample);
-            rightSample = filter.processSample(1, rightSample);
+            const float filtFreq = smoothedFilterFrequency.getNextValue();
+            const float filtRes = smoothedFilterResonance.getNextValue();
+            const float filtMorph = smoothedFilterMorph.getNextValue();
+            processFilterSample(leftSample, rightSample, filtFreq, filtRes, filtMorph);
         }
 
         // Tempo-synced gate effect (independent from PlayMode::Gate trigger behavior).
@@ -6134,22 +6172,217 @@ void EnhancedAudioStrip::processPitchShift(float& left, float& right)
     pitchShiftWritePos = (pitchShiftWritePos + 1) % pitchShiftDelaySize;
 }
 
+void EnhancedAudioStrip::updateFilterCoefficients(float frequency, float resonance)
+{
+    const float freq = juce::jlimit(20.0f, 20000.0f, frequency);
+    const float q = juce::jlimit(0.1f, 10.0f, resonance);
+    const float ladderRes = juce::jlimit(0.0f, 1.0f, std::pow((q - 0.1f) / 9.9f, 0.8f));
+
+    filterLp.setCutoffFrequency(freq);
+    filterBp.setCutoffFrequency(freq);
+    filterHp.setCutoffFrequency(freq);
+    filterLpStage2.setCutoffFrequency(freq);
+    filterBpStage2.setCutoffFrequency(freq);
+    filterHpStage2.setCutoffFrequency(freq);
+
+    filterLp.setResonance(q);
+    filterBp.setResonance(q);
+    filterHp.setResonance(q);
+    filterLpStage2.setResonance(q);
+    filterBpStage2.setResonance(q);
+    filterHpStage2.setResonance(q);
+
+    ladderLp.setCutoffFrequencyHz(freq);
+    ladderBp.setCutoffFrequencyHz(freq);
+    ladderHp.setCutoffFrequencyHz(freq);
+    ladderLp.setResonance(ladderRes);
+    ladderBp.setResonance(ladderRes);
+    ladderHp.setResonance(ladderRes);
+
+    if (moogLpL != nullptr && moogLpR != nullptr)
+    {
+        if (std::abs(freq - cachedMoogCutoff) > 1.0e-3f)
+        {
+            moogLpL->SetCutoff(freq);
+            moogLpR->SetCutoff(freq);
+            cachedMoogCutoff = freq;
+        }
+        const float moogRes = juce::jlimit(0.0f, 1.2f, (q - 0.1f) / 8.0f);
+        if (std::abs(moogRes - cachedMoogResonance) > 1.0e-4f)
+        {
+            moogLpL->SetResonance(moogRes);
+            moogLpR->SetResonance(moogRes);
+            cachedMoogResonance = moogRes;
+        }
+    }
+}
+
+void EnhancedAudioStrip::ensureAnalogFiltersInitialized(FilterAlgorithm algorithm)
+{
+    auto makeModel = [&](FilterAlgorithm a) -> std::unique_ptr<LadderFilterBase>
+    {
+        switch (a)
+        {
+            case FilterAlgorithm::MoogHuov:
+                return std::make_unique<HuovilainenMoog>(static_cast<float>(currentSampleRate));
+            case FilterAlgorithm::MoogStilson:
+            default:
+                return std::make_unique<StilsonMoog>(static_cast<float>(currentSampleRate));
+        }
+    };
+
+    const bool needMoog = (algorithm == FilterAlgorithm::MoogStilson || algorithm == FilterAlgorithm::MoogHuov);
+    if (needMoog)
+    {
+        if (moogLpL == nullptr || moogLpR == nullptr)
+        {
+            moogLpL = makeModel(algorithm);
+            moogLpR = makeModel(algorithm);
+            cachedMoogCutoff = -1.0f;
+            cachedMoogResonance = -1.0f;
+            cachedMoogModel = static_cast<int>(algorithm);
+            cachedMoogSampleRate = static_cast<float>(currentSampleRate);
+        }
+        else
+        {
+            const bool wrongType = cachedMoogModel != static_cast<int>(algorithm)
+                                || std::abs(cachedMoogSampleRate - static_cast<float>(currentSampleRate)) > 0.5f;
+            if (wrongType)
+            {
+                moogLpL = makeModel(algorithm);
+                moogLpR = makeModel(algorithm);
+                cachedMoogCutoff = -1.0f;
+                cachedMoogResonance = -1.0f;
+                cachedMoogModel = static_cast<int>(algorithm);
+                cachedMoogSampleRate = static_cast<float>(currentSampleRate);
+            }
+        }
+    }
+
+}
+
+void EnhancedAudioStrip::processFilterSample(float& left, float& right, float frequency, float resonance, float morph)
+{
+    const auto algorithm = getFilterAlgorithm();
+    ensureAnalogFiltersInitialized(algorithm);
+    updateFilterCoefficients(frequency, resonance);
+
+    float lpL = filterLp.processSample(0, left);
+    float bpL = filterBp.processSample(0, left);
+    float hpL = filterHp.processSample(0, left);
+    float lpR = filterLp.processSample(1, right);
+    float bpR = filterBp.processSample(1, right);
+    float hpR = filterHp.processSample(1, right);
+
+    if (algorithm == FilterAlgorithm::Tpt24)
+    {
+        lpL = filterLpStage2.processSample(0, lpL);
+        bpL = filterBpStage2.processSample(0, bpL);
+        hpL = filterHpStage2.processSample(0, hpL);
+        lpR = filterLpStage2.processSample(1, lpR);
+        bpR = filterBpStage2.processSample(1, bpR);
+        hpR = filterHpStage2.processSample(1, hpR);
+    }
+    else if (algorithm == FilterAlgorithm::Ladder12 || algorithm == FilterAlgorithm::Ladder24)
+    {
+        const int wantedMode = (algorithm == FilterAlgorithm::Ladder24) ? 24 : 12;
+        if (cachedLadderMode != wantedMode)
+        {
+            const auto lpMode = (algorithm == FilterAlgorithm::Ladder24)
+                ? juce::dsp::LadderFilterMode::LPF24
+                : juce::dsp::LadderFilterMode::LPF12;
+            const auto bpMode = (algorithm == FilterAlgorithm::Ladder24)
+                ? juce::dsp::LadderFilterMode::BPF24
+                : juce::dsp::LadderFilterMode::BPF12;
+            const auto hpMode = (algorithm == FilterAlgorithm::Ladder24)
+                ? juce::dsp::LadderFilterMode::HPF24
+                : juce::dsp::LadderFilterMode::HPF12;
+
+            ladderLp.setMode(lpMode);
+            ladderBp.setMode(bpMode);
+            ladderHp.setMode(hpMode);
+            cachedLadderMode = wantedMode;
+        }
+
+        lpL = ladderLp.processSample(left, 0);
+        bpL = ladderBp.processSample(left, 0);
+        hpL = ladderHp.processSample(left, 0);
+        lpR = ladderLp.processSample(right, 1);
+        bpR = ladderBp.processSample(right, 1);
+        hpR = ladderHp.processSample(right, 1);
+    }
+    else if ((algorithm == FilterAlgorithm::MoogStilson || algorithm == FilterAlgorithm::MoogHuov)
+             && moogLpL != nullptr && moogLpR != nullptr)
+    {
+        float monoL = left;
+        float monoR = right;
+        moogLpL->Process(&monoL, 1);
+        moogLpR->Process(&monoR, 1);
+        lpL = monoL;
+        lpR = monoR;
+    }
+    const float m = juce::jlimit(0.0f, 1.0f, morph);
+    float wLP = 0.0f;
+    float wBP = 0.0f;
+    float wHP = 0.0f;
+    if (m <= 0.5f)
+    {
+        const float t = juce::jlimit(0.0f, 1.0f, m * 2.0f);
+        wLP = std::cos(t * juce::MathConstants<float>::halfPi);
+        wBP = std::sin(t * juce::MathConstants<float>::halfPi);
+    }
+    else
+    {
+        const float t = juce::jlimit(0.0f, 1.0f, (m - 0.5f) * 2.0f);
+        wBP = std::cos(t * juce::MathConstants<float>::halfPi);
+        wHP = std::sin(t * juce::MathConstants<float>::halfPi);
+    }
+
+    const float q = juce::jlimit(0.1f, 10.0f, resonance);
+    const float bpComp = 1.0f / (1.0f + (0.17f * juce::jmax(0.0f, q - 0.707f)));
+    wBP *= bpComp;
+    const float norm = 1.0f / std::sqrt(juce::jmax(1.0e-5f, (wLP * wLP) + (wBP * wBP) + (wHP * wHP)));
+    wLP *= norm;
+    wBP *= norm;
+    wHP *= norm;
+
+    left = (lpL * wLP) + (bpL * wBP) + (hpL * wHP);
+    right = (lpR * wLP) + (bpR * wBP) + (hpR * wHP);
+
+    // Post-filter safety safeguard at 0 dBFS.
+    left = safetyClip0dB(left);
+    right = safetyClip0dB(right);
+}
+
 void EnhancedAudioStrip::setFilterFrequency(float freq)
 {
-    filterFrequency = juce::jlimit(20.0f, 20000.0f, freq);
-    filter.setCutoffFrequency(filterFrequency.load());
-    
-    // Auto-enable filter when frequency is adjusted
+    const float clamped = juce::jlimit(20.0f, 20000.0f, freq);
+    filterFrequency.store(clamped, std::memory_order_release);
+    smoothedFilterFrequency.setTargetValue(clamped);
     if (!filterEnabled)
         filterEnabled = true;
 }
 
 void EnhancedAudioStrip::setFilterResonance(float res)
 {
-    filterResonance = juce::jlimit(0.1f, 10.0f, res);  // Q range: 0.1 to 10
-    filter.setResonance(filterResonance.load());
-    
-    // Auto-enable filter when resonance is adjusted
+    const float clamped = juce::jlimit(0.1f, 10.0f, res);
+    filterResonance.store(clamped, std::memory_order_release);
+    smoothedFilterResonance.setTargetValue(clamped);
+    if (!filterEnabled)
+        filterEnabled = true;
+}
+
+void EnhancedAudioStrip::setFilterMorph(float morph)
+{
+    const float clamped = juce::jlimit(0.0f, 1.0f, morph);
+    filterMorph.store(clamped, std::memory_order_release);
+    smoothedFilterMorph.setTargetValue(clamped);
+
+    // Keep legacy type snapshot coherent for preset compatibility.
+    if (clamped < 0.3333f) filterType = FilterType::LowPass;
+    else if (clamped < 0.6666f) filterType = FilterType::BandPass;
+    else filterType = FilterType::HighPass;
+
     if (!filterEnabled)
         filterEnabled = true;
 }
@@ -6157,22 +6390,19 @@ void EnhancedAudioStrip::setFilterResonance(float res)
 void EnhancedAudioStrip::setFilterType(FilterType type)
 {
     filterType = type;
-    
-    using FilterMode = juce::dsp::StateVariableTPTFilterType;
-    switch(type)
+    switch (type)
     {
-        case FilterType::LowPass:
-            filter.setType(FilterMode::lowpass);
-            break;
-        case FilterType::BandPass:
-            filter.setType(FilterMode::bandpass);
-            break;
-        case FilterType::HighPass:
-            filter.setType(FilterMode::highpass);
-            break;
+        case FilterType::LowPass: setFilterMorph(0.0f); break;
+        case FilterType::BandPass: setFilterMorph(0.5f); break;
+        case FilterType::HighPass: setFilterMorph(1.0f); break;
+        default: setFilterMorph(0.0f); break;
     }
-    
-    // Auto-enable filter when type is changed
+}
+
+void EnhancedAudioStrip::setFilterAlgorithm(FilterAlgorithm algorithm)
+{
+    const int raw = juce::jlimit(0, 5, static_cast<int>(algorithm));
+    filterAlgorithm.store(raw, std::memory_order_release);
     if (!filterEnabled)
         filterEnabled = true;
 }
