@@ -2501,11 +2501,15 @@ void MlrVSTAudioProcessor::performPresetLoad(int presetIndex, double hostPpqSnap
         MlrVSTAudioProcessor& processor;
     } scopedSuspend(*this);
 
+    // Always reset to a known clean runtime state before applying preset data.
+    // This guarantees no strip audio/params leak across preset transitions.
+    resetRuntimePresetStateToDefaults();
+    loadedPresetIndex = -1;
+
     if (!PresetStore::presetExists(presetIndex))
     {
-        // Empty slot recall should load runtime defaults without creating a preset file.
-        resetRuntimePresetStateToDefaults();
-        loadedPresetIndex = -1;
+        // Empty slot recall keeps the freshly reset runtime defaults and does
+        // not create or mutate preset files.
         presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
         return;
     }
@@ -2579,7 +2583,7 @@ bool MlrVSTAudioProcessor::deletePreset(int presetIndex)
     try
     {
         const bool deleted = PresetStore::deletePreset(presetIndex);
-        if (deleted && loadedPresetIndex == presetIndex)
+        if (deleted)
         {
             struct ScopedSuspendProcessing
             {
@@ -2588,6 +2592,7 @@ bool MlrVSTAudioProcessor::deletePreset(int presetIndex)
                 MlrVSTAudioProcessor& processor;
             } scopedSuspend(*this);
 
+            // Deleting any preset slot should leave runtime in a clean state.
             resetRuntimePresetStateToDefaults();
             loadedPresetIndex = -1;
             updateMonomeLEDs();
