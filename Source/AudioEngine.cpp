@@ -36,11 +36,6 @@ constexpr std::array<int, 7> kScaleMinor{{0, 2, 3, 5, 7, 8, 10}};
 constexpr std::array<int, 7> kScaleDorian{{0, 2, 3, 5, 7, 9, 10}};
 constexpr std::array<int, 5> kScalePentMinor{{0, 3, 5, 7, 10}};
 
-bool modTargetSupportsBipolar(ModernAudioEngine::ModTarget target)
-{
-    return target != ModernAudioEngine::ModTarget::None;
-}
-
 bool modTargetAutoDefaultBipolar(ModernAudioEngine::ModTarget target)
 {
     return target == ModernAudioEngine::ModTarget::Pan
@@ -3274,12 +3269,12 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         --grainEntryIdentitySamplesRemaining;
 }
 
-void EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
+bool EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
 {
     if (!file.existsAsFile())
     {
         DBG("Sample load rejected (missing file): " << file.getFullPathName());
-        return;
+        return false;
     }
 
     try
@@ -3292,7 +3287,7 @@ void EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
         if (reader == nullptr)
         {
             DBG("Sample load rejected (unsupported format): " << file.getFullPathName());
-            return;
+            return false;
         }
 
         // Validate stream metadata before any allocation/engine state changes.
@@ -3301,19 +3296,19 @@ void EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
         if (!std::isfinite(reader->sampleRate) || reader->sampleRate <= 0.0 || reader->sampleRate > 384000.0)
         {
             DBG("Sample load rejected (invalid sample rate): " << reader->sampleRate);
-            return;
+            return false;
         }
 
         if (reader->lengthInSamples <= 0 || reader->lengthInSamples > kMaxReaderSamples || reader->lengthInSamples > kMaxIntSamples)
         {
             DBG("Sample load rejected (invalid length): " << reader->lengthInSamples);
-            return;
+            return false;
         }
 
         if (reader->numChannels <= 0 || reader->numChannels > 8)
         {
             DBG("Sample load rejected (invalid channels): " << static_cast<int>(reader->numChannels));
-            return;
+            return false;
         }
 
         const int channelCount = static_cast<int>(reader->numChannels);
@@ -3325,7 +3320,7 @@ void EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
         if (!reader->read(&tempBuffer, 0, sampleCount, 0, true, true))
         {
             DBG("Sample load failed during read: " << file.getFullPathName());
-            return;
+            return false;
         }
 
         juce::AudioBuffer<float> newSampleBuffer;
@@ -3372,15 +3367,20 @@ void EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
         grainCenterSmoother.setCurrentAndTargetValue(playbackPosition.load());
         resetGrainState();
         resetPitchShifter();
+        return true;
     }
     catch (const std::exception& e)
     {
         DBG("Sample load exception: " << e.what());
+        return false;
     }
     catch (...)
     {
         DBG("Sample load exception: unknown");
+        return false;
     }
+
+    return false;
 }
 
 void EnhancedAudioStrip::clearSample()
@@ -7262,6 +7262,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
     const bool hasPpq = positionInfo.getPpqPosition().hasValue();
     const double basePpq = hasPpq ? *positionInfo.getPpqPosition() : 0.0;
     const double samplesPerBeat = (tempoNow > 0.0) ? ((60.0 / tempoNow) * currentSampleRate) : 0.0;
+    const bool modulationPpqReady = hasPpq && samplesPerBeat > 0.0;
 
     auto makeSegmentPositionInfo = [&](int sampleOffset)
     {
@@ -7287,25 +7288,49 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             auto* strip = strips[i].get();
             auto& seq = modSequencers[i];
             const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
-            const bool applyMod = (target != ModTarget::None) && strip->isPlaying();
+            const bool stripPlaying = strip->isPlaying();
+            const bool applyParamMod = modulationPpqReady
+                && stripPlaying
+                && target != ModTarget::None
+                && target != ModTarget::Retrigger;
 
-            const float originalVol = strip->getVolume();
-            const float originalPan = strip->getPan();
-            const float originalSpeed = strip->getPlaybackSpeed();
-            const float originalPitch = strip->getPitchShift();
-            const float originalFilterFreq = strip->getFilterFrequency();
-            const float originalFilterRes = strip->getFilterResonance();
-            const float originalGrainSize = strip->getGrainBaseSizeMs();
-            const float originalGrainDensity = strip->getGrainDensity();
-            const float originalGrainPitch = strip->getGrainPitch();
-            const float originalGrainPitchJitter = strip->getGrainPitchJitter();
-            const float originalGrainSpread = strip->getGrainSpread();
-            const float originalGrainJitter = strip->getGrainJitter();
-            const float originalGrainRandom = strip->getGrainRandomDepth();
-            const float originalGrainArp = strip->getGrainArpDepth();
-            const float originalGrainCloud = strip->getGrainCloudDepth();
-            const float originalGrainEmitter = strip->getGrainEmitterDepth();
-            const float originalGrainEnvelope = strip->getGrainEnvelope();
+            float originalVol = 1.0f;
+            float originalPan = 0.0f;
+            float originalSpeed = 1.0f;
+            float originalPitch = 0.0f;
+            float originalFilterFreq = 20000.0f;
+            float originalFilterRes = 0.707f;
+            float originalGrainSize = 1240.0f;
+            float originalGrainDensity = 0.05f;
+            float originalGrainPitch = 0.0f;
+            float originalGrainPitchJitter = 0.0f;
+            float originalGrainSpread = 0.0f;
+            float originalGrainJitter = 0.0f;
+            float originalGrainRandom = 0.0f;
+            float originalGrainArp = 0.0f;
+            float originalGrainCloud = 0.0f;
+            float originalGrainEmitter = 0.0f;
+            float originalGrainEnvelope = 0.0f;
+            if (applyParamMod)
+            {
+                originalVol = strip->getVolume();
+                originalPan = strip->getPan();
+                originalSpeed = strip->getPlaybackSpeed();
+                originalPitch = strip->getPitchShift();
+                originalFilterFreq = strip->getFilterFrequency();
+                originalFilterRes = strip->getFilterResonance();
+                originalGrainSize = strip->getGrainBaseSizeMs();
+                originalGrainDensity = strip->getGrainDensity();
+                originalGrainPitch = strip->getGrainPitch();
+                originalGrainPitchJitter = strip->getGrainPitchJitter();
+                originalGrainSpread = strip->getGrainSpread();
+                originalGrainJitter = strip->getGrainJitter();
+                originalGrainRandom = strip->getGrainRandomDepth();
+                originalGrainArp = strip->getGrainArpDepth();
+                originalGrainCloud = strip->getGrainCloudDepth();
+                originalGrainEmitter = strip->getGrainEmitterDepth();
+                originalGrainEnvelope = strip->getGrainEnvelope();
+            }
 
             const int lengthBars = juce::jlimit(1, MaxModBars, seq.lengthBars.load(std::memory_order_acquire));
             const int totalSteps = juce::jmax(ModSteps, ModSteps * lengthBars);
@@ -7313,27 +7338,18 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             int globalStep = seq.lastGlobalStep.load(std::memory_order_acquire);
 
             double stepPhase = 0.0;
-            if (strip->isPlaying())
+            if (stripPlaying && modulationPpqReady)
             {
-                if (hasPpq)
-                {
-                    const double stepPpq = basePpq + (static_cast<double>(startSample) / juce::jmax(1.0, samplesPerBeat));
-                    const double stepsPos = (stepPpq * 4.0) + static_cast<double>(offset);
-                    const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
-                    const double wrappedPos = (wrapped < 0.0) ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
-                    globalStep = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
-                    stepPhase = juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(globalStep));
-                }
-                else
-                {
-                    const int currentCol = strip->getCurrentColumn();
-                    globalStep = juce::jlimit(0, totalSteps - 1,
-                        ((currentCol + offset) % totalSteps + totalSteps) % totalSteps);
-                }
+                const double stepPpq = basePpq + (static_cast<double>(startSample) / juce::jmax(1.0, samplesPerBeat));
+                const double stepsPos = (stepPpq * 4.0) + static_cast<double>(offset);
+                const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
+                const double wrappedPos = (wrapped < 0.0) ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
+                globalStep = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
+                stepPhase = juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(globalStep));
                 seq.lastGlobalStep.store(globalStep, std::memory_order_release);
             }
 
-            if (applyMod)
+            if (applyParamMod)
             {
                 // Grain-size modulation is applied via runtime override to avoid zippering
                 // from write/restore ping-pong against the base parameter.
@@ -7470,7 +7486,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                         break;
                     }
                     case ModTarget::GrainDensity:
-                        strip->setGrainDensity(juce::jlimit(0.05f, 0.9f, strip->getGrainDensity() + (0.4f * modBi)));
+                        strip->setGrainDensity(juce::jlimit(0.05f, 0.9f, strip->getGrainDensity() + (0.4f * modSigned)));
                         break;
                     case ModTarget::GrainPitch:
                         strip->setGrainPitch(juce::jlimit(-48.0f, 48.0f, strip->getGrainPitch() + (24.0f * modSigned)));
@@ -7479,7 +7495,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                         strip->setGrainPitchJitter(juce::jlimit(0.0f, 48.0f, strip->getGrainPitchJitter() + (16.0f * modNorm)));
                         break;
                     case ModTarget::GrainSpread:
-                        strip->setGrainSpread(juce::jlimit(0.0f, 1.0f, strip->getGrainSpread() + (0.5f * modBi)));
+                        strip->setGrainSpread(juce::jlimit(0.0f, 1.0f, strip->getGrainSpread() + (0.5f * modSigned)));
                         break;
                     case ModTarget::GrainJitter:
                         strip->setGrainJitter(juce::jlimit(0.0f, 1.0f, strip->getGrainJitter() + (0.5f * modNorm)));
@@ -7537,7 +7553,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 strip->process(*targetBuffer, startSample, segmentSamples, segmentPosInfo, segmentGlobalSample, tempoNow, quantizeBeatsNow);
             }
 
-            if (applyMod)
+            if (applyParamMod)
             {
                 strip->setVolume(originalVol);
                 strip->setPan(originalPan);
@@ -7914,18 +7930,17 @@ EnhancedAudioStrip* ModernAudioEngine::getStrip(int index)
     return nullptr;
 }
 
-void ModernAudioEngine::loadSampleToStrip(int stripIndex, const juce::File& file)
+bool ModernAudioEngine::loadSampleToStrip(int stripIndex, const juce::File& file)
 {
     if (auto* strip = getStrip(stripIndex))
     {
-        strip->loadSampleFromFile(file);
-        if (!strip->hasAudio())
-            return;
+        if (!strip->loadSampleFromFile(file) || !strip->hasAudio())
+            return false;
 
         const auto* loadedBuffer = strip->getAudioBuffer();
         const double sourceRate = strip->getSourceSampleRate();
         if (loadedBuffer == nullptr || loadedBuffer->getNumSamples() <= 0 || sourceRate <= 0.0)
-            return;
+            return false;
 
         const double hostTempoNow = juce::jlimit(20.0, 320.0, currentTempo.load());
         const double sampleSeconds = static_cast<double>(loadedBuffer->getNumSamples()) / sourceRate;
@@ -7978,7 +7993,11 @@ void ModernAudioEngine::loadSampleToStrip(int stripIndex, const juce::File& file
                     << " because PPQ anchor is not stable; retry when timeline is anchored.");
             }
         }
+
+        return true;
     }
+
+    return false;
 }
 
 StripGroup* ModernAudioEngine::getGroup(int index)
@@ -8311,6 +8330,53 @@ PatternRecorder* ModernAudioEngine::getPattern(int index)
     if (index >= 0 && index < 4)
         return patterns[static_cast<size_t>(index)].get();
     return nullptr;
+}
+
+bool ModernAudioEngine::modTargetSupportsBipolar(ModTarget target)
+{
+    switch (target)
+    {
+        case ModTarget::None:
+            return false;
+        case ModTarget::Volume:
+            return false;
+        case ModTarget::Pan:
+            return true;
+        case ModTarget::Pitch:
+            return true;
+        case ModTarget::Speed:
+            return false;
+        case ModTarget::Cutoff:
+            return false;
+        case ModTarget::Resonance:
+            return false;
+        case ModTarget::GrainSize:
+            return true;
+        case ModTarget::GrainDensity:
+            return true;
+        case ModTarget::GrainPitch:
+            return true;
+        case ModTarget::GrainPitchJitter:
+            return false;
+        case ModTarget::GrainSpread:
+            return true;
+        case ModTarget::GrainJitter:
+            return false;
+        case ModTarget::GrainRandom:
+            return false;
+        case ModTarget::GrainArp:
+            return false;
+        case ModTarget::GrainCloud:
+            return false;
+        case ModTarget::GrainEmitter:
+            return false;
+        case ModTarget::GrainEnvelope:
+            return false;
+        case ModTarget::Retrigger:
+            return false;
+    }
+
+    return false;
 }
 
 ModernAudioEngine::ModSequencerState ModernAudioEngine::getModSequencerState(int stripIndex) const

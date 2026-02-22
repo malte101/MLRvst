@@ -408,7 +408,7 @@ public:
     
     void prepareToPlay(double sampleRate, int maxBlockSize);
     void loadSample(const juce::AudioBuffer<float>& buffer, double sourceRate);
-    void loadSampleFromFile(const juce::File& file);
+    bool loadSampleFromFile(const juce::File& file);
     void clearSample();
     
     void process(juce::AudioBuffer<float>& output, 
@@ -1042,7 +1042,7 @@ public:
 class ModernAudioEngine
 {
 public:
-    static constexpr int MaxStrips = 8;
+    static constexpr int MaxStrips = 6;
     static constexpr int MaxColumns = 16;
     static constexpr int MaxGroups = 4;
     static constexpr int MaxPatterns = 4;
@@ -1118,7 +1118,7 @@ public:
     
     // Strip access
     EnhancedAudioStrip* getStrip(int index);
-    void loadSampleToStrip(int stripIndex, const juce::File& file);
+    bool loadSampleToStrip(int stripIndex, const juce::File& file);
     
     // Groups
     StripGroup* getGroup(int index);
@@ -1148,6 +1148,7 @@ public:
 
     // Per-strip modulation sequencers.
     ModSequencerState getModSequencerState(int stripIndex) const;
+    static bool modTargetSupportsBipolar(ModTarget target);
     void setModTarget(int stripIndex, ModTarget target);
     ModTarget getModTarget(int stripIndex) const;
     void setModBipolar(int stripIndex, bool bipolar);

@@ -190,8 +190,7 @@ ModernAudioEngine::ModTarget comboIdToModTarget(int id)
 
 bool modTargetAllowsBipolar(ModernAudioEngine::ModTarget target)
 {
-    juce::ignoreUnused(target);
-    return true;
+    return ModernAudioEngine::modTargetSupportsBipolar(target);
 }
 
 int pitchScaleToComboId(ModernAudioEngine::PitchScale scale)
@@ -1770,7 +1769,7 @@ void StripControl::paintModulationLane(juce::Graphics& g)
 void StripControl::applyModulationPoint(juce::Point<int> p)
 {
     auto* engine = processor.getAudioEngine();
-    if (!engine || stripIndex >= 6)
+    if (!engine || stripIndex >= MlrVSTAudioProcessor::MaxStrips)
         return;
 
     auto lane = getModulationLaneBounds().reduced(12, 2);
@@ -1836,7 +1835,7 @@ int StripControl::getModulationStepFromPoint(juce::Point<int> p) const
 void StripControl::applyModulationCellDuplicateFromDrag(int deltaY)
 {
     auto* engine = processor.getAudioEngine();
-    if (!engine || stripIndex >= 6 || modTransformStep < 0 || modTransformStep >= modTransformStepCount)
+    if (!engine || stripIndex >= MlrVSTAudioProcessor::MaxStrips || modTransformStep < 0 || modTransformStep >= modTransformStepCount)
         return;
 
     // Cmd/Ctrl drag edits local virtual density while keeping the cycle duration fixed.
@@ -1910,7 +1909,7 @@ void StripControl::applyModulationCellDuplicateFromDrag(int deltaY)
 void StripControl::applyModulationCellCurveFromDrag(int deltaY)
 {
     auto* engine = processor.getAudioEngine();
-    if (!engine || stripIndex >= 6 || modTransformStep < 0 || modTransformStep >= modTransformStepCount)
+    if (!engine || stripIndex >= MlrVSTAudioProcessor::MaxStrips || modTransformStep < 0 || modTransformStep >= modTransformStepCount)
         return;
 
     const float srcV = modTransformSourceSteps[static_cast<size_t>(modTransformStep)];
@@ -1944,7 +1943,7 @@ void StripControl::mouseDown(const juce::MouseEvent& e)
     if (modulationLaneView)
     {
         auto* engine = processor.getAudioEngine();
-        if (!engine || stripIndex >= 6)
+        if (!engine || stripIndex >= MlrVSTAudioProcessor::MaxStrips)
             return;
 
         const auto state = engine->getModSequencerState(stripIndex);
@@ -1991,7 +1990,7 @@ void StripControl::mouseDoubleClick(const juce::MouseEvent& e)
         return;
 
     auto* engine = processor.getAudioEngine();
-    if (!engine || stripIndex >= 6)
+    if (!engine || stripIndex >= MlrVSTAudioProcessor::MaxStrips)
         return;
 
     const int step = getModulationStepFromPoint(e.getPosition());
@@ -2165,15 +2164,15 @@ void StripControl::resized()
         controlsArea.reduce(4, 0);
         const int gap = 4;
         const int columnWidth = juce::jmax(88, (controlsArea.getWidth() - gap) / 2);
-        auto splitRow = [columnWidth](juce::Rectangle<int> row)
+        auto splitRow = [columnWidth](juce::Rectangle<int> row, const int rowGap)
         {
             auto left = row.removeFromLeft(columnWidth);
-            row.removeFromLeft(gap);
+            row.removeFromLeft(rowGap);
             return std::pair<juce::Rectangle<int>, juce::Rectangle<int>>(left, row);
         };
 
         auto row0 = controlsArea.removeFromTop(18);
-        auto cols0 = splitRow(row0);
+        auto cols0 = splitRow(row0, gap);
         auto row0Left = cols0.first;
         modTargetLabel.setBounds(row0Left.removeFromLeft(42));
         modTargetBox.setBounds(row0Left);
@@ -2182,7 +2181,7 @@ void StripControl::resized()
 
         controlsArea.removeFromTop(2);
         auto row1 = controlsArea.removeFromTop(18);
-        auto cols1 = splitRow(row1);
+        auto cols1 = splitRow(row1, gap);
         auto row1Left = cols1.first;
         modDepthLabel.setBounds(row1Left.removeFromLeft(42));
         modDepthSlider.setBounds(row1Left);
@@ -2190,7 +2189,7 @@ void StripControl::resized()
 
         controlsArea.removeFromTop(2);
         auto row2 = controlsArea.removeFromTop(18);
-        auto cols2 = splitRow(row2);
+        auto cols2 = splitRow(row2, gap);
         auto row2Left = cols2.first;
         modOffsetLabel.setBounds(row2Left.removeFromLeft(42));
         modOffsetSlider.setBounds(row2Left);
@@ -2199,13 +2198,13 @@ void StripControl::resized()
 
         controlsArea.removeFromTop(2);
         auto row3 = controlsArea.removeFromTop(18);
-        auto cols3 = splitRow(row3);
+        auto cols3 = splitRow(row3, gap);
         modPitchQuantToggle.setBounds(cols3.first);
         modPitchScaleBox.setBounds(cols3.second);
 
         controlsArea.removeFromTop(2);
         auto row4 = controlsArea.removeFromTop(18);
-        auto cols4 = splitRow(row4);
+        auto cols4 = splitRow(row4, gap);
         modCurveTypeLabel.setBounds(cols4.first.removeFromLeft(34));
         modCurveTypeBox.setBounds(cols4.first);
         modShapeLabel.setBounds(cols4.second.removeFromLeft(34));
@@ -3863,7 +3862,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
 PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     : processor(p)
 {
-    instructionsLabel.setText("Click=load  Shift+Click=save  Delete removes selected slot", juce::dontSendNotification);
+    instructionsLabel.setText("Click=load default/preset  Shift+Click=save  Right-click=delete", juce::dontSendNotification);
     instructionsLabel.setJustificationType(juce::Justification::centredLeft);
     instructionsLabel.setColour(juce::Label::textColourId, kTextMuted);
     addAndMakeVisible(instructionsLabel);
@@ -3928,6 +3927,7 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
         button.setButtonText(juce::String(x) + "," + juce::String(y));
         button.setClickingTogglesState(false);
         styleUiButton(button);
+        button.addMouseListener(this, false);
 
         button.onClick = [this, i]()
         {
@@ -3984,6 +3984,28 @@ void PresetControlPanel::resized()
 
     presetViewport.setBounds(bounds);
     layoutPresetButtons();
+}
+
+void PresetControlPanel::mouseUp(const juce::MouseEvent& e)
+{
+    if (!e.mods.isRightButtonDown())
+        return;
+
+    for (int i = 0; i < MlrVSTAudioProcessor::MaxPresetSlots; ++i)
+    {
+        auto& button = presetButtons[static_cast<size_t>(i)];
+        if (e.originalComponent == &button || e.eventComponent == &button)
+        {
+            selectedPresetIndex = i;
+            if (processor.deletePreset(i))
+            {
+                presetNameDraft = processor.getPresetName(i);
+                presetNameEditor.setText(presetNameDraft, juce::dontSendNotification);
+                updatePresetButtons();
+            }
+            break;
+        }
+    }
 }
 
 void PresetControlPanel::savePresetClicked(int index, juce::String typedName)
@@ -5477,7 +5499,7 @@ void ModulationControlPanel::refreshFromEngine()
     if (!engine)
         return;
 
-    selectedStrip = juce::jlimit(0, 5, processor.getLastMonomePressedStripRow());
+    selectedStrip = juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, processor.getLastMonomePressedStripRow());
     stripLabel.setText("Selected Row: " + juce::String(selectedStrip + 1) + " (last pressed)", juce::dontSendNotification);
 
     const auto state = engine->getModSequencerState(selectedStrip);
@@ -5538,7 +5560,7 @@ MlrVSTAudioProcessorEditor::MlrVSTAudioProcessorEditor(MlrVSTAudioProcessor& p)
 
 void MlrVSTAudioProcessorEditor::createUIComponents()
 {
-    constexpr int kVisibleSampleStrips = 6;
+    constexpr int kVisibleSampleStrips = MlrVSTAudioProcessor::MaxStrips;
     // Monome grid hidden to save space - use physical monome instead
     monomeGrid = std::make_unique<MonomeGridDisplay>(audioProcessor);
     // Don't add to view - saves space
@@ -5793,9 +5815,9 @@ void MlrVSTAudioProcessorEditor::timerCallback()
     {
         if (auto* strip = stripControls[i])
         {
-            const bool showLane = modulationActive && i < 6;
+            const bool showLane = modulationActive && i < MlrVSTAudioProcessor::MaxStrips;
             strip->setModulationLaneView(showLane);
-            strip->setVisible(!modulationActive || i < 6);
+            strip->setVisible(!modulationActive || i < MlrVSTAudioProcessor::MaxStrips);
         }
     }
 

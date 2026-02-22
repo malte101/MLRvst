@@ -837,6 +837,7 @@ public:
     
     void paint(juce::Graphics& g) override;
     void resized() override;
+    void mouseUp(const juce::MouseEvent& e) override;
     void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override;
     void refreshVisualState();
     

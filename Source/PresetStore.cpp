@@ -26,6 +26,7 @@ struct GlobalParameterSnapshot
     float inputMonitor = 1.0f;
     float crossfadeMs = 10.0f;
     float triggerFadeInMs = 12.0f;
+    float outputRouting = 0.0f;
 };
 
 GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeState& parameters)
@@ -45,6 +46,8 @@ GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeSta
         snapshot.crossfadeMs = *p;
     if (auto* p = parameters.getRawParameterValue("triggerFadeIn"))
         snapshot.triggerFadeInMs = *p;
+    if (auto* p = parameters.getRawParameterValue("outputRouting"))
+        snapshot.outputRouting = *p;
     return snapshot;
 }
 
@@ -64,6 +67,13 @@ void restoreGlobalParameters(juce::AudioProcessorValueTreeState& parameters, con
         param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, (snapshot.crossfadeMs - 1.0f) / 49.0f));
     if (auto* param = parameters.getParameter("triggerFadeIn"))
         param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, (snapshot.triggerFadeInMs - 0.1f) / 119.9f));
+    if (auto* param = parameters.getParameter("outputRouting"))
+    {
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(param))
+            param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(snapshot.outputRouting)));
+        else
+            param->setValueNotifyingHost(snapshot.outputRouting > 0.5f ? 1.0f : 0.0f);
+    }
 }
 
 void setParameterToDefault(juce::AudioProcessorValueTreeState& parameters, const juce::String& parameterId)
@@ -551,16 +561,16 @@ void savePreset(int presetIndex,
     }
 }
 
-void loadPreset(int presetIndex,
+bool loadPreset(int presetIndex,
                 int maxStrips,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,
-                const std::function<void(int, const juce::File&)>& loadSampleToStrip,
+                const std::function<bool(int, const juce::File&)>& loadSampleToStrip,
                 double hostPpqSnapshot,
                 double hostTempoSnapshot)
 {
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots || audioEngine == nullptr)
-        return;
+        return false;
 
     try
     {
@@ -574,7 +584,7 @@ void loadPreset(int presetIndex,
         else
         {
             DBG("Preset " << (presetIndex + 1) << " not found and could not be created");
-            return;
+            return false;
         }
     }
 
@@ -585,13 +595,13 @@ void loadPreset(int presetIndex,
         if (!writeDefaultPresetFile(presetFile, presetIndex))
         {
             DBG("Invalid preset file and recovery failed");
-            return;
+            return false;
         }
         preset = juce::XmlDocument::parse(presetFile);
         if (!preset || preset->getTagName() != "mlrVSTPreset")
         {
             DBG("Invalid preset file after recovery");
-            return;
+            return false;
         }
     }
 
@@ -647,8 +657,7 @@ void loadPreset(int presetIndex,
             juce::File sampleFile(samplePath);
             if (sampleFile.existsAsFile())
             {
-                loadSampleToStrip(stripIndex, sampleFile);
-                loadedStripAudio = true;
+                loadedStripAudio = loadSampleToStrip(stripIndex, sampleFile);
             }
         }
 
@@ -782,20 +791,20 @@ void loadPreset(int presetIndex,
         strip->currentStep = juce::jmax(0, stripXml->getIntAttribute("stepCurrent", 0));
         decodeStepPatternBits(stripXml->getStringAttribute("stepPatternBits"), strip->stepPattern);
 
-        strip->setGrainSizeMs(static_cast<float>(stripXml->getDoubleAttribute("grainSizeMs", strip->getGrainSizeMs())));
-        strip->setGrainDensity(static_cast<float>(stripXml->getDoubleAttribute("grainDensity", strip->getGrainDensity())));
-        strip->setGrainPitch(clampedFloat(stripXml->getDoubleAttribute("grainPitch", strip->getGrainPitch()), strip->getGrainPitch(), -48.0f, 48.0f));
-        strip->setGrainPitchJitter(static_cast<float>(stripXml->getDoubleAttribute("grainPitchJitter", strip->getGrainPitchJitter())));
-        strip->setGrainSpread(static_cast<float>(stripXml->getDoubleAttribute("grainSpread", strip->getGrainSpread())));
-        strip->setGrainJitter(static_cast<float>(stripXml->getDoubleAttribute("grainJitter", strip->getGrainJitter())));
-        strip->setGrainRandomDepth(static_cast<float>(stripXml->getDoubleAttribute("grainRandomDepth", strip->getGrainRandomDepth())));
-        strip->setGrainArpDepth(static_cast<float>(stripXml->getDoubleAttribute("grainArpDepth", strip->getGrainArpDepth())));
-        strip->setGrainCloudDepth(static_cast<float>(stripXml->getDoubleAttribute("grainCloudDepth", strip->getGrainCloudDepth())));
-        strip->setGrainEmitterDepth(static_cast<float>(stripXml->getDoubleAttribute("grainEmitterDepth", strip->getGrainEmitterDepth())));
-        strip->setGrainEnvelope(static_cast<float>(stripXml->getDoubleAttribute("grainEnvelope", strip->getGrainEnvelope())));
-        strip->setGrainShape(clampedFloat(stripXml->getDoubleAttribute("grainShape", strip->getGrainShape()), strip->getGrainShape(), -1.0f, 1.0f));
-        strip->setGrainArpMode(clampedInt(stripXml->getIntAttribute("grainArpMode", strip->getGrainArpMode()), 0, 5, strip->getGrainArpMode()));
-        strip->setGrainTempoSyncEnabled(stripXml->getBoolAttribute("grainTempoSync", strip->isGrainTempoSyncEnabled()));
+        strip->setGrainSizeMs(static_cast<float>(stripXml->getDoubleAttribute("grainSizeMs", 1240.0)));
+        strip->setGrainDensity(static_cast<float>(stripXml->getDoubleAttribute("grainDensity", 0.05)));
+        strip->setGrainPitch(clampedFloat(stripXml->getDoubleAttribute("grainPitch", 0.0), 0.0f, -48.0f, 48.0f));
+        strip->setGrainPitchJitter(static_cast<float>(stripXml->getDoubleAttribute("grainPitchJitter", 0.0)));
+        strip->setGrainSpread(static_cast<float>(stripXml->getDoubleAttribute("grainSpread", 0.0)));
+        strip->setGrainJitter(static_cast<float>(stripXml->getDoubleAttribute("grainJitter", 0.0)));
+        strip->setGrainRandomDepth(static_cast<float>(stripXml->getDoubleAttribute("grainRandomDepth", 0.0)));
+        strip->setGrainArpDepth(static_cast<float>(stripXml->getDoubleAttribute("grainArpDepth", 0.0)));
+        strip->setGrainCloudDepth(static_cast<float>(stripXml->getDoubleAttribute("grainCloudDepth", 0.0)));
+        strip->setGrainEmitterDepth(static_cast<float>(stripXml->getDoubleAttribute("grainEmitterDepth", 0.0)));
+        strip->setGrainEnvelope(static_cast<float>(stripXml->getDoubleAttribute("grainEnvelope", 0.0)));
+        strip->setGrainShape(clampedFloat(stripXml->getDoubleAttribute("grainShape", 0.0), 0.0f, -1.0f, 1.0f));
+        strip->setGrainArpMode(clampedInt(stripXml->getIntAttribute("grainArpMode", 0), 0, 5, 0));
+        strip->setGrainTempoSyncEnabled(stripXml->getBoolAttribute("grainTempoSync", true));
 
         audioEngine->setModTarget(stripIndex,
             static_cast<ModernAudioEngine::ModTarget>(clampedInt(stripXml->getIntAttribute("modTarget", 0), 0, 18, 0)));
@@ -918,15 +927,20 @@ void loadPreset(int presetIndex,
     }
 
         DBG("Preset " << (presetIndex + 1) << " loaded");
+        return true;
     }
     catch (const std::exception& e)
     {
         DBG("Preset load failed for slot " << (presetIndex + 1) << ": " << e.what());
+        return false;
     }
     catch (...)
     {
         DBG("Preset load failed for slot " << (presetIndex + 1) << ": unknown exception");
+        return false;
     }
+
+    return false;
 }
 
 juce::String getPresetName(int presetIndex)

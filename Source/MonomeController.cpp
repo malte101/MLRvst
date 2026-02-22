@@ -350,7 +350,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
             if (controlModeActive && currentControlMode == ControlMode::Modulation)
             {
-                const int targetStrip = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+                const int targetStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
                 auto* engine = getAudioEngine();
                 if (!engine)
                     return;
@@ -516,7 +516,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
 
             int stripIndex = y - FIRST_STRIP_ROW;
-            if (stripIndex < 6 && x < 16)
+            if (stripIndex < MaxStrips && x < 16)
             {
                 if (!(controlModeActive && (currentControlMode == ControlMode::GrainSize
                     || currentControlMode == ControlMode::Modulation)))
@@ -576,7 +576,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     }
                     else if (currentControlMode == ControlMode::GrainSize)
                     {
-                        const int targetStripIndex = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+                        const int targetStripIndex = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
                         if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
                             MonomeMixActions::handleGrainPageButtonPress(*targetStrip, stripIndex, x);
                     }
@@ -595,7 +595,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     }
                     else if (currentControlMode == ControlMode::Modulation)
                     {
-                        const int targetStrip = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+                        const int targetStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
                         const int activePage = audioEngine->getModCurrentPage(targetStrip);
                         audioEngine->setModEditPage(targetStrip, activePage);
                         const bool bipolar = audioEngine->isModBipolar(targetStrip);
@@ -674,7 +674,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         if (y >= FIRST_STRIP_ROW && y < CONTROL_ROW)
         {
             int stripIndex = y - FIRST_STRIP_ROW;
-            if (stripIndex < 6 && x < 16)
+            if (stripIndex < MaxStrips && x < 16)
             {
                 auto* strip = audioEngine->getStrip(stripIndex);
                 if (strip)
@@ -689,7 +689,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         if (y >= FIRST_STRIP_ROW && y < CONTROL_ROW)
         {
             int stripIndex = y - FIRST_STRIP_ROW;
-            if (stripIndex < 6 && x < 16)
+            if (stripIndex < MaxStrips && x < 16)
             {
                 auto* strip = audioEngine->getStrip(stripIndex);
                 if (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Gate)
@@ -758,13 +758,22 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                     {
                         savePreset(presetIndex);
                         presetPadHoldSaveTriggered[idx] = true;
+                        presetPadSaveBurstUntilMs[idx] = nowMs + presetSaveBurstDurationMs;
                     }
                 }
 
                 const bool exists = presetExists(presetIndex);
                 int level = exists ? 8 : 2;  // Existing lit, empty dim.
-                if (presetIndex == loadedPresetIndex && exists)
+                const bool burstActive = nowMs < presetPadSaveBurstUntilMs[idx];
+                if (burstActive)
+                {
+                    const bool burstOn = ((nowMs / presetSaveBurstIntervalMs) & 1u) == 0u;
+                    level = burstOn ? 15 : 0;
+                }
+                else if (presetIndex == loadedPresetIndex && exists)
+                {
                     level = slowBlinkOn ? 15 : 0;  // Loaded preset blinks.
+                }
                 newLedState[x][y] = level;
             }
         }
@@ -822,7 +831,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     }
     else if (currentControlMode == ControlMode::Modulation && controlModeActive)
     {
-        const int targetStrip = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+        const int targetStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
         const int activePage = audioEngine->getModCurrentPage(targetStrip);
         audioEngine->setModEditPage(targetStrip, activePage);
         const auto seq = audioEngine->getModSequencerState(targetStrip);
@@ -952,7 +961,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     }
     
     // ROWS 1-6: Strip displays
-    for (int stripIndex = 0; stripIndex < 6; ++stripIndex)
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
     {
         int y = FIRST_STRIP_ROW + stripIndex;
         auto* strip = audioEngine->getStrip(stripIndex);
@@ -1010,7 +1019,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
         else if (controlModeActive && currentControlMode == ControlMode::GrainSize)
         {
-            const int targetStripIndex = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+            const int targetStripIndex = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
             if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
                 MonomeMixActions::renderGrainPageRow(*targetStrip, stripIndex, y, newLedState);
         }
@@ -1028,7 +1037,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
         else if (controlModeActive && currentControlMode == ControlMode::Modulation)
         {
-            const int selectedStrip = juce::jlimit(0, 5, getLastMonomePressedStripRow());
+            const int selectedStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
             const int activePage = audioEngine->getModCurrentPage(selectedStrip);
             audioEngine->setModEditPage(selectedStrip, activePage);
             const auto seq = audioEngine->getModSequencerState(selectedStrip);

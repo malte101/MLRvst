@@ -730,9 +730,7 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
                       .withOutput("Strip 3", juce::AudioChannelSet::stereo(), false)
                       .withOutput("Strip 4", juce::AudioChannelSet::stereo(), false)
                       .withOutput("Strip 5", juce::AudioChannelSet::stereo(), false)
-                      .withOutput("Strip 6", juce::AudioChannelSet::stereo(), false)
-                      .withOutput("Strip 7", juce::AudioChannelSet::stereo(), false)
-                      .withOutput("Strip 8", juce::AudioChannelSet::stereo(), false)),
+                      .withOutput("Strip 6", juce::AudioChannelSet::stereo(), false)),
        parameters(*this, nullptr, juce::Identifier("MlrVST"), createParameterLayout())
 {
     // Initialize audio engine
@@ -1005,10 +1003,9 @@ void MlrVSTAudioProcessor::releaseResources()
 
 bool MlrVSTAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
-    // Check main output
+    // Main output is fixed stereo; strip outputs are stereo buses.
     auto mainOutput = layouts.getMainOutputChannelSet();
-    if (mainOutput != juce::AudioChannelSet::mono()
-     && mainOutput != juce::AudioChannelSet::stereo())
+    if (mainOutput != juce::AudioChannelSet::stereo())
         return false;
 
     // Aux outputs are either disabled or match main output channel set.
@@ -1235,7 +1232,7 @@ void MlrVSTAudioProcessor::setStateInformation(const void* data, int sizeInBytes
 }
 
 //==============================================================================
-void MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& file)
+bool MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& file)
 {
     if (file.existsAsFile() && stripIndex >= 0 && stripIndex < MaxStrips)
     {
@@ -1243,12 +1240,15 @@ void MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& f
         // default XML paths here. Those are updated only by explicit
         // manual path selections (load button / Paths tab).
         lastSampleFolder = file.getParentDirectory();
-        
-        // Remember this file for this strip
-        currentStripFiles[stripIndex] = file;
 
-        audioEngine->loadSampleToStrip(stripIndex, file);
+        const bool loaded = audioEngine->loadSampleToStrip(stripIndex, file);
+        if (loaded)
+            currentStripFiles[stripIndex] = file;
+
+        return loaded;
     }
+
+    return false;
 }
 
 void MlrVSTAudioProcessor::captureRecentAudioToStrip(int stripIndex)
@@ -2501,23 +2501,32 @@ void MlrVSTAudioProcessor::performPresetLoad(int presetIndex, double hostPpqSnap
         MlrVSTAudioProcessor& processor;
     } scopedSuspend(*this);
 
+    if (!PresetStore::presetExists(presetIndex))
+    {
+        // Empty slot recall should load runtime defaults without creating a preset file.
+        resetRuntimePresetStateToDefaults();
+        loadedPresetIndex = -1;
+        presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+        return;
+    }
+
     // Clear stale file references; preset load repopulates file-backed strips.
     for (auto& f : currentStripFiles)
         f = juce::File();
 
-    PresetStore::loadPreset(
+    const bool loadSucceeded = PresetStore::loadPreset(
         presetIndex,
         MaxStrips,
         audioEngine.get(),
         parameters,
         [this](int stripIndex, const juce::File& sampleFile)
         {
-            loadSampleToStrip(stripIndex, sampleFile);
+            return loadSampleToStrip(stripIndex, sampleFile);
         },
         hostPpqSnapshot,
         hostTempoSnapshot);
 
-    if (PresetStore::presetExists(presetIndex))
+    if (loadSucceeded && PresetStore::presetExists(presetIndex))
         loadedPresetIndex = presetIndex;
     presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
 }

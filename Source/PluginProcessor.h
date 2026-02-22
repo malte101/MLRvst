@@ -180,7 +180,7 @@ public:
     ModernAudioEngine* getAudioEngine() { return audioEngine.get(); }
     MonomeConnection& getMonomeConnection() { return monomeConnection; }
     
-    void loadSampleToStrip(int stripIndex, const juce::File& file);
+    bool loadSampleToStrip(int stripIndex, const juce::File& file);
     void loadAdjacentFile(int stripIndex, int direction);  // Browse files
     void captureRecentAudioToStrip(int stripIndex);
     void clearRecentAudioBuffer();
@@ -246,7 +246,7 @@ public:
     // Parameters
     juce::AudioProcessorValueTreeState parameters;
     
-    static constexpr int MaxStrips = 8;
+    static constexpr int MaxStrips = ModernAudioEngine::MaxStrips;
     static constexpr int MaxColumns = 16;
 
 private:
@@ -390,10 +390,13 @@ private:
     std::array<bool, MaxPresetSlots> presetPadHoldSaveTriggered{};
     std::array<bool, MaxPresetSlots> presetPadDeleteTriggered{};
     std::array<uint32_t, MaxPresetSlots> presetPadPressStartMs{};
+    std::array<uint32_t, MaxPresetSlots> presetPadSaveBurstUntilMs{};
     std::atomic<uint32_t> presetRefreshToken{0};
     std::array<uint32_t, MaxPresetSlots> presetPadLastTapMs{};
     static constexpr uint32_t presetHoldSaveMs = 3000;
     static constexpr uint32_t presetDoubleTapMs = 350;
+    static constexpr uint32_t presetSaveBurstDurationMs = 260;
+    static constexpr uint32_t presetSaveBurstIntervalMs = 55;
     std::atomic<int> pendingPresetLoadIndex{-1};
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MlrVSTAudioProcessor)
