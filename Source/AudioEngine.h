@@ -104,6 +104,7 @@ struct QuantisedTrigger
     double targetPPQ = 0.0;      // Exact PPQ grid value (calculated at schedule time)
     int stripIndex = -1;
     int column = 0;
+    bool clearPendingOnFire = true;
 };
 
 class QuantizationClock
@@ -342,13 +343,6 @@ public:
         MoogHuov      // MoogLadders Huovilainen LP model
     };
 
-    enum class GateShape
-    {
-        Sine = 0,
-        Triangle,
-        Square
-    };
-
     enum class SwingDivision
     {
         Quarter = 0,   // 1/4
@@ -406,7 +400,7 @@ public:
     std::atomic<float> gateAmount{0.0f};    // 0..1 gate effect depth
     std::atomic<float> gateSpeed{4.0f};     // cycles per beat (default 1/16)
     std::atomic<float> gateEnvelope{0.5f};  // 0..1 smoothing
-    GateShape gateShape = GateShape::Sine;
+    std::atomic<float> gateShape{0.5f};     // 0..1 pulse/curve shape
     
     // Public methods
     EnhancedAudioStrip(int stripIndex);
@@ -514,6 +508,7 @@ public:
     int getGrainSizeControlColumn() const;
     int getGrainHeldCount() const;
     float getGrainSizeMs() const;
+    float getGrainBaseSizeMs() const;
     float getGrainDensity() const;
     float getGrainPitch() const;
     float getGrainPitchJitter() const;
@@ -524,11 +519,14 @@ public:
     float getGrainCloudDepth() const;
     float getGrainEmitterDepth() const;
     float getGrainEnvelope() const;
+    float getGrainShape() const;
     int getGrainArpMode() const;
     bool isGrainTempoSyncEnabled() const;
     std::array<float, 8> getGrainPreviewPositions() const;
     std::array<float, 8> getGrainPreviewPitchNorms() const;
     void setGrainSizeMs(float value);
+    void setGrainSizeModulatedMs(float value);
+    void clearGrainSizeModulation();
     void setGrainDensity(float value);
     void setGrainPitch(float semitones);
     void setGrainPitchJitter(float semitones);
@@ -539,11 +537,13 @@ public:
     void setGrainCloudDepth(float value);
     void setGrainEmitterDepth(float value);
     void setGrainEnvelope(float value);
+    void setGrainShape(float value);
     void setGrainArpMode(int mode);
     void setGrainTempoSyncEnabled(bool enabled);
     void setGrainResamplerQuality(Resampler::Quality quality) { grainResampler.setQuality(quality); }
     void captureMomentaryPhaseReference(double hostPpq);
     void enforceMomentaryPhaseReference(double hostPpq, int64_t currentGlobalSample);
+    void realignToPpqAnchor(double hostPpq, int64_t currentGlobalSample);
     
     // StepSampler access
     StepSampler* getStepSampler() { return &stepSampler; }
@@ -575,8 +575,8 @@ public:
     float getGateSpeed() const { return gateSpeed.load(std::memory_order_acquire); }
     void setGateEnvelope(float amount) { gateEnvelope = juce::jlimit(0.0f, 1.0f, amount); }
     float getGateEnvelope() const { return gateEnvelope.load(std::memory_order_acquire); }
-    void setGateShape(GateShape shape) { gateShape = shape; }
-    GateShape getGateShape() const { return gateShape; }
+    void setGateShape(float shape) { gateShape = juce::jlimit(0.0f, 1.0f, shape); }
+    float getGateShape() const { return gateShape.load(std::memory_order_acquire); }
     void setLoopCrossfadeLengthMs(float ms) { loopCrossfadeLengthMs.store(juce::jlimit(1.0f, 50.0f, ms), std::memory_order_release); }
     
     // Play mode setters/getters
@@ -628,6 +628,9 @@ public:
                 grainCenterSmoother.setCurrentAndTargetValue(playbackPosition.load());
             // Force immediate first grain spawn when entering grain mode.
             grainSpawnAccumulator = 1.0;
+            // Brief identity scheduler hold so initial grain playback tracks
+            // one deterministic playhead before evolving into full cloud behavior.
+            grainEntryIdentitySamplesRemaining = juce::jmax(32, static_cast<int>(currentSampleRate * 0.18));
 
             // Short output blend from previous sample to prevent mode-switch crackle.
             const float modeFadeMs = juce::jlimit(0.2f, 8.0f, triggerFadeInMs.load(std::memory_order_acquire));
@@ -652,6 +655,7 @@ public:
         else if (oldMode == PlayMode::Grain && mode != PlayMode::Grain)
         {
             resetGrainState();
+            grainEntryIdentitySamplesRemaining = 0;
         }
     }
     PlayMode getPlayMode() const { return playMode; }
@@ -700,6 +704,7 @@ private:
         float cloudDepth = 0.0f;   // 0..1 cloud delay mix/feedback
         float emitterDepth = 0.0f; // 0..1 quantized emitter around playhead
         float envelope = 0.0f;     // 0..1 edge fade length (higher = longer fades)
+        float shape = 0.0f;        // -1..1 envelope bend (negative=rounder, positive=sharper)
         int arpMode = 0;           // 0=Octave, 1=Power, 2=Zigzag
         bool reverse = false;
     };
@@ -765,9 +770,13 @@ private:
     double grainSchedulerNoise = 0.0;
     double grainSchedulerNoiseTarget = 0.0;
     int grainSchedulerNoiseCountdown = 0;
+    int grainEntryIdentitySamplesRemaining = 0;
     juce::SmoothedValue<double> grainCenterSmoother{0.0};
     juce::SmoothedValue<float> grainSizeSmoother{1240.0f};
+    juce::SmoothedValue<float> grainSyncedSizeSmoother{1240.0f};
     juce::SmoothedValue<float> grainDensitySmoother{0.05f};
+    juce::SmoothedValue<float> grainPitchSmoother{0.0f};
+    juce::SmoothedValue<float> grainPitchJitterSmoother{0.0f};
     juce::SmoothedValue<float> grainFreezeBlendSmoother{0.0f};
     juce::SmoothedValue<float> grainScratchSceneMix{0.0f};
     double grainBloomPhase = 0.0;
@@ -899,6 +908,7 @@ private:
     std::atomic<int> grainLedSizeControl{-1};
     std::atomic<bool> grainLedFreeze{false};
     std::atomic<float> grainSizeMsAtomic{1240.0f};
+    std::atomic<float> grainSizeModulatedMsAtomic{-1.0f}; // < 0 => modulation inactive
     std::atomic<float> grainDensityAtomic{0.05f};
     std::atomic<float> grainPitchAtomic{0.0f};
     std::atomic<float> grainPitchJitterAtomic{0.0f};
@@ -909,8 +919,11 @@ private:
     std::atomic<float> grainCloudDepthAtomic{0.0f};
     std::atomic<float> grainEmitterDepthAtomic{0.0f};
     std::atomic<float> grainEnvelopeAtomic{0.0f};
+    std::atomic<float> grainShapeAtomic{0.0f};
     std::atomic<int> grainArpModeAtomic{0};
-    std::atomic<bool> grainTempoSyncAtomic{false};
+    float grainPitchBeforeArp = 0.0f;
+    bool grainArpWasActive = false;
+    std::atomic<bool> grainTempoSyncAtomic{true};
     std::array<std::atomic<float>, 8> grainPreviewPositions {
         std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f},
         std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f}, std::atomic<float>{-1.0f}
@@ -924,6 +937,8 @@ private:
     int grainVoiceSearchStart = 0;
     int64_t grainSizeJitterBeatGroup = std::numeric_limits<int64_t>::min();
     float grainSizeJitterMul = 1.0f;
+    int grainTempoSyncDivisionIndex = 0;
+    int64_t grainTempoSyncDivisionBeatGroup = std::numeric_limits<int64_t>::min();
     GrainParams grainParamsBeforeGesture;
     bool grainParamsSnapshotValid = false;
     bool grainThreeButtonSnapshotActive = false;
@@ -1054,6 +1069,7 @@ public:
         GrainCloud,
         GrainEmitter,
         GrainEnvelope,
+        Retrigger,
         FilterFrequency = Cutoff
     };
 
@@ -1113,6 +1129,11 @@ public:
     void scheduleQuantizedTrigger(int stripIndex, int column, double currentPPQ);
     void triggerStripWithQuantization(int stripIndex, int column, bool useQuantize);
     bool hasPendingTrigger(int stripIndex) const { return quantizeClock.hasPendingTrigger(stripIndex); }
+    void setMomentaryStutterActive(bool enabled);
+    void setMomentaryStutterDivision(double beats);
+    void setMomentaryStutterStartPpq(double ppq);
+    void setMomentaryStutterStrip(int stripIndex, int column, bool enabled);
+    void clearMomentaryStutterStrips();
     
     // Pattern recording
     void startPatternRecording(int patternIndex);
@@ -1214,6 +1235,8 @@ private:
         std::atomic<int> pitchScale{static_cast<int>(PitchScale::Chromatic)};
         std::array<std::atomic<float>, ModTotalSteps> steps;
         float smoothedRaw = 0.0f;
+        float grainDezipperedRaw = 0.0f;
+        float pitchDezipperedRaw = 0.0f;
         std::atomic<int> lastGlobalStep{0};
     };
 
@@ -1221,6 +1244,12 @@ private:
     std::array<std::unique_ptr<StripGroup>, MaxGroups> groups;
     std::array<std::unique_ptr<PatternRecorder>, 4> patterns;
     std::array<ModSequencer, MaxStrips> modSequencers;
+    std::atomic<int> momentaryStutterActive{0};
+    std::atomic<double> momentaryStutterDivisionBeats{0.5}; // quarter-note units
+    std::atomic<double> momentaryStutterStartPpq{0.0};
+    std::array<std::atomic<int>, MaxStrips> momentaryStutterStripEnabled{};
+    std::array<std::atomic<int>, MaxStrips> momentaryStutterColumns{};
+    std::array<std::atomic<double>, MaxStrips> momentaryStutterNextPpq{};
     std::unique_ptr<LiveRecorder> liveRecorder;
     
     QuantizationClock quantizeClock;

@@ -155,6 +155,7 @@ int modTargetToComboId(ModernAudioEngine::ModTarget target)
         case ModernAudioEngine::ModTarget::GrainCloud: return 16;
         case ModernAudioEngine::ModTarget::GrainEmitter: return 17;
         case ModernAudioEngine::ModTarget::GrainEnvelope: return 18;
+        case ModernAudioEngine::ModTarget::Retrigger: return 19;
         case ModernAudioEngine::ModTarget::None:
         default: return 1;
     }
@@ -181,6 +182,7 @@ ModernAudioEngine::ModTarget comboIdToModTarget(int id)
         case 16: return ModernAudioEngine::ModTarget::GrainCloud;
         case 17: return ModernAudioEngine::ModTarget::GrainEmitter;
         case 18: return ModernAudioEngine::ModTarget::GrainEnvelope;
+        case 19: return ModernAudioEngine::ModTarget::Retrigger;
         case 1:
         default: return ModernAudioEngine::ModTarget::None;
     }
@@ -188,10 +190,8 @@ ModernAudioEngine::ModTarget comboIdToModTarget(int id)
 
 bool modTargetAllowsBipolar(ModernAudioEngine::ModTarget target)
 {
-    return target == ModernAudioEngine::ModTarget::Pan
-        || target == ModernAudioEngine::ModTarget::Pitch
-        || target == ModernAudioEngine::ModTarget::Speed
-        || target == ModernAudioEngine::ModTarget::GrainPitch;
+    juce::ignoreUnused(target);
+    return true;
 }
 
 int pitchScaleToComboId(ModernAudioEngine::PitchScale scale)
@@ -1062,6 +1062,8 @@ void StripControl::setupComponents()
     setupGrainKnob(grainSizeSlider, grainSizeLabel, "SIZE", 5.0, 2400.0, 1.0);
     setupGrainKnob(grainDensitySlider, grainDensityLabel, "DENS", 0.05, 0.9, 0.01);
     setupGrainKnob(grainPitchSlider, grainPitchLabel, "PITCH", -48.0, 48.0, 0.1);
+    grainPitchSlider.getProperties().set("bipolarBase", true);
+    grainPitchLabel.setJustificationType(juce::Justification::centredLeft);
     setupGrainKnob(grainPitchJitterSlider, grainPitchJitterLabel, "PJIT", 0.0, 48.0, 0.1);
     setupGrainKnob(grainSpreadSlider, grainSpreadLabel, "SPRD", 0.0, 1.0, 0.01);
     setupGrainKnob(grainJitterSlider, grainJitterLabel, "SJTR", 0.0, 1.0, 0.01);
@@ -1070,6 +1072,7 @@ void StripControl::setupComponents()
     setupGrainKnob(grainCloudSlider, grainCloudLabel, "CLOUD", 0.0, 1.0, 0.01);
     setupGrainKnob(grainEmitterSlider, grainEmitterLabel, "EMIT", 0.0, 1.0, 0.01);
     setupGrainKnob(grainEnvelopeSlider, grainEnvelopeLabel, "ENV", 0.0, 1.0, 0.01);
+    setupGrainKnob(grainShapeSlider, grainShapeLabel, "SHAPE", -1.0, 1.0, 0.01);
     enableAltClickReset(grainSizeSlider, 1240.0);
     enableAltClickReset(grainDensitySlider, 0.05);
     enableAltClickReset(grainPitchSlider, 0.0);
@@ -1081,6 +1084,7 @@ void StripControl::setupComponents()
     enableAltClickReset(grainCloudSlider, 0.0);
     enableAltClickReset(grainEmitterSlider, 0.0);
     enableAltClickReset(grainEnvelopeSlider, 0.0);
+    enableAltClickReset(grainShapeSlider, 0.0);
     auto setupMini = [](juce::Slider& slider)
     {
         slider.setSliderStyle(juce::Slider::LinearHorizontal);
@@ -1095,6 +1099,7 @@ void StripControl::setupComponents()
     setupMini(grainCloudSlider);
     setupMini(grainEmitterSlider);
     setupMini(grainEnvelopeSlider);
+    setupMini(grainShapeSlider);
     grainPitchSlider.textFromValueFunction = [this](double value)
     {
         const bool arpActive = grainArpSlider.getValue() > 0.001;
@@ -1120,7 +1125,7 @@ void StripControl::setupComponents()
         const double t = juce::jlimit(0.0, 1.0, (value - 5.0) / (2400.0 - 5.0));
         const int idx = juce::jlimit(0, static_cast<int>(sizeDivisionLabels.size()) - 1,
                                      static_cast<int>(std::round(t * static_cast<double>(sizeDivisionLabels.size() - 1))));
-        return juce::String(value, 1) + " ms (" + juce::String(sizeDivisionLabels[static_cast<size_t>(idx)]) + ")";
+        return juce::String(sizeDivisionLabels[static_cast<size_t>(idx)]);
     };
     grainArpSlider.textFromValueFunction = [](double value)
     {
@@ -1143,6 +1148,11 @@ void StripControl::setupComponents()
     {
         const int percent = static_cast<int>(std::round(juce::jlimit(0.0, 1.0, value) * 100.0));
         return juce::String(percent) + "% Fade";
+    };
+    grainShapeSlider.textFromValueFunction = [](double value)
+    {
+        const int percent = static_cast<int>(std::round(juce::jlimit(-1.0, 1.0, value) * 100.0));
+        return juce::String(percent) + "% Shape";
     };
     grainRandomSlider.setTooltip("RAND: macro random depth (position, pitch, size, reverse), not just position jitter.");
 
@@ -1198,8 +1208,6 @@ void StripControl::setupComponents()
             if (grainArpSlider.getValue() > 0.001)
             {
                 const int mode = juce::jlimit(0, 5, static_cast<int>(std::floor(juce::jlimit(0.0, 0.999999, grainArpSlider.getValue()) * 6.0)));
-                grainArpModeSlider.setValue(static_cast<double>(mode), juce::dontSendNotification);
-                grainArpModeLabel.setText(getGrainArpModeName(mode), juce::dontSendNotification);
                 strip->setGrainArpMode(mode);
             }
         }
@@ -1219,36 +1227,15 @@ void StripControl::setupComponents()
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
             strip->setGrainEnvelope(static_cast<float>(grainEnvelopeSlider.getValue()));
     };
-
-    grainArpModeLabel.setText("Octave", juce::dontSendNotification);
-    grainArpModeLabel.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
-    grainArpModeLabel.setJustificationType(juce::Justification::centred);
-    grainArpModeLabel.setColour(juce::Label::textColourId, stripColor.brighter(0.35f));
-    addAndMakeVisible(grainArpModeLabel);
-    grainArpModeSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-    grainArpModeSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-    grainArpModeSlider.setRange(0.0, 5.0, 1.0);
-    grainArpModeSlider.setValue(0.0, juce::dontSendNotification);
-    grainArpModeSlider.setPopupDisplayEnabled(true, false, this);
-    grainArpModeSlider.textFromValueFunction = [](double v)
+    grainShapeSlider.onValueChange = [this]()
     {
-        const int mode = juce::jlimit(0, 5, static_cast<int>(std::round(v)));
-        return juce::String(mode + 1) + "/6 " + getGrainArpModeName(mode);
-    };
-    grainArpModeSlider.onValueChange = [this]()
-    {
-        const int mode = juce::jlimit(0, 5, static_cast<int>(std::round(grainArpModeSlider.getValue())));
-        if (std::abs(grainArpModeSlider.getValue() - static_cast<double>(mode)) > 1.0e-6)
-            grainArpModeSlider.setValue(static_cast<double>(mode), juce::dontSendNotification);
-        grainArpModeLabel.setText(getGrainArpModeName(mode), juce::dontSendNotification);
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-            strip->setGrainArpMode(mode);
+            strip->setGrainShape(static_cast<float>(grainShapeSlider.getValue()));
     };
-    addAndMakeVisible(grainArpModeSlider);
 
     grainSizeSyncToggle.setButtonText("");
     grainSizeSyncToggle.setClickingTogglesState(true);
-    grainSizeSyncToggle.setToggleState(false, juce::dontSendNotification);
+    grainSizeSyncToggle.setToggleState(true, juce::dontSendNotification);
     grainSizeSyncToggle.setColour(juce::ToggleButton::textColourId, stripColor.withAlpha(0.72f));
     grainSizeSyncToggle.setColour(juce::ToggleButton::tickColourId, stripColor.withAlpha(0.72f));
     grainSizeSyncToggle.setColour(juce::ToggleButton::tickDisabledColourId, stripColor.withAlpha(0.28f));
@@ -1264,12 +1251,33 @@ void StripControl::setupComponents()
     };
     addAndMakeVisible(grainSizeSyncToggle);
 
-    grainSizeDivLabel.setText("FREE", juce::dontSendNotification);
+    grainSizeDivLabel.setText("SYNC", juce::dontSendNotification);
     grainSizeDivLabel.setJustificationType(juce::Justification::centredRight);
     grainSizeDivLabel.setColour(juce::Label::textColourId, stripColor.withAlpha(0.78f));
     grainSizeDivLabel.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
     addAndMakeVisible(grainSizeDivLabel);
     grainSizeLabel.setJustificationType(juce::Justification::centredLeft);
+
+    auto setupGrainTab = [this](juce::TextButton& button, const juce::String& text, GrainSubPage page)
+    {
+        button.setButtonText(text);
+        button.setClickingTogglesState(false);
+        button.setTooltip("Grain page: " + text);
+        styleUiButton(button, false);
+        button.onClick = [this, page]()
+        {
+            grainSubPage = page;
+            updateGrainTabButtons();
+            updateGrainOverlayVisibility();
+            resized();
+            repaint();
+        };
+        addAndMakeVisible(button);
+    };
+    setupGrainTab(grainTabPitchButton, "PITCH", GrainSubPage::Pitch);
+    setupGrainTab(grainTabSpaceButton, "SPACE", GrainSubPage::Space);
+    setupGrainTab(grainTabShapeButton, "SHAPE", GrainSubPage::Shape);
+    updateGrainTabButtons();
 
     patternLengthBox.addItem("16", 1);
     patternLengthBox.addItem("32", 2);
@@ -1377,11 +1385,15 @@ void StripControl::setupComponents()
     modTargetBox.addItem("G.Cloud", 16);
     modTargetBox.addItem("G.Emit", 17);
     modTargetBox.addItem("G.Env", 18);
+    modTargetBox.addItem("Retrig", 19);
     modTargetBox.setSelectedId(1, juce::dontSendNotification);
     modTargetBox.onChange = [this]()
     {
         if (auto* engine = processor.getAudioEngine())
+        {
             engine->setModTarget(stripIndex, comboIdToModTarget(modTargetBox.getSelectedId()));
+            modBipolarToggle.setToggleState(engine->isModBipolar(stripIndex), juce::dontSendNotification);
+        }
     };
     addAndMakeVisible(modTargetBox);
 
@@ -1528,6 +1540,9 @@ void StripControl::updateGrainOverlayVisibility()
                           && processor.getAudioEngine()->getStrip(stripIndex)
                           && processor.getAudioEngine()->getStrip(stripIndex)->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain;
     grainOverlayVisible = isGrainMode;
+    const bool showPitchPage = isGrainMode && grainSubPage == GrainSubPage::Pitch;
+    const bool showSpacePage = isGrainMode && grainSubPage == GrainSubPage::Space;
+    const bool showShapePage = isGrainMode && grainSubPage == GrainSubPage::Shape;
 
     volumeSlider.setVisible(!isGrainMode);
     panSlider.setVisible(!isGrainMode);
@@ -1542,31 +1557,52 @@ void StripControl::updateGrainOverlayVisibility()
 
     grainSizeSlider.setVisible(isGrainMode);
     grainDensitySlider.setVisible(isGrainMode);
-    grainPitchSlider.setVisible(isGrainMode);
-    grainPitchJitterSlider.setVisible(isGrainMode);
-    grainSpreadSlider.setVisible(isGrainMode);
-    grainJitterSlider.setVisible(isGrainMode);
-    grainRandomSlider.setVisible(isGrainMode);
-    grainArpSlider.setVisible(isGrainMode);
-    grainCloudSlider.setVisible(isGrainMode);
-    grainEmitterSlider.setVisible(isGrainMode);
-    grainEnvelopeSlider.setVisible(isGrainMode);
-    grainArpModeSlider.setVisible(false);
+    grainPitchSlider.setVisible(showPitchPage);
+    grainPitchJitterSlider.setVisible(showPitchPage);
+    grainSpreadSlider.setVisible(showSpacePage);
+    grainJitterSlider.setVisible(showSpacePage);
+    grainRandomSlider.setVisible(showPitchPage);
+    grainArpSlider.setVisible(showPitchPage);
+    grainCloudSlider.setVisible(showSpacePage);
+    grainEmitterSlider.setVisible(showSpacePage);
+    grainEnvelopeSlider.setVisible(showShapePage);
+    grainShapeSlider.setVisible(showShapePage);
+    grainTabPitchButton.setVisible(isGrainMode);
+    grainTabSpaceButton.setVisible(isGrainMode);
+    grainTabShapeButton.setVisible(isGrainMode);
     grainSizeSyncToggle.setVisible(isGrainMode);
     grainSizeDivLabel.setVisible(isGrainMode);
     grainSizeLabel.setVisible(isGrainMode);
     grainDensityLabel.setVisible(isGrainMode);
-    grainPitchLabel.setVisible(isGrainMode);
-    grainPitchJitterLabel.setVisible(isGrainMode);
-    grainSpreadLabel.setVisible(isGrainMode);
-    grainJitterLabel.setVisible(isGrainMode);
-    grainRandomLabel.setVisible(isGrainMode);
-    grainArpLabel.setVisible(isGrainMode);
-    grainCloudLabel.setVisible(isGrainMode);
-    grainEmitterLabel.setVisible(isGrainMode);
-    grainEnvelopeLabel.setVisible(isGrainMode);
-    grainArpModeLabel.setVisible(false);
-    grainArpModeBox.setVisible(false);
+    grainPitchLabel.setVisible(showPitchPage);
+    grainPitchJitterLabel.setVisible(showPitchPage);
+    grainSpreadLabel.setVisible(showSpacePage);
+    grainJitterLabel.setVisible(showSpacePage);
+    grainRandomLabel.setVisible(showPitchPage);
+    grainArpLabel.setVisible(showPitchPage);
+    grainCloudLabel.setVisible(showSpacePage);
+    grainEmitterLabel.setVisible(showSpacePage);
+    grainEnvelopeLabel.setVisible(showShapePage);
+    grainShapeLabel.setVisible(showShapePage);
+    updateGrainTabButtons();
+}
+
+void StripControl::updateGrainTabButtons()
+{
+    auto tintTab = [](juce::TextButton& button, bool active)
+    {
+        button.setColour(juce::TextButton::buttonColourId,
+                         active ? kAccent.withAlpha(0.95f) : juce::Colour(0xff3b4146));
+        button.setColour(juce::TextButton::buttonOnColourId,
+                         active ? kAccent.brighter(0.12f) : juce::Colour(0xff4a5258));
+        button.setColour(juce::TextButton::textColourOffId,
+                         active ? juce::Colour(0xff121212) : kTextPrimary);
+        button.setColour(juce::TextButton::textColourOnId,
+                         active ? juce::Colour(0xff101010) : juce::Colour(0xfff5f5f5));
+    };
+    tintTab(grainTabPitchButton, grainSubPage == GrainSubPage::Pitch);
+    tintTab(grainTabSpaceButton, grainSubPage == GrainSubPage::Space);
+    tintTab(grainTabShapeButton, grainSubPage == GrainSubPage::Shape);
 }
 
 
@@ -2000,11 +2036,12 @@ void StripControl::hideAllGrainControls()
     auto hide = [](juce::Component& c){ c.setVisible(false); };
     hide(grainSizeSlider); hide(grainDensitySlider); hide(grainPitchSlider); hide(grainPitchJitterSlider);
     hide(grainSpreadSlider); hide(grainJitterSlider); hide(grainRandomSlider); hide(grainArpSlider);
-    hide(grainCloudSlider); hide(grainEmitterSlider); hide(grainEnvelopeSlider); hide(grainArpModeSlider);
-    hide(grainArpModeBox); hide(grainSizeSyncToggle); hide(grainSizeDivLabel); hide(grainSizeLabel);
+    hide(grainCloudSlider); hide(grainEmitterSlider); hide(grainEnvelopeSlider); hide(grainShapeSlider);
+    hide(grainTabPitchButton); hide(grainTabSpaceButton); hide(grainTabShapeButton);
+    hide(grainSizeSyncToggle); hide(grainSizeDivLabel); hide(grainSizeLabel);
     hide(grainDensityLabel); hide(grainPitchLabel); hide(grainPitchJitterLabel); hide(grainSpreadLabel);
     hide(grainJitterLabel); hide(grainRandomLabel); hide(grainArpLabel); hide(grainCloudLabel);
-    hide(grainEmitterLabel); hide(grainEnvelopeLabel); hide(grainArpModeLabel);
+    hide(grainEmitterLabel); hide(grainEnvelopeLabel); hide(grainShapeLabel);
 }
 
 void StripControl::paintLEDOverlay(juce::Graphics& g)
@@ -2307,39 +2344,53 @@ void StripControl::resized()
         return;
     }
 
-    // Dynamic compact grain layout to keep all controls visible.
-    const int remainingH = juce::jmax(0, controlsArea.getHeight());
-    const int syncRowH = juce::jlimit(6, 9, remainingH / 5);
-    const int miniRowsTotal = juce::jmax(0, remainingH - syncRowH);
-    const int rowH = juce::jlimit(6, 10, miniRowsTotal / 4);
+    controlsArea.removeFromTop(1);
+    auto tabRow = controlsArea.removeFromTop(13);
+    const int tabGap = 2;
+    const int tabW = juce::jmax(1, (tabRow.getWidth() - (2 * tabGap)) / 3);
+    grainTabPitchButton.setBounds(tabRow.removeFromLeft(tabW));
+    tabRow.removeFromLeft(tabGap);
+    grainTabSpaceButton.setBounds(tabRow.removeFromLeft(tabW));
+    tabRow.removeFromLeft(tabGap);
+    grainTabShapeButton.setBounds(tabRow);
 
-    auto syncRow = controlsArea.removeFromTop(syncRowH);
-    auto envArea = syncRow.removeFromRight(128);
-    grainEnvelopeLabel.setBounds(envArea.removeFromLeft(30));
-    grainEnvelopeSlider.setBounds(envArea);
-
-    auto layoutGrainMiniRow = [&](int height, juce::Label& labelA, juce::Slider& sliderA,
-                                  juce::Label* labelB, juce::Slider* sliderB)
+    controlsArea.removeFromTop(2);
+    const int rowGapMini = 2;
+    const int totalMiniRows = (grainSubPage == GrainSubPage::Shape) ? 2 : 2;
+    const int rowH = juce::jlimit(12, 22, (controlsArea.getHeight() - ((totalMiniRows - 1) * rowGapMini)) / totalMiniRows);
+    auto layoutGrainMiniRow = [&](juce::Label& labelA, juce::Slider& sliderA,
+                                  juce::Label& labelB, juce::Slider& sliderB)
     {
-        if (controlsArea.getHeight() < height)
+        if (controlsArea.getHeight() <= 0)
             return;
-        auto row = controlsArea.removeFromTop(height);
+        auto row = controlsArea.removeFromTop(rowH);
         auto left = row.removeFromLeft(row.getWidth() / 2);
-        labelA.setBounds(left.removeFromLeft(30));
+        labelA.setBounds(left.removeFromLeft(34));
         sliderA.setBounds(left);
-
-        if (labelB != nullptr && sliderB != nullptr)
-        {
-            row.removeFromLeft(2);
-            labelB->setBounds(row.removeFromLeft(30));
-            sliderB->setBounds(row);
-        }
+        row.removeFromLeft(2);
+        labelB.setBounds(row.removeFromLeft(34));
+        sliderB.setBounds(row);
+        if (controlsArea.getHeight() > rowGapMini)
+            controlsArea.removeFromTop(rowGapMini);
     };
 
-    layoutGrainMiniRow(rowH, grainPitchLabel, grainPitchSlider, &grainPitchJitterLabel, &grainPitchJitterSlider);
-    layoutGrainMiniRow(rowH, grainSpreadLabel, grainSpreadSlider, &grainJitterLabel, &grainJitterSlider);
-    layoutGrainMiniRow(rowH, grainRandomLabel, grainRandomSlider, &grainArpLabel, &grainArpSlider);
-    layoutGrainMiniRow(rowH, grainCloudLabel, grainCloudSlider, &grainEmitterLabel, &grainEmitterSlider);
+    if (grainSubPage == GrainSubPage::Pitch)
+    {
+        if (controlsArea.getHeight() > 0)
+        {
+            layoutGrainMiniRow(grainPitchLabel, grainPitchSlider, grainPitchJitterLabel, grainPitchJitterSlider);
+        }
+        layoutGrainMiniRow(grainArpLabel, grainArpSlider, grainRandomLabel, grainRandomSlider);
+    }
+    else if (grainSubPage == GrainSubPage::Space)
+    {
+        layoutGrainMiniRow(grainSpreadLabel, grainSpreadSlider, grainJitterLabel, grainJitterSlider);
+        layoutGrainMiniRow(grainCloudLabel, grainCloudSlider, grainEmitterLabel, grainEmitterSlider);
+    }
+    else
+    {
+        layoutGrainMiniRow(grainEnvelopeLabel, grainEnvelopeSlider, grainShapeLabel, grainShapeSlider);
+    }
 }
 
 
@@ -2415,6 +2466,11 @@ void StripControl::updateFromEngine()
     
     auto* strip = processor.getAudioEngine()->getStrip(stripIndex);
     if (!strip) return;
+    const auto modState = processor.getAudioEngine()->getModSequencerState(stripIndex);
+    const auto modulates = [&](ModernAudioEngine::ModTarget t)
+    {
+        return modState.target == t;
+    };
 
     if (modulationLaneView)
     {
@@ -2549,9 +2605,12 @@ void StripControl::updateFromEngine()
     scratchSlider.setValue(strip->getScratchAmount(), juce::dontSendNotification);
     patternLengthBox.setSelectedId(strip->getStepPatternBars(), juce::dontSendNotification);
     {
+        const float recordingBarsBeats = static_cast<float>(juce::jlimit(1, 8, strip->getRecordingBars()) * 4);
         float beats = strip->getBeatsPerLoop();
         if (!(beats > 0.0f && std::isfinite(beats)))
-            beats = static_cast<float>(juce::jlimit(1, 8, strip->getRecordingBars()) * 4);
+            beats = recordingBarsBeats;
+        else if (strip->isPlaying() && beats >= 4.0f && std::abs(beats - recordingBarsBeats) > 0.01f)
+            beats = recordingBarsBeats;
 
         struct BeatChoice { float beats; int id; };
         static constexpr BeatChoice choices[] {
@@ -2582,11 +2641,14 @@ void StripControl::updateFromEngine()
     recordButton.setColour(juce::TextButton::textColourOffId, juce::Colour(0xfff0f0f0));
     
     // Sync volume and pan from engine
-    volumeSlider.setValue(strip->getVolume(), juce::dontSendNotification);
-    panSlider.setValue(strip->getPan(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::Volume))
+        volumeSlider.setValue(strip->getVolume(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::Pan))
+        panSlider.setValue(strip->getPan(), juce::dontSendNotification);
     const bool showDisplaySpeed = strip->isScratchActive()
         || (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain && strip->getGrainHeldCount() > 0);
-    speedSlider.setValue(showDisplaySpeed ? strip->getDisplaySpeed() : strip->getPlaybackSpeed(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::Speed))
+        speedSlider.setValue(showDisplaySpeed ? strip->getDisplaySpeed() : strip->getPlaybackSpeed(), juce::dontSendNotification);
     
     // Sync play mode dropdown with strip state
     int modeId = static_cast<int>(strip->getPlayMode()) + 1;
@@ -2602,25 +2664,29 @@ void StripControl::updateFromEngine()
     transientSliceButton.setToggleState(transientMode, juce::dontSendNotification);
     transientSliceButton.setButtonText(transientMode ? "TRANS" : "TIME");
     updateGrainOverlayVisibility();
-    grainSizeSlider.setValue(strip->getGrainSizeMs(), juce::dontSendNotification);
-    grainDensitySlider.setValue(strip->getGrainDensity(), juce::dontSendNotification);
-    grainPitchSlider.setValue(strip->getGrainPitch(), juce::dontSendNotification);
-    grainPitchJitterSlider.setValue(strip->getGrainPitchJitter(), juce::dontSendNotification);
-    grainSpreadSlider.setValue(strip->getGrainSpread(), juce::dontSendNotification);
-    grainJitterSlider.setValue(strip->getGrainJitter(), juce::dontSendNotification);
-    grainRandomSlider.setValue(strip->getGrainRandomDepth(), juce::dontSendNotification);
-    grainArpSlider.setValue(strip->getGrainArpDepth(), juce::dontSendNotification);
-    grainCloudSlider.setValue(strip->getGrainCloudDepth(), juce::dontSendNotification);
-    grainEmitterSlider.setValue(strip->getGrainEmitterDepth(), juce::dontSendNotification);
-    grainEnvelopeSlider.setValue(strip->getGrainEnvelope(), juce::dontSendNotification);
-    if (!grainArpModeSlider.isMouseButtonDown())
-        grainArpModeSlider.setValue(strip->getGrainArpMode(), juce::dontSendNotification);
-    {
-        if (grainArpModeSlider.isMouseButtonDown())
-            strip->setGrainArpMode(juce::jlimit(0, 5, static_cast<int>(std::round(grainArpModeSlider.getValue()))));
-        const int arpMode = juce::jlimit(0, 5, static_cast<int>(std::round(grainArpModeSlider.getValue())));
-        grainArpModeLabel.setText(getGrainArpModeName(arpMode), juce::dontSendNotification);
-    }
+    if (!modulates(ModernAudioEngine::ModTarget::GrainSize))
+        grainSizeSlider.setValue(strip->getGrainSizeMs(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::GrainDensity))
+        grainDensitySlider.setValue(strip->getGrainDensity(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::GrainPitch))
+        grainPitchSlider.setValue(strip->getGrainPitch(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::GrainPitchJitter))
+        grainPitchJitterSlider.setValue(strip->getGrainPitchJitter(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::GrainSpread))
+        grainSpreadSlider.setValue(strip->getGrainSpread(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::GrainJitter))
+        grainJitterSlider.setValue(strip->getGrainJitter(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::GrainRandom))
+        grainRandomSlider.setValue(strip->getGrainRandomDepth(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::GrainArp))
+        grainArpSlider.setValue(strip->getGrainArpDepth(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::GrainCloud))
+        grainCloudSlider.setValue(strip->getGrainCloudDepth(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::GrainEmitter))
+        grainEmitterSlider.setValue(strip->getGrainEmitterDepth(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::GrainEnvelope))
+        grainEnvelopeSlider.setValue(strip->getGrainEnvelope(), juce::dontSendNotification);
+    grainShapeSlider.setValue(strip->getGrainShape(), juce::dontSendNotification);
     const bool grainSyncEnabled = strip->isGrainTempoSyncEnabled();
     grainSizeSyncToggle.setToggleState(grainSyncEnabled, juce::dontSendNotification);
     grainSizeDivLabel.setText(grainSyncEnabled ? "SYNC" : "FREE", juce::dontSendNotification);
@@ -2629,14 +2695,18 @@ void StripControl::updateFromEngine()
     {
         const bool arpActive = strip->getGrainArpDepth() > 0.001f;
         grainPitchLabel.setText(arpActive ? "RANGE" : "PITCH", juce::dontSendNotification);
-        if (arpActive)
+        if (!grainPitchSlider.isMouseButtonDown())
         {
-            grainPitchSlider.setRange(0.0, 48.0, 0.1);
-            grainPitchSlider.setValue(std::abs(strip->getGrainPitch()), juce::dontSendNotification);
-        }
-        else
-        {
-            grainPitchSlider.setRange(-48.0, 48.0, 0.1);
+            if (arpActive)
+            {
+                grainPitchSlider.setRange(0.0, 48.0, 0.1);
+                grainPitchSlider.setValue(std::abs(strip->getGrainPitch()), juce::dontSendNotification);
+            }
+            else
+            {
+                grainPitchSlider.setRange(-48.0, 48.0, 0.1);
+                grainPitchSlider.setValue(strip->getGrainPitch(), juce::dontSendNotification);
+            }
         }
     }
 
@@ -2699,6 +2769,7 @@ void StripControl::updateFromEngine()
     tintSlider(grainCloudSlider, baseControl, 0.0f);
     tintSlider(grainEmitterSlider, baseControl, 0.0f);
     tintSlider(grainEnvelopeSlider, baseControl, 0.0f);
+    tintSlider(grainShapeSlider, baseControl, 0.0f);
     setModIndicator(volumeSlider, false, 0.0f, 0.0f, kAccent);
     setModIndicator(panSlider, false, 0.0f, 0.0f, kAccent);
     setModIndicator(speedSlider, false, 0.0f, 0.0f, kAccent);
@@ -2714,6 +2785,7 @@ void StripControl::updateFromEngine()
     setModIndicator(grainCloudSlider, false, 0.0f, 0.0f, kAccent);
     setModIndicator(grainEmitterSlider, false, 0.0f, 0.0f, kAccent);
     setModIndicator(grainEnvelopeSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainShapeSlider, false, 0.0f, 0.0f, kAccent);
 
     if (auto* engine = processor.getAudioEngine())
     {
@@ -2757,6 +2829,7 @@ void StripControl::updateFromEngine()
                     case ModernAudioEngine::ModTarget::GrainCloud: return &grainCloudSlider;
                     case ModernAudioEngine::ModTarget::GrainEmitter: return &grainEmitterSlider;
                     case ModernAudioEngine::ModTarget::GrainEnvelope: return &grainEnvelopeSlider;
+                    case ModernAudioEngine::ModTarget::Retrigger: return nullptr;
                     default: return nullptr;
                 }
             }();
@@ -2943,22 +3016,16 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     gateShapeLabel.setColour(juce::Label::textColourId, stripColor);
     addAndMakeVisible(gateShapeLabel);
 
-    gateShapeBox.addItem("Sine", 1);
-    gateShapeBox.addItem("Triangle", 2);
-    gateShapeBox.addItem("Square", 3);
-    gateShapeBox.setSelectedId(1);
-    gateShapeBox.onChange = [this]()
+    gateShapeSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+    gateShapeSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 38, 14);
+    gateShapeSlider.setRange(0.0, 1.0, 0.01);
+    gateShapeSlider.setValue(0.5);
+    gateShapeSlider.onValueChange = [this]()
     {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-        {
-            const int id = gateShapeBox.getSelectedId();
-            EnhancedAudioStrip::GateShape shape = EnhancedAudioStrip::GateShape::Sine;
-            if (id == 2) shape = EnhancedAudioStrip::GateShape::Triangle;
-            else if (id == 3) shape = EnhancedAudioStrip::GateShape::Square;
-            strip->setGateShape(shape);
-        }
+            strip->setGateShape(static_cast<float>(gateShapeSlider.getValue()));
     };
-    addAndMakeVisible(gateShapeBox);
+    addAndMakeVisible(gateShapeSlider);
     
     // Start timer for updating from engine
     startTimer(50);  // Update at 20Hz
@@ -3042,7 +3109,7 @@ void FXStripControl::resized()
 
     auto shapeRow = field2.removeFromTop(20);
     gateShapeLabel.setBounds(shapeRow.removeFromLeft(38));
-    gateShapeBox.setBounds(shapeRow);
+    gateShapeSlider.setBounds(shapeRow);
 
     // === FIELD 3: RESERVED ===
     (void) field3;
@@ -3063,6 +3130,30 @@ void FXStripControl::updateFromEngine()
     gateSpeedBox.setSelectedId(gateRateIdFromCycles(strip->getGateSpeed()), juce::dontSendNotification);
     gateEnvSlider.setValue(strip->getGateEnvelope(), juce::dontSendNotification);
 
+    const auto base = stripColor.withAlpha(0.72f);
+    auto setBaseSliderTint = [](juce::Slider& s, juce::Colour c)
+    {
+        s.setColour(juce::Slider::rotarySliderFillColourId, c);
+        s.setColour(juce::Slider::trackColourId, c.withAlpha(0.78f));
+        s.setColour(juce::Slider::thumbColourId, c.brighter(0.18f));
+        s.setColour(juce::Slider::rotarySliderOutlineColourId, c.darker(0.72f).withAlpha(0.82f));
+    };
+    auto pickVisibleModColour = [](juce::Colour baseColour)
+    {
+        const auto baseRgb = juce::Colour::fromRGB(baseColour.getRed(), baseColour.getGreen(), baseColour.getBlue());
+        const auto accentRgb = juce::Colour::fromRGB(0xff, 0xd2, 0x4a);
+        const auto dR = static_cast<float>(baseRgb.getFloatRed() - accentRgb.getFloatRed());
+        const auto dG = static_cast<float>(baseRgb.getFloatGreen() - accentRgb.getFloatGreen());
+        const auto dB = static_cast<float>(baseRgb.getFloatBlue() - accentRgb.getFloatBlue());
+        const float rgbDist = std::sqrt((dR * dR) + (dG * dG) + (dB * dB));
+        const bool nearYellowHue = baseColour.getHue() > 0.10f && baseColour.getHue() < 0.18f;
+        const bool nearAccent = baseColour.getPerceivedBrightness() > 0.45f && rgbDist < 0.34f;
+        return (nearYellowHue || nearAccent) ? juce::Colour(0xff3bd5ff) : juce::Colour(0xffffd24a);
+    };
+
+    setBaseSliderTint(filterFreqSlider, base);
+    setBaseSliderTint(filterResSlider, base);
+
     const auto algo = strip->getFilterAlgorithm();
     int algoId = 1;
     if (algo == EnhancedAudioStrip::FilterAlgorithm::Tpt24) algoId = 2;
@@ -3071,15 +3162,28 @@ void FXStripControl::updateFromEngine()
     else if (algo == EnhancedAudioStrip::FilterAlgorithm::MoogStilson) algoId = 5;
     else if (algo == EnhancedAudioStrip::FilterAlgorithm::MoogHuov) algoId = 6;
     filterAlgoBox.setSelectedId(algoId, juce::dontSendNotification);
-    int gateShapeId = 1;
-    switch (strip->getGateShape())
+    gateShapeSlider.setValue(strip->getGateShape(), juce::dontSendNotification);
+
+    if (auto* engine = processor.getAudioEngine())
     {
-        case EnhancedAudioStrip::GateShape::Triangle: gateShapeId = 2; break;
-        case EnhancedAudioStrip::GateShape::Square: gateShapeId = 3; break;
-        case EnhancedAudioStrip::GateShape::Sine:
-        default: gateShapeId = 1; break;
+        const auto mod = engine->getModSequencerState(stripIndex);
+        const bool active = (mod.target == ModernAudioEngine::ModTarget::Cutoff
+                          || mod.target == ModernAudioEngine::ModTarget::Resonance);
+        if (active)
+        {
+            const float depth = juce::jlimit(0.0f, 1.0f, mod.depth);
+            const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, engine->getModLengthBars(stripIndex));
+            const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
+            const int step = juce::jlimit(0, totalSteps - 1, engine->getModCurrentGlobalStep(stripIndex));
+            const float raw = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(stripIndex, step));
+            const float pulse = juce::jlimit(0.0f, 1.0f, (0.35f + (0.65f * (raw * depth))) * (((step & 1) == 0) ? 1.0f : 0.65f));
+            const auto modColour = pickVisibleModColour(base).withAlpha(0.82f + (0.18f * pulse));
+            if (mod.target == ModernAudioEngine::ModTarget::Cutoff)
+                setBaseSliderTint(filterFreqSlider, modColour);
+            else
+                setBaseSliderTint(filterResSlider, modColour);
+        }
     }
-    gateShapeBox.setSelectedId(gateShapeId, juce::dontSendNotification);
 }
 
 void FXStripControl::timerCallback()
@@ -5030,10 +5134,14 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
     targetBox.addItem("Grain Cloud", 16);
     targetBox.addItem("Grain Emitter", 17);
     targetBox.addItem("Grain Envelope", 18);
+    targetBox.addItem("Retrigger", 19);
     targetBox.onChange = [this]()
     {
         if (auto* engine = processor.getAudioEngine())
+        {
             engine->setModTarget(selectedStrip, comboIdToModTarget(targetBox.getSelectedId()));
+            bipolarToggle.setToggleState(engine->isModBipolar(selectedStrip), juce::dontSendNotification);
+        }
     };
     addAndMakeVisible(targetBox);
 

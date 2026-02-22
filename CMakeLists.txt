@@ -159,10 +159,24 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     endif()
 endif()
 
+# Reduce known warning noise from JUCE + external DSP headers when building with Clang.
+# This does not change DSP/runtime behavior.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(mlrVST PRIVATE
+        -Wno-nan-infinity-disabled
+    )
+endif()
+
 # Include directories
 target_include_directories(mlrVST
     PRIVATE
         Source
+)
+
+# Third-party headers are treated as system includes to avoid surfacing
+# vendor warnings as project warnings.
+target_include_directories(mlrVST
+    SYSTEM PRIVATE
         third_party/MoogLadders-main/src
 )
 

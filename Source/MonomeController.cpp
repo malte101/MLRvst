@@ -3,7 +3,28 @@
 #include "MonomeFilterActions.h"
 #include "MonomeGroupAssignActions.h"
 #include "MonomeMixActions.h"
+#include <array>
 #include <cmath>
+#include <limits>
+
+namespace
+{
+double stutterDivisionBeatsFromButton(int x)
+{
+    static constexpr std::array<double, 7> kDivisionBeats{
+        1.0,            // col 9  -> 1/4
+        2.0 / 3.0,      // col 10 -> 1/4T
+        0.5,            // col 11 -> 1/8
+        1.0 / 3.0,      // col 12 -> 1/8T
+        0.25,           // col 13 -> 1/16
+        0.125,          // col 14 -> 1/32
+        0.0625          // col 15 -> 1/64
+    };
+
+    const int idx = juce::jlimit(0, 6, x - 9);
+    return kDivisionBeats[static_cast<size_t>(idx)];
+}
+}
 
 void MlrVSTAudioProcessor::setMomentaryScratchHold(bool shouldEnable)
 {
@@ -13,8 +34,8 @@ void MlrVSTAudioProcessor::setMomentaryScratchHold(bool shouldEnable)
     if (momentaryScratchHoldActive == shouldEnable)
         return;
 
-    momentaryScratchHoldActive = shouldEnable;
     const double hostPpqNow = audioEngine->getTimelineBeat();
+    momentaryScratchHoldActive = shouldEnable;
 
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -31,31 +52,157 @@ void MlrVSTAudioProcessor::setMomentaryScratchHold(bool shouldEnable)
             momentaryScratchSavedDirection[idx] = strip->getDirectionMode();
             momentaryScratchWasStepMode[idx] = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
 
-            // Force temporary scratch timing profile and enable scratch globally.
+            // Original momentary scratch profile.
             strip->setScratchAmount(15.0f);
 
-            // In Step mode, temporarily switch to Random behavior while held.
             if (momentaryScratchWasStepMode[idx])
                 strip->setDirectionMode(EnhancedAudioStrip::DirectionMode::Random);
         }
         else
         {
             const int64_t nowSample = audioEngine->getGlobalSampleCount();
-
             strip->setScratchAmount(momentaryScratchSavedAmount[idx]);
 
             if (momentaryScratchWasStepMode[idx])
                 strip->setDirectionMode(momentaryScratchSavedDirection[idx]);
 
-            // Ensure no strip remains in half-finished scratch after momentary
-            // modifier release; force return to timeline phase.
             if (strip->isScratchActive())
                 strip->snapToTimeline(nowSample);
 
-            // Final bulletproof phase guard: compare against pre-momentary phase
-            // reference and hard-correct if drifted.
             strip->enforceMomentaryPhaseReference(hostPpqNow, nowSample);
         }
+    }
+}
+
+void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
+{
+    if (!audioEngine)
+        return;
+
+    if (momentaryStutterHoldActive == shouldEnable && !shouldEnable)
+        return;
+
+    const double hostPpqNow = audioEngine->getTimelineBeat();
+    const int64_t nowSample = audioEngine->getGlobalSampleCount();
+
+    if (shouldEnable && momentaryStutterHoldActive)
+    {
+        pendingStutterReleaseActive.store(0, std::memory_order_release);
+        pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
+        pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
+        audioEngine->setMomentaryStutterDivision(momentaryStutterDivisionBeats);
+        for (int i = 0; i < MaxStrips; ++i)
+        {
+            auto* strip = audioEngine->getStrip(i);
+            if (!strip || !strip->hasAudio() || !strip->isPlaying())
+                continue;
+            const int stutterColumn = juce::jlimit(0, 15, strip->getCurrentColumn());
+            audioEngine->setMomentaryStutterStrip(i, stutterColumn, true);
+        }
+        return;
+    }
+
+    momentaryStutterHoldActive = shouldEnable;
+    if (shouldEnable)
+    {
+        pendingStutterReleaseActive.store(0, std::memory_order_release);
+        pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
+        pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
+
+        double currentPpq = audioEngine->getTimelineBeat();
+        if (auto* playHead = getPlayHead())
+        {
+            if (auto position = playHead->getPosition())
+            {
+                if (position->getPpqPosition().hasValue())
+                    currentPpq = *position->getPpqPosition();
+            }
+        }
+        const int quantizeDivision = juce::jmax(1, getQuantizeDivision());
+        const double quantBeats = 4.0 / static_cast<double>(quantizeDivision);
+        double entryPpq = std::ceil(currentPpq / quantBeats) * quantBeats;
+        if (entryPpq <= (currentPpq + 1.0e-6))
+            entryPpq += quantBeats;
+        entryPpq = std::round(entryPpq / quantBeats) * quantBeats;
+
+        audioEngine->setMomentaryStutterDivision(momentaryStutterDivisionBeats);
+        audioEngine->setMomentaryStutterStartPpq(entryPpq);
+        audioEngine->clearMomentaryStutterStrips();
+        for (int i = 0; i < MaxStrips; ++i)
+        {
+            auto* strip = audioEngine->getStrip(i);
+            const auto idx = static_cast<size_t>(i);
+            momentaryStutterStripArmed[idx] = false;
+            if (!strip || !strip->hasAudio() || !strip->isPlaying())
+            {
+                audioEngine->setMomentaryStutterStrip(i, 0, false);
+                continue;
+            }
+
+            strip->captureMomentaryPhaseReference(hostPpqNow);
+            const int stutterColumn = juce::jlimit(0, 15, strip->getCurrentColumn());
+            audioEngine->setMomentaryStutterStrip(i, stutterColumn, true);
+            momentaryStutterStripArmed[idx] = true;
+        }
+        audioEngine->setMomentaryStutterActive(true);
+    }
+    else
+    {
+        // UI/key state ends immediately on key-up; audio release remains quantized.
+        momentaryStutterHoldActive = false;
+        momentaryStutterActiveDivisionButton = -1;
+
+        // Quantized stutter release (PPQ-locked):
+        // convert next PPQ grid boundary to an absolute sample target now.
+        const int division = juce::jmax(1, getQuantizeDivision());
+        const double quantBeats = 4.0 / static_cast<double>(division);
+
+        double currentPpq = audioEngine->getTimelineBeat();
+        double tempoNow = juce::jmax(1.0, audioEngine->getCurrentTempo());
+        if (auto* playHead = getPlayHead())
+        {
+            if (auto position = playHead->getPosition())
+            {
+                if (position->getPpqPosition().hasValue())
+                    currentPpq = *position->getPpqPosition();
+                if (position->getBpm().hasValue() && *position->getBpm() > 1.0)
+                    tempoNow = *position->getBpm();
+            }
+        }
+
+        double releasePpq = std::ceil(currentPpq / quantBeats) * quantBeats;
+        if (releasePpq <= (currentPpq + 1.0e-6))
+            releasePpq += quantBeats;
+        releasePpq = std::round(releasePpq / quantBeats) * quantBeats;
+
+        const double samplesPerQuarter = (60.0 / tempoNow) * currentSampleRate;
+        const int64_t currentAbsSample = static_cast<int64_t>(std::llround(currentPpq * samplesPerQuarter));
+        const int64_t targetAbsSample = static_cast<int64_t>(std::llround(releasePpq * samplesPerQuarter));
+        const int64_t deltaSamples = juce::jmax<int64_t>(1, targetAbsSample - currentAbsSample);
+        const int64_t targetSample = nowSample + deltaSamples;
+
+        pendingStutterReleaseQuantizeDivision.store(division, std::memory_order_release);
+        pendingStutterReleasePpq.store(releasePpq, std::memory_order_release);
+        pendingStutterReleaseSampleTarget.store(targetSample, std::memory_order_release);
+        pendingStutterReleaseActive.store(1, std::memory_order_release);
+    }
+}
+
+void MlrVSTAudioProcessor::performMomentaryStutterReleaseNow(double hostPpqNow, int64_t nowSample)
+{
+    if (!audioEngine)
+        return;
+
+    audioEngine->setMomentaryStutterActive(false);
+    audioEngine->setMomentaryStutterStartPpq(-1.0);
+    audioEngine->clearMomentaryStutterStrips();
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        auto* strip = audioEngine->getStrip(i);
+        if (!strip)
+            continue;
+        strip->enforceMomentaryPhaseReference(hostPpqNow, nowSample);
+        momentaryStutterStripArmed[static_cast<size_t>(i)] = false;
     }
 }
 
@@ -121,7 +268,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 return;
             }
 
-            // Restore ONLY row 0 col 8 momentary scratch hold.
+            // Row 0 col 8: original momentary scratch hold.
             if (x == 8 && (!controlModeActive || currentControlMode == ControlMode::Normal))
             {
                 setMomentaryScratchHold(true);
@@ -129,7 +276,16 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 return;
             }
 
-            // Row 0 cols 9..14 remain intentionally unused (time/trans not implemented).
+            // Row 0, cols 9-15: momentary stutter rates (timeline-synced):
+            // 9=1/4 ... 15=1/64.
+            if (x >= 9 && x <= 15 && (!controlModeActive || currentControlMode == ControlMode::Normal))
+            {
+                momentaryStutterDivisionBeats = stutterDivisionBeatsFromButton(x);
+                momentaryStutterActiveDivisionButton = x;
+                updateMonomeLEDs();
+                setMomentaryStutterHold(true);
+                return;
+            }
 
             // FILTER MODE: Buttons 0-3 select filter sub-pages
             if (controlModeActive && currentControlMode == ControlMode::Filter)
@@ -471,6 +627,12 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             updateMonomeLEDs();
             return;
         }
+        if (y == GROUP_ROW && x >= 9 && x <= 15)
+        {
+            setMomentaryStutterHold(false);
+            updateMonomeLEDs();
+            return;
+        }
 
         // Notify strip of button release (for musical scratching)
         if (y >= FIRST_STRIP_ROW && y < CONTROL_ROW)
@@ -537,6 +699,10 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     const double beatNow = audioEngine->getTimelineBeat();
     const bool fastBlinkOn = std::fmod(beatNow * 2.0, 1.0) < 0.5;  // Twice per beat
     const bool slowBlinkOn = std::fmod(beatNow, 1.0) < 0.5;        // Once per beat
+    const double beatPhase = std::fmod(beatNow, 1.0);
+    const bool metroPulseOn = beatPhase < 0.22;                    // Short pulse at each beat
+    const int beatIndexInBar = juce::jmax(0, static_cast<int>(std::floor(beatNow)) % 4);
+    const bool metroDownbeat = (beatIndexInBar == 0);
 
     if (controlModeActive && currentControlMode == ControlMode::Preset)
     {
@@ -573,7 +739,12 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         const int activeButton = getControlButtonForMode(currentControlMode);
         if (activeButton >= 0 && activeButton < NumControlRowPages)
             newLedState[activeButton][CONTROL_ROW] = 15;
-        newLedState[15][CONTROL_ROW] = quantizeEnabled ? 12 : 3;
+        // Metronome pulse on control-row quantize button (row 7, col 15):
+        // beat pulses dim, bar "1" pulses bright.
+        if (metroPulseOn)
+            newLedState[15][CONTROL_ROW] = metroDownbeat ? 15 : 7;
+        else
+            newLedState[15][CONTROL_ROW] = quantizeEnabled ? 5 : 2;
 
         for (int y = 0; y < 8; ++y)
         {
@@ -733,7 +904,16 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     if (!controlModeActive || currentControlMode == ControlMode::Normal)
         newLedState[8][GROUP_ROW] = momentaryScratchHoldActive ? 15 : 4;
 
-    // Row 0 columns 9..14 intentionally left unused (time/trans not implemented).
+    // Row 0, cols 9-15: momentary stutter division selectors.
+    // Visible on normal page only.
+    if (!controlModeActive || currentControlMode == ControlMode::Normal)
+    {
+        for (int x = 9; x <= 15; ++x)
+        {
+            const bool active = momentaryStutterHoldActive && (momentaryStutterActiveDivisionButton == x);
+            newLedState[x][GROUP_ROW] = active ? (fastBlinkOn ? 15 : 8) : 2;
+        }
+    }
     
     // ROWS 1-6: Strip displays
     for (int stripIndex = 0; stripIndex < 6; ++stripIndex)
@@ -982,7 +1162,12 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             newLedState[activeButton][CONTROL_ROW] = 15;
     }
 
-    newLedState[15][CONTROL_ROW] = quantizeEnabled ? 12 : 3;
+    // Metronome pulse on control-row quantize button (row 7, col 15):
+    // beat pulses dim, bar "1" pulses bright.
+    if (metroPulseOn)
+        newLedState[15][CONTROL_ROW] = metroDownbeat ? 15 : 7;
+    else
+        newLedState[15][CONTROL_ROW] = quantizeEnabled ? 5 : 2;
     
     // Differential update
     for (int y = 0; y < 8; ++y)

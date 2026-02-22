@@ -370,7 +370,7 @@ void savePreset(int presetIndex,
         stripXml->setAttribute("gateAmount", strip->getGateAmount());
         stripXml->setAttribute("gateSpeed", strip->getGateSpeed());
         stripXml->setAttribute("gateEnvelope", strip->getGateEnvelope());
-        stripXml->setAttribute("gateShape", static_cast<int>(strip->getGateShape()));
+        stripXml->setAttribute("gateShapeCurve", strip->getGateShape());
         stripXml->setAttribute("stepPatternBars", strip->getStepPatternBars());
         stripXml->setAttribute("stepViewPage", strip->getStepPage());
         stripXml->setAttribute("stepCurrent", strip->currentStep);
@@ -387,6 +387,7 @@ void savePreset(int presetIndex,
         stripXml->setAttribute("grainCloudDepth", strip->getGrainCloudDepth());
         stripXml->setAttribute("grainEmitterDepth", strip->getGrainEmitterDepth());
         stripXml->setAttribute("grainEnvelope", strip->getGrainEnvelope());
+        stripXml->setAttribute("grainShape", strip->getGrainShape());
         stripXml->setAttribute("grainArpMode", strip->getGrainArpMode());
         stripXml->setAttribute("grainTempoSync", strip->isGrainTempoSyncEnabled());
 
@@ -662,8 +663,22 @@ void loadPreset(int presetIndex,
         strip->setGateAmount(clampedFloat(stripXml->getDoubleAttribute("gateAmount", 0.0), 0.0f, 0.0f, 1.0f));
         strip->setGateSpeed(clampedFloat(stripXml->getDoubleAttribute("gateSpeed", 4.0), 4.0f, 0.25f, 16.0f));
         strip->setGateEnvelope(clampedFloat(stripXml->getDoubleAttribute("gateEnvelope", 0.5), 0.5f, 0.0f, 1.0f));
-        strip->setGateShape(static_cast<EnhancedAudioStrip::GateShape>(
-            clampedInt(stripXml->getIntAttribute("gateShape", 0), 0, 2, 0)));
+        if (stripXml->hasAttribute("gateShapeCurve"))
+        {
+            strip->setGateShape(clampedFloat(stripXml->getDoubleAttribute("gateShapeCurve", 0.5), 0.5f, 0.0f, 1.0f));
+        }
+        else
+        {
+            // Backward compatibility for older enum presets:
+            // Sine(0)->0.50, Triangle(1)->0.75, Square(2)->0.20
+            const int legacyShape = clampedInt(stripXml->getIntAttribute("gateShape", 0), 0, 2, 0);
+            float mappedShape = 0.5f;
+            if (legacyShape == 1)
+                mappedShape = 0.75f;
+            else if (legacyShape == 2)
+                mappedShape = 0.2f;
+            strip->setGateShape(mappedShape);
+        }
 
         strip->setStepPatternBars(clampedInt(stripXml->getIntAttribute("stepPatternBars", 1), 1, 4, 1));
         strip->setStepPage(clampedInt(stripXml->getIntAttribute("stepViewPage", 0), 0, 3, 0));
@@ -681,11 +696,12 @@ void loadPreset(int presetIndex,
         strip->setGrainCloudDepth(static_cast<float>(stripXml->getDoubleAttribute("grainCloudDepth", strip->getGrainCloudDepth())));
         strip->setGrainEmitterDepth(static_cast<float>(stripXml->getDoubleAttribute("grainEmitterDepth", strip->getGrainEmitterDepth())));
         strip->setGrainEnvelope(static_cast<float>(stripXml->getDoubleAttribute("grainEnvelope", strip->getGrainEnvelope())));
+        strip->setGrainShape(clampedFloat(stripXml->getDoubleAttribute("grainShape", strip->getGrainShape()), strip->getGrainShape(), -1.0f, 1.0f));
         strip->setGrainArpMode(clampedInt(stripXml->getIntAttribute("grainArpMode", strip->getGrainArpMode()), 0, 5, strip->getGrainArpMode()));
         strip->setGrainTempoSyncEnabled(stripXml->getBoolAttribute("grainTempoSync", strip->isGrainTempoSyncEnabled()));
 
         audioEngine->setModTarget(stripIndex,
-            static_cast<ModernAudioEngine::ModTarget>(clampedInt(stripXml->getIntAttribute("modTarget", 0), 0, 17, 0)));
+            static_cast<ModernAudioEngine::ModTarget>(clampedInt(stripXml->getIntAttribute("modTarget", 0), 0, 18, 0)));
         audioEngine->setModBipolar(stripIndex, stripXml->getBoolAttribute("modBipolar", false));
         audioEngine->setModCurveMode(stripIndex, stripXml->getBoolAttribute("modCurveMode", false));
         audioEngine->setModDepth(stripIndex, clampedFloat(stripXml->getDoubleAttribute("modDepth", 1.0), 1.0f, 0.0f, 1.0f));

@@ -270,6 +270,9 @@ private:
         bool reverse = false;
         bool quantized = false;
         double targetPpq = 0.0;
+        int quantizeDivision = 8;
+        bool postClearTriggerArmed = false;
+        int postClearTriggerColumn = 0;
     };
 
     struct PendingBarChange
@@ -342,6 +345,7 @@ private:
     
     void handleMonomeKeyPress(int x, int y, int state);
     void setMomentaryScratchHold(bool shouldEnable);
+    void setMomentaryStutterHold(bool shouldEnable);
     
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     void cacheParameterPointers();
@@ -357,6 +361,8 @@ private:
     void queueLoopChange(int stripIndex, bool clearLoop, int startColumn, int endColumn, bool reverseDirection, int markerColumn = -1);
     void applyPendingLoopChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
     void applyPendingBarChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
+    void applyPendingStutterRelease(const juce::AudioPlayHead::PositionInfo& posInfo);
+    void performMomentaryStutterReleaseNow(double hostPpqNow, int64_t nowSample);
     bool getHostSyncSnapshot(double& outPpq, double& outTempo) const;
     void performPresetLoad(int presetIndex, double hostPpqSnapshot, double hostTempoSnapshot);
 
@@ -365,6 +371,16 @@ private:
     std::array<float, MaxStrips> momentaryScratchSavedAmount{};
     std::array<EnhancedAudioStrip::DirectionMode, MaxStrips> momentaryScratchSavedDirection{};
     std::array<bool, MaxStrips> momentaryScratchWasStepMode{};
+
+    // Row 0, cols 9..15: PPQ stutter-hold with fixed divisions.
+    bool momentaryStutterHoldActive = false;
+    double momentaryStutterDivisionBeats = 1.0; // 1.0=1/4 ... 0.0625=1/64
+    int momentaryStutterActiveDivisionButton = -1;
+    std::array<bool, MaxStrips> momentaryStutterStripArmed{};
+    std::atomic<int> pendingStutterReleaseActive{0};
+    std::atomic<double> pendingStutterReleasePpq{-1.0};
+    std::atomic<int> pendingStutterReleaseQuantizeDivision{8};
+    std::atomic<int64_t> pendingStutterReleaseSampleTarget{-1};
 
     // Preset page hold/double-tap state (used when control mode == Preset).
     int loadedPresetIndex = -1;

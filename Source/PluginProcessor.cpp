@@ -1107,6 +1107,7 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     // Apply any pending loop enter/exit actions that were quantized to timeline.
     applyPendingLoopChanges(posInfo);
     applyPendingBarChanges(posInfo);
+    applyPendingStutterRelease(posInfo);
 
     // Update strip parameters
     for (int i = 0; i < MaxStrips; ++i)
@@ -1287,11 +1288,12 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
         return;
 
     const auto selection = decodeBarSelection(bars);
+    // UI should reflect requested bars immediately; beat-domain remap can still be quantized.
+    strip->setRecordingBars(selection.recordingBars);
     setPendingBarLengthApply(stripIndex, false);
 
     if (!strip->hasAudio())
     {
-        strip->setRecordingBars(selection.recordingBars);
         strip->setBeatsPerLoop(selection.beatsPerLoop);
         const juce::ScopedLock lock(pendingBarChangeLock);
         pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
@@ -1300,7 +1302,6 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
 
     if (!strip->isPlaying())
     {
-        strip->setRecordingBars(selection.recordingBars);
         strip->setBeatsPerLoop(selection.beatsPerLoop);
         const juce::ScopedLock lock(pendingBarChangeLock);
         pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
@@ -1308,8 +1309,8 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
     }
 
     const int quantizeDivision = getQuantizeDivision();
-    // Bar-change timing follows the global quantize grid selection directly.
-    const bool useQuantize = (quantizeDivision > 1);
+    // Bar changes must always be PPQ-grid scheduled; no immediate fallback path.
+    const bool useQuantize = (quantizeDivision >= 1);
 
     double currentPpq = audioEngine->getTimelineBeat();
     if (auto* playHead = getPlayHead())
@@ -1321,14 +1322,10 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
         }
     }
 
-    // Strict PPQ safety: only accept live bar-change requests when we have a
-    // valid current PPQ and the strip is timeline-anchored.
-    if (!std::isfinite(currentPpq) || !strip->isPpqTimelineAnchored())
-    {
-        const juce::ScopedLock lock(pendingBarChangeLock);
-        pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
-        return;
-    }
+    // Strict PPQ safety:
+    // if PPQ/anchor is not valid at request time, keep request pending and
+    // resolve target grid later when timing becomes valid.
+    juce::ignoreUnused(currentPpq);
 
     const juce::ScopedLock lock(pendingBarChangeLock);
     auto& pending = pendingBarChanges[static_cast<size_t>(stripIndex)];
@@ -1339,17 +1336,8 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
     pending.quantizeDivision = quantizeDivision;
     pending.targetPpq = std::numeric_limits<double>::quiet_NaN();
 
-    if (!pending.quantized)
-        return;
-
-    if (!std::isfinite(currentPpq))
-        return;
-
-    const double quantBeats = 4.0 / static_cast<double>(pending.quantizeDivision);
-    double targetPpq = std::ceil(currentPpq / quantBeats) * quantBeats;
-    if (targetPpq <= (currentPpq + 1.0e-6))
-        targetPpq += quantBeats;
-    pending.targetPpq = std::round(targetPpq / quantBeats) * quantBeats;
+    // PPQ target is intentionally resolved on the audio thread in
+    // applyPendingBarChanges() to avoid GUI/OSC vs audio clock skew.
 }
 
 int MlrVSTAudioProcessor::getQuantizeDivision() const
@@ -1370,7 +1358,8 @@ void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int s
         return;
 
     const int quantizeDivision = getQuantizeDivision();
-    const bool useQuantize = quantizeEnabled && quantizeDivision > 1;
+    // PPQ safety: clearing an active inner loop must always be grid-scheduled.
+    const bool useQuantize = clearLoop || (quantizeEnabled && quantizeDivision > 1);
 
     if (!useQuantize)
     {
@@ -1433,6 +1422,9 @@ void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int s
     pending.reverse = reverseDirection;
     pending.quantized = true;
     pending.targetPpq = targetPpq;
+    pending.quantizeDivision = quantizeDivision;
+    pending.postClearTriggerArmed = false;
+    pending.postClearTriggerColumn = 0;
 }
 
 void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::PositionInfo& posInfo)
@@ -1443,6 +1435,9 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
     double currentPpq = audioEngine->getTimelineBeat();
     if (posInfo.getPpqPosition().hasValue())
         currentPpq = *posInfo.getPpqPosition();
+    const double currentTempo = (posInfo.getBpm().hasValue() && *posInfo.getBpm() > 0.0)
+        ? *posInfo.getBpm()
+        : audioEngine->getCurrentTempo();
 
     std::array<PendingLoopChange, MaxStrips> readyChanges{};
     {
@@ -1460,7 +1455,33 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
             }
             else if (std::isfinite(currentPpq))
             {
-                canApplyNow = (currentPpq + 1.0e-6 >= pending.targetPpq);
+                if (!std::isfinite(pending.targetPpq))
+                {
+                    const int division = juce::jmax(1, pending.quantizeDivision);
+                    const double quantBeats = 4.0 / static_cast<double>(division);
+                    double targetPpq = std::ceil(currentPpq / quantBeats) * quantBeats;
+                    if (targetPpq <= (currentPpq + 1.0e-6))
+                        targetPpq += quantBeats;
+                    pending.targetPpq = std::round(targetPpq / quantBeats) * quantBeats;
+                    continue;
+                }
+
+                auto* strip = audioEngine->getStrip(i);
+                const bool hasAnchor = (strip != nullptr) && strip->isPpqTimelineAnchored();
+                const bool targetReached = (currentPpq + 1.0e-6 >= pending.targetPpq);
+                if (targetReached && !hasAnchor)
+                {
+                    // Strict PPQ safety: never apply late/off-grid.
+                    // If not anchor-safe at this grid, roll to the next grid.
+                    const int division = juce::jmax(1, pending.quantizeDivision);
+                    const double quantBeats = 4.0 / static_cast<double>(division);
+                    double nextTarget = std::ceil(currentPpq / quantBeats) * quantBeats;
+                    if (nextTarget <= (currentPpq + 1.0e-6))
+                        nextTarget += quantBeats;
+                    pending.targetPpq = std::round(nextTarget / quantBeats) * quantBeats;
+                    continue;
+                }
+                canApplyNow = hasAnchor && targetReached;
             }
 
             if (!canApplyNow)
@@ -1482,12 +1503,26 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
         if (!strip)
             continue;
 
+        bool triggeredAtColumn = false;
         if (change.clear)
         {
             strip->clearLoop();
             strip->setReverse(false);
-            if (change.markerColumn >= 0)
+            if (change.markerColumn >= 0 && std::isfinite(currentPpq) && currentTempo > 0.0)
+            {
+                juce::AudioPlayHead::PositionInfo retriggerPosInfo;
+                const double applyPpq = (change.quantized && std::isfinite(change.targetPpq))
+                    ? change.targetPpq
+                    : currentPpq;
+                retriggerPosInfo.setPpqPosition(applyPpq);
+                retriggerPosInfo.setBpm(currentTempo);
+                strip->triggerAtSample(change.markerColumn, currentTempo, currentGlobalSample, retriggerPosInfo);
+                triggeredAtColumn = true;
+            }
+            else if (change.markerColumn >= 0)
+            {
                 strip->setPlaybackMarkerColumn(change.markerColumn, currentGlobalSample);
+            }
         }
         else
         {
@@ -1495,9 +1530,31 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
             strip->setReverse(change.reverse);
         }
 
-        const bool markerApplied = (change.clear && change.markerColumn >= 0);
-        if (!markerApplied && strip->isPlaying() && strip->hasAudio())
-            strip->snapToTimeline(currentGlobalSample);
+        if (change.quantized && !triggeredAtColumn)
+        {
+            // Deterministic PPQ realign after loop-geometry change.
+            const double applyPpq = std::isfinite(currentPpq)
+                ? currentPpq
+                : (std::isfinite(change.targetPpq) ? change.targetPpq : audioEngine->getTimelineBeat());
+            strip->realignToPpqAnchor(applyPpq, currentGlobalSample);
+            strip->setBeatsPerLoopAtPpq(strip->getBeatsPerLoop(), applyPpq);
+        }
+        else
+        {
+            const bool markerApplied = (change.clear && change.markerColumn >= 0);
+            if (!markerApplied && strip->isPlaying() && strip->hasAudio())
+                strip->snapToTimeline(currentGlobalSample);
+        }
+
+        // Inner-loop clear gesture: the NEXT pad press while clear is pending
+        // becomes the start column after exit, quantized like normal triggers.
+        if (change.clear && change.postClearTriggerArmed)
+        {
+            const int targetColumn = juce::jlimit(0, MaxColumns - 1, change.postClearTriggerColumn);
+            const int quantizeDivision = getQuantizeDivision();
+            const bool useQuantize = quantizeEnabled && quantizeDivision > 1;
+            audioEngine->triggerStripWithQuantization(i, targetColumn, useQuantize);
+        }
     }
 }
 
@@ -1530,16 +1587,38 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
                 if (targetPpq <= (currentPpq + 1.0e-6))
                     targetPpq += quantBeats;
                 pending.targetPpq = std::round(targetPpq / quantBeats) * quantBeats;
+                continue;
             }
+
+            auto* strip = audioEngine->getStrip(i);
+            const bool stripApplyReady = (strip != nullptr) && strip->hasAudio() && strip->isPlaying();
 
             bool canApplyNow = false;
             if (!pending.quantized)
             {
-                canApplyNow = std::isfinite(currentPpq);
+                canApplyNow = std::isfinite(currentPpq)
+                    && stripApplyReady
+                    && strip->isPpqTimelineAnchored();
             }
             else if (std::isfinite(currentPpq) && std::isfinite(pending.targetPpq))
             {
-                canApplyNow = (currentPpq + 1.0e-6 >= pending.targetPpq);
+                const bool hasAnchor = stripApplyReady && strip->isPpqTimelineAnchored();
+                const bool targetReached = (currentPpq + 1.0e-6 >= pending.targetPpq);
+
+                if (targetReached && !hasAnchor)
+                {
+                    // Strict PPQ safety: if anchor is not valid on target grid,
+                    // roll to the next grid instead of applying off-sync.
+                    const int division = juce::jmax(1, pending.quantizeDivision);
+                    const double quantBeats = 4.0 / static_cast<double>(division);
+                    double nextTarget = std::ceil(currentPpq / quantBeats) * quantBeats;
+                    if (nextTarget <= (currentPpq + 1.0e-6))
+                        nextTarget += quantBeats;
+                    pending.targetPpq = std::round(nextTarget / quantBeats) * quantBeats;
+                    continue;
+                }
+
+                canApplyNow = hasAnchor && targetReached;
             }
 
             if (!canApplyNow)
@@ -1550,6 +1629,11 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
         }
     }
 
+    double currentTempo = audioEngine->getCurrentTempo();
+    if (posInfo.getBpm().hasValue() && *posInfo.getBpm() > 0.0)
+        currentTempo = *posInfo.getBpm();
+
+    const int64_t currentGlobalSample = audioEngine->getGlobalSampleCount();
     for (int i = 0; i < MaxStrips; ++i)
     {
         const auto& change = readyChanges[static_cast<size_t>(i)];
@@ -1560,15 +1644,41 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
         if (!strip || !strip->hasAudio() || !strip->isPlaying())
             continue;
 
-        // Strict PPQ safety: if we cannot prove a stable PPQ anchor now, reject
-        // this pending change and require an explicit retry.
-        if (!std::isfinite(currentPpq) || !strip->isPpqTimelineAnchored())
-            continue;
-
-        const double applyPpq = currentPpq;
+        const double applyPpq = (change.quantized && std::isfinite(change.targetPpq))
+            ? change.targetPpq
+            : currentPpq;
         strip->setRecordingBars(change.recordingBars);
         strip->setBeatsPerLoopAtPpq(change.beatsPerLoop, applyPpq);
+        if (std::isfinite(applyPpq) && currentTempo > 0.0)
+        {
+            // Use the same hard PPQ restore path as preset load to keep
+            // timing deterministic after bar-domain remap.
+            strip->restorePresetPpqState(true,
+                                         true,
+                                         strip->getPpqTimelineOffsetBeats(),
+                                         strip->getCurrentColumn(),
+                                         currentTempo,
+                                         applyPpq,
+                                         currentGlobalSample);
+        }
     }
+}
+
+void MlrVSTAudioProcessor::applyPendingStutterRelease(const juce::AudioPlayHead::PositionInfo& posInfo)
+{
+    if (!audioEngine || pendingStutterReleaseActive.load(std::memory_order_acquire) == 0)
+        return;
+
+    juce::ignoreUnused(posInfo);
+    const int64_t currentSample = audioEngine->getGlobalSampleCount();
+    int64_t targetSample = pendingStutterReleaseSampleTarget.load(std::memory_order_acquire);
+    if (targetSample < 0 || currentSample < targetSample)
+        return;
+
+    pendingStutterReleaseActive.store(0, std::memory_order_release);
+    pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
+    pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
+    performMomentaryStutterReleaseNow(audioEngine->getTimelineBeat(), currentSample);
 }
 
 juce::File MlrVSTAudioProcessor::getDefaultSampleDirectory(int stripIndex, SamplePathMode mode) const
@@ -1863,13 +1973,46 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     auto* strip = audioEngine->getStrip(stripIndex);
     if (!strip) return;
 
+    // If bar length was changed while playing, apply it on the next row trigger.
+    const auto stripIdx = static_cast<size_t>(stripIndex);
+    if (pendingBarLengthApply[stripIdx] && strip->hasAudio())
+    {
+        const int bars = juce::jlimit(1, 8, strip->getRecordingBars());
+        strip->setBeatsPerLoop(static_cast<float>(bars * 4));
+        pendingBarLengthApply[stripIdx] = false;
+    }
+
     // CHECK: If inner loop is active, clear it and return to full loop
     if (strip->getLoopStart() != 0 || strip->getLoopEnd() != MaxColumns)
     {
-        // Inner loop is active - next press clears it, aligned to current quantize grid.
-        queueLoopChange(stripIndex, true, 0, MaxColumns, false, column);
-        DBG("Inner loop clear requested on strip " << stripIndex << " (quantized when enabled)");
-        return;  // Don't trigger, just clear the loop
+        const int targetColumn = juce::jlimit(0, MaxColumns - 1, column);
+        bool updatedPendingClear = false;
+        {
+            const juce::ScopedLock lock(pendingLoopChangeLock);
+            auto& pending = pendingLoopChanges[static_cast<size_t>(stripIndex)];
+            if (pending.active && pending.clear)
+            {
+                // Keep a single quantized clear request active, but allow the
+                // user's latest pad press to define the post-exit position.
+                pending.markerColumn = targetColumn;
+                pending.postClearTriggerArmed = false;
+                updatedPendingClear = true;
+            }
+        }
+
+        if (updatedPendingClear)
+        {
+            DBG("Inner loop clear pending on strip " << stripIndex
+                << " -> updated marker column " << targetColumn);
+            return;
+        }
+
+        // Inner loop is active: this press both clears the loop and defines
+        // the re-entry column, applied together on the quantized boundary.
+        queueLoopChange(stripIndex, true, 0, MaxColumns, false, targetColumn);
+        DBG("Inner loop clear+retrigger requested on strip " << stripIndex
+            << " -> column " << targetColumn << " (quantized)");
+        return;
     }
     
     const double timelineBeat = audioEngine->getTimelineBeat();
@@ -2117,9 +2260,24 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
     int savedGroup = strip->getGroup();
     int savedLoopStart = strip->getLoopStart();
     int savedLoopEnd = strip->getLoopEnd();
-    const double hostPpqBeforeLoad = audioEngine->getTimelineBeat();
+    const bool savedTimelineAnchored = strip->isPpqTimelineAnchored();
+    const double savedTimelineOffsetBeats = strip->getPpqTimelineOffsetBeats();
+    const int savedColumn = strip->getCurrentColumn();
+
+    double hostPpqBeforeLoad = 0.0;
+    double hostTempoBeforeLoad = 0.0;
+    const int64_t globalSampleBeforeLoad = audioEngine->getGlobalSampleCount();
     if (wasPlaying)
-        strip->captureMomentaryPhaseReference(hostPpqBeforeLoad);
+    {
+        // Strict PPQ safety for file browsing:
+        // do not load when hard PPQ resync cannot be guaranteed.
+        if (!savedTimelineAnchored || !getHostSyncSnapshot(hostPpqBeforeLoad, hostTempoBeforeLoad))
+        {
+            DBG("File browse load skipped on strip " << stripIndex
+                << ": requires anchored strip + valid host PPQ/BPM.");
+            return;
+        }
+    }
     
     try
     {
@@ -2133,11 +2291,22 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
         strip->setGroup(savedGroup);
         strip->setLoop(savedLoopStart, savedLoopEnd);
         
-        // If browsing while playing, enforce phase guard only (no retime trigger).
+        // If browsing while playing, hard-restore PPQ state with deterministic
+        // host-time projection based on pre-load PPQ snapshot.
         if (wasPlaying)
         {
-            strip->enforceMomentaryPhaseReference(audioEngine->getTimelineBeat(),
-                                                  audioEngine->getGlobalSampleCount());
+            const int64_t globalSampleNow = audioEngine->getGlobalSampleCount();
+            const int64_t deltaSamples = juce::jmax<int64_t>(0, globalSampleNow - globalSampleBeforeLoad);
+            const double samplesPerQuarter = (60.0 / juce::jmax(1.0, hostTempoBeforeLoad)) * juce::jmax(1.0, currentSampleRate);
+            const double hostPpqApply = hostPpqBeforeLoad + (static_cast<double>(deltaSamples) / juce::jmax(1.0, samplesPerQuarter));
+
+            strip->restorePresetPpqState(true,
+                                         savedTimelineAnchored,
+                                         savedTimelineOffsetBeats,
+                                         savedColumn,
+                                         hostTempoBeforeLoad,
+                                         hostPpqApply,
+                                         globalSampleNow);
         }
     }
     catch (...)

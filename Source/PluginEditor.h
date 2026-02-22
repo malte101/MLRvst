@@ -115,7 +115,7 @@ private:
     juce::Label gateShapeLabel;
     juce::ComboBox gateSpeedBox;
     juce::Slider gateEnvSlider;
-    juce::ComboBox gateShapeBox;
+    juce::Slider gateShapeSlider;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FXStripControl)
 };
@@ -173,8 +173,31 @@ public:
             g.setColour(ringColour.withAlpha(0.9f));
             g.drawEllipse(rx + 1.5f, ry + 1.5f, rw - 3.0f, rw - 3.0f, 1.0f);
 
-            // Modulation indicator (synth-style): bipolar range around current knob position.
+            // Optional bipolar base indicator (used by pitch-like knobs).
             const auto& props = slider.getProperties();
+            const bool bipolarBase = static_cast<bool>(props.getWithDefault("bipolarBase", false));
+            if (bipolarBase)
+            {
+                const float midAngle = rotaryStartAngle + (0.5f * (rotaryEndAngle - rotaryStartAngle));
+                const float rOuter = radius - 0.8f;
+                const float rInner = radius - 4.2f;
+                const float mx1 = centreX + (std::cos(midAngle - juce::MathConstants<float>::halfPi) * rInner);
+                const float my1 = centreY + (std::sin(midAngle - juce::MathConstants<float>::halfPi) * rInner);
+                const float mx2 = centreX + (std::cos(midAngle - juce::MathConstants<float>::halfPi) * rOuter);
+                const float my2 = centreY + (std::sin(midAngle - juce::MathConstants<float>::halfPi) * rOuter);
+                g.setColour(juce::Colour(0xfff0f0f0).withAlpha(0.9f));
+                g.drawLine(mx1, my1, mx2, my2, 1.4f);
+
+                juce::Path bipolarArc;
+                bipolarArc.addArc(rx + 2.2f, ry + 2.2f, rw - 4.4f, rw - 4.4f,
+                                  juce::jmin(midAngle, angle) - juce::MathConstants<float>::halfPi,
+                                  juce::jmax(midAngle, angle) - juce::MathConstants<float>::halfPi,
+                                  true);
+                g.setColour(ringColour.withAlpha(0.95f));
+                g.strokePath(bipolarArc, juce::PathStrokeType(1.8f));
+            }
+
+            // Modulation indicator (synth-style): bipolar range around current knob position.
             const bool modActive = static_cast<bool>(props.getWithDefault("modActive", false));
             if (modActive)
             {
@@ -231,10 +254,57 @@ public:
                               float sliderPos, float minSliderPos, float maxSliderPos,
                               const juce::Slider::SliderStyle style, juce::Slider& slider) override
         {
+            const auto& props = slider.getProperties();
+            const bool bipolarBase = static_cast<bool>(props.getWithDefault("bipolarBase", false));
+
+            // True bipolar rendering: center is neutral, fill extends left/right from center.
+            const bool customBipolarHorizontal = bipolarBase && !(style == juce::Slider::LinearVertical || style == juce::Slider::LinearBarVertical);
+            if (customBipolarHorizontal)
+            {
+                const float cx = static_cast<float>(x) + (0.5f * static_cast<float>(width));
+                const float cy = static_cast<float>(y) + (0.5f * static_cast<float>(height));
+                const float trackH = juce::jlimit(2.0f, 6.0f, static_cast<float>(height) * 0.26f);
+                const float trackY = cy - (trackH * 0.5f);
+                const float left = static_cast<float>(x);
+                const float right = static_cast<float>(x + width);
+                const float pos = juce::jlimit(left, right, sliderPos);
+
+                g.setColour(slider.findColour(juce::Slider::backgroundColourId).withAlpha(0.75f));
+                g.fillRoundedRectangle(left, trackY, static_cast<float>(width), trackH, trackH * 0.5f);
+
+                const float fillX = juce::jmin(cx, pos);
+                const float fillW = std::abs(pos - cx);
+                if (fillW > 0.5f)
+                {
+                    g.setColour(slider.findColour(juce::Slider::trackColourId).withAlpha(0.95f));
+                    g.fillRoundedRectangle(fillX, trackY, fillW, trackH, trackH * 0.5f);
+                }
+
+                g.setColour(juce::Colour(0xfff0f0f0).withAlpha(0.95f));
+                g.drawLine(cx, static_cast<float>(y + 2), cx, static_cast<float>(y + height - 2), 1.2f);
+
+                g.setColour(slider.findColour(juce::Slider::thumbColourId));
+                g.fillEllipse(pos - 4.0f, cy - 4.0f, 8.0f, 8.0f);
+                g.setColour(juce::Colour(0xff0e0e0e).withAlpha(0.8f));
+                g.drawEllipse(pos - 4.0f, cy - 4.0f, 8.0f, 8.0f, 1.0f);
+            }
+            else
+            {
             juce::LookAndFeel_V4::drawLinearSlider(g, x, y, width, height,
                                                    sliderPos, minSliderPos, maxSliderPos, style, slider);
+            }
 
-            const auto& props = slider.getProperties();
+            if (bipolarBase && !customBipolarHorizontal)
+            {
+                const float cy = static_cast<float>(y + (height / 2));
+                const float centerX = static_cast<float>(x) + (0.5f * static_cast<float>(width));
+                const auto baseColour = slider.findColour(juce::Slider::trackColourId).withAlpha(0.9f);
+                g.setColour(baseColour);
+                g.drawLine(centerX, cy, sliderPos, cy, 2.0f); // bipolar value segment from center
+                g.setColour(juce::Colour(0xfff0f0f0).withAlpha(0.9f));
+                g.drawLine(centerX, static_cast<float>(y + 2), centerX, static_cast<float>(y + height - 2), 1.2f);
+            }
+
             const bool modActive = static_cast<bool>(props.getWithDefault("modActive", false));
             if (!modActive)
                 return;
@@ -281,6 +351,7 @@ public:
                 g.setColour(modColour.brighter(0.45f));
                 g.fillEllipse(marker - 2.0f, cy - 2.0f, 4.0f, 4.0f);
             }
+
         }
         
     private:
@@ -335,8 +406,10 @@ private:
     juce::Slider grainCloudSlider;
     juce::Slider grainEmitterSlider;
     juce::Slider grainEnvelopeSlider;
-    juce::Slider grainArpModeSlider;
-    juce::ComboBox grainArpModeBox;
+    juce::Slider grainShapeSlider;
+    juce::TextButton grainTabPitchButton;
+    juce::TextButton grainTabSpaceButton;
+    juce::TextButton grainTabShapeButton;
     juce::ToggleButton grainSizeSyncToggle;
     juce::Label grainSizeDivLabel;
     juce::Label grainSizeLabel;
@@ -350,7 +423,7 @@ private:
     juce::Label grainCloudLabel;
     juce::Label grainEmitterLabel;
     juce::Label grainEnvelopeLabel;
-    juce::Label grainArpModeLabel;
+    juce::Label grainShapeLabel;
     juce::Label modTargetLabel;
     juce::ComboBox modTargetBox;
     juce::ToggleButton modBipolarToggle;
@@ -369,6 +442,13 @@ private:
     juce::Label modCurveTypeLabel;
     juce::ComboBox modCurveTypeBox;
     bool grainOverlayVisible = false;
+    enum class GrainSubPage
+    {
+        Pitch = 0,
+        Space,
+        Shape
+    };
+    GrainSubPage grainSubPage = GrainSubPage::Pitch;
     juce::TextButton loadButton;    // Small
     juce::ComboBox groupSelector;   // Compact
     juce::Label stripLabel;         // Small
@@ -392,6 +472,7 @@ private:
     void hideAllPrimaryControls();
     void hideAllGrainControls();
     void updateGrainOverlayVisibility();
+    void updateGrainTabButtons();
 
     enum class ModTransformMode
     {
@@ -855,7 +936,7 @@ private:
 
         juce::Font getPopupMenuFont() override
         {
-            return juce::Font(juce::FontOptions(11.0f, juce::Font::bold));
+            return juce::Font(juce::FontOptions(14.0f, juce::Font::bold));
         }
     };
 
