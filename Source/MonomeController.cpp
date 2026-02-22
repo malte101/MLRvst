@@ -90,15 +90,41 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
         pendingStutterReleaseActive.store(0, std::memory_order_release);
         pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
         pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
+
+        double currentPpq = audioEngine->getTimelineBeat();
+        if (auto* playHead = getPlayHead())
+        {
+            if (auto position = playHead->getPosition())
+            {
+                if (position->getPpqPosition().hasValue())
+                    currentPpq = *position->getPpqPosition();
+            }
+        }
+        const int quantizeDivision = juce::jmax(1, getQuantizeDivision());
+        const double quantBeats = 4.0 / static_cast<double>(quantizeDivision);
+        double entryPpq = currentPpq;
+        if (std::isfinite(currentPpq))
+        {
+            entryPpq = std::ceil(currentPpq / quantBeats) * quantBeats;
+            if (entryPpq <= (currentPpq + 1.0e-6))
+                entryPpq += quantBeats;
+            entryPpq = std::round(entryPpq / quantBeats) * quantBeats;
+        }
+
         audioEngine->setMomentaryStutterDivision(momentaryStutterDivisionBeats);
+        audioEngine->setMomentaryStutterStartPpq(entryPpq);
+        audioEngine->clearMomentaryStutterStrips();
         for (int i = 0; i < MaxStrips; ++i)
         {
             auto* strip = audioEngine->getStrip(i);
             if (!strip || !strip->hasAudio() || !strip->isPlaying())
                 continue;
+            if (std::isfinite(hostPpqNow))
+                strip->captureMomentaryPhaseReference(hostPpqNow);
             const int stutterColumn = juce::jlimit(0, 15, strip->getCurrentColumn());
             audioEngine->setMomentaryStutterStrip(i, stutterColumn, true);
         }
+        audioEngine->setMomentaryStutterActive(true);
         return;
     }
 
@@ -139,7 +165,8 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
                 continue;
             }
 
-            strip->captureMomentaryPhaseReference(hostPpqNow);
+            if (std::isfinite(hostPpqNow))
+                strip->captureMomentaryPhaseReference(hostPpqNow);
             const int stutterColumn = juce::jlimit(0, 15, strip->getCurrentColumn());
             audioEngine->setMomentaryStutterStrip(i, stutterColumn, true);
             momentaryStutterStripArmed[idx] = true;
@@ -168,6 +195,15 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
                 if (position->getBpm().hasValue() && *position->getBpm() > 1.0)
                     tempoNow = *position->getBpm();
             }
+        }
+
+        if (!std::isfinite(currentPpq) || !std::isfinite(tempoNow) || tempoNow <= 0.0 || currentSampleRate <= 0.0)
+        {
+            pendingStutterReleaseActive.store(0, std::memory_order_release);
+            pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
+            pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
+            performMomentaryStutterReleaseNow(audioEngine->getTimelineBeat(), nowSample);
+            return;
         }
 
         double releasePpq = std::ceil(currentPpq / quantBeats) * quantBeats;

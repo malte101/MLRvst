@@ -1669,16 +1669,44 @@ void MlrVSTAudioProcessor::applyPendingStutterRelease(const juce::AudioPlayHead:
     if (!audioEngine || pendingStutterReleaseActive.load(std::memory_order_acquire) == 0)
         return;
 
-    juce::ignoreUnused(posInfo);
+    double currentPpq = audioEngine->getTimelineBeat();
+    if (posInfo.getPpqPosition().hasValue())
+        currentPpq = *posInfo.getPpqPosition();
+
+    const double targetPpq = pendingStutterReleasePpq.load(std::memory_order_acquire);
     const int64_t currentSample = audioEngine->getGlobalSampleCount();
-    int64_t targetSample = pendingStutterReleaseSampleTarget.load(std::memory_order_acquire);
-    if (targetSample < 0 || currentSample < targetSample)
+    const int64_t targetSample = pendingStutterReleaseSampleTarget.load(std::memory_order_acquire);
+
+    bool releaseReady = false;
+    double applyPpq = currentPpq;
+
+    // Primary path: PPQ-locked release.
+    if (std::isfinite(targetPpq) && std::isfinite(currentPpq))
+    {
+        releaseReady = (currentPpq + 1.0e-6 >= targetPpq);
+        applyPpq = targetPpq;
+    }
+    // Fallback path: sample-target release if PPQ is unavailable.
+    else if (targetSample >= 0)
+    {
+        releaseReady = (currentSample >= targetSample);
+    }
+    // Safety fallback: never stay latched forever when host is not playing.
+    else if (!posInfo.getIsPlaying())
+    {
+        releaseReady = true;
+    }
+
+    if (!releaseReady)
         return;
 
     pendingStutterReleaseActive.store(0, std::memory_order_release);
     pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
     pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
-    performMomentaryStutterReleaseNow(audioEngine->getTimelineBeat(), currentSample);
+
+    if (!std::isfinite(applyPpq))
+        applyPpq = audioEngine->getTimelineBeat();
+    performMomentaryStutterReleaseNow(applyPpq, currentSample);
 }
 
 juce::File MlrVSTAudioProcessor::getDefaultSampleDirectory(int stripIndex, SamplePathMode mode) const
