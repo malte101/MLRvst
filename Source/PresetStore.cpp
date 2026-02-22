@@ -66,6 +66,87 @@ void restoreGlobalParameters(juce::AudioProcessorValueTreeState& parameters, con
         param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, (snapshot.triggerFadeInMs - 0.1f) / 119.9f));
 }
 
+void setParameterToDefault(juce::AudioProcessorValueTreeState& parameters, const juce::String& parameterId)
+{
+    if (auto* param = parameters.getParameter(parameterId))
+        param->setValueNotifyingHost(param->getDefaultValue());
+}
+
+void resetStripParametersToDefaults(juce::AudioProcessorValueTreeState& parameters, int stripIndex)
+{
+    setParameterToDefault(parameters, "stripVolume" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripPan" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripSpeed" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripPitch" + juce::String(stripIndex));
+}
+
+void resetStripToDefaultState(int stripIndex,
+                              EnhancedAudioStrip& strip,
+                              ModernAudioEngine& audioEngine,
+                              juce::AudioProcessorValueTreeState& parameters)
+{
+    strip.clearSample();
+    strip.stop(true);
+    strip.setLoop(0, ModernAudioEngine::MaxColumns);
+    strip.setPlayMode(EnhancedAudioStrip::PlayMode::Loop);
+    strip.setDirectionMode(EnhancedAudioStrip::DirectionMode::Normal);
+    strip.setReverse(false);
+    strip.setVolume(1.0f);
+    strip.setPan(0.0f);
+    strip.setPlaybackSpeed(1.0f);
+    strip.setBeatsPerLoop(-1.0f);
+    strip.setScratchAmount(0.0f);
+    strip.setTransientSliceMode(false);
+    strip.setPitchShift(0.0f);
+    strip.setRecordingBars(1);
+    strip.setFilterFrequency(20000.0f);
+    strip.setFilterResonance(0.707f);
+    strip.setFilterMorph(0.0f);
+    strip.setFilterAlgorithm(EnhancedAudioStrip::FilterAlgorithm::Tpt12);
+    strip.setFilterEnabled(false);
+    strip.setSwingAmount(0.0f);
+    strip.setGateAmount(0.0f);
+    strip.setGateSpeed(4.0f);
+    strip.setGateEnvelope(0.5f);
+    strip.setGateShape(0.5f);
+    strip.setStepPatternBars(1);
+    strip.setStepPage(0);
+    strip.currentStep = 0;
+    strip.stepPattern.fill(false);
+    strip.setGrainSizeMs(1240.0f);
+    strip.setGrainDensity(0.05f);
+    strip.setGrainPitch(0.0f);
+    strip.setGrainPitchJitter(0.0f);
+    strip.setGrainSpread(0.0f);
+    strip.setGrainJitter(0.0f);
+    strip.setGrainRandomDepth(0.0f);
+    strip.setGrainArpDepth(0.0f);
+    strip.setGrainCloudDepth(0.0f);
+    strip.setGrainEmitterDepth(0.0f);
+    strip.setGrainEnvelope(0.0f);
+    strip.setGrainShape(0.0f);
+    strip.setGrainArpMode(0);
+    strip.setGrainTempoSyncEnabled(true);
+
+    audioEngine.assignStripToGroup(stripIndex, -1);
+    audioEngine.setModTarget(stripIndex, ModernAudioEngine::ModTarget::None);
+    audioEngine.setModBipolar(stripIndex, false);
+    audioEngine.setModCurveMode(stripIndex, false);
+    audioEngine.setModDepth(stripIndex, 1.0f);
+    audioEngine.setModOffset(stripIndex, 0);
+    audioEngine.setModLengthBars(stripIndex, 1);
+    audioEngine.setModEditPage(stripIndex, 0);
+    audioEngine.setModSmoothingMs(stripIndex, 0.0f);
+    audioEngine.setModCurveBend(stripIndex, 0.0f);
+    audioEngine.setModCurveShape(stripIndex, ModernAudioEngine::ModCurveShape::Power);
+    audioEngine.setModPitchScaleQuantize(stripIndex, false);
+    audioEngine.setModPitchScale(stripIndex, ModernAudioEngine::PitchScale::Chromatic);
+    for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
+        audioEngine.setModStepValueAbsolute(stripIndex, s, 0.0f);
+
+    resetStripParametersToDefaults(parameters, stripIndex);
+}
+
 juce::String encodeStepPatternBits(const std::array<bool, 64>& bits)
 {
     juce::String out;
@@ -516,16 +597,30 @@ void loadPreset(int presetIndex,
 
         const auto globalSnapshot = captureGlobalParameters(parameters);
 
+        bool restoredParameterState = false;
         if (auto* paramsXml = preset->getChildByName("ParametersState"))
         {
             auto state = juce::ValueTree::fromXml(*paramsXml);
             if (state.isValid())
+            {
                 parameters.replaceState(state);
+                restoredParameterState = true;
+            }
         }
 
         // Preset recall should not overwrite global controls.
         restoreGlobalParameters(parameters, globalSnapshot);
 
+        const int safeMaxStrips = juce::jlimit(0, ModernAudioEngine::MaxStrips, maxStrips);
+        if (!restoredParameterState)
+        {
+            for (int i = 0; i < safeMaxStrips; ++i)
+                resetStripParametersToDefaults(parameters, i);
+        }
+
+        const bool canRecallPlayingState = std::isfinite(hostPpqSnapshot)
+            && std::isfinite(hostTempoSnapshot)
+            && hostTempoSnapshot > 0.0;
         const double recallPpq = std::isfinite(hostPpqSnapshot)
             ? hostPpqSnapshot
             : audioEngine->getTimelineBeat();
@@ -533,11 +628,11 @@ void loadPreset(int presetIndex,
             ? hostTempoSnapshot
             : audioEngine->getCurrentTempo();
 
-        std::vector<bool> stripSeen(static_cast<size_t>(juce::jmax(0, maxStrips)), false);
+        std::vector<bool> stripSeen(static_cast<size_t>(safeMaxStrips), false);
         for (auto* stripXml : preset->getChildWithTagNameIterator("Strip"))
         {
         int stripIndex = stripXml->getIntAttribute("index");
-        if (stripIndex < 0 || stripIndex >= maxStrips)
+        if (stripIndex < 0 || stripIndex >= safeMaxStrips)
             continue;
 
         stripSeen[static_cast<size_t>(stripIndex)] = true;
@@ -597,7 +692,8 @@ void loadPreset(int presetIndex,
         int groupId = stripXml->getIntAttribute("group", -1);
         audioEngine->assignStripToGroup(stripIndex, groupId);
 
-        const bool restorePlaying = stripXml->getBoolAttribute("isPlaying", false);
+        const bool restorePlayingRequested = stripXml->getBoolAttribute("isPlaying", false);
+        const bool restorePlaying = canRecallPlayingState && restorePlayingRequested;
         const int restoreMarkerColumn = clampedInt(stripXml->getIntAttribute("playbackColumn", safeLoopStart),
                                                    0, ModernAudioEngine::MaxColumns - 1, safeLoopStart);
         const bool restorePpqAnchored = stripXml->getBoolAttribute("ppqTimelineAnchored", false);
@@ -648,7 +744,7 @@ void loadPreset(int presetIndex,
         strip->setTransientSliceMode(stripXml->getBoolAttribute("transientSliceMode", false));
         strip->setPitchShift(clampedFloat(stripXml->getDoubleAttribute("pitchShift", 0.0), 0.0f, -12.0f, 12.0f));
         strip->setRecordingBars(clampedInt(stripXml->getIntAttribute("recordingBars", 1), 1, 8, 1));
-        strip->setFilterEnabled(stripXml->getBoolAttribute("filterEnabled", false));
+        const bool restoreFilterEnabled = stripXml->getBoolAttribute("filterEnabled", false);
         strip->setFilterFrequency(clampedFloat(stripXml->getDoubleAttribute("filterFrequency", 20000.0), 20000.0f, 20.0f, 20000.0f));
         strip->setFilterResonance(clampedFloat(stripXml->getDoubleAttribute("filterResonance", 0.707), 0.707f, 0.1f, 10.0f));
         if (stripXml->hasAttribute("filterMorph"))
@@ -659,6 +755,7 @@ void loadPreset(int presetIndex,
 
         strip->setFilterAlgorithm(static_cast<EnhancedAudioStrip::FilterAlgorithm>(
             clampedInt(stripXml->getIntAttribute("filterAlgorithm", 0), 0, 5, 0)));
+        strip->setFilterEnabled(restoreFilterEnabled);
         strip->setSwingAmount(clampedFloat(stripXml->getDoubleAttribute("swingAmount", 0.0), 0.0f, 0.0f, 1.0f));
         strip->setGateAmount(clampedFloat(stripXml->getDoubleAttribute("gateAmount", 0.0), 0.0f, 0.0f, 1.0f));
         strip->setGateSpeed(clampedFloat(stripXml->getDoubleAttribute("gateSpeed", 4.0), 4.0f, 0.25f, 16.0f));
@@ -750,17 +847,15 @@ void loadPreset(int presetIndex,
         }
     }
 
-    for (int i = 0; i < maxStrips; ++i)
+    for (int i = 0; i < safeMaxStrips; ++i)
     {
         if (stripSeen[static_cast<size_t>(i)])
             continue;
 
         if (auto* strip = audioEngine->getStrip(i))
-        {
-            strip->clearSample();
-            strip->stop(true);
-            audioEngine->assignStripToGroup(i, -1);
-        }
+            resetStripToDefaultState(i, *strip, *audioEngine, parameters);
+        else
+            resetStripParametersToDefaults(parameters, i);
     }
 
     for (int i = 0; i < ModernAudioEngine::MaxGroups; ++i)
@@ -817,7 +912,7 @@ void loadPreset(int presetIndex,
 
             const int lengthBeats = patternXml->getIntAttribute("lengthBeats", 4);
             pattern->setEventsSnapshot(events, lengthBeats);
-            if (patternXml->getBoolAttribute("isPlaying", false) && !events.empty())
+            if (canRecallPlayingState && patternXml->getBoolAttribute("isPlaying", false) && !events.empty())
                 pattern->startPlayback(nowBeat);
         }
     }

@@ -10,6 +10,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "PresetStore.h"
+#include <limits>
 
 namespace
 {
@@ -1270,6 +1271,14 @@ void MlrVSTAudioProcessor::captureRecentAudioToStrip(int stripIndex)
     }
 }
 
+void MlrVSTAudioProcessor::clearRecentAudioBuffer()
+{
+    if (!audioEngine)
+        return;
+
+    audioEngine->clearRecentInputBuffer();
+}
+
 void MlrVSTAudioProcessor::setPendingBarLengthApply(int stripIndex, bool pending)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
@@ -2346,6 +2355,121 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
 // Preset Management
 //==============================================================================
 
+void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
+{
+    if (!audioEngine)
+        return;
+
+    pendingPresetLoadIndex.store(-1, std::memory_order_release);
+
+    {
+        const juce::ScopedLock lock(pendingLoopChangeLock);
+        for (auto& pending : pendingLoopChanges)
+            pending = PendingLoopChange{};
+    }
+    {
+        const juce::ScopedLock lock(pendingBarChangeLock);
+        for (auto& pending : pendingBarChanges)
+            pending = PendingBarChange{};
+    }
+    pendingBarLengthApply.fill(false);
+    momentaryScratchHoldActive = false;
+    momentaryStutterHoldActive = false;
+    momentaryStutterActiveDivisionButton = -1;
+    pendingStutterReleaseActive.store(0, std::memory_order_release);
+    pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
+    pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
+    audioEngine->clearMomentaryStutterStrips();
+
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        currentStripFiles[i] = juce::File();
+
+        if (auto* strip = audioEngine->getStrip(i))
+        {
+            strip->clearSample();
+            strip->stop(true);
+            strip->setLoop(0, MaxColumns);
+            strip->setPlayMode(EnhancedAudioStrip::PlayMode::Loop);
+            strip->setDirectionMode(EnhancedAudioStrip::DirectionMode::Normal);
+            strip->setReverse(false);
+            strip->setVolume(1.0f);
+            strip->setPan(0.0f);
+            strip->setPlaybackSpeed(1.0f);
+            strip->setBeatsPerLoop(-1.0f);
+            strip->setScratchAmount(0.0f);
+            strip->setTransientSliceMode(false);
+            strip->setPitchShift(0.0f);
+            strip->setRecordingBars(1);
+            strip->setFilterFrequency(20000.0f);
+            strip->setFilterResonance(0.707f);
+            strip->setFilterMorph(0.0f);
+            strip->setFilterAlgorithm(EnhancedAudioStrip::FilterAlgorithm::Tpt12);
+            strip->setFilterEnabled(false);
+            strip->setSwingAmount(0.0f);
+            strip->setGateAmount(0.0f);
+            strip->setGateSpeed(4.0f);
+            strip->setGateEnvelope(0.5f);
+            strip->setGateShape(0.5f);
+            strip->setStepPatternBars(1);
+            strip->setStepPage(0);
+            strip->currentStep = 0;
+            strip->stepPattern.fill(false);
+            strip->setGrainSizeMs(1240.0f);
+            strip->setGrainDensity(0.05f);
+            strip->setGrainPitch(0.0f);
+            strip->setGrainPitchJitter(0.0f);
+            strip->setGrainSpread(0.0f);
+            strip->setGrainJitter(0.0f);
+            strip->setGrainRandomDepth(0.0f);
+            strip->setGrainArpDepth(0.0f);
+            strip->setGrainCloudDepth(0.0f);
+            strip->setGrainEmitterDepth(0.0f);
+            strip->setGrainEnvelope(0.0f);
+            strip->setGrainShape(0.0f);
+            strip->setGrainArpMode(0);
+            strip->setGrainTempoSyncEnabled(true);
+        }
+
+        audioEngine->assignStripToGroup(i, -1);
+        audioEngine->setModTarget(i, ModernAudioEngine::ModTarget::None);
+        audioEngine->setModBipolar(i, false);
+        audioEngine->setModCurveMode(i, false);
+        audioEngine->setModDepth(i, 1.0f);
+        audioEngine->setModOffset(i, 0);
+        audioEngine->setModLengthBars(i, 1);
+        audioEngine->setModEditPage(i, 0);
+        audioEngine->setModSmoothingMs(i, 0.0f);
+        audioEngine->setModCurveBend(i, 0.0f);
+        audioEngine->setModCurveShape(i, ModernAudioEngine::ModCurveShape::Power);
+        audioEngine->setModPitchScaleQuantize(i, false);
+        audioEngine->setModPitchScale(i, ModernAudioEngine::PitchScale::Chromatic);
+        for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
+            audioEngine->setModStepValueAbsolute(i, s, 0.0f);
+
+        if (auto* param = parameters.getParameter("stripVolume" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripPan" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripSpeed" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripPitch" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+    }
+
+    for (int i = 0; i < ModernAudioEngine::MaxGroups; ++i)
+    {
+        if (auto* group = audioEngine->getGroup(i))
+        {
+            group->setVolume(1.0f);
+            group->setMuted(false);
+        }
+    }
+
+    for (int i = 0; i < ModernAudioEngine::MaxPatterns; ++i)
+        audioEngine->clearPattern(i);
+}
+
 bool MlrVSTAudioProcessor::getHostSyncSnapshot(double& outPpq, double& outTempo) const
 {
     if (auto* playHead = getPlayHead())
@@ -2419,14 +2543,13 @@ void MlrVSTAudioProcessor::loadPreset(int presetIndex)
 {
     try
     {
-        double hostPpqSnapshot = 0.0;
-        double hostTempoSnapshot = 0.0;
-        if (!getHostSyncSnapshot(hostPpqSnapshot, hostTempoSnapshot))
+        double hostPpqSnapshot = std::numeric_limits<double>::quiet_NaN();
+        double hostTempoSnapshot = std::numeric_limits<double>::quiet_NaN();
+        const bool hasHostSync = getHostSyncSnapshot(hostPpqSnapshot, hostTempoSnapshot);
+        if (!hasHostSync)
         {
-            pendingPresetLoadIndex.store(presetIndex, std::memory_order_release);
             DBG("Preset " << (presetIndex + 1)
-                << " deferred: waiting for valid host PPQ+BPM for strict PPQ-safe recall.");
-            return;
+                << " loaded without host PPQ/BPM snapshot; recalling audio/parameters only.");
         }
 
         pendingPresetLoadIndex.store(-1, std::memory_order_release);
@@ -2448,7 +2571,20 @@ bool MlrVSTAudioProcessor::deletePreset(int presetIndex)
     {
         const bool deleted = PresetStore::deletePreset(presetIndex);
         if (deleted && loadedPresetIndex == presetIndex)
+        {
+            struct ScopedSuspendProcessing
+            {
+                explicit ScopedSuspendProcessing(MlrVSTAudioProcessor& p) : processor(p) { processor.suspendProcessing(true); }
+                ~ScopedSuspendProcessing() { processor.suspendProcessing(false); }
+                MlrVSTAudioProcessor& processor;
+            } scopedSuspend(*this);
+
+            resetRuntimePresetStateToDefaults();
             loadedPresetIndex = -1;
+            updateMonomeLEDs();
+        }
+        if (deleted)
+            presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
         return deleted;
     }
     catch (...)

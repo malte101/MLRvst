@@ -247,6 +247,7 @@ public:
     void setCrossfadeLengthMs(float ms);
     juce::AudioBuffer<float> captureLoop(double tempo, int bars);  // Capture N bars
     bool shouldBlinkRecordLED(double beatPosition) const;  // For LED feedback
+    void clearBuffer();
     
     bool isRecording() const { return recording; }
     float getRecordingProgress() const;
@@ -1186,6 +1187,7 @@ public:
     int getRecordingLoopLength() const;     // Legacy - now per-strip
     void captureLoopToStrip(int stripIndex, int bars);  // Capture with specified length
     bool shouldBlinkRecordLED() const;  // For LED feedback
+    void clearRecentInputBuffer();
     
     // Legacy live recording (kept for compatibility)
     void startLiveRecording(int stripIndex, int lengthBeats);

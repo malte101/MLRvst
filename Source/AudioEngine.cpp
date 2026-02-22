@@ -998,6 +998,13 @@ void LiveRecorder::processInput(const juce::AudioBuffer<float>& input,
     writeHead = (writePos + numSamples) % bufferSize;
 }
 
+void LiveRecorder::clearBuffer()
+{
+    juce::ScopedLock lock(bufferLock);
+    circularBuffer.clear();
+    writeHead.store(0, std::memory_order_release);
+}
+
 juce::AudioBuffer<float> LiveRecorder::captureLoop(double tempo, int bars)
 {
     juce::ScopedLock lock(bufferLock);
@@ -8720,6 +8727,12 @@ bool ModernAudioEngine::shouldBlinkRecordLED() const
     // Get current beat position for blinking
     double beatPos = currentBeat.load();
     return liveRecorder->shouldBlinkRecordLED(beatPos);
+}
+
+void ModernAudioEngine::clearRecentInputBuffer()
+{
+    if (liveRecorder)
+        liveRecorder->clearBuffer();
 }
 
 void ModernAudioEngine::stopPatternPlayback(int patternIndex)

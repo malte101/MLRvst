@@ -183,6 +183,7 @@ public:
     void loadSampleToStrip(int stripIndex, const juce::File& file);
     void loadAdjacentFile(int stripIndex, int direction);  // Browse files
     void captureRecentAudioToStrip(int stripIndex);
+    void clearRecentAudioBuffer();
     void requestBarLengthChange(int stripIndex, int bars);
     void setPendingBarLengthApply(int stripIndex, bool pending);
     void triggerStrip(int stripIndex, int column);
@@ -365,6 +366,7 @@ private:
     void performMomentaryStutterReleaseNow(double hostPpqNow, int64_t nowSample);
     bool getHostSyncSnapshot(double& outPpq, double& outTempo) const;
     void performPresetLoad(int presetIndex, double hostPpqSnapshot, double hostTempoSnapshot);
+    void resetRuntimePresetStateToDefaults();
 
     // Row 0, col 8: global momentary scratch modifier.
     bool momentaryScratchHoldActive = false;

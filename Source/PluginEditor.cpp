@@ -1355,12 +1355,13 @@ void StripControl::setupComponents()
     addAndMakeVisible(recordBarsBox);
 
     recordButton.setButtonText("REC");
-    recordButton.setTooltip("Capture recent input audio into this strip (same action as monome record button).");
+    recordButton.setTooltip("Left-click: capture recent input audio. Right-click: clear recent input buffer.");
     recordButton.onClick = [this]()
     {
         processor.captureRecentAudioToStrip(stripIndex);
     };
     addAndMakeVisible(recordButton);
+    recordButton.addMouseListener(this, false);
 
     modTargetLabel.setText("TARGET", juce::dontSendNotification);
     modTargetLabel.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
@@ -1933,6 +1934,13 @@ void StripControl::applyModulationCellCurveFromDrag(int deltaY)
 
 void StripControl::mouseDown(const juce::MouseEvent& e)
 {
+    if (e.originalComponent == &recordButton || e.eventComponent == &recordButton)
+    {
+        if (e.mods.isRightButtonDown())
+            processor.clearRecentAudioBuffer();
+        return;
+    }
+
     if (modulationLaneView)
     {
         auto* engine = processor.getAudioEngine();
@@ -3994,9 +4002,6 @@ void PresetControlPanel::savePresetClicked(int index, juce::String typedName)
 
 void PresetControlPanel::loadPresetClicked(int index)
 {
-    if (!processor.presetExists(index))
-        return;
-
     processor.loadPreset(index);
     selectedPresetIndex = index;
     const auto name = processor.getPresetName(index);
