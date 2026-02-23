@@ -18,7 +18,7 @@ double stutterDivisionBeatsFromButton(int x)
         1.0 / 3.0,      // col 12 -> 1/8T
         0.25,           // col 13 -> 1/16
         0.125,          // col 14 -> 1/32
-        0.0625          // col 15 -> 1/64
+        1.0 / 12.0      // col 15 -> 1/32T (safer than 1/64 for click-free musical use)
     };
 
     const int idx = juce::jlimit(0, 6, x - 9);

@@ -591,8 +591,13 @@ void WaveformDisplay::setAudioBuffer(const juce::AudioBuffer<float>& buffer, dou
 {
     (void) sampleRate;
     hasAudio = buffer.getNumSamples() > 0;
-    if (hasAudio)
-        generateThumbnail(buffer);
+    if (!hasAudio)
+    {
+        clear();
+        return;
+    }
+
+    generateThumbnail(buffer);
     repaint();
 }
 
@@ -2580,14 +2585,8 @@ void StripControl::updateFromEngine()
     }
     else if (!showingStepDisplay)
     {
-        waveform.setSliceMarkers({}, {}, 0, false);
-        waveform.setGrainWindowOverlay(false, 0.0);
-        std::array<float, 8> emptyMarkers{};
-        emptyMarkers.fill(-1.0f);
-        std::array<float, 8> emptyPitch{};
-        emptyPitch.fill(0.0f);
-        waveform.setGrainMarkerPositions(emptyMarkers, emptyPitch);
-        waveform.setGrainHudOverlay(false, {}, {}, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        if (waveform.hasLoadedAudio())
+            waveform.clear();
     }
     
     // Update tempo label - only if visible

@@ -185,6 +185,26 @@ inline float safetyClip0dB(float sample)
     return juce::jlimit(-1.0f, 1.0f, sample);
 }
 
+inline float filterLimiter0dB(float sample, float resonanceDrive)
+{
+    const float drive = juce::jlimit(0.0f, 1.0f, resonanceDrive);
+    const float threshold = juce::jmap(drive, 0.96f, 0.86f);
+    const float ceiling = 0.992f; // Keep a little headroom below 0 dBFS.
+
+    const float mag = std::abs(sample);
+    if (mag <= threshold)
+        return juce::jlimit(-ceiling, ceiling, sample);
+
+    const float over = mag - threshold;
+    const float ratioControl = 10.0f + (22.0f * drive);
+    const float compressed = threshold + (over / (1.0f + (ratioControl * over)));
+
+    const float normalized = juce::jlimit(0.0f, 1.25f, compressed / ceiling);
+    const float shaped = std::tanh(normalized * (1.15f + (0.95f * drive)));
+    const float limited = juce::jmin(ceiling, shaped * ceiling);
+    return std::copysign(limited, sample);
+}
+
 }
 
 //==============================================================================
@@ -6458,7 +6478,16 @@ void EnhancedAudioStrip::processFilterSample(float& left, float& right, float fr
     left = (lpL * wLP) + (bpL * wBP) + (hpL * wHP);
     right = (lpR * wLP) + (bpR * wBP) + (hpR * wHP);
 
-    // Post-filter safety safeguard at 0 dBFS.
+    // Resonance-aware post gain + limiter: applies to all filter algorithms.
+    const float resonanceDrive = juce::jlimit(0.0f, 1.0f, (q - 0.707f) / 9.293f);
+    const float resonanceGuardGain = juce::jmap(resonanceDrive, 1.0f, 0.68f);
+    left *= resonanceGuardGain;
+    right *= resonanceGuardGain;
+
+    left = filterLimiter0dB(left, resonanceDrive);
+    right = filterLimiter0dB(right, resonanceDrive);
+
+    // Hard safety guard: never exceed full scale.
     left = safetyClip0dB(left);
     right = safetyClip0dB(right);
 }

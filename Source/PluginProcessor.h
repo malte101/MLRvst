@@ -401,6 +401,7 @@ private:
     {
         bool valid = false;
         float pan = 0.0f;
+        float playbackSpeed = 1.0f;
         float pitchShift = 0.0f;
         bool filterEnabled = false;
         float filterFrequency = 20000.0f;

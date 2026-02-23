@@ -47,6 +47,7 @@ public:
                          int totalSamples,
                          bool transientModeActive);
     void setWaveformColor(juce::Colour color);
+    bool hasLoadedAudio() const noexcept { return hasAudio; }
     void clear();
     
 private:

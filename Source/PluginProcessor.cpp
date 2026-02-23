@@ -1839,6 +1839,7 @@ void MlrVSTAudioProcessor::captureMomentaryStutterMacroBaseline()
 
         saved.valid = true;
         saved.pan = strip->getPan();
+        saved.playbackSpeed = strip->getPlaybackSpeed();
         saved.pitchShift = strip->getPitchShift();
         saved.filterEnabled = strip->isFilterEnabled();
         saved.filterFrequency = strip->getFilterFrequency();
@@ -1877,12 +1878,12 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
     const int bitCount = countStutterBits(comboMask);
     const int highestBit = highestStutterBit(comboMask);
     const int lowestBit = lowestStutterBit(comboMask);
-    const int seed = (static_cast<int>(comboMask) * 131)
-        + (bitCount * 17)
-        + (highestBit * 29)
-        + (lowestBit * 7);
+    const int seed = (static_cast<int>(comboMask) * 97)
+        + (bitCount * 19)
+        + (highestBit * 11)
+        + (lowestBit * 5);
     const int variant = seed % 8;
-    const int lengthBars = 1 + ((seed / 7) % 4);
+    const int lengthBars = 1 + ((seed / 13) % 4);
     const double cycleBeats = 4.0 * static_cast<double>(lengthBars);
     if (cycleBeats <= 0.0 || !std::isfinite(cycleBeats))
         return;
@@ -1890,107 +1891,147 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
     const double cycleBeatPosRaw = std::fmod(ppqNow - momentaryStutterMacroStartPpq, cycleBeats);
     const double cycleBeatPos = cycleBeatPosRaw < 0.0 ? cycleBeatPosRaw + cycleBeats : cycleBeatPosRaw;
     const double phase = wrapUnitPhase(cycleBeatPos / cycleBeats);
-    const double fastPhase = wrapUnitPhase(phase * static_cast<double>(2 + ((seed >> 2) % 5)));
-    const double panPhase = wrapUnitPhase(phase * static_cast<double>(1 + ((seed >> 4) % 4)));
-    const double filterPhase = wrapUnitPhase(phase * static_cast<double>(1 + ((seed >> 6) % 3)));
+    const int stepsPerBar = 8;
+    const int totalSteps = juce::jmax(8, stepsPerBar * lengthBars);
+    const int stepIndex = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(phase * static_cast<double>(totalSteps))));
+    const int stepLoop = stepIndex % 8;
+    const float normStep = static_cast<float>(stepLoop) / 7.0f;
 
-    const double tri = 1.0 - std::abs((phase * 2.0) - 1.0);      // 0..1
-    const double triSigned = (tri * 2.0) - 1.0;                  // -1..1
-    const double sawSigned = (phase * 2.0) - 1.0;                // -1..1
-    const double sine = std::sin(juce::MathConstants<double>::twoPi * phase);
-    const double sineFast = std::sin(juce::MathConstants<double>::twoPi * fastPhase);
-    const double panSine = std::sin(juce::MathConstants<double>::twoPi * panPhase);
-    const double filterTri = 1.0 - std::abs((filterPhase * 2.0) - 1.0);
-    const int stepIndex = static_cast<int>(std::floor(phase * 16.0)) & 15;
+    const bool singleButton = (bitCount <= 1);
+    const float comboIntensity = juce::jlimit(0.25f, 1.0f, 0.34f + (0.16f * static_cast<float>(bitCount - 1)));
 
-    float pitchDelta = 0.0f;
-    float panOffset = 0.0f;
-    float cutoffNorm = 1.0f;
-    float resonanceNorm = 0.25f;
-    float morph = 0.0f;
+    float shapeIntensity = 1.0f;
+    float speedMult = 1.0f;
+    float panPattern = 0.0f;
+    float pitchPattern = 0.0f;
+    float cutoffNorm = 0.85f;
+    float targetResonance = 1.2f;
+    float targetMorph = 0.25f;
 
-    switch (variant)
+    if (variant < 4)
     {
-        case 0:
-            pitchDelta = juce::jmap(static_cast<float>(phase), -2.0f, 10.0f) + static_cast<float>(1.5 * sineFast);
-            panOffset = static_cast<float>(0.65 * panSine);
-            cutoffNorm = static_cast<float>(0.12 + (0.85 * phase));
-            resonanceNorm = static_cast<float>(0.25 + (0.55 * filterTri));
-            morph = static_cast<float>(0.15 + (0.55 * filterPhase));
-            break;
-        case 1:
-            pitchDelta = juce::jmap(static_cast<float>(phase), 8.0f, -9.0f) + static_cast<float>(1.2 * sine);
-            panOffset = static_cast<float>(0.80 * triSigned);
-            cutoffNorm = static_cast<float>(0.90 - (0.75 * phase));
-            resonanceNorm = static_cast<float>(0.30 + (0.60 * phase));
-            morph = static_cast<float>(0.90 - (0.70 * filterPhase));
-            break;
-        case 2:
-            pitchDelta = static_cast<float>((6.5 * std::sin(juce::MathConstants<double>::twoPi * phase * 2.0))
-                + (3.0 * std::sin(juce::MathConstants<double>::twoPi * (phase + 0.25))));
-            panOffset = static_cast<float>(0.70 * std::sin(juce::MathConstants<double>::twoPi * (panPhase * 2.0)));
-            cutoffNorm = static_cast<float>(0.18 + (0.74 * filterTri));
-            resonanceNorm = static_cast<float>(0.18 + (0.72 * wrapUnitPhase(filterPhase * 2.0)));
-            morph = static_cast<float>(0.50 + (0.45 * std::sin(juce::MathConstants<double>::twoPi * filterPhase)));
-            break;
-        case 3:
+        // Smooth musical movement modes (continuous phase paths).
+        const double fastPhase = wrapUnitPhase(phase * static_cast<double>(2 + ((seed >> 2) % 5)));
+        const double panPhase = wrapUnitPhase(phase * static_cast<double>(1 + ((seed >> 4) % 4)));
+        const double filterPhase = wrapUnitPhase(phase * static_cast<double>(1 + ((seed >> 6) % 3)));
+        const double tri = 1.0 - std::abs((phase * 2.0) - 1.0);
+        const double triSigned = (tri * 2.0) - 1.0;
+        const double sawSigned = (phase * 2.0) - 1.0;
+        const double sine = std::sin(juce::MathConstants<double>::twoPi * phase);
+        const double sineFast = std::sin(juce::MathConstants<double>::twoPi * fastPhase);
+        const double panSine = std::sin(juce::MathConstants<double>::twoPi * panPhase);
+        const double filterTri = 1.0 - std::abs((filterPhase * 2.0) - 1.0);
+
+        switch (variant)
         {
-            static constexpr std::array<float, 8> pitchSequence { 0.0f, 3.0f, 7.0f, 12.0f, 7.0f, 3.0f, 0.0f, -5.0f };
-            const int seqIdx = (stepIndex + highestBit + lowestBit) % static_cast<int>(pitchSequence.size());
-            pitchDelta = pitchSequence[static_cast<size_t>(seqIdx)] + (bitCount > 2 ? 2.0f : 0.0f);
-            panOffset = ((stepIndex & 1) == 0 ? -0.72f : 0.72f) * (0.60f + (0.06f * static_cast<float>(bitCount)));
-            cutoffNorm = 0.15f + (0.80f * (static_cast<float>((stepIndex + lowestBit) % 8) / 7.0f));
-            resonanceNorm = ((stepIndex / 2) & 1) == 0 ? 0.35f : 0.82f;
-            morph = (stepIndex % 3 == 0) ? 0.08f : ((stepIndex % 3 == 1) ? 0.50f : 0.92f);
-            break;
+            case 0: // riser
+                shapeIntensity = juce::jlimit(0.18f, 1.0f, static_cast<float>(phase));
+                speedMult = juce::jlimit(0.70f, 2.40f, static_cast<float>(0.95 + (0.95 * phase) + (0.18 * sineFast)));
+                panPattern = static_cast<float>(0.48 * panSine);
+                pitchPattern = static_cast<float>(-1.0 + (11.5 * phase) + (1.8 * sineFast));
+                cutoffNorm = static_cast<float>(0.18 + (0.78 * phase));
+                targetResonance = static_cast<float>(0.9 + (2.9 * filterTri));
+                targetMorph = static_cast<float>(0.12 + (0.58 * filterPhase));
+                break;
+            case 1: // faller
+                shapeIntensity = juce::jlimit(0.18f, 1.0f, static_cast<float>(1.0 - phase));
+                speedMult = juce::jlimit(0.70f, 2.30f, static_cast<float>(1.90 - (1.00 * phase) + (0.16 * sine)));
+                panPattern = static_cast<float>(0.72 * triSigned);
+                pitchPattern = static_cast<float>(8.0 - (14.0 * phase) + (1.3 * sine));
+                cutoffNorm = static_cast<float>(0.92 - (0.70 * phase));
+                targetResonance = static_cast<float>(1.1 + (3.1 * phase));
+                targetMorph = static_cast<float>(0.88 - (0.62 * filterPhase));
+                break;
+            case 2: // swirl
+                shapeIntensity = juce::jlimit(0.20f, 1.0f, static_cast<float>(tri));
+                speedMult = juce::jlimit(0.75f, 2.15f, static_cast<float>(1.0
+                    + (0.42 * std::sin(juce::MathConstants<double>::twoPi * phase * 2.0))
+                    + (0.14 * sineFast)));
+                panPattern = static_cast<float>(0.80 * std::sin(juce::MathConstants<double>::twoPi * (panPhase * 2.0)));
+                pitchPattern = static_cast<float>((6.0 * sine) + (3.0 * std::sin(juce::MathConstants<double>::twoPi * (phase + 0.25))));
+                cutoffNorm = static_cast<float>(0.24 + (0.66 * filterTri));
+                targetResonance = static_cast<float>(0.9 + (2.5 * wrapUnitPhase(filterPhase * 2.0)));
+                targetMorph = static_cast<float>(0.50 + (0.40 * std::sin(juce::MathConstants<double>::twoPi * filterPhase)));
+                break;
+            case 3:
+            default: // surge
+                shapeIntensity = juce::jlimit(0.22f, 1.0f, static_cast<float>(0.55 + (0.45 * std::abs(sineFast))));
+                speedMult = juce::jlimit(0.70f, 2.40f, static_cast<float>(1.0 + (0.95 * triSigned) + (0.14 * sineFast)));
+                panPattern = static_cast<float>(0.90 * sawSigned);
+                pitchPattern = static_cast<float>((9.0 * sine) + (4.5 * triSigned));
+                cutoffNorm = static_cast<float>(0.14 + (0.80 * wrapUnitPhase(phase + (0.25 * juce::jmax(0.0, sine)))));
+                targetResonance = static_cast<float>(1.0 + (3.0 * wrapUnitPhase(filterPhase + (0.20 * triSigned))));
+                targetMorph = static_cast<float>(wrapUnitPhase((0.40 * phase) + (0.60 * filterPhase)));
+                break;
         }
-        case 4:
-            pitchDelta = static_cast<float>((14.0 * triSigned) + (1.0 * sineFast));
-            panOffset = static_cast<float>(0.90 * sawSigned);
-            cutoffNorm = static_cast<float>(0.08 + (0.86 * tri));
-            resonanceNorm = static_cast<float>(0.25 + (0.65 * (1.0 - tri)));
-            morph = static_cast<float>(0.50 + (0.45 * std::sin((juce::MathConstants<double>::twoPi * filterPhase)
-                                                                + juce::MathConstants<double>::halfPi)));
-            break;
-        case 5:
+    }
+    else
+    {
+        // Hard step modes (deterministic rhythmic snapshots).
+        static constexpr std::array<std::array<float, 8>, 8> kSpeedPatterns{{
+            {{ 1.00f, 1.25f, 1.50f, 1.75f, 1.50f, 1.25f, 1.00f, 0.85f }},
+            {{ 1.00f, 0.90f, 1.10f, 1.35f, 1.60f, 1.35f, 1.10f, 0.90f }},
+            {{ 1.00f, 1.12f, 1.25f, 1.38f, 1.50f, 1.62f, 1.75f, 1.50f }},
+            {{ 1.00f, 1.50f, 1.00f, 1.25f, 1.00f, 1.75f, 1.00f, 1.50f }},
+            {{ 1.00f, 1.15f, 1.30f, 1.45f, 1.30f, 1.15f, 1.00f, 0.90f }},
+            {{ 1.00f, 0.85f, 1.00f, 1.35f, 1.00f, 1.55f, 1.20f, 1.00f }},
+            {{ 1.00f, 1.20f, 1.45f, 1.20f, 0.95f, 1.20f, 1.45f, 1.70f }},
+            {{ 1.00f, 1.33f, 1.67f, 1.33f, 1.00f, 0.90f, 1.10f, 1.30f }}
+        }};
+        static constexpr std::array<std::array<float, 8>, 8> kPanPatterns{{
+            {{ -1.00f, 1.00f, -0.80f, 0.80f, -0.60f, 0.60f, -0.35f, 0.35f }},
+            {{ -0.70f, -0.30f, 0.30f, 0.70f, 1.00f, 0.70f, 0.30f, -0.30f }},
+            {{ -1.00f, -0.60f, -0.20f, 0.20f, 0.60f, 1.00f, 0.40f, -0.20f }},
+            {{ -1.00f, 1.00f, -1.00f, 1.00f, -0.50f, 0.50f, -0.20f, 0.20f }},
+            {{ -0.25f, -0.75f, -1.00f, -0.50f, 0.50f, 1.00f, 0.75f, 0.25f }},
+            {{ -0.90f, -0.20f, 0.90f, 0.20f, -0.90f, -0.20f, 0.90f, 0.20f }},
+            {{ -0.40f, 0.40f, -0.70f, 0.70f, -1.00f, 1.00f, -0.60f, 0.60f }},
+            {{ -1.00f, -0.50f, 0.00f, 0.50f, 1.00f, 0.50f, 0.00f, -0.50f }}
+        }};
+        static constexpr std::array<std::array<float, 8>, 8> kPitchPatterns{{
+            {{ 0.0f, 2.0f, 5.0f, 7.0f, 10.0f, 7.0f, 5.0f, 2.0f }},
+            {{ 0.0f, -2.0f, 3.0f, 5.0f, 8.0f, 5.0f, 3.0f, -2.0f }},
+            {{ 0.0f, 3.0f, 7.0f, 10.0f, 12.0f, 10.0f, 7.0f, 3.0f }},
+            {{ 0.0f, 5.0f, 0.0f, 7.0f, 0.0f, 10.0f, 0.0f, 12.0f }},
+            {{ 0.0f, 2.0f, 4.0f, 7.0f, 9.0f, 7.0f, 4.0f, 2.0f }},
+            {{ 0.0f, -3.0f, 0.0f, 4.0f, 7.0f, 4.0f, 0.0f, -3.0f }},
+            {{ 0.0f, 1.0f, 5.0f, 8.0f, 12.0f, 8.0f, 5.0f, 1.0f }},
+            {{ 0.0f, 4.0f, 7.0f, 11.0f, 7.0f, 4.0f, 2.0f, 0.0f }}
+        }};
+
+        const auto& speedPattern = kSpeedPatterns[static_cast<size_t>(variant)];
+        const auto& panPatternTable = kPanPatterns[static_cast<size_t>((variant + highestBit) % 8)];
+        const auto& pitchPatternTable = kPitchPatterns[static_cast<size_t>((variant + lowestBit) % 8)];
+
+        switch (variant % 4)
         {
-            const double pulse = std::fmod(phase * static_cast<double>(4 + bitCount), 1.0) < 0.5 ? 1.0 : -1.0;
-            pitchDelta = static_cast<float>(pulse * static_cast<double>(3 + highestBit));
-            panOffset = static_cast<float>(0.85 * std::sin(juce::MathConstants<double>::twoPi * fastPhase));
-            cutoffNorm = pulse > 0.0 ? 0.86f : 0.22f;
-            resonanceNorm = pulse > 0.0 ? 0.76f : 0.30f;
-            morph = pulse > 0.0 ? 0.22f : 0.78f;
-            break;
+            case 0: shapeIntensity = juce::jlimit(0.15f, 1.0f, normStep); break; // rise
+            case 1: shapeIntensity = juce::jlimit(0.15f, 1.0f, 1.0f - normStep); break; // fall
+            case 2: shapeIntensity = juce::jlimit(0.15f, 1.0f, 1.0f - std::abs((normStep * 2.0f) - 1.0f)); break; // triangle
+            case 3:
+            default: shapeIntensity = (stepLoop & 1) == 0 ? 1.0f : 0.45f; break; // pulse
         }
-        case 6:
-        {
-            const double doublePhase = wrapUnitPhase(phase * 2.0);
-            pitchDelta = juce::jmap(static_cast<float>(doublePhase), -11.0f, 11.0f) + static_cast<float>(2.0 * sine);
-            panOffset = static_cast<float>(0.72 * std::sin(juce::MathConstants<double>::twoPi * (panPhase * 3.0)));
-            cutoffNorm = static_cast<float>(0.12 + (0.82 * wrapUnitPhase(filterPhase + (0.35 * tri))));
-            resonanceNorm = static_cast<float>(0.28 + (0.58 * wrapUnitPhase(filterPhase + 0.5)));
-            morph = static_cast<float>(wrapUnitPhase(filterPhase + (0.25 * sineFast)));
-            break;
-        }
-        case 7:
-        default:
-            pitchDelta = static_cast<float>((9.0 * sine) + (5.0 * triSigned));
-            panOffset = static_cast<float>(0.88 * std::sin(juce::MathConstants<double>::twoPi * (panPhase + (0.20 * tri))));
-            cutoffNorm = static_cast<float>(0.10 + (0.88 * wrapUnitPhase(phase + (0.5 * juce::jmax(0.0, sine)))));
-            resonanceNorm = static_cast<float>(0.22 + (0.62 * wrapUnitPhase(filterPhase + (0.25 * triSigned))));
-            morph = static_cast<float>(wrapUnitPhase((0.5 * phase) + (0.5 * filterPhase)));
-            break;
+
+        speedMult = speedPattern[static_cast<size_t>(stepLoop)];
+        panPattern = panPatternTable[static_cast<size_t>(stepLoop)];
+        pitchPattern = pitchPatternTable[static_cast<size_t>(stepLoop)];
+        cutoffNorm = juce::jlimit(0.10f, 1.0f, 0.25f + (0.70f * normStep));
+        targetResonance = 0.9f + (3.2f * shapeIntensity);
+        targetMorph = juce::jlimit(0.05f, 0.95f, 0.10f + (0.80f * normStep));
     }
 
-    pitchDelta = juce::jlimit(-18.0f, 18.0f, pitchDelta);
-    panOffset = juce::jlimit(-1.0f, 1.0f, panOffset);
-    cutoffNorm = juce::jlimit(0.0f, 1.0f, cutoffNorm);
-    resonanceNorm = juce::jlimit(0.0f, 1.0f, resonanceNorm);
-    morph = juce::jlimit(0.0f, 1.0f, morph);
+    const float intensity = juce::jlimit(0.20f, 1.0f, comboIntensity * shapeIntensity);
+    const float speedIntensityScale = juce::jlimit(0.35f, 1.0f, 0.42f + (0.58f * intensity));
+    const float shapedSpeedMult = 1.0f + ((speedMult - 1.0f) * speedIntensityScale);
+    const float panOffsetBase = juce::jlimit(-1.0f, 1.0f, panPattern * intensity);
+    const float pitchOffsetBase = juce::jlimit(-18.0f, 18.0f, pitchPattern * (0.60f + (0.35f * intensity)));
+
+    cutoffNorm = juce::jlimit(0.05f, 1.0f, cutoffNorm);
+    targetResonance = juce::jlimit(0.2f, 8.0f, targetResonance * comboIntensity);
+    targetMorph = juce::jlimit(0.05f, 0.95f, targetMorph);
 
     const auto filterAlgorithm = filterAlgorithmFromIndex((variant + bitCount + highestBit + lowestBit) % 6);
     const float targetCutoff = cutoffFromNormalized(cutoffNorm);
-    const float targetResonance = juce::jmap(resonanceNorm, 0.2f, 9.0f);
 
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -2003,21 +2044,38 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         if (!strip || !strip->hasAudio() || !strip->isPlaying())
             continue;
 
-        const float stripPanScale = juce::jlimit(0.35f, 1.0f, 0.55f + (0.06f * static_cast<float>(bitCount))
-            + (0.05f * static_cast<float>(i)));
-        const float stripPitchSpread = (bitCount > 3)
-            ? static_cast<float>((i - (MaxStrips / 2)) * 0.45f)
-            : 0.0f;
-        const float stripMorphOffset = static_cast<float>(0.10 * std::sin(
-            juce::MathConstants<double>::twoPi * wrapUnitPhase(phase + (0.17 * static_cast<double>(i)))));
+        const float stripOffset = static_cast<float>(i - (MaxStrips / 2));
+        const float stripPanScale = juce::jlimit(0.35f, 1.0f, 0.55f + (0.05f * static_cast<float>(bitCount))
+            + (0.04f * static_cast<float>(i)));
+        const float stripPitchSpread = (bitCount > 2) ? (stripOffset * 0.35f) : 0.0f;
+        const float stripSpeedSpread = (bitCount > 3) ? (stripOffset * 0.02f) : 0.0f;
+        const float stripMorphOffset = static_cast<float>(0.08 * std::sin(
+            juce::MathConstants<double>::twoPi * wrapUnitPhase(phase + (0.13 * static_cast<double>(i)))));
 
-        strip->setPan(juce::jlimit(-1.0f, 1.0f, saved.pan + (panOffset * stripPanScale)));
-        strip->setPitchShift(juce::jlimit(-24.0f, 24.0f, saved.pitchShift + pitchDelta + stripPitchSpread));
-        strip->setFilterEnabled(true);
-        strip->setFilterAlgorithm(filterAlgorithm);
-        strip->setFilterFrequency(targetCutoff);
-        strip->setFilterResonance(targetResonance);
-        strip->setFilterMorph(juce::jlimit(0.0f, 1.0f, morph + stripMorphOffset));
+        const float savedSpeed = juce::jlimit(0.25f, 4.0f, saved.playbackSpeed);
+        const float targetSpeed = juce::jlimit(0.35f, 4.0f, (savedSpeed * shapedSpeedMult) + stripSpeedSpread);
+
+        strip->setPlaybackSpeed(targetSpeed);
+        strip->setPan(juce::jlimit(-1.0f, 1.0f, saved.pan + (panOffsetBase * stripPanScale)));
+        strip->setPitchShift(juce::jlimit(-24.0f, 24.0f, saved.pitchShift + pitchOffsetBase + stripPitchSpread));
+
+        if (singleButton)
+        {
+            // Single-button stutter is intended as a clean rhythmic retrigger: no filter color.
+            strip->setFilterAlgorithm(saved.filterAlgorithm);
+            strip->setFilterFrequency(saved.filterFrequency);
+            strip->setFilterResonance(saved.filterResonance);
+            strip->setFilterMorph(saved.filterMorph);
+            strip->setFilterEnabled(saved.filterEnabled);
+        }
+        else
+        {
+            strip->setFilterEnabled(true);
+            strip->setFilterAlgorithm(filterAlgorithm);
+            strip->setFilterFrequency(targetCutoff);
+            strip->setFilterResonance(targetResonance);
+            strip->setFilterMorph(juce::jlimit(0.0f, 1.0f, targetMorph + stripMorphOffset));
+        }
     }
 }
 
@@ -2036,6 +2094,7 @@ void MlrVSTAudioProcessor::restoreMomentaryStutterMacroBaseline()
         if (auto* strip = audioEngine->getStrip(i))
         {
             strip->setPan(saved.pan);
+            strip->setPlaybackSpeed(saved.playbackSpeed);
             strip->setPitchShift(saved.pitchShift);
             strip->setFilterAlgorithm(saved.filterAlgorithm);
             strip->setFilterFrequency(saved.filterFrequency);
