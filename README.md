@@ -7,6 +7,12 @@ Modern JUCE-based version of mlrVST for monome grid performance workflows.
 - Monome integration: serialosc-compatible grid input and LED feedback
 - Build system: CMake + Makefile helpers
 
+## Licensing At A Glance
+
+- Project code in this repository is MIT-licensed (`LICENSE`).
+- Distributed binaries may include third-party components with additional obligations.
+- See `THIRD_PARTY_NOTICES.md` before redistributing builds.
+
 ## Repository
 
 ```bash

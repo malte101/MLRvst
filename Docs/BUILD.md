@@ -112,6 +112,9 @@ make au          # Audio Unit only
 
 # Install to system
 make install
+
+# Create release zips (includes license notices)
+make package-release
 ```
 
 ### Manual Build (CMake)
@@ -250,6 +253,15 @@ If JUCE is in a different location:
 
 ```bash
 cmake .. -DJUCE_DIR=/path/to/JUCE
+```
+
+### Optional Huovilainen Model
+
+`MLRVST_ENABLE_HUOVILAINEN` is `OFF` by default.
+
+```bash
+# Enable only if you have reviewed licensing obligations
+cmake .. -DMLRVST_ENABLE_HUOVILAINEN=ON
 ```
 
 ### Code Signing (macOS)

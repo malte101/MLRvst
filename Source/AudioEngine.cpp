@@ -9,7 +9,12 @@
 
 #include "AudioEngine.h"
 #include "StilsonModel.h"
+#ifndef MLRVST_ENABLE_HUOVILAINEN
+#define MLRVST_ENABLE_HUOVILAINEN 0
+#endif
+#if MLRVST_ENABLE_HUOVILAINEN
 #include "HuovilainenModel.h"
+#endif
 #include <random>
 #include <map>
 #include <cmath>
@@ -6354,7 +6359,11 @@ void EnhancedAudioStrip::ensureAnalogFiltersInitialized(FilterAlgorithm algorith
             case FilterAlgorithm::Ladder24:
                 return std::make_unique<StilsonMoog>(static_cast<float>(currentSampleRate));
             case FilterAlgorithm::MoogHuov:
+#if MLRVST_ENABLE_HUOVILAINEN
                 return std::make_unique<HuovilainenMoog>(static_cast<float>(currentSampleRate));
+#else
+                return std::make_unique<StilsonMoog>(static_cast<float>(currentSampleRate));
+#endif
             case FilterAlgorithm::MoogStilson:
                 return std::make_unique<StilsonMoog>(static_cast<float>(currentSampleRate));
         }

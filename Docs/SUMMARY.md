@@ -304,7 +304,9 @@ If you have the original mlrVST code:
 
 ## License
 
-MIT - see [../LICENSE](../LICENSE).
+- Project source in this repository is MIT-licensed: see [../LICENSE](../LICENSE).
+- Third-party components included/used by the build have additional terms.
+- See [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) before distributing binaries.
 
 ## Credits
 

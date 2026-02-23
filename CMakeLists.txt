@@ -8,6 +8,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Licensing-sensitive optional model:
+# OFF by default so release binaries do not accidentally include Huovilainen code.
+option(MLRVST_ENABLE_HUOVILAINEN "Enable Huovilainen Moog model (LGPL-derived upstream)" OFF)
+
 # Export compile commands for IDE support
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -88,6 +92,12 @@ target_compile_definitions(mlrVST
         JUCE_MODAL_LOOPS_PERMITTED=1
         JUCE_STRICT_REFCOUNTEDPOINTER=1
 )
+
+if(MLRVST_ENABLE_HUOVILAINEN)
+    target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_HUOVILAINEN=1)
+else()
+    target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_HUOVILAINEN=0)
+endif()
 
 # Link libraries
 target_link_libraries(mlrVST
@@ -194,6 +204,7 @@ message(STATUS "═════════════════════�
 message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ Standard: C++${CMAKE_CXX_STANDARD}")
 message(STATUS "  System: ${CMAKE_SYSTEM_NAME}")
+message(STATUS "  Huovilainen model: ${MLRVST_ENABLE_HUOVILAINEN}")
 message(STATUS "")
 message(STATUS "Plugin Formats:")
 message(STATUS "  ✓ VST3")

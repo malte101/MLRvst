@@ -2962,11 +2962,19 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     filterAlgoBox.addItem("LAD12", 3);
     filterAlgoBox.addItem("LAD24", 4);
     filterAlgoBox.addItem("MOOG S", 5);
+#if MLRVST_ENABLE_HUOVILAINEN
     filterAlgoBox.addItem("MOOG H", 6);
+#else
+    filterAlgoBox.addItem("MOOG H*", 6);
+#endif
     filterAlgoBox.setSelectedId(1);
     styleUiCombo(filterAlgoBox);
     filterAlgoBox.setJustificationType(juce::Justification::centred);
+#if MLRVST_ENABLE_HUOVILAINEN
     filterAlgoBox.setTooltip("Filter algorithm: SVF12, SVF24, Ladder12, Ladder24, Moog Stilson LP, Moog Huovilainen LP");
+#else
+    filterAlgoBox.setTooltip("Filter algorithm: SVF12, SVF24, Ladder12, Ladder24, Moog Stilson LP, Moog H* (Stilson fallback; Huovilainen disabled in this build)");
+#endif
     filterAlgoBox.onChange = [this]()
     {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))

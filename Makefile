@@ -40,7 +40,7 @@ YELLOW=\033[1;33m
 RED=\033[0;31m
 BLUE=\033[0;34m
 
-.PHONY: all clean configure build install help check-juce vst3 au standalone
+.PHONY: all clean configure build install help check-juce vst3 au standalone package-release
 
 # Default target
 all: check-juce configure build
@@ -57,6 +57,7 @@ help:
 	@echo "  make au            - Build Audio Unit only (macOS)"
 	@echo "  make standalone    - Build standalone app only"
 	@echo "  make install       - Install plugins to system"
+	@echo "  make package-release - Build + package release zips with notices (macOS)"
 	@echo "  make clean         - Clean build directory"
 	@echo "  make distclean     - Remove all build artifacts"
 	@echo "  make check-juce    - Check if JUCE is available"
@@ -153,6 +154,16 @@ else
 	@echo "$(YELLOW)Copy from: $(BUILD_DIR)/$(PROJECT_NAME)_artefacts/$(CONFIG)/$(NO_COLOR)"
 endif
 	@echo "$(GREEN)✓ Installation complete$(NO_COLOR)"
+
+# Build and package release archives with license notices (macOS)
+package-release: build
+ifeq ($(DETECTED_OS),Darwin)
+	@echo "$(BLUE)Packaging release zips...$(NO_COLOR)"
+	@./scripts/package_release_macos.sh --build-dir $(BUILD_DIR) --config $(CONFIG)
+	@echo "$(GREEN)✓ Release packages created in ./release$(NO_COLOR)"
+else
+	@echo "$(YELLOW)Release packaging script currently supports macOS only$(NO_COLOR)"
+endif
 
 # Clean build directory
 clean:

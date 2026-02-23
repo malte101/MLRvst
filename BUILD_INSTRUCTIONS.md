@@ -30,7 +30,18 @@ ls Build/mlrVST_artefacts/Release/VST3/
 ls Build/mlrVST_artefacts/Release/AU/   # macOS
 ```
 
+## Create Release Zips (with notices)
+
+```bash
+# Uses Build/ by default
+make package-release
+
+# Or package directly from cmake-build-release
+./scripts/package_release_macos.sh --build-dir cmake-build-release
+```
+
 ## Notes
 
 - There is no standalone app target in the current `CMakeLists.txt`.
+- `MLRVST_ENABLE_HUOVILAINEN` defaults to `OFF` for release compliance; enable explicitly only if you have validated obligations.
 - For detailed platform setup and troubleshooting, see `Docs/BUILD.md`.
