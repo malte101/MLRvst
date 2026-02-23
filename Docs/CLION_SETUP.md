@@ -58,11 +58,11 @@ Install **Visual Studio 2019 or later** with "Desktop development with C++" work
 
 ## Solution 3: Open Project in CLion
 
-1. **File → Open** → Select `mlrVST-modern` folder
+1. **File → Open** → Select your project root folder
 2. CLion will ask to load CMake project → Click **OK**
 3. Wait for CMake to configure
 4. If it fails, check:
-   - JUCE is cloned: `mlrVST-modern/JUCE/` should exist
+   - JUCE is cloned: `<repo-root>/JUCE/` should exist
    - Toolchain is configured (see Solution 2)
 
 ## Solution 4: Manual CMake Configuration
@@ -85,12 +85,12 @@ If CLion's automatic configuration fails:
 
 ### 1. Clone JUCE (if not done)
 ```bash
-cd mlrVST-modern
+cd <repo-root>
 git clone https://github.com/juce-framework/JUCE.git
 ```
 
 ### 2. Open in CLion
-- **File → Open** → Navigate to `mlrVST-modern` folder
+- **File → Open** → Navigate to your project root folder
 - Click **OK**
 
 ### 3. Configure CMake
@@ -115,7 +115,7 @@ CLion should automatically:
 
 **Solution:**
 ```bash
-cd mlrVST-modern
+cd <repo-root>
 git clone https://github.com/juce-framework/JUCE.git
 ```
 Then in CLion: **Tools → CMake → Reload CMake Project**

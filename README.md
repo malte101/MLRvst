@@ -1,24 +1,23 @@
 # mlrVST (Modern)
 
-Modern JUCE-based version of mlrVST for monome grid performance workflows.
+Modern JUCE-based mlrVST for monome grid performance workflows.
 
 - Plugin formats: VST3 and AU (macOS)
 - Engine strips: 6
 - Monome integration: serialosc-compatible grid input and LED feedback
 - Build system: CMake + Makefile helpers
 
-## Licensing At A Glance
-
-- Project code in this repository is MIT-licensed (`LICENSE`).
-- Distributed binaries may include third-party components with additional obligations.
-- See `THIRD_PARTY_NOTICES.md` before redistributing builds.
-
-## Repository
+## Quick Start
 
 ```bash
 git clone https://github.com/malte101/MLRvst.git
 cd MLRvst
+git clone https://github.com/juce-framework/JUCE.git
+make
+make install
 ```
+
+For full platform setup and troubleshooting, see `Docs/BUILD.md`.
 
 ## Requirements
 
@@ -27,17 +26,17 @@ cd MLRvst
 - JUCE source at `./JUCE`
 - serialosc (for monome hardware use)
 
-## Build
+## Build Commands
 
 ```bash
-# configure + build
+# Default build
 make
 
-# format-specific
+# Format-specific
 make vst3
 make au
 
-# install plugin bundles to local plugin folders
+# Install plugin bundles to local plugin folders
 make install
 ```
 
@@ -50,33 +49,28 @@ cmake --build Build --config Release
 
 ## Release Packaging
 
-Create release zips that include binaries plus license notices:
+Create release zips that include binaries and notices:
 
 ```bash
 make package-release
 # or
-./scripts/package_release_macos.sh --build-dir cmake-build-release --config Release
+./scripts/package_release_macos.sh --config Release
 ```
 
 Artifacts are written to `release/`.
 
-## Notes
-
-- The build currently prints whether `MLRVST_ENABLE_HUOVILAINEN` is enabled.
-- Default is `OFF` for release compliance.
-- If enabled explicitly (`-DMLRVST_ENABLE_HUOVILAINEN=ON`), review and satisfy applicable third-party obligations before distributing binaries.
-
 ## Documentation
 
+- Quick start: `QUICKSTART.md`
 - Build guide: `Docs/BUILD.md`
 - CLion setup: `Docs/CLION_SETUP.md`
 - Audio engine notes: `Docs/AUDIO_ENGINE_DOCS.md`
 - SerialOSC reference: `Docs/SERIALOSC_REFERENCE.md`
 
-## License
+## Licensing
 
-- Project code: MIT (`LICENSE`)
-- Third-party terms: `THIRD_PARTY_NOTICES.md`
+- Project code in this repository is MIT-licensed: `LICENSE`
+- Third-party terms and redistribution notes: `THIRD_PARTY_NOTICES.md`
 
 If you redistribute binaries, include the relevant notice files.
 

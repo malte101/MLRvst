@@ -81,7 +81,7 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake make
 ### Option 1: Git Clone (Recommended)
 
 ```bash
-cd mlrVST-modern
+cd <repo-root>
 git clone https://github.com/juce-framework/JUCE.git
 ```
 
@@ -89,7 +89,7 @@ git clone https://github.com/juce-framework/JUCE.git
 
 1. Visit https://github.com/juce-framework/JUCE/releases
 2. Download JUCE 8.0.4 or later
-3. Extract to `mlrVST-modern/JUCE/`
+3. Extract to `<repo-root>/JUCE/`
 
 ### Option 3: Git Submodule
 
@@ -180,7 +180,7 @@ After `make install`:
 
 ```cmd
 REM Open "Developer Command Prompt for VS 2019"
-cd mlrVST-modern
+cd <repo-root>
 mkdir Build
 cd Build
 

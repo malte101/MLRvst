@@ -1252,6 +1252,7 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
         p.store(0.0f, std::memory_order_release);
     grainArpStep = 0;
     grainNeutralBlendState = 1.0f;
+    grainOverlapNormState = 1.0f;
     grainPreviewDecimationCounter = 0;
     grainSizeJitterBeatGroup = std::numeric_limits<int64_t>::min();
     grainSizeJitterMul = grainParams.sizeMs;
@@ -1832,6 +1833,7 @@ void EnhancedAudioStrip::resetGrainState()
     grainSchedulerNoiseTarget = 0.0;
     grainSchedulerNoiseCountdown = 0;
     grainNeutralBlendState = 1.0f;
+    grainOverlapNormState = 1.0f;
     grainParamsSnapshotValid = false;
     for (auto& p : grainPreviewPositions)
         p.store(-1.0f, std::memory_order_release);
@@ -2321,15 +2323,26 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
         }
     }
 
-    // Fallback: steal oldest active voice (same policy as before).
+    // Fallback: steal the voice closest to its tail to avoid abrupt mid-grain cuts.
     if (voiceIndex < 0)
     {
-        int oldestAge = -1;
+        double bestStealScore = -1.0;
         for (int i = 0; i < voiceCount; ++i)
         {
-            if (grainVoices[static_cast<size_t>(i)].ageSamples > oldestAge)
+            const auto& candidate = grainVoices[static_cast<size_t>(i)];
+            if (!candidate.active)
             {
-                oldestAge = grainVoices[static_cast<size_t>(i)].ageSamples;
+                voiceIndex = i;
+                break;
+            }
+
+            const int length = juce::jmax(1, candidate.lengthSamples);
+            const double progress = juce::jlimit(0.0, 1.0,
+                static_cast<double>(candidate.ageSamples) / static_cast<double>(length));
+            const double score = (progress * 2.0) + (static_cast<double>(candidate.ageSamples) * 1.0e-6);
+            if (score > bestStealScore)
+            {
+                bestStealScore = score;
                 voiceIndex = i;
             }
         }
@@ -2867,6 +2880,11 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         }
     }
 
+    // Short grains need a denser floor to avoid audible holes/clicks between grains.
+    const float shortSizeNorm = juce::jlimit(0.0f, 1.0f, (96.0f - effectiveSizeMs) / 91.0f);
+    const float antiGapDensityFloor = kGrainMinDensity + (0.07f * shortSizeNorm);
+    effectiveDensity = juce::jmax(effectiveDensity, antiGapDensityFloor);
+
     const double jitterLfo = std::sin(grainBloomPhase) + (0.45 * std::sin((grainBloomPhase * 2.37) + 1.3));
     const double jitterSamples = jitterLfo * static_cast<double>(effectiveSizeMs * 0.001f * static_cast<float>(currentSampleRate))
                                  * static_cast<double>(grainBloomAmount * randomDepth * 0.22f);
@@ -2954,7 +2972,12 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     const double jitterRateMul = 1.0 + (grainSchedulerNoise * static_cast<double>(0.35f + (0.65f * randomDepth)) * 0.45);
     const double emitterRateMul = 1.0 + (2.0 * emitShape);
     const double effectedSpawnRate = juce::jlimit(0.00005, 0.24, baseSpawnRate * jitterRateMul * emitterRateMul);
-    double spawnRate = effectedSpawnRate * static_cast<double>(granularBlend);
+    const float shapePosNow = juce::jmax(0.0f, shapeNow);
+    const double minOverlapFactor = 0.95
+        + (0.55 * static_cast<double>(envelopeNow))
+        + (0.40 * static_cast<double>(shapePosNow));
+    const double minSpawnRate = juce::jlimit(0.00005, 0.24, minOverlapFactor / juce::jmax(1.0, sizeSamplesD));
+    double spawnRate = juce::jmax(effectedSpawnRate, minSpawnRate) * static_cast<double>(granularBlend);
     if (entryIdentityScheduler)
     {
         // Identity entry: run a single deterministic playhead-like scheduler.
@@ -3058,6 +3081,7 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
 
     float windowSumL = 0.0f;
     float windowSumR = 0.0f;
+    float windowEnergy = 0.0f;
     int previewCount = 0;
     const auto grainQuality = grainResampler.getQuality();
     for (auto& voice : grainVoices)
@@ -3081,6 +3105,11 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
             const float pitchNorm = juce::jlimit(-1.0f, 1.0f, voice.pitchSemitones / 48.0f);
             grainPreviewPitchNorms[pitchIdx].store(pitchNorm, std::memory_order_release);
         }
+
+        const int voiceLengthSamples = juce::jmax(1, voice.lengthSamples);
+        const int safetyRampSamples = juce::jlimit(8, 160,
+            static_cast<int>(std::round(static_cast<float>(voiceLengthSamples) * 0.08f)));
+        const float safetyRampNorm = static_cast<float>(safetyRampSamples) / static_cast<float>(voiceLengthSamples);
         const float normPos = static_cast<float>(voice.ageSamples) / static_cast<float>(juce::jmax(1, voice.lengthSamples - 1));
         const int windowIdx = juce::jlimit(0, static_cast<int>(grainWindow.size()) - 1,
             static_cast<int>(std::round(normPos * static_cast<float>(grainWindow.size() - 1))));
@@ -3117,6 +3146,7 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         if (fade > 1.0e-4f)
         {
             const float fadeWidth = juce::jlimit(0.02f, 0.30f, 0.28f - (fade * 0.24f));
+            const float minFadeWidth = juce::jlimit(0.012f, 0.14f, safetyRampNorm * 1.35f);
             float shapedFadeWidth = fadeWidth;
             float shapePos = 0.0f;
             float shapeNeg = 0.0f;
@@ -3126,8 +3156,9 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
                 shapePos = juce::jmax(0.0f, bend);
                 shapeNeg = juce::jmax(0.0f, -bend);
                 // Positive shape can create very short, steep grains.
-                shapedFadeWidth = juce::jlimit(0.0035f, 0.30f, fadeWidth * (1.0f - (0.92f * shapePos)));
+                shapedFadeWidth = juce::jlimit(minFadeWidth, 0.30f, fadeWidth * (1.0f - (0.92f * shapePos)));
             }
+            shapedFadeWidth = juce::jmax(shapedFadeWidth, minFadeWidth);
             const float edgeDistance = juce::jmin(normPos, 1.0f - normPos);
             const float fadeNorm = juce::jlimit(0.0f, 1.0f, edgeDistance / shapedFadeWidth);
             const float edgeExponent = 1.0f + (3.2f * fade);
@@ -3152,17 +3183,29 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
             const float centerFocus = std::pow(centerTri, centerExponent);
             env *= juce::jlimit(0.10f, 1.0f, 0.18f + (0.82f * centerFocus));
         }
+        const float inRamp = juce::jlimit(0.0f, 1.0f,
+            static_cast<float>(voice.ageSamples) / static_cast<float>(juce::jmax(1, safetyRampSamples)));
+        const int samplesFromEnd = juce::jmax(0, voice.lengthSamples - 1 - voice.ageSamples);
+        const float outRamp = juce::jlimit(0.0f, 1.0f,
+            static_cast<float>(samplesFromEnd) / static_cast<float>(juce::jmax(1, safetyRampSamples)));
+        const float edgeRamp = juce::jmin(inRamp, outRamp);
+        const float safetyRamp = std::sin(edgeRamp * juce::MathConstants<float>::halfPi);
+        env *= juce::jlimit(0.0f, 1.0f, safetyRamp);
+
         const float amp = shapedWindow * env;
-        windowSumL += amp * voice.panL;
-        windowSumR += amp * voice.panR;
+        const float ampL = amp * voice.panL;
+        const float ampR = amp * voice.panR;
+        windowSumL += std::abs(ampL);
+        windowSumR += std::abs(ampR);
+        windowEnergy += 0.5f * ((ampL * ampL) + (ampR * ampR));
 
         float l = grainResampler.getSample(sampleBuffer, 0, voice.readPos, 1.0);
         float r = (sampleBuffer.getNumChannels() > 1)
             ? grainResampler.getSample(sampleBuffer, 1, voice.readPos, 1.0)
             : l;
 
-        outL += l * amp * voice.panL;
-        outR += r * amp * voice.panR;
+        outL += l * ampL;
+        outR += r * ampR;
 
         voice.readPos += voice.step;
         if (voice.readPos >= sampleLength)
@@ -3178,10 +3221,14 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     // Clamp denominator to avoid low-level boosting and denormal issues.
     const float densityPresence = juce::jlimit(0.0f, 1.0f, (0.55f * cloudLift) + (0.75f * effectiveEmitterDepth));
     const float normExp = juce::jlimit(0.35f, 0.85f, 0.85f - (0.42f * densityPresence));
-    const float denomL = std::pow(juce::jmax(1.0f, windowSumL), normExp);
-    const float denomR = std::pow(juce::jmax(1.0f, windowSumR), normExp);
-    outL /= denomL;
-    outR /= denomR;
+    const float stereoWindow = 0.5f * (windowSumL + windowSumR);
+    const float overlapPower = std::pow(juce::jmax(1.0f, stereoWindow), normExp);
+    const float overlapEnergy = std::sqrt(juce::jmax(1.0f, windowEnergy));
+    const float targetNorm = juce::jmax(1.0f, juce::jmax(overlapPower, overlapEnergy));
+    grainOverlapNormState += (targetNorm - grainOverlapNormState) * 0.10f;
+    const float overlapNorm = juce::jmax(1.0f, grainOverlapNormState);
+    outL /= overlapNorm;
+    outR /= overlapNorm;
 
     // Cloud-delay style smear feeding the granular output with short feedback tails.
     const float cloudBoost = juce::jlimit(0.0f, 1.0f, cloudDepth);

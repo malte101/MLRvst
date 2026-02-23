@@ -1,69 +1,33 @@
-# mlrVST v167 - Build Instructions
+# Build Reference
 
-## ⚠️ IMPORTANT: You Need JUCE First!
+This file is a short build reference.
 
-This project requires the JUCE framework to compile. The error you're seeing happens because JUCE is not in the directory.
+For full setup, platform dependencies, and troubleshooting, use:
 
-## Solution: Get JUCE
+- `Docs/BUILD.md`
 
-### On a Machine With Internet
-
-```bash
-cd mlrVST-modern
-git clone --depth 1 --branch 8.0.4 https://github.com/juce-framework/JUCE.git
-```
-
-That's it! Now you can build.
-
-### Alternative: Download JUCE Manually
-
-1. Go to: https://github.com/juce-framework/JUCE/releases/tag/8.0.4
-2. Download the source code zip
-3. Extract it to `mlrVST-modern/JUCE/`
-
-## Then Build
+## Quick Build
 
 ```bash
-cd mlrVST-modern
-make clean
+git clone https://github.com/malte101/MLRvst.git
+cd MLRvst
+git clone https://github.com/juce-framework/JUCE.git
 make
+make install
 ```
 
-Or if that fails:
+## Direct CMake Build
 
 ```bash
 cmake -B Build -DCMAKE_BUILD_TYPE=Release
 cmake --build Build --config Release
+cmake --install Build
 ```
 
-## Install
+## Release Packages
 
 ```bash
-# VST3
-sudo cp -r Build/mlrVST_artefacts/Release/VST3/mlrVST.vst3 ~/Library/Audio/Plug-Ins/VST3/
-
-# Audio Unit
-sudo cp -r Build/mlrVST_artefacts/Release/AU/mlrVST.component ~/Library/Audio/Plug-Ins/Components/
+make package-release
 ```
 
-## What's in v167
-
-✅ Crash fix (v164)  
-✅ Perfect clock sync (v166)  
-✅ Input monitoring (v167) - NEW!
-
-All features work. You just need to compile it!
-
-## Need Help?
-
-The code is all in `Source/`:
-- `PluginProcessor.cpp` - Main plugin logic
-- `AudioEngine.cpp` - Audio processing engine
-- `PluginEditor.cpp` - GUI
-
-Changes for v167:
-- Added `inputMonitor` parameter (line 547 in PluginProcessor.cpp)
-- Added input buffer copy and mix (AudioEngine.cpp processBlock)
-- Added `setInputMonitorVolume()` method
-
-Everything else remains the same from v166.
+Release artifacts are written to `release/`.

@@ -783,6 +783,7 @@ private:
     double grainBloomPhase = 0.0;
     float grainBloomAmount = 0.0f;
     float grainNeutralBlendState = 1.0f;
+    float grainOverlapNormState = 1.0f;
     
     // Smoothed parameters
     juce::SmoothedValue<float> smoothedVolume{0.7f};
