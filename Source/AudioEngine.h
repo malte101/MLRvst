@@ -515,6 +515,7 @@ public:
     float getGrainPitchJitter() const;
     float getGrainSpread() const;
     float getGrainJitter() const;
+    float getGrainPositionJitter() const;
     float getGrainRandomDepth() const;
     float getGrainArpDepth() const;
     float getGrainCloudDepth() const;
@@ -533,6 +534,7 @@ public:
     void setGrainPitchJitter(float semitones);
     void setGrainSpread(float value);
     void setGrainJitter(float value);
+    void setGrainPositionJitter(float value);
     void setGrainRandomDepth(float value);
     void setGrainArpDepth(float value);
     void setGrainCloudDepth(float value);
@@ -632,6 +634,7 @@ public:
             // Brief identity scheduler hold so initial grain playback tracks
             // one deterministic playhead before evolving into full cloud behavior.
             grainEntryIdentitySamplesRemaining = juce::jmax(32, static_cast<int>(currentSampleRate * 0.18));
+            grainEntryIdentityTotalSamples = grainEntryIdentitySamplesRemaining;
 
             // Short output blend from previous sample to prevent mode-switch crackle.
             const float modeFadeMs = juce::jlimit(0.2f, 8.0f, triggerFadeInMs.load(std::memory_order_acquire));
@@ -657,6 +660,7 @@ public:
         {
             resetGrainState();
             grainEntryIdentitySamplesRemaining = 0;
+            grainEntryIdentityTotalSamples = 0;
         }
     }
     PlayMode getPlayMode() const { return playMode; }
@@ -700,6 +704,7 @@ private:
         float pitchJitterSemitones = 0.0f;
         float spread = 0.0f;       // 0..1
         float jitter = 0.0f;       // 0..1 bloom modulation depth
+        float positionJitter = 0.0f; // 0..1 grain center jitter depth
         float randomDepth = 0.0f;  // 0..1 spray/reverse modulation depth
         float arpDepth = 0.0f;     // 0..1 arpeggiation depth
         float cloudDepth = 0.0f;   // 0..1 cloud delay mix/feedback
@@ -772,6 +777,7 @@ private:
     double grainSchedulerNoiseTarget = 0.0;
     int grainSchedulerNoiseCountdown = 0;
     int grainEntryIdentitySamplesRemaining = 0;
+    int grainEntryIdentityTotalSamples = 0;
     juce::SmoothedValue<double> grainCenterSmoother{0.0};
     juce::SmoothedValue<float> grainSizeSmoother{1240.0f};
     juce::SmoothedValue<float> grainSyncedSizeSmoother{1240.0f};
@@ -916,6 +922,7 @@ private:
     std::atomic<float> grainPitchJitterAtomic{0.0f};
     std::atomic<float> grainSpreadAtomic{0.0f};
     std::atomic<float> grainJitterAtomic{0.0f};
+    std::atomic<float> grainPositionJitterAtomic{0.0f};
     std::atomic<float> grainRandomDepthAtomic{0.0f};
     std::atomic<float> grainArpDepthAtomic{0.0f};
     std::atomic<float> grainCloudDepthAtomic{0.0f};

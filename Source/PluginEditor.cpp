@@ -1071,6 +1071,7 @@ void StripControl::setupComponents()
     setupGrainKnob(grainPitchJitterSlider, grainPitchJitterLabel, "PJIT", 0.0, 48.0, 0.1);
     setupGrainKnob(grainSpreadSlider, grainSpreadLabel, "SPRD", 0.0, 1.0, 0.01);
     setupGrainKnob(grainJitterSlider, grainJitterLabel, "SJTR", 0.0, 1.0, 0.01);
+    setupGrainKnob(grainPositionJitterSlider, grainPositionJitterLabel, "POSJ", 0.0, 1.0, 0.01);
     setupGrainKnob(grainRandomSlider, grainRandomLabel, "RAND", 0.0, 1.0, 0.01);
     setupGrainKnob(grainArpSlider, grainArpLabel, "ARP", 0.0, 1.0, 0.01);
     setupGrainKnob(grainCloudSlider, grainCloudLabel, "CLOUD", 0.0, 1.0, 0.01);
@@ -1083,6 +1084,7 @@ void StripControl::setupComponents()
     enableAltClickReset(grainPitchJitterSlider, 0.0);
     enableAltClickReset(grainSpreadSlider, 0.0);
     enableAltClickReset(grainJitterSlider, 0.0);
+    enableAltClickReset(grainPositionJitterSlider, 0.0);
     enableAltClickReset(grainRandomSlider, 0.0);
     enableAltClickReset(grainArpSlider, 0.0);
     enableAltClickReset(grainCloudSlider, 0.0);
@@ -1098,6 +1100,7 @@ void StripControl::setupComponents()
     setupMini(grainPitchJitterSlider);
     setupMini(grainSpreadSlider);
     setupMini(grainJitterSlider);
+    setupMini(grainPositionJitterSlider);
     setupMini(grainRandomSlider);
     setupMini(grainArpSlider);
     setupMini(grainCloudSlider);
@@ -1143,6 +1146,15 @@ void StripControl::setupComponents()
         const int percent = static_cast<int>(std::round(juce::jlimit(0.0, 1.0, value) * 100.0));
         return juce::String(percent) + "% size jitter";
     };
+    grainPositionJitterSlider.textFromValueFunction = [this](double value)
+    {
+        const int percent = static_cast<int>(std::round(juce::jlimit(0.0, 1.0, value) * 100.0));
+        bool syncEnabled = grainSizeSyncToggle.getToggleState();
+        if (auto* engine = processor.getAudioEngine())
+            if (auto* strip = engine->getStrip(stripIndex))
+                syncEnabled = strip->isGrainTempoSyncEnabled();
+        return juce::String(percent) + (syncEnabled ? "% pos jitter (sync)" : "% pos jitter");
+    };
     grainRandomSlider.textFromValueFunction = [](double value)
     {
         const int percent = static_cast<int>(std::round(juce::jlimit(0.0, 1.0, value) * 100.0));
@@ -1158,7 +1170,8 @@ void StripControl::setupComponents()
         const int percent = static_cast<int>(std::round(juce::jlimit(-1.0, 1.0, value) * 100.0));
         return juce::String(percent) + "% Shape";
     };
-    grainRandomSlider.setTooltip("RAND: macro random depth (position, pitch, size, reverse), not just position jitter.");
+    grainPositionJitterSlider.setTooltip("POSJ: grain center position jitter. Quantized to sync grid when Grain SYNC is enabled.");
+    grainRandomSlider.setTooltip("RAND: macro random depth (pitch, size, reverse, spray), independent of POSJ.");
 
     grainSizeSlider.onValueChange = [this]()
     {
@@ -1198,6 +1211,11 @@ void StripControl::setupComponents()
     {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
             strip->setGrainJitter(static_cast<float>(grainJitterSlider.getValue()));
+    };
+    grainPositionJitterSlider.onValueChange = [this]()
+    {
+        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
+            strip->setGrainPositionJitter(static_cast<float>(grainPositionJitterSlider.getValue()));
     };
     grainRandomSlider.onValueChange = [this]()
     {
@@ -1566,6 +1584,7 @@ void StripControl::updateGrainOverlayVisibility()
     grainPitchJitterSlider.setVisible(showPitchPage);
     grainSpreadSlider.setVisible(showSpacePage);
     grainJitterSlider.setVisible(showSpacePage);
+    grainPositionJitterSlider.setVisible(showSpacePage);
     grainRandomSlider.setVisible(showPitchPage);
     grainArpSlider.setVisible(showPitchPage);
     grainCloudSlider.setVisible(showSpacePage);
@@ -1583,6 +1602,7 @@ void StripControl::updateGrainOverlayVisibility()
     grainPitchJitterLabel.setVisible(showPitchPage);
     grainSpreadLabel.setVisible(showSpacePage);
     grainJitterLabel.setVisible(showSpacePage);
+    grainPositionJitterLabel.setVisible(showSpacePage);
     grainRandomLabel.setVisible(showPitchPage);
     grainArpLabel.setVisible(showPitchPage);
     grainCloudLabel.setVisible(showSpacePage);
@@ -2047,12 +2067,12 @@ void StripControl::hideAllGrainControls()
 {
     auto hide = [](juce::Component& c){ c.setVisible(false); };
     hide(grainSizeSlider); hide(grainDensitySlider); hide(grainPitchSlider); hide(grainPitchJitterSlider);
-    hide(grainSpreadSlider); hide(grainJitterSlider); hide(grainRandomSlider); hide(grainArpSlider);
+    hide(grainSpreadSlider); hide(grainJitterSlider); hide(grainPositionJitterSlider); hide(grainRandomSlider); hide(grainArpSlider);
     hide(grainCloudSlider); hide(grainEmitterSlider); hide(grainEnvelopeSlider); hide(grainShapeSlider);
     hide(grainTabPitchButton); hide(grainTabSpaceButton); hide(grainTabShapeButton);
     hide(grainSizeSyncToggle); hide(grainSizeDivLabel); hide(grainSizeLabel);
     hide(grainDensityLabel); hide(grainPitchLabel); hide(grainPitchJitterLabel); hide(grainSpreadLabel);
-    hide(grainJitterLabel); hide(grainRandomLabel); hide(grainArpLabel); hide(grainCloudLabel);
+    hide(grainJitterLabel); hide(grainPositionJitterLabel); hide(grainRandomLabel); hide(grainArpLabel); hide(grainCloudLabel);
     hide(grainEmitterLabel); hide(grainEnvelopeLabel); hide(grainShapeLabel);
 }
 
@@ -2244,11 +2264,13 @@ void StripControl::resized()
     controlsArea.reduce(4, 0);
     
     const bool isGrainMode = grainOverlayVisible;
+    const bool isGrainSpacePage = isGrainMode && grainSubPage == GrainSubPage::Space;
 
     const int rowGap = isGrainMode ? 0 : 1;
 
     // Top row: Load + slice mode
-    auto topRow = controlsArea.removeFromTop(isGrainMode ? 14 : 18);
+    const int topRowHeight = isGrainMode ? (isGrainSpacePage ? 12 : 14) : 18;
+    auto topRow = controlsArea.removeFromTop(topRowHeight);
     const int half = topRow.getWidth() / 2;
     auto loadArea = topRow.removeFromLeft(half);
     loadButton.setBounds(loadArea.reduced(0, 0));
@@ -2257,7 +2279,8 @@ void StripControl::resized()
     controlsArea.removeFromTop(rowGap);
     
     // Second row: Play mode and Direction mode (2/3 width each), Group (1/3 width)
-    auto modesRow = controlsArea.removeFromTop(isGrainMode ? 14 : 18);
+    const int modesRowHeight = isGrainMode ? (isGrainSpacePage ? 12 : 14) : 18;
+    auto modesRow = controlsArea.removeFromTop(modesRowHeight);
     int thirdWidth = modesRow.getWidth() / 3;
     playModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
     directionModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
@@ -2298,7 +2321,8 @@ void StripControl::resized()
     }
     
     // Rotary knobs row.
-    auto knobsRow = controlsArea.removeFromTop(isGrainMode ? 22 : 30);
+    const int knobsRowHeight = isGrainMode ? (isGrainSpacePage ? 20 : 22) : 30;
+    auto knobsRow = controlsArea.removeFromTop(knobsRowHeight);
     int totalWidth = knobsRow.getWidth();
     int mainKnobsWidth = (totalWidth * 7) / 10;
     int mainKnobWidth = mainKnobsWidth / 3;
@@ -2322,7 +2346,8 @@ void StripControl::resized()
     else
         scratchSlider.setBounds(knobsRow.reduced(2));
 
-    auto labelsRow = controlsArea.removeFromTop(isGrainMode ? 10 : 9);
+    const int labelsRowHeight = isGrainMode ? (isGrainSpacePage ? 9 : 10) : 9;
+    auto labelsRow = controlsArea.removeFromTop(labelsRowHeight);
     if (isGrainMode)
     {
         auto sizeLabelArea = labelsRow.removeFromLeft(mainKnobWidth);
@@ -2356,8 +2381,8 @@ void StripControl::resized()
         return;
     }
 
-    controlsArea.removeFromTop(1);
-    auto tabRow = controlsArea.removeFromTop(13);
+    controlsArea.removeFromTop(isGrainSpacePage ? 0 : 1);
+    auto tabRow = controlsArea.removeFromTop(isGrainSpacePage ? 11 : 13);
     const int tabGap = 2;
     const int tabW = juce::jmax(1, (tabRow.getWidth() - (2 * tabGap)) / 3);
     grainTabPitchButton.setBounds(tabRow.removeFromLeft(tabW));
@@ -2366,10 +2391,15 @@ void StripControl::resized()
     tabRow.removeFromLeft(tabGap);
     grainTabShapeButton.setBounds(tabRow);
 
-    controlsArea.removeFromTop(2);
-    const int rowGapMini = 2;
-    const int totalMiniRows = (grainSubPage == GrainSubPage::Shape) ? 2 : 2;
-    const int rowH = juce::jlimit(12, 22, (controlsArea.getHeight() - ((totalMiniRows - 1) * rowGapMini)) / totalMiniRows);
+    controlsArea.removeFromTop(isGrainSpacePage ? 1 : 2);
+    const int rowGapMini = isGrainSpacePage ? 1 : 2;
+    const int totalMiniRows = (grainSubPage == GrainSubPage::Space) ? 3 : 2;
+    const int minMiniRowH = isGrainSpacePage ? 8 : 12;
+    const int maxMiniRowH = isGrainSpacePage ? 20 : 22;
+    const int rowH = juce::jlimit(minMiniRowH,
+                                  maxMiniRowH,
+                                  (controlsArea.getHeight() - ((totalMiniRows - 1) * rowGapMini)) / totalMiniRows);
+    const int miniLabelW = isGrainSpacePage ? 30 : 34;
     auto layoutGrainMiniRow = [&](juce::Label& labelA, juce::Slider& sliderA,
                                   juce::Label& labelB, juce::Slider& sliderB)
     {
@@ -2377,11 +2407,21 @@ void StripControl::resized()
             return;
         auto row = controlsArea.removeFromTop(rowH);
         auto left = row.removeFromLeft(row.getWidth() / 2);
-        labelA.setBounds(left.removeFromLeft(34));
+        labelA.setBounds(left.removeFromLeft(miniLabelW));
         sliderA.setBounds(left);
         row.removeFromLeft(2);
-        labelB.setBounds(row.removeFromLeft(34));
+        labelB.setBounds(row.removeFromLeft(miniLabelW));
         sliderB.setBounds(row);
+        if (controlsArea.getHeight() > rowGapMini)
+            controlsArea.removeFromTop(rowGapMini);
+    };
+    auto layoutGrainSingleRow = [&](juce::Label& label, juce::Slider& slider)
+    {
+        if (controlsArea.getHeight() <= 0)
+            return;
+        auto row = controlsArea.removeFromTop(rowH);
+        label.setBounds(row.removeFromLeft(miniLabelW));
+        slider.setBounds(row);
         if (controlsArea.getHeight() > rowGapMini)
             controlsArea.removeFromTop(rowGapMini);
     };
@@ -2398,6 +2438,7 @@ void StripControl::resized()
     {
         layoutGrainMiniRow(grainSpreadLabel, grainSpreadSlider, grainJitterLabel, grainJitterSlider);
         layoutGrainMiniRow(grainCloudLabel, grainCloudSlider, grainEmitterLabel, grainEmitterSlider);
+        layoutGrainSingleRow(grainPositionJitterLabel, grainPositionJitterSlider);
     }
     else
     {
@@ -2682,6 +2723,8 @@ void StripControl::updateFromEngine()
         grainSpreadSlider.setValue(strip->getGrainSpread(), juce::dontSendNotification);
     if (!modulates(ModernAudioEngine::ModTarget::GrainJitter))
         grainJitterSlider.setValue(strip->getGrainJitter(), juce::dontSendNotification);
+    if (!grainPositionJitterSlider.isMouseButtonDown())
+        grainPositionJitterSlider.setValue(strip->getGrainPositionJitter(), juce::dontSendNotification);
     if (!modulates(ModernAudioEngine::ModTarget::GrainRandom))
         grainRandomSlider.setValue(strip->getGrainRandomDepth(), juce::dontSendNotification);
     if (!modulates(ModernAudioEngine::ModTarget::GrainArp))
@@ -2770,6 +2813,7 @@ void StripControl::updateFromEngine()
     tintSlider(grainPitchJitterSlider, baseControl, 0.0f);
     tintSlider(grainSpreadSlider, baseControl, 0.0f);
     tintSlider(grainJitterSlider, baseControl, 0.0f);
+    tintSlider(grainPositionJitterSlider, baseControl, 0.0f);
     tintSlider(grainRandomSlider, baseControl, 0.0f);
     tintSlider(grainArpSlider, baseControl, 0.0f);
     tintSlider(grainCloudSlider, baseControl, 0.0f);
@@ -2786,6 +2830,7 @@ void StripControl::updateFromEngine()
     setModIndicator(grainPitchJitterSlider, false, 0.0f, 0.0f, kAccent);
     setModIndicator(grainSpreadSlider, false, 0.0f, 0.0f, kAccent);
     setModIndicator(grainJitterSlider, false, 0.0f, 0.0f, kAccent);
+    setModIndicator(grainPositionJitterSlider, false, 0.0f, 0.0f, kAccent);
     setModIndicator(grainRandomSlider, false, 0.0f, 0.0f, kAccent);
     setModIndicator(grainArpSlider, false, 0.0f, 0.0f, kAccent);
     setModIndicator(grainCloudSlider, false, 0.0f, 0.0f, kAccent);

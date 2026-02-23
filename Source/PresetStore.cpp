@@ -198,6 +198,7 @@ void resetStripToDefaultState(int stripIndex,
     strip.setGrainPitchJitter(0.0f);
     strip.setGrainSpread(0.0f);
     strip.setGrainJitter(0.0f);
+    strip.setGrainPositionJitter(0.0f);
     strip.setGrainRandomDepth(0.0f);
     strip.setGrainArpDepth(0.0f);
     strip.setGrainCloudDepth(0.0f);
@@ -550,6 +551,7 @@ bool savePreset(int presetIndex,
         stripXml->setAttribute("grainPitchJitter", strip->getGrainPitchJitter());
         stripXml->setAttribute("grainSpread", strip->getGrainSpread());
         stripXml->setAttribute("grainJitter", strip->getGrainJitter());
+        stripXml->setAttribute("grainPositionJitter", strip->getGrainPositionJitter());
         stripXml->setAttribute("grainRandomDepth", strip->getGrainRandomDepth());
         stripXml->setAttribute("grainArpDepth", strip->getGrainArpDepth());
         stripXml->setAttribute("grainCloudDepth", strip->getGrainCloudDepth());
@@ -890,6 +892,7 @@ bool loadPreset(int presetIndex,
         strip->setGrainPitchJitter(static_cast<float>(stripXml->getDoubleAttribute("grainPitchJitter", 0.0)));
         strip->setGrainSpread(static_cast<float>(stripXml->getDoubleAttribute("grainSpread", 0.0)));
         strip->setGrainJitter(static_cast<float>(stripXml->getDoubleAttribute("grainJitter", 0.0)));
+        strip->setGrainPositionJitter(static_cast<float>(stripXml->getDoubleAttribute("grainPositionJitter", 0.0)));
         strip->setGrainRandomDepth(static_cast<float>(stripXml->getDoubleAttribute("grainRandomDepth", 0.0)));
         strip->setGrainArpDepth(static_cast<float>(stripXml->getDoubleAttribute("grainArpDepth", 0.0)));
         strip->setGrainCloudDepth(static_cast<float>(stripXml->getDoubleAttribute("grainCloudDepth", 0.0)));

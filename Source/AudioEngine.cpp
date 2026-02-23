@@ -1230,6 +1230,7 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     grainPitchJitterAtomic.store(grainParams.pitchJitterSemitones, std::memory_order_release);
     grainSpreadAtomic.store(grainParams.spread, std::memory_order_release);
     grainJitterAtomic.store(grainParams.jitter, std::memory_order_release);
+    grainPositionJitterAtomic.store(grainParams.positionJitter, std::memory_order_release);
     grainRandomDepthAtomic.store(grainParams.randomDepth, std::memory_order_release);
     grainArpDepthAtomic.store(grainParams.arpDepth, std::memory_order_release);
     grainCloudDepthAtomic.store(grainParams.cloudDepth, std::memory_order_release);
@@ -1244,6 +1245,7 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     grainSchedulerNoiseTarget = 0.0;
     grainSchedulerNoiseCountdown = 0;
     grainEntryIdentitySamplesRemaining = 0;
+    grainEntryIdentityTotalSamples = 0;
     grainParamsSnapshotValid = false;
     grainThreeButtonSnapshotActive = false;
     for (auto& p : grainPreviewPositions)
@@ -1832,6 +1834,8 @@ void EnhancedAudioStrip::resetGrainState()
     grainSchedulerNoise = 0.0;
     grainSchedulerNoiseTarget = 0.0;
     grainSchedulerNoiseCountdown = 0;
+    grainEntryIdentitySamplesRemaining = 0;
+    grainEntryIdentityTotalSamples = 0;
     grainNeutralBlendState = 1.0f;
     grainOverlapNormState = 1.0f;
     grainParamsSnapshotValid = false;
@@ -1869,6 +1873,7 @@ void EnhancedAudioStrip::resetGrainState()
     grainPitchJitterAtomic.store(grainParams.pitchJitterSemitones, std::memory_order_release);
     grainSpreadAtomic.store(grainParams.spread, std::memory_order_release);
     grainJitterAtomic.store(grainParams.jitter, std::memory_order_release);
+    grainPositionJitterAtomic.store(grainParams.positionJitter, std::memory_order_release);
     grainRandomDepthAtomic.store(grainParams.randomDepth, std::memory_order_release);
     grainArpDepthAtomic.store(grainParams.arpDepth, std::memory_order_release);
     grainCloudDepthAtomic.store(grainParams.cloudDepth, std::memory_order_release);
@@ -2194,6 +2199,7 @@ void EnhancedAudioStrip::updateGrainGestureOnRelease(int column, int64_t globalS
         grainPitchJitterAtomic.store(grainParams.pitchJitterSemitones, std::memory_order_release);
         grainSpreadAtomic.store(grainParams.spread, std::memory_order_release);
         grainJitterAtomic.store(grainParams.jitter, std::memory_order_release);
+        grainPositionJitterAtomic.store(grainParams.positionJitter, std::memory_order_release);
         grainRandomDepthAtomic.store(grainParams.randomDepth, std::memory_order_release);
         grainArpDepthAtomic.store(grainParams.arpDepth, std::memory_order_release);
         grainCloudDepthAtomic.store(grainParams.cloudDepth, std::memory_order_release);
@@ -2613,6 +2619,7 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     grainPitchJitterAtomic.store(pitchJitterNow, std::memory_order_release);
     const float arpDepth = grainArpDepthAtomic.load(std::memory_order_acquire);
     float jitterAmount = grainJitterAtomic.load(std::memory_order_acquire);
+    const float positionJitterAmount = grainPositionJitterAtomic.load(std::memory_order_acquire);
     float randomDepth = grainRandomDepthAtomic.load(std::memory_order_acquire);
     const float spreadBaseNow = grainSpreadAtomic.load(std::memory_order_acquire);
     const float cloudDepth = grainCloudDepthAtomic.load(std::memory_order_acquire);
@@ -2900,18 +2907,23 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     const double sizeSamplesD = juce::jmax(1.0, static_cast<double>(effectiveSizeMs * 0.001f * static_cast<float>(currentSampleRate)));
     constexpr float kNeutralSizeMs = 1240.0f;
     constexpr float kNeutralDensity = 0.05f;
+    const bool grainEntryTransitionActive = (grainEntryIdentitySamplesRemaining > 0
+                                             && grainEntryIdentityTotalSamples > 0);
     const bool neutralContext = heldCount == 0
         && !grainGesture.anyHeld
         && !grainGesture.freeze
-        && !grainGesture.returningToTimeline
-        && !tempoSyncEnabled;
-    const bool entryIdentityScheduler = neutralContext && grainEntryIdentitySamplesRemaining > 0;
+        && !grainGesture.returningToTimeline;
+    const bool entryIdentityScheduler = grainEntryTransitionActive;
     const double neutralReadPos = getWrappedSamplePosition(centerSamplePos, loopStartSamples, loopLengthSamplesLocal);
     const double neutralStep = 1.0;
     const float neutralSampleL = grainResampler.getSample(sampleBuffer, 0, neutralReadPos, neutralStep);
     const float neutralSampleR = (sampleBuffer.getNumChannels() > 1)
         ? grainResampler.getSample(sampleBuffer, 1, neutralReadPos, neutralStep)
         : neutralSampleL;
+    const float entryDrySampleL = resampler.getSample(sampleBuffer, 0, neutralReadPos, neutralStep);
+    const float entryDrySampleR = (sampleBuffer.getNumChannels() > 1)
+        ? resampler.getSample(sampleBuffer, 1, neutralReadPos, neutralStep)
+        : entryDrySampleL;
 
     float neutralTargetBlend = 0.0f;
     if (neutralContext)
@@ -2924,6 +2936,7 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         const float dPitchJitter = pitchJitterNow / 2.0f;
         const float dSpread = spreadBaseNow / 0.2f;
         const float dJitter = jitterAmount / 0.2f;
+        const float dPosJitter = positionJitterAmount / 0.2f;
         const float dRandom = randomDepth / 0.2f;
         const float dArp = arpDepth / 0.15f;
         const float dCloud = cloudDepth / 0.12f;
@@ -2931,7 +2944,7 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         const float dEnv = envelopeNow / 0.2f;
         const float dScene = std::abs(sceneMix) / 0.1f;
         const float deviation = juce::jlimit(0.0f, 1.0f, std::max({
-            dSize, dDensity, dSpeed, dPitch, dPitchJitter, dSpread, dJitter,
+            dSize, dDensity, dSpeed, dPitch, dPitchJitter, dSpread, dJitter, dPosJitter,
             dRandom, dArp, dCloud, dEmitter, dEnv, dScene
         }));
         neutralTargetBlend = 1.0f - deviation;
@@ -2942,7 +2955,13 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     const float neutralBlend = juce::jlimit(0.0f, 1.0f, grainNeutralBlendState);
     const float granularBlend = 1.0f - neutralBlend;
 
-    if (grainSchedulerNoiseCountdown <= 0)
+    if (grainEntryTransitionActive)
+    {
+        grainSchedulerNoise = 0.0;
+        grainSchedulerNoiseTarget = 0.0;
+        grainSchedulerNoiseCountdown = 0;
+    }
+    else if (grainSchedulerNoiseCountdown <= 0)
     {
         std::uniform_real_distribution<double> schedNoiseDist(-1.0, 1.0);
         grainSchedulerNoiseTarget = schedNoiseDist(randomGenerator);
@@ -3058,6 +3077,27 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
             if (spawnSafety < static_cast<int>(emitterSpawnInLoop.size()))
                 emitterSpawnInLoop[static_cast<size_t>(spawnSafety)] = distributed;
             spawnCenter = loopStartSamples + distributed;
+        }
+
+        if (positionJitterAmount > 0.001f)
+        {
+            double jitterOffsetSamples = 0.0;
+            if (tempoSyncEnabled && lastObservedTempo > 0.0)
+            {
+                const double syncStep = juce::jmax(1.0, static_cast<double>(tempoSyncedSizeMs * 0.001f * static_cast<float>(currentSampleRate)));
+                const int maxSteps = juce::jlimit(1, 12, static_cast<int>(std::round(1.0f + (positionJitterAmount * 11.0f))));
+                std::uniform_int_distribution<int> stepDist(-maxSteps, maxSteps);
+                jitterOffsetSamples = static_cast<double>(stepDist(randomGenerator)) * syncStep;
+            }
+            else
+            {
+                const double maxOffset = juce::jlimit(0.0, loopLengthSamplesLocal * 0.45,
+                    sizeSamplesD * static_cast<double>(0.35f + (7.5f * juce::jlimit(0.0f, 1.0f, positionJitterAmount))));
+                std::uniform_real_distribution<double> offsetDist(-maxOffset, maxOffset);
+                jitterOffsetSamples = offsetDist(randomGenerator);
+            }
+
+            spawnCenter = getWrappedSamplePosition(spawnCenter + jitterOffsetSamples, loopStartSamples, loopLengthSamplesLocal);
         }
 
         spawnGrainVoice(spawnCenter,
@@ -3273,6 +3313,7 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
             juce::jlimit(0.0f, 1.0f, grainPitchJitterAtomic.load(std::memory_order_acquire) / 48.0f),
             juce::jlimit(0.0f, 1.0f, grainSpreadAtomic.load(std::memory_order_acquire)),
             juce::jlimit(0.0f, 1.0f, grainJitterAtomic.load(std::memory_order_acquire)),
+            juce::jlimit(0.0f, 1.0f, grainPositionJitterAtomic.load(std::memory_order_acquire)),
             juce::jlimit(0.0f, 1.0f, grainRandomDepthAtomic.load(std::memory_order_acquire)),
             juce::jlimit(0.0f, 1.0f, grainArpDepthAtomic.load(std::memory_order_acquire)),
             cloudBoost,
@@ -3292,6 +3333,15 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     {
         outL = (outL * granularBlend) + (neutralSampleL * neutralBlend);
         outR = (outR * granularBlend) + (neutralSampleR * neutralBlend);
+    }
+
+    if (grainEntryTransitionActive)
+    {
+        const float entryRemain = static_cast<float>(grainEntryIdentitySamplesRemaining)
+                                / static_cast<float>(juce::jmax(1, grainEntryIdentityTotalSamples));
+        const float dryBlend = juce::jlimit(0.0f, 1.0f, entryRemain * entryRemain);
+        outL = (outL * (1.0f - dryBlend)) + (entryDrySampleL * dryBlend);
+        outR = (outR * (1.0f - dryBlend)) + (entryDrySampleR * dryBlend);
     }
 
     if (grainEntryIdentitySamplesRemaining > 0)
@@ -6754,6 +6804,11 @@ float EnhancedAudioStrip::getGrainJitter() const
     return grainJitterAtomic.load(std::memory_order_acquire);
 }
 
+float EnhancedAudioStrip::getGrainPositionJitter() const
+{
+    return grainPositionJitterAtomic.load(std::memory_order_acquire);
+}
+
 float EnhancedAudioStrip::getGrainRandomDepth() const
 {
     return grainRandomDepthAtomic.load(std::memory_order_acquire);
@@ -6868,6 +6923,13 @@ void EnhancedAudioStrip::setGrainJitter(float value)
     juce::ScopedLock lock(bufferLock);
     grainParams.jitter = juce::jlimit(0.0f, 1.0f, value);
     grainJitterAtomic.store(grainParams.jitter, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::setGrainPositionJitter(float value)
+{
+    juce::ScopedLock lock(bufferLock);
+    grainParams.positionJitter = juce::jlimit(0.0f, 1.0f, value);
+    grainPositionJitterAtomic.store(grainParams.positionJitter, std::memory_order_release);
 }
 
 void EnhancedAudioStrip::setGrainRandomDepth(float value)

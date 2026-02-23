@@ -2989,6 +2989,7 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
             strip->setGrainPitchJitter(0.0f);
             strip->setGrainSpread(0.0f);
             strip->setGrainJitter(0.0f);
+            strip->setGrainPositionJitter(0.0f);
             strip->setGrainRandomDepth(0.0f);
             strip->setGrainArpDepth(0.0f);
             strip->setGrainCloudDepth(0.0f);

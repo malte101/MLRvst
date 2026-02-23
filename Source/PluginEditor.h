@@ -402,6 +402,7 @@ private:
     juce::Slider grainPitchJitterSlider;
     juce::Slider grainSpreadSlider;
     juce::Slider grainJitterSlider;
+    juce::Slider grainPositionJitterSlider;
     juce::Slider grainRandomSlider;
     juce::Slider grainArpSlider;
     juce::Slider grainCloudSlider;
@@ -419,6 +420,7 @@ private:
     juce::Label grainPitchJitterLabel;
     juce::Label grainSpreadLabel;
     juce::Label grainJitterLabel;
+    juce::Label grainPositionJitterLabel;
     juce::Label grainRandomLabel;
     juce::Label grainArpLabel;
     juce::Label grainCloudLabel;
