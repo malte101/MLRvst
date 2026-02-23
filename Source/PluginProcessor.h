@@ -364,8 +364,25 @@ private:
     void applyPendingBarChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
     void applyPendingStutterRelease(const juce::AudioPlayHead::PositionInfo& posInfo);
     void performMomentaryStutterReleaseNow(double hostPpqNow, int64_t nowSample);
+    void captureMomentaryStutterMacroBaseline();
+    void applyMomentaryStutterMacro(const juce::AudioPlayHead::PositionInfo& posInfo);
+    void restoreMomentaryStutterMacroBaseline();
     bool getHostSyncSnapshot(double& outPpq, double& outTempo) const;
     void performPresetLoad(int presetIndex, double hostPpqSnapshot, double hostTempoSnapshot);
+    struct PresetSaveRequest
+    {
+        int presetIndex = -1;
+        std::array<juce::File, MaxStrips> stripFiles;
+    };
+    struct PresetSaveResult
+    {
+        int presetIndex = -1;
+        bool success = false;
+    };
+    class PresetSaveJob;
+    bool runPresetSaveRequest(const PresetSaveRequest& request);
+    void pushPresetSaveResult(const PresetSaveResult& result);
+    void applyCompletedPresetSaves();
     void resetRuntimePresetStateToDefaults();
 
     // Row 0, col 8: global momentary scratch modifier.
@@ -378,7 +395,23 @@ private:
     bool momentaryStutterHoldActive = false;
     double momentaryStutterDivisionBeats = 1.0; // 1.0=1/4 ... 0.0625=1/64
     int momentaryStutterActiveDivisionButton = -1;
+    std::atomic<uint8_t> momentaryStutterButtonMask{0};
     std::array<bool, MaxStrips> momentaryStutterStripArmed{};
+    struct MomentaryStutterSavedStripState
+    {
+        bool valid = false;
+        float pan = 0.0f;
+        float pitchShift = 0.0f;
+        bool filterEnabled = false;
+        float filterFrequency = 20000.0f;
+        float filterResonance = 0.707f;
+        float filterMorph = 0.0f;
+        EnhancedAudioStrip::FilterAlgorithm filterAlgorithm = EnhancedAudioStrip::FilterAlgorithm::Tpt12;
+    };
+    std::array<MomentaryStutterSavedStripState, MaxStrips> momentaryStutterSavedState{};
+    bool momentaryStutterMacroBaselineCaptured = false;
+    bool momentaryStutterMacroCapturePending = false;
+    double momentaryStutterMacroStartPpq = 0.0;
     std::atomic<int> pendingStutterReleaseActive{0};
     std::atomic<double> pendingStutterReleasePpq{-1.0};
     std::atomic<int> pendingStutterReleaseQuantizeDivision{8};
@@ -398,6 +431,10 @@ private:
     static constexpr uint32_t presetSaveBurstDurationMs = 260;
     static constexpr uint32_t presetSaveBurstIntervalMs = 55;
     std::atomic<int> pendingPresetLoadIndex{-1};
+    juce::ThreadPool presetSaveThreadPool{1};
+    juce::CriticalSection presetSaveResultLock;
+    std::vector<PresetSaveResult> presetSaveResults;
+    std::atomic<int> presetSaveJobsInFlight{0};
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MlrVSTAudioProcessor)
 };

@@ -8,7 +8,7 @@ class ModernAudioEngine;
 namespace PresetStore
 {
 juce::File getPresetDirectory();
-void savePreset(int presetIndex,
+bool savePreset(int presetIndex,
                 int maxStrips,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,

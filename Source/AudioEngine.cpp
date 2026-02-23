@@ -18,7 +18,6 @@
 
 namespace
 {
-constexpr bool kEnableRealtimeFileLogging = false;
 constexpr double kMaxScratchRateAbs = 2.5;
 constexpr double kMaxPatternRateAbs = 4.0;
 constexpr double kForwardScratchDecay = 7.0;
@@ -434,11 +433,6 @@ void QuantizationClock::scheduleTrigger(int stripIndex, int column, double ppq, 
     // For 1/8 notes (0.5 beats), snap to 0.0, 0.5, 1.0, 1.5, 2.0...
     nextGridPPQ = std::round(nextGridPPQ / quantBeats) * quantBeats;
     
-    // DEBUG: Log to file
-    juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                           .getChildFile("mlrVST_schedule_debug.txt");
-    juce::FileOutputStream stream(logFile, 1024);
-    
     bool gateClosed = false;
     QuantisedTrigger existingTrigger;
     int64_t currentSampleSnapshot = 0;
@@ -459,18 +453,7 @@ void QuantizationClock::scheduleTrigger(int stripIndex, int column, double ppq, 
 
     if (gateClosed)
     {
-        if (stream.openedOk())
-        {
-            juce::String msg = "IGNORED (gate closed - trigger pending): Strip=" + juce::String(stripIndex)
-                             + " Col=" + juce::String(column)
-                             + " pendingCol=" + juce::String(existingTrigger.column)
-                             + " pendingGrid=" + juce::String(existingTrigger.targetPPQ)
-                             + "\n";
-            stream.writeText(msg, false, false, nullptr);
-        }
-        DBG("▶▶ IGNORING PRESS (gate closed - trigger pending):");
-        DBG("   Strip=" << stripIndex << " pressed Column=" << column << " (IGNORED)");
-        DBG("   Pending trigger: Column=" << existingTrigger.column << " at gridPPQ=" << existingTrigger.targetPPQ);
+        juce::ignoreUnused(existingTrigger);
         return;
     }
     
@@ -502,32 +485,6 @@ void QuantizationClock::scheduleTrigger(int stripIndex, int column, double ppq, 
     t.targetPPQ = nextGridPPQ;  // Store exact grid PPQ for debugging
     t.stripIndex = stripIndex;
     t.column = column;
-    
-    // DEBUG logging
-    juce::File detailLogFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                           .getChildFile("mlrVST_schedule_detail.txt");
-    juce::FileOutputStream detailStream(detailLogFile, 1024);
-    if (detailStream.openedOk())
-    {
-        juce::String msg = "SCHEDULE: Strip=" + juce::String(stripIndex) +
-                         " Col=" + juce::String(column) +
-                         " currentPPQ=" + juce::String(ppq) +
-                         " nextGridPPQ=" + juce::String(nextGridPPQ) +
-                         " samplesPerQ=" + juce::String((int)samplesPerQuarter) +
-                         " currentAbsSample=" + juce::String(currentAbsSample) +
-                         " targetAbsSample=" + juce::String(targetAbsSample) +
-                         " samplesToWait=" + juce::String(samplesToWait) +
-                         " targetSample=" + juce::String(targetSample) +
-                         "\n";
-        detailStream.writeText(msg, false, false, nullptr);
-    }
-    
-    DBG("▶▶ SCHEDULE TRIGGER:");
-    DBG("   Strip=" << stripIndex << " Column=" << column);
-    DBG("   quantBeats=" << quantBeats << " (division=" << quantizeDivision << ")");
-    DBG("   ppq=" << ppq << " → nextGrid=" << nextGridPPQ);
-    DBG("   currentSample=" << currentSampleSnapshot << " targetSample=" << targetSample);
-    DBG("   samplesToWait=" << samplesToWait);
     
     // Keep triggers sorted by target sample so event extraction is linear-time.
     const juce::SpinLock::ScopedLockType lock(pendingTriggersLock);
@@ -3419,6 +3376,22 @@ void EnhancedAudioStrip::clearSample()
     currentStep = 0;
     resetGrainState();
     resetPitchShifter();
+    resetScratchComboState();
+}
+
+void EnhancedAudioStrip::resetScratchComboState()
+{
+    heldButtons.clear();
+    heldButtonOrder.clear();
+    patternActive = false;
+    activePattern = -1;
+    patternHoldCountRequired = 3;
+    patternStartBeat = -1.0;
+    lastPatternStep = -1;
+    buttonHeld = false;
+    heldButton = -1;
+    buttonPressTime = 0;
+    scratchArrived = false;
 }
 
 void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output, 
@@ -3452,27 +3425,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         lastObservedPPQ = *positionInfo.getPpqPosition();
         lastObservedGlobalSample = globalSampleStart;
         lastObservedTempo = tempo;
-    }
-    
-    // DEBUG: ALWAYS log on transport change for ALL strips
-    if (hostJustStarted || hostJustStopped)
-    {
-        juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                               .getChildFile("mlrVST_strip_log.txt");
-        juce::FileOutputStream stream(logFile, 1024);
-        if (stream.openedOk())
-        {
-            juce::String logMsg = juce::Time::getCurrentTime().toString(true, true) + 
-                                 " - Strip " + juce::String(stripIndex) +
-                                 " | Mode: " + juce::String((int)playMode) +
-                                 " (0=OneShot,1=Loop,2=Gate,3=Step)" +
-                                 " | Playing: " + (playing ? "YES" : "NO") +
-                                 " | HostJustStarted: " + (hostJustStarted ? "YES" : "NO") +
-                                 " | HostJustStopped: " + (hostJustStopped ? "YES" : "NO") +
-                                 " | WasPlayingBeforeStop: " + (wasPlayingBeforeStop ? "YES" : "NO") +
-                                 "\n";
-            stream.writeText(logMsg, false, false, nullptr);
-        }
     }
     
     if (playMode == PlayMode::Step && hostJustStarted)
@@ -3516,8 +3468,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         isReverseScratch = false;
         reverseScratchPpqRetarget = false;
         reverseScratchUseRateBlend = false;
-        buttonHeld = false;
-        heldButton = -1;
+        resetScratchComboState();
     }
     
     // Auto-resume audio strips when transport starts
@@ -3570,8 +3521,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         loopCols = ModernAudioEngine::MaxColumns;
         loopStartSamples = 0.0;
         loopLength = sampleLength;
-        
-        DBG("Scratch mode: using full sample (inner loop disabled)");
     }
     else
     {
@@ -3871,15 +3820,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     double sampleRateRatio = sourceSampleRate / currentSampleRate;
     const double triggerOffsetRatioLocal = juce::jlimit(0.0, 0.999999, triggerOffsetRatio);
     
-    // DEBUG: Track column changes
-    static int lastTriggerColumn = -1;
-    if (triggerColumn != lastTriggerColumn && stripIndex == 0)
-    {
-        DBG("Column changed: " << lastTriggerColumn << " → " << triggerColumn 
-            << " offsetRatio=" << triggerOffsetRatioLocal);
-        lastTriggerColumn = triggerColumn;
-    }
-    
     // STEP SEQUENCER MODE - handle entirely separately (before main loop)
     if (playMode == PlayMode::Step)
     {
@@ -3974,8 +3914,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             if (stepPattern[static_cast<size_t>(currentStep)])
             {
                 stepSampler.triggerNote(1.0f);
-                DBG("Step " << currentStep << " triggered at PPQ=" << ppqForLog
-                << " (sixteenth=" << static_cast<double>(sixteenthIndex) << ")");
             }
         };
 
@@ -4074,7 +4012,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         double columnOffsetSamples = 0.0;
         double samplesElapsed = 0.0;
         double ppqElapsed = 0.0;
-        double timelineSamples = 0.0;
 
         if (ppqTimelineAnchored)
         {
@@ -4083,8 +4020,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             const double timelinePosition = (timelineBeats / beatsForLoop) * sampleLength;
             positionInLoop = mapLoopPositionForMode(timelinePosition);
             playbackPosition = loopStartSamples + positionInLoop;
-
-            timelineSamples = (currentPpq * (60.0 / tempo) * currentSampleRate) * autoWarpSpeed;
         }
         else
         {
@@ -4094,7 +4029,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             {
                 triggerPpqPosition = currentPpq;
                 ppqElapsed = 0.0;
-                DBG("PPQ jumped backwards - resync strip " << stripIndex);
             }
 
             const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
@@ -4105,41 +4039,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             playbackPosition = loopStartSamples + positionInLoop;
         }
         
-        // DEBUG: First few buffers after trigger - WRITE TO FILE
-        static int debugBufferCount = 0;
-        
-        if (std::abs(triggerPpqPosition - lastTriggerPPQ) > 1.0e-6)
-        {
-            lastTriggerPPQ = triggerPpqPosition;
-            debugBufferCount = 0;
-        }
-        
-        if (debugBufferCount < 5 && stripIndex == 0)
-        {
-            debugBufferCount++;
-            double columnInSixteenths = (positionInLoop / loopLength) * 16.0;
-            
-            if (kEnableRealtimeFileLogging)
-            {
-                juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                                       .getChildFile("mlrVST_position_debug.txt");
-                juce::FileOutputStream stream(logFile, 1024);
-                if (stream.openedOk())
-                {
-                    juce::String logMsg = 
-                        "▶ POSITION CALC Buffer #" + juce::String(debugBufferCount) + "\n" +
-                        "  triggerColumn=" + juce::String(triggerColumn) + " (should jump here)\n" +
-                        "  timelineAnchored=" + juce::String(ppqTimelineAnchored ? "YES" : "NO") + "\n" +
-                        "  triggerPPQ=" + juce::String(triggerPpqPosition) + " currentPPQ=" + juce::String(currentPpq) + "\n" +
-                        "  ppqElapsed=" + juce::String(ppqElapsed) + " timelineSamples=" + juce::String(timelineSamples) + "\n" +
-                        "  columnOffsetSamples=" + juce::String(columnOffsetSamples) + " samplesElapsed=" + juce::String(samplesElapsed) + "\n" +
-                        "  loopLength=" + juce::String(loopLength) + " loopStartSamples=" + juce::String(loopStartSamples) + "\n" +
-                        "  positionInLoop=" + juce::String(positionInLoop) + "\n" +
-                        "  ►►► PLAYING AT POSITION: " + juce::String(columnInSixteenths, 2) + " /16\n\n";
-                    stream.writeText(logMsg, false, false, nullptr);
-                }
-            }
-        }
     }
     else if (positionInfo.getPpqPosition().hasValue() && !bypassPpqSync && playing)
     {
@@ -4384,8 +4283,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     {
                         // FREEZE: Audio completely stopped at button position
                         // No clock playback, no modulation - totally frozen
-                        DBG("Scratch arrived while button held - FREEZING at button position");
-                        
                         tapeStopActive = true;
                         scrubActive = false;
                         scratchTravelDistance = 0.0;
@@ -4404,7 +4301,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                         // already happened, so do not rely on it firing again.
                         snapToTimeline(currentGlobalSample);
                         scratchRate = 1.0;
-                        DBG("Scratch complete after early release - snapped to timeline");
                     }
                 }
             }
@@ -4601,8 +4497,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 scrubActive = false;
                 tapeStopActive = false;
                 scratchGestureActive = false;
-                buttonHeld = false;
-                heldButton = -1;
+                resetScratchComboState();
                 playbackPosition = (positionInLoop < 0.0)
                     ? loopStartSamples
                     : (loopStartSamples + loopLength);
@@ -4632,8 +4527,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             scrubActive = false;
             tapeStopActive = false;
             scratchGestureActive = false;
-            buttonHeld = false;
-            heldButton = -1;
+            resetScratchComboState();
             break;
         }
         
@@ -4942,19 +4836,6 @@ void EnhancedAudioStrip::trigger(int column, double tempo, bool quantized)
     stopAfterFade = false;
     playing = true;
     
-    // DEBUG: Log that strip was triggered
-    juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                           .getChildFile("mlrVST_strip_log.txt");
-    juce::FileOutputStream stream(logFile, 1024);
-    if (stream.openedOk())
-    {
-        juce::String logMsg = juce::Time::getCurrentTime().toString(true, true) + 
-                             " - >>> TRIGGERED Strip " + juce::String(stripIndex) + 
-                             " (Mode: " + juce::String((int)playMode) + 
-                             ", Column: " + juce::String(column) + ")\n";
-        stream.writeText(logMsg, false, false, nullptr);
-    }
-    
     // Configurable fade-in to suppress discontinuities on sustained material retriggers.
     const float triggerFadeMs = triggerFadeInMs.load(std::memory_order_acquire);
     int fadeSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
@@ -4974,7 +4855,6 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         toggleStepAtVisibleColumn(column);
         const int absoluteStep = getVisibleStepOffset() + juce::jlimit(0, 15, column);
         juce::ignoreUnused(absoluteStep);
-        DBG("Step " << absoluteStep << " toggled");
         
         // Don't trigger playback immediately - steps trigger on clock
         return;
@@ -5034,30 +4914,11 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
             ppqTimelineAnchored = false;
             ppqTimelineOffsetBeats = 0.0;
         }
-        
-        // DEBUG: Log every trigger with timing info
-        juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                               .getChildFile("mlrVST_trigger_execute.txt");
-        juce::FileOutputStream stream(logFile, 1024);
-        if (stream.openedOk())
-        {
-            juce::String msg = juce::Time::getCurrentTime().toString(true, true) +
-                             " - TRIGGER FIRED: Strip=" + juce::String(stripIndex) +
-                             " Column=" + juce::String(column) +
-                             " PPQ=" + juce::String(triggerPpqPosition) +
-                             " playing=" + juce::String(playing ? "YES" : "NO") +
-                             "\n";
-            stream.writeText(msg, false, false, nullptr);
-        }
-        
-        DBG("Strip " << stripIndex << " triggered at PPQ=" << triggerPpqPosition 
-            << " (column " << column << ")");
     }
     else
     {
         triggerPpqPosition = -1.0;  // No PPQ available (fallback to free-running)
         ppqTimelineAnchored = false;
-        DBG("Strip " << stripIndex << " triggered without PPQ (free-running mode)");
     }
     
     // Calculate target position for this column
@@ -5271,34 +5132,6 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
     
     stopAfterFade = false;
     playing = true;
-    
-    // Check for potential double triggers (debug)
-    static int64_t lastTriggerSample = -1000000;
-    static int lastTriggerStrip = -1;
-    int64_t samplesSinceLastTrigger = globalSample - lastTriggerSample;
-    
-    if (lastTriggerStrip == stripIndex && samplesSinceLastTrigger < 100)
-    {
-        DBG("⚠️ POTENTIAL DOUBLE TRIGGER: Strip " << stripIndex 
-            << " triggered twice within " << samplesSinceLastTrigger << " samples!");
-    }
-    
-    lastTriggerSample = globalSample;
-    lastTriggerStrip = stripIndex;
-    
-    // DEBUG: Log that strip was triggered  
-    juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                           .getChildFile("mlrVST_strip_log.txt");
-    juce::FileOutputStream stream(logFile, 1024);
-    if (stream.openedOk())
-    {
-        juce::String logMsg = juce::Time::getCurrentTime().toString(true, true) + 
-                             " - >>> TRIGGERED Strip " + juce::String(stripIndex) + 
-                             " via triggerAtSample (Mode: " + juce::String((int)playMode) + 
-                             ", Column: " + juce::String(column) + 
-                             ", Scratch: " + juce::String(stripScratch) + ")\n";
-        stream.writeText(logMsg, false, false, nullptr);
-    }
     
     // Configurable trigger fade-in for sustained/phase-misaligned retriggers.
     const float triggerFadeMs = triggerFadeInMs.load(std::memory_order_acquire);
@@ -5846,8 +5679,7 @@ void EnhancedAudioStrip::enforceMomentaryPhaseReference(double hostPpq, int64_t 
     reverseScratchPpqRetarget = false;
     reverseScratchUseRateBlend = false;
     scratchTravelDistance = 0.0;
-    buttonHeld = false;
-    heldButton = -1;
+    resetScratchComboState();
     rateSmoother.setCurrentAndTargetValue(1.0);
 
     // Keep trigger sample coherent for sample-based fallback paths.
@@ -6098,6 +5930,14 @@ void EnhancedAudioStrip::stop(bool immediate)
     triggerOutputBlendActive = false;
     triggerOutputBlendSamplesRemaining = 0;
     triggerOutputBlendTotalSamples = 0;
+    scrubActive = false;
+    tapeStopActive = false;
+    scratchGestureActive = false;
+    isReverseScratch = false;
+    reverseScratchPpqRetarget = false;
+    reverseScratchUseRateBlend = false;
+    scratchTravelDistance = 0.0;
+    resetScratchComboState();
 
     if (immediate)
     {
@@ -7190,23 +7030,6 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
 {
     juce::ScopedNoDenormals noDenormals;
     
-    // DEBUG: Log what the ENGINE sees for positionInfo
-    static int engineCallCount = 0;
-    engineCallCount++;
-    if (kEnableRealtimeFileLogging && engineCallCount % 500 == 0)
-    {
-        juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                               .getChildFile("mlrVST_strip_log.txt");
-        juce::FileOutputStream stream(logFile, 1024);
-        if (stream.openedOk())
-        {
-            juce::String logMsg = juce::Time::getCurrentTime().toString(true, true) + 
-                                 " - ENGINE PROCESSBLOCK #" + juce::String(engineCallCount) +
-                                 " | HostPlaying (from posInfo): " + (positionInfo.getIsPlaying() ? "YES" : "NO") + "\n";
-            stream.writeText(logMsg, false, false, nullptr);
-        }
-    }
-    
     // Update tempo
     updateTempo(positionInfo);
     
@@ -7800,35 +7623,6 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 {
                     // Use the scheduled grid PPQ so column jumps are deterministic.
                     triggerPosInfo.setPpqPosition(event.targetPPQ);
-                    const double actualPpq = basePpq + (static_cast<double>(eventOffset) / samplesPerBeat);
-
-                    DBG("=== QUANTIZED TRIGGER FIRING === Strip " << event.stripIndex
-                        << " Column " << event.column
-                        << " at GRID PPQ=" << event.targetPPQ
-                        << " (segment at=" << actualPpq << ")");
-
-                    if (kEnableRealtimeFileLogging)
-                    {
-                        juce::File logFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                                               .getChildFile("mlrVST_COMPREHENSIVE_DEBUG.txt");
-                        juce::FileOutputStream stream(logFile, 1024);
-                        if (stream.openedOk())
-                        {
-                            juce::String timestamp = juce::Time::getCurrentTime().toString(true, true, true, true);
-                            juce::String msg =
-                                ">>> TRIGGER FIRED: " + timestamp + "\n"
-                                "    Strip: " + juce::String(event.stripIndex) +
-                                " | Column: " + juce::String(event.column) + "\n"
-                                "    scheduledPPQ:  " + juce::String(event.targetPPQ, 6) + "\n"
-                                "    actualPPQ:     " + juce::String(actualPpq, 6) + "\n"
-                                "    PPQ_ERROR:     " + juce::String(actualPpq - event.targetPPQ, 6) + " beats\n"
-                                "    targetSample:  " + juce::String(event.targetSample) + "\n"
-                                "    blockStart:    " + juce::String(blockStart) + "\n"
-                                "    offset:        " + juce::String(eventOffset) + " samples\n"
-                                "\n";
-                            stream.writeText(msg, false, false, nullptr);
-                        }
-                    }
                 }
 
                 const int64_t triggerSample = blockStart + eventOffset;

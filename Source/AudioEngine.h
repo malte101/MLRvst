@@ -1015,6 +1015,7 @@ public:
     void setGrainScratchSceneTarget(float targetMix, int heldCount, double tempoBpm);
     void spawnGrainVoice(double centerSamplePos, float sizeMs, float density, float spread, float pitchOffsetSemitones, double playbackStepBase);
     void renderGrainAtSample(float& outL, float& outR, double centerSamplePos, double effectiveSpeed, int64_t globalSample);
+    void resetScratchComboState();
     
     // Musical scratching helpers
     void snapToTimeline(int64_t currentGlobalSample);

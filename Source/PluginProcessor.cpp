@@ -10,7 +10,9 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "PresetStore.h"
+#include <cmath>
 #include <limits>
+#include <utility>
 
 namespace
 {
@@ -85,6 +87,77 @@ juce::File getGlobalSettingsFile()
     return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
         .getChildFile("mlrVST")
         .getChildFile("GlobalSettings.xml");
+}
+
+constexpr int kStutterButtonFirstColumn = 9;
+constexpr int kStutterButtonCount = 7;
+
+uint8_t stutterButtonBitFromColumn(int column)
+{
+    if (column < kStutterButtonFirstColumn || column >= (kStutterButtonFirstColumn + kStutterButtonCount))
+        return 0;
+    return static_cast<uint8_t>(1u << static_cast<unsigned int>(column - kStutterButtonFirstColumn));
+}
+
+int countStutterBits(uint8_t mask)
+{
+    int count = 0;
+    for (int i = 0; i < kStutterButtonCount; ++i)
+    {
+        if ((mask & static_cast<uint8_t>(1u << static_cast<unsigned int>(i))) != 0)
+            ++count;
+    }
+    return count;
+}
+
+int highestStutterBit(uint8_t mask)
+{
+    for (int i = kStutterButtonCount - 1; i >= 0; --i)
+    {
+        if ((mask & static_cast<uint8_t>(1u << static_cast<unsigned int>(i))) != 0)
+            return i;
+    }
+    return 0;
+}
+
+int lowestStutterBit(uint8_t mask)
+{
+    for (int i = 0; i < kStutterButtonCount; ++i)
+    {
+        if ((mask & static_cast<uint8_t>(1u << static_cast<unsigned int>(i))) != 0)
+            return i;
+    }
+    return 0;
+}
+
+double wrapUnitPhase(double phase)
+{
+    if (!std::isfinite(phase))
+        return 0.0;
+    phase = std::fmod(phase, 1.0);
+    if (phase < 0.0)
+        phase += 1.0;
+    return phase;
+}
+
+float cutoffFromNormalized(float normalized)
+{
+    normalized = juce::jlimit(0.0f, 1.0f, normalized);
+    return 20.0f * std::pow(1000.0f, normalized);
+}
+
+EnhancedAudioStrip::FilterAlgorithm filterAlgorithmFromIndex(int index)
+{
+    switch (juce::jlimit(0, 5, index))
+    {
+        case 0: return EnhancedAudioStrip::FilterAlgorithm::Tpt12;
+        case 1: return EnhancedAudioStrip::FilterAlgorithm::Tpt24;
+        case 2: return EnhancedAudioStrip::FilterAlgorithm::Ladder12;
+        case 3: return EnhancedAudioStrip::FilterAlgorithm::Ladder24;
+        case 4: return EnhancedAudioStrip::FilterAlgorithm::MoogStilson;
+        case 5:
+        default: return EnhancedAudioStrip::FilterAlgorithm::MoogHuov;
+    }
 }
 }
 
@@ -722,6 +795,34 @@ void MonomeConnection::handleTiltMessage(const juce::OSCMessage& message)
 // MlrVSTAudioProcessor Implementation
 //==============================================================================
 
+class MlrVSTAudioProcessor::PresetSaveJob final : public juce::ThreadPoolJob
+{
+public:
+    PresetSaveJob(MlrVSTAudioProcessor& ownerIn, PresetSaveRequest requestIn)
+        : juce::ThreadPoolJob("mlrVSTPresetSave_" + juce::String(requestIn.presetIndex + 1)),
+          owner(ownerIn),
+          request(std::move(requestIn))
+    {
+    }
+
+    JobStatus runJob() override
+    {
+        if (shouldExit())
+        {
+            owner.pushPresetSaveResult({ request.presetIndex, false });
+            return jobHasFinished;
+        }
+
+        const bool success = owner.runPresetSaveRequest(request);
+        owner.pushPresetSaveResult({ request.presetIndex, success });
+        return jobHasFinished;
+    }
+
+private:
+    MlrVSTAudioProcessor& owner;
+    PresetSaveRequest request;
+};
+
 MlrVSTAudioProcessor::MlrVSTAudioProcessor()
      : AudioProcessor(BusesProperties()
                       .withInput("Input", juce::AudioChannelSet::stereo(), true)
@@ -785,6 +886,7 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
 
 MlrVSTAudioProcessor::~MlrVSTAudioProcessor()
 {
+    presetSaveThreadPool.removeAllJobs(true, 4000);
     stopTimer();
     monomeConnection.disconnect();
 }
@@ -1130,6 +1232,8 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
                 strip->setPitchShift(*pitchParam);
         }
     }
+
+    applyMomentaryStutterMacro(posInfo);
     
     const bool separateStripRouting = (outputRoutingParam != nullptr && *outputRoutingParam > 0.5f);
     if (separateStripRouting && getBusCount(false) > 1)
@@ -1718,6 +1822,235 @@ void MlrVSTAudioProcessor::applyPendingStutterRelease(const juce::AudioPlayHead:
     performMomentaryStutterReleaseNow(applyPpq, currentSample);
 }
 
+void MlrVSTAudioProcessor::captureMomentaryStutterMacroBaseline()
+{
+    if (!audioEngine)
+        return;
+
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        const auto idx = static_cast<size_t>(i);
+        auto& saved = momentaryStutterSavedState[idx];
+        saved = MomentaryStutterSavedStripState{};
+
+        auto* strip = audioEngine->getStrip(i);
+        if (!strip || !momentaryStutterStripArmed[idx] || !strip->hasAudio() || !strip->isPlaying())
+            continue;
+
+        saved.valid = true;
+        saved.pan = strip->getPan();
+        saved.pitchShift = strip->getPitchShift();
+        saved.filterEnabled = strip->isFilterEnabled();
+        saved.filterFrequency = strip->getFilterFrequency();
+        saved.filterResonance = strip->getFilterResonance();
+        saved.filterMorph = strip->getFilterMorph();
+        saved.filterAlgorithm = strip->getFilterAlgorithm();
+    }
+
+    momentaryStutterMacroBaselineCaptured = true;
+    momentaryStutterMacroCapturePending = false;
+}
+
+void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead::PositionInfo& posInfo)
+{
+    if (!audioEngine || !momentaryStutterHoldActive)
+        return;
+
+    if (!posInfo.getPpqPosition().hasValue())
+        return;
+
+    const double ppqNow = *posInfo.getPpqPosition();
+    if (!std::isfinite(ppqNow))
+        return;
+
+    if (momentaryStutterMacroCapturePending || !momentaryStutterMacroBaselineCaptured)
+        captureMomentaryStutterMacroBaseline();
+    if (!momentaryStutterMacroBaselineCaptured)
+        return;
+
+    uint8_t comboMask = static_cast<uint8_t>(momentaryStutterButtonMask.load(std::memory_order_acquire) & 0x7f);
+    if (comboMask == 0)
+        comboMask = stutterButtonBitFromColumn(momentaryStutterActiveDivisionButton);
+    if (comboMask == 0)
+        return;
+
+    const int bitCount = countStutterBits(comboMask);
+    const int highestBit = highestStutterBit(comboMask);
+    const int lowestBit = lowestStutterBit(comboMask);
+    const int seed = (static_cast<int>(comboMask) * 131)
+        + (bitCount * 17)
+        + (highestBit * 29)
+        + (lowestBit * 7);
+    const int variant = seed % 8;
+    const int lengthBars = 1 + ((seed / 7) % 4);
+    const double cycleBeats = 4.0 * static_cast<double>(lengthBars);
+    if (cycleBeats <= 0.0 || !std::isfinite(cycleBeats))
+        return;
+
+    const double cycleBeatPosRaw = std::fmod(ppqNow - momentaryStutterMacroStartPpq, cycleBeats);
+    const double cycleBeatPos = cycleBeatPosRaw < 0.0 ? cycleBeatPosRaw + cycleBeats : cycleBeatPosRaw;
+    const double phase = wrapUnitPhase(cycleBeatPos / cycleBeats);
+    const double fastPhase = wrapUnitPhase(phase * static_cast<double>(2 + ((seed >> 2) % 5)));
+    const double panPhase = wrapUnitPhase(phase * static_cast<double>(1 + ((seed >> 4) % 4)));
+    const double filterPhase = wrapUnitPhase(phase * static_cast<double>(1 + ((seed >> 6) % 3)));
+
+    const double tri = 1.0 - std::abs((phase * 2.0) - 1.0);      // 0..1
+    const double triSigned = (tri * 2.0) - 1.0;                  // -1..1
+    const double sawSigned = (phase * 2.0) - 1.0;                // -1..1
+    const double sine = std::sin(juce::MathConstants<double>::twoPi * phase);
+    const double sineFast = std::sin(juce::MathConstants<double>::twoPi * fastPhase);
+    const double panSine = std::sin(juce::MathConstants<double>::twoPi * panPhase);
+    const double filterTri = 1.0 - std::abs((filterPhase * 2.0) - 1.0);
+    const int stepIndex = static_cast<int>(std::floor(phase * 16.0)) & 15;
+
+    float pitchDelta = 0.0f;
+    float panOffset = 0.0f;
+    float cutoffNorm = 1.0f;
+    float resonanceNorm = 0.25f;
+    float morph = 0.0f;
+
+    switch (variant)
+    {
+        case 0:
+            pitchDelta = juce::jmap(static_cast<float>(phase), -2.0f, 10.0f) + static_cast<float>(1.5 * sineFast);
+            panOffset = static_cast<float>(0.65 * panSine);
+            cutoffNorm = static_cast<float>(0.12 + (0.85 * phase));
+            resonanceNorm = static_cast<float>(0.25 + (0.55 * filterTri));
+            morph = static_cast<float>(0.15 + (0.55 * filterPhase));
+            break;
+        case 1:
+            pitchDelta = juce::jmap(static_cast<float>(phase), 8.0f, -9.0f) + static_cast<float>(1.2 * sine);
+            panOffset = static_cast<float>(0.80 * triSigned);
+            cutoffNorm = static_cast<float>(0.90 - (0.75 * phase));
+            resonanceNorm = static_cast<float>(0.30 + (0.60 * phase));
+            morph = static_cast<float>(0.90 - (0.70 * filterPhase));
+            break;
+        case 2:
+            pitchDelta = static_cast<float>((6.5 * std::sin(juce::MathConstants<double>::twoPi * phase * 2.0))
+                + (3.0 * std::sin(juce::MathConstants<double>::twoPi * (phase + 0.25))));
+            panOffset = static_cast<float>(0.70 * std::sin(juce::MathConstants<double>::twoPi * (panPhase * 2.0)));
+            cutoffNorm = static_cast<float>(0.18 + (0.74 * filterTri));
+            resonanceNorm = static_cast<float>(0.18 + (0.72 * wrapUnitPhase(filterPhase * 2.0)));
+            morph = static_cast<float>(0.50 + (0.45 * std::sin(juce::MathConstants<double>::twoPi * filterPhase)));
+            break;
+        case 3:
+        {
+            static constexpr std::array<float, 8> pitchSequence { 0.0f, 3.0f, 7.0f, 12.0f, 7.0f, 3.0f, 0.0f, -5.0f };
+            const int seqIdx = (stepIndex + highestBit + lowestBit) % static_cast<int>(pitchSequence.size());
+            pitchDelta = pitchSequence[static_cast<size_t>(seqIdx)] + (bitCount > 2 ? 2.0f : 0.0f);
+            panOffset = ((stepIndex & 1) == 0 ? -0.72f : 0.72f) * (0.60f + (0.06f * static_cast<float>(bitCount)));
+            cutoffNorm = 0.15f + (0.80f * (static_cast<float>((stepIndex + lowestBit) % 8) / 7.0f));
+            resonanceNorm = ((stepIndex / 2) & 1) == 0 ? 0.35f : 0.82f;
+            morph = (stepIndex % 3 == 0) ? 0.08f : ((stepIndex % 3 == 1) ? 0.50f : 0.92f);
+            break;
+        }
+        case 4:
+            pitchDelta = static_cast<float>((14.0 * triSigned) + (1.0 * sineFast));
+            panOffset = static_cast<float>(0.90 * sawSigned);
+            cutoffNorm = static_cast<float>(0.08 + (0.86 * tri));
+            resonanceNorm = static_cast<float>(0.25 + (0.65 * (1.0 - tri)));
+            morph = static_cast<float>(0.50 + (0.45 * std::sin((juce::MathConstants<double>::twoPi * filterPhase)
+                                                                + juce::MathConstants<double>::halfPi)));
+            break;
+        case 5:
+        {
+            const double pulse = std::fmod(phase * static_cast<double>(4 + bitCount), 1.0) < 0.5 ? 1.0 : -1.0;
+            pitchDelta = static_cast<float>(pulse * static_cast<double>(3 + highestBit));
+            panOffset = static_cast<float>(0.85 * std::sin(juce::MathConstants<double>::twoPi * fastPhase));
+            cutoffNorm = pulse > 0.0 ? 0.86f : 0.22f;
+            resonanceNorm = pulse > 0.0 ? 0.76f : 0.30f;
+            morph = pulse > 0.0 ? 0.22f : 0.78f;
+            break;
+        }
+        case 6:
+        {
+            const double doublePhase = wrapUnitPhase(phase * 2.0);
+            pitchDelta = juce::jmap(static_cast<float>(doublePhase), -11.0f, 11.0f) + static_cast<float>(2.0 * sine);
+            panOffset = static_cast<float>(0.72 * std::sin(juce::MathConstants<double>::twoPi * (panPhase * 3.0)));
+            cutoffNorm = static_cast<float>(0.12 + (0.82 * wrapUnitPhase(filterPhase + (0.35 * tri))));
+            resonanceNorm = static_cast<float>(0.28 + (0.58 * wrapUnitPhase(filterPhase + 0.5)));
+            morph = static_cast<float>(wrapUnitPhase(filterPhase + (0.25 * sineFast)));
+            break;
+        }
+        case 7:
+        default:
+            pitchDelta = static_cast<float>((9.0 * sine) + (5.0 * triSigned));
+            panOffset = static_cast<float>(0.88 * std::sin(juce::MathConstants<double>::twoPi * (panPhase + (0.20 * tri))));
+            cutoffNorm = static_cast<float>(0.10 + (0.88 * wrapUnitPhase(phase + (0.5 * juce::jmax(0.0, sine)))));
+            resonanceNorm = static_cast<float>(0.22 + (0.62 * wrapUnitPhase(filterPhase + (0.25 * triSigned))));
+            morph = static_cast<float>(wrapUnitPhase((0.5 * phase) + (0.5 * filterPhase)));
+            break;
+    }
+
+    pitchDelta = juce::jlimit(-18.0f, 18.0f, pitchDelta);
+    panOffset = juce::jlimit(-1.0f, 1.0f, panOffset);
+    cutoffNorm = juce::jlimit(0.0f, 1.0f, cutoffNorm);
+    resonanceNorm = juce::jlimit(0.0f, 1.0f, resonanceNorm);
+    morph = juce::jlimit(0.0f, 1.0f, morph);
+
+    const auto filterAlgorithm = filterAlgorithmFromIndex((variant + bitCount + highestBit + lowestBit) % 6);
+    const float targetCutoff = cutoffFromNormalized(cutoffNorm);
+    const float targetResonance = juce::jmap(resonanceNorm, 0.2f, 9.0f);
+
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        const auto idx = static_cast<size_t>(i);
+        const auto& saved = momentaryStutterSavedState[idx];
+        if (!saved.valid || !momentaryStutterStripArmed[idx])
+            continue;
+
+        auto* strip = audioEngine->getStrip(i);
+        if (!strip || !strip->hasAudio() || !strip->isPlaying())
+            continue;
+
+        const float stripPanScale = juce::jlimit(0.35f, 1.0f, 0.55f + (0.06f * static_cast<float>(bitCount))
+            + (0.05f * static_cast<float>(i)));
+        const float stripPitchSpread = (bitCount > 3)
+            ? static_cast<float>((i - (MaxStrips / 2)) * 0.45f)
+            : 0.0f;
+        const float stripMorphOffset = static_cast<float>(0.10 * std::sin(
+            juce::MathConstants<double>::twoPi * wrapUnitPhase(phase + (0.17 * static_cast<double>(i)))));
+
+        strip->setPan(juce::jlimit(-1.0f, 1.0f, saved.pan + (panOffset * stripPanScale)));
+        strip->setPitchShift(juce::jlimit(-24.0f, 24.0f, saved.pitchShift + pitchDelta + stripPitchSpread));
+        strip->setFilterEnabled(true);
+        strip->setFilterAlgorithm(filterAlgorithm);
+        strip->setFilterFrequency(targetCutoff);
+        strip->setFilterResonance(targetResonance);
+        strip->setFilterMorph(juce::jlimit(0.0f, 1.0f, morph + stripMorphOffset));
+    }
+}
+
+void MlrVSTAudioProcessor::restoreMomentaryStutterMacroBaseline()
+{
+    if (!audioEngine || !momentaryStutterMacroBaselineCaptured)
+        return;
+
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        const auto idx = static_cast<size_t>(i);
+        auto& saved = momentaryStutterSavedState[idx];
+        if (!saved.valid)
+            continue;
+
+        if (auto* strip = audioEngine->getStrip(i))
+        {
+            strip->setPan(saved.pan);
+            strip->setPitchShift(saved.pitchShift);
+            strip->setFilterAlgorithm(saved.filterAlgorithm);
+            strip->setFilterFrequency(saved.filterFrequency);
+            strip->setFilterResonance(saved.filterResonance);
+            strip->setFilterMorph(saved.filterMorph);
+            strip->setFilterEnabled(saved.filterEnabled);
+        }
+
+        saved.valid = false;
+    }
+
+    momentaryStutterMacroBaselineCaptured = false;
+    momentaryStutterMacroCapturePending = false;
+}
+
 juce::File MlrVSTAudioProcessor::getDefaultSampleDirectory(int stripIndex, SamplePathMode mode) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
@@ -2205,6 +2538,8 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 
 void MlrVSTAudioProcessor::timerCallback()
 {
+    applyCompletedPresetSaves();
+
     const int pendingPreset = pendingPresetLoadIndex.load(std::memory_order_acquire);
     if (pendingPreset >= 0)
     {
@@ -2376,6 +2711,12 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
     momentaryScratchHoldActive = false;
     momentaryStutterHoldActive = false;
     momentaryStutterActiveDivisionButton = -1;
+    momentaryStutterButtonMask.store(0, std::memory_order_release);
+    momentaryStutterMacroBaselineCaptured = false;
+    momentaryStutterMacroCapturePending = false;
+    momentaryStutterMacroStartPpq = 0.0;
+    for (auto& saved : momentaryStutterSavedState)
+        saved = MomentaryStutterSavedStripState{};
     pendingStutterReleaseActive.store(0, std::memory_order_release);
     pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
     pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
@@ -2535,21 +2876,94 @@ void MlrVSTAudioProcessor::performPresetLoad(int presetIndex, double hostPpqSnap
     presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
 }
 
-void MlrVSTAudioProcessor::savePreset(int presetIndex)
+bool MlrVSTAudioProcessor::runPresetSaveRequest(const PresetSaveRequest& request)
 {
+    if (!audioEngine || request.presetIndex < 0 || request.presetIndex >= MaxPresetSlots)
+        return false;
+
     try
     {
-        PresetStore::savePreset(presetIndex, MaxStrips, audioEngine.get(), parameters, currentStripFiles);
-        loadedPresetIndex = presetIndex;
+        struct ScopedSuspendProcessing
+        {
+            explicit ScopedSuspendProcessing(MlrVSTAudioProcessor& p) : processor(p) { processor.suspendProcessing(true); }
+            ~ScopedSuspendProcessing() { processor.suspendProcessing(false); }
+            MlrVSTAudioProcessor& processor;
+        } scopedSuspend(*this);
+
+        return PresetStore::savePreset(request.presetIndex,
+                                       MaxStrips,
+                                       audioEngine.get(),
+                                       parameters,
+                                       request.stripFiles.data());
     }
     catch (const std::exception& e)
     {
-        DBG("savePreset exception for slot " << presetIndex << ": " << e.what());
+        DBG("async savePreset exception for slot " << request.presetIndex << ": " << e.what());
+        return false;
     }
     catch (...)
     {
-        DBG("savePreset exception for slot " << presetIndex << ": unknown");
+        DBG("async savePreset exception for slot " << request.presetIndex << ": unknown");
+        return false;
     }
+}
+
+void MlrVSTAudioProcessor::pushPresetSaveResult(const PresetSaveResult& result)
+{
+    {
+        const juce::ScopedLock lock(presetSaveResultLock);
+        presetSaveResults.push_back(result);
+    }
+    presetSaveJobsInFlight.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void MlrVSTAudioProcessor::applyCompletedPresetSaves()
+{
+    std::vector<PresetSaveResult> completed;
+    {
+        const juce::ScopedLock lock(presetSaveResultLock);
+        if (presetSaveResults.empty())
+            return;
+        completed.swap(presetSaveResults);
+    }
+
+    uint32_t successfulSaves = 0;
+    for (const auto& result : completed)
+    {
+        if (!result.success)
+        {
+            DBG("Preset save failed for slot " << result.presetIndex);
+            continue;
+        }
+
+        loadedPresetIndex = result.presetIndex;
+        ++successfulSaves;
+    }
+
+    if (successfulSaves > 0)
+        presetRefreshToken.fetch_add(successfulSaves, std::memory_order_acq_rel);
+}
+
+void MlrVSTAudioProcessor::savePreset(int presetIndex)
+{
+    if (!audioEngine || presetIndex < 0 || presetIndex >= MaxPresetSlots)
+        return;
+
+    if (!isTimerRunning())
+        startTimer(100);
+
+    PresetSaveRequest request;
+    request.presetIndex = presetIndex;
+    for (int i = 0; i < MaxStrips; ++i)
+        request.stripFiles[static_cast<size_t>(i)] = currentStripFiles[i];
+
+    auto* job = new PresetSaveJob(*this, std::move(request));
+    presetSaveJobsInFlight.fetch_add(1, std::memory_order_acq_rel);
+    presetSaveThreadPool.addJob(job, true);
+
+    // Keep UI/LED state responsive immediately; completion still updates token.
+    loadedPresetIndex = presetIndex;
+    presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void MlrVSTAudioProcessor::loadPreset(int presetIndex)

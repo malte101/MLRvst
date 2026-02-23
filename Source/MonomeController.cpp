@@ -24,6 +24,23 @@ double stutterDivisionBeatsFromButton(int x)
     const int idx = juce::jlimit(0, 6, x - 9);
     return kDivisionBeats[static_cast<size_t>(idx)];
 }
+
+uint8_t stutterButtonBitForColumn(int x)
+{
+    if (x < 9 || x > 15)
+        return 0;
+    return static_cast<uint8_t>(1u << static_cast<unsigned int>(x - 9));
+}
+
+int stutterColumnFromMask(uint8_t mask)
+{
+    for (int bit = 6; bit >= 0; --bit)
+    {
+        if ((mask & static_cast<uint8_t>(1u << static_cast<unsigned int>(bit))) != 0)
+            return 9 + bit;
+    }
+    return -1;
+}
 }
 
 void MlrVSTAudioProcessor::setMomentaryScratchHold(bool shouldEnable)
@@ -110,12 +127,15 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
                 entryPpq += quantBeats;
             entryPpq = std::round(entryPpq / quantBeats) * quantBeats;
         }
+        if (std::isfinite(entryPpq))
+            momentaryStutterMacroStartPpq = entryPpq;
 
         audioEngine->setMomentaryStutterDivision(momentaryStutterDivisionBeats);
         audioEngine->setMomentaryStutterStartPpq(entryPpq);
         audioEngine->clearMomentaryStutterStrips();
         for (int i = 0; i < MaxStrips; ++i)
         {
+            momentaryStutterStripArmed[static_cast<size_t>(i)] = false;
             auto* strip = audioEngine->getStrip(i);
             if (!strip || !strip->hasAudio() || !strip->isPlaying())
                 continue;
@@ -123,6 +143,7 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
                 strip->captureMomentaryPhaseReference(hostPpqNow);
             const int stutterColumn = juce::jlimit(0, 15, strip->getCurrentColumn());
             audioEngine->setMomentaryStutterStrip(i, stutterColumn, true);
+            momentaryStutterStripArmed[static_cast<size_t>(i)] = true;
         }
         audioEngine->setMomentaryStutterActive(true);
         return;
@@ -131,6 +152,18 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
     momentaryStutterHoldActive = shouldEnable;
     if (shouldEnable)
     {
+        if (momentaryStutterButtonMask.load(std::memory_order_acquire) == 0)
+        {
+            const uint8_t fallbackBit = stutterButtonBitForColumn(momentaryStutterActiveDivisionButton);
+            if (fallbackBit != 0)
+                momentaryStutterButtonMask.store(fallbackBit, std::memory_order_release);
+        }
+
+        momentaryStutterMacroCapturePending = true;
+        momentaryStutterMacroBaselineCaptured = false;
+        for (auto& saved : momentaryStutterSavedState)
+            saved = MomentaryStutterSavedStripState{};
+
         pendingStutterReleaseActive.store(0, std::memory_order_release);
         pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
         pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
@@ -150,6 +183,8 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
         if (entryPpq <= (currentPpq + 1.0e-6))
             entryPpq += quantBeats;
         entryPpq = std::round(entryPpq / quantBeats) * quantBeats;
+        if (std::isfinite(entryPpq))
+            momentaryStutterMacroStartPpq = entryPpq;
 
         audioEngine->setMomentaryStutterDivision(momentaryStutterDivisionBeats);
         audioEngine->setMomentaryStutterStartPpq(entryPpq);
@@ -178,6 +213,8 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
         // UI/key state ends immediately on key-up; audio release remains quantized.
         momentaryStutterHoldActive = false;
         momentaryStutterActiveDivisionButton = -1;
+        momentaryStutterButtonMask.store(0, std::memory_order_release);
+        restoreMomentaryStutterMacroBaseline();
 
         // Quantized stutter release (PPQ-locked):
         // convert next PPQ grid boundary to an absolute sample target now.
@@ -229,9 +266,11 @@ void MlrVSTAudioProcessor::performMomentaryStutterReleaseNow(double hostPpqNow, 
     if (!audioEngine)
         return;
 
+    restoreMomentaryStutterMacroBaseline();
     audioEngine->setMomentaryStutterActive(false);
     audioEngine->setMomentaryStutterStartPpq(-1.0);
     audioEngine->clearMomentaryStutterStrips();
+    momentaryStutterButtonMask.store(0, std::memory_order_release);
     for (int i = 0; i < MaxStrips; ++i)
     {
         auto* strip = audioEngine->getStrip(i);
@@ -316,6 +355,9 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             // 9=1/4 ... 15=1/64.
             if (x >= 9 && x <= 15 && (!controlModeActive || currentControlMode == ControlMode::Normal))
             {
+                const uint8_t bit = stutterButtonBitForColumn(x);
+                if (bit != 0)
+                    momentaryStutterButtonMask.fetch_or(bit, std::memory_order_acq_rel);
                 momentaryStutterDivisionBeats = stutterDivisionBeatsFromButton(x);
                 momentaryStutterActiveDivisionButton = x;
                 updateMonomeLEDs();
@@ -665,7 +707,25 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         }
         if (y == GROUP_ROW && x >= 9 && x <= 15)
         {
-            setMomentaryStutterHold(false);
+            const uint8_t bit = stutterButtonBitForColumn(x);
+            uint8_t currentMask = momentaryStutterButtonMask.load(std::memory_order_acquire);
+            currentMask = static_cast<uint8_t>(currentMask & static_cast<uint8_t>(~bit));
+            momentaryStutterButtonMask.store(currentMask, std::memory_order_release);
+
+            if (currentMask == 0)
+            {
+                setMomentaryStutterHold(false);
+            }
+            else
+            {
+                const int activeColumn = stutterColumnFromMask(currentMask);
+                if (activeColumn >= 9 && activeColumn <= 15)
+                {
+                    momentaryStutterActiveDivisionButton = activeColumn;
+                    momentaryStutterDivisionBeats = stutterDivisionBeatsFromButton(activeColumn);
+                    audioEngine->setMomentaryStutterDivision(momentaryStutterDivisionBeats);
+                }
+            }
             updateMonomeLEDs();
             return;
         }
@@ -953,10 +1013,18 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     // Visible on normal page only.
     if (!controlModeActive || currentControlMode == ControlMode::Normal)
     {
+        const uint8_t heldMask = momentaryStutterButtonMask.load(std::memory_order_acquire);
         for (int x = 9; x <= 15; ++x)
         {
+            const uint8_t bit = stutterButtonBitForColumn(x);
+            const bool held = (heldMask & bit) != 0;
             const bool active = momentaryStutterHoldActive && (momentaryStutterActiveDivisionButton == x);
-            newLedState[x][GROUP_ROW] = active ? (fastBlinkOn ? 15 : 8) : 2;
+            if (active)
+                newLedState[x][GROUP_ROW] = fastBlinkOn ? 15 : 8;
+            else if (held)
+                newLedState[x][GROUP_ROW] = 9;
+            else
+                newLedState[x][GROUP_ROW] = 2;
         }
     }
     

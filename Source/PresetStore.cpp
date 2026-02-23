@@ -16,6 +16,9 @@ constexpr const char* kAnalysisZeroCrossAttr = "analysisZeroCrossMap";
 constexpr const char* kAnalysisSampleCountAttr = "analysisSampleCount";
 constexpr int kMaxEmbeddedBase64Chars = 64 * 1024 * 1024;
 constexpr size_t kMaxEmbeddedWavBytes = 48 * 1024 * 1024;
+constexpr int64_t kMaxPresetXmlBytes = 128LL * 1024LL * 1024LL;
+constexpr int64_t kMaxPresetNameXmlBytes = 8LL * 1024LL * 1024LL;
+constexpr int kMaxStoredSamplePathChars = 4096;
 
 struct GlobalParameterSnapshot
 {
@@ -28,6 +31,72 @@ struct GlobalParameterSnapshot
     float triggerFadeInMs = 12.0f;
     float outputRouting = 0.0f;
 };
+
+bool isPresetFileSizeValid(const juce::File& file, int64_t maxBytes)
+{
+    if (!file.existsAsFile())
+        return false;
+
+    const int64_t size = file.getSize();
+    return size > 0 && size <= maxBytes;
+}
+
+std::unique_ptr<juce::XmlElement> parsePresetXmlSafely(const juce::File& presetFile, int64_t maxBytes)
+{
+    if (!isPresetFileSizeValid(presetFile, maxBytes))
+        return nullptr;
+
+    auto xml = juce::XmlDocument::parse(presetFile);
+    if (xml == nullptr || !xml->hasTagName("mlrVSTPreset"))
+        return nullptr;
+
+    return xml;
+}
+
+bool writePresetAtomically(const juce::XmlElement& preset, const juce::File& targetFile)
+{
+    juce::TemporaryFile tempFile(targetFile);
+    if (!preset.writeTo(tempFile.getFile()))
+        return false;
+
+    return tempFile.overwriteTargetFileWithTemporary();
+}
+
+bool isValidStoredSamplePath(const juce::String& rawPath)
+{
+    const auto path = rawPath.trim();
+    if (path.isEmpty() || path.length() > kMaxStoredSamplePathChars)
+        return false;
+
+    if (!juce::File::isAbsolutePath(path))
+        return false;
+
+    if (path.contains("\n") || path.contains("\r") || path.contains("://"))
+        return false;
+
+    if (path.startsWith("//") || path.startsWith("\\\\"))
+        return false;
+
+    const juce::File file(path);
+    if (!file.hasFileExtension("wav;aif;aiff;mp3;ogg;flac"))
+        return false;
+
+    return true;
+}
+
+bool shouldEmbedAudioBuffer(const juce::AudioBuffer<float>& buffer)
+{
+    const int channels = buffer.getNumChannels();
+    const int samples = buffer.getNumSamples();
+    if (channels <= 0 || samples <= 0)
+        return false;
+
+    const uint64_t estimatedWavBytes = static_cast<uint64_t>(channels)
+        * static_cast<uint64_t>(samples)
+        * 3ULL  // 24-bit WAV payload
+        + 4096ULL;
+    return estimatedWavBytes <= static_cast<uint64_t>(kMaxEmbeddedWavBytes);
+}
 
 GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeState& parameters)
 {
@@ -278,7 +347,7 @@ bool writeDefaultPresetFile(const juce::File& presetFile, int presetIndex)
     preset.setAttribute("index", presetIndex);
     if (presetFile.existsAsFile())
     {
-        if (auto existing = juce::XmlDocument::parse(presetFile))
+        if (auto existing = parsePresetXmlSafely(presetFile, kMaxPresetNameXmlBytes))
         {
             const auto existingName = existing->getStringAttribute("name").trim();
             if (existingName.isNotEmpty())
@@ -291,7 +360,7 @@ bool writeDefaultPresetFile(const juce::File& presetFile, int presetIndex)
     globalsXml->setAttribute("quantize", 5);
     globalsXml->setAttribute("crossfadeLength", 10.0);
 
-    return preset.writeTo(presetFile);
+    return writePresetAtomically(preset, presetFile);
 }
 
 bool encodeBufferAsWavBase64(const juce::AudioBuffer<float>& buffer,
@@ -373,14 +442,14 @@ juce::File getPresetDirectory()
     return dir;
 }
 
-void savePreset(int presetIndex,
+bool savePreset(int presetIndex,
                 int maxStrips,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,
                 const juce::File* currentStripFiles)
 {
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots || audioEngine == nullptr || currentStripFiles == nullptr)
-        return;
+        return false;
 
     try
     {
@@ -395,7 +464,7 @@ void savePreset(int presetIndex,
         preset.setAttribute("index", presetIndex);
         if (presetFile.existsAsFile())
         {
-            if (auto existing = juce::XmlDocument::parse(presetFile))
+            if (auto existing = parsePresetXmlSafely(presetFile, kMaxPresetNameXmlBytes))
             {
                 const auto existingName = existing->getStringAttribute("name").trim();
                 if (existingName.isNotEmpty())
@@ -414,15 +483,23 @@ void savePreset(int presetIndex,
 
         if (strip->hasAudio())
         {
-            if (currentStripFiles[i] != juce::File())
+            const juce::String storedPath = currentStripFiles[i].getFullPathName().trim();
+            if (isValidStoredSamplePath(storedPath))
             {
-                stripXml->setAttribute("samplePath", currentStripFiles[i].getFullPathName());
+                stripXml->setAttribute("samplePath", storedPath);
             }
             else if (const auto* audioBuffer = strip->getAudioBuffer())
             {
                 juce::String embeddedWav;
-                if (encodeBufferAsWavBase64(*audioBuffer, strip->getSourceSampleRate(), embeddedWav))
+                if (shouldEmbedAudioBuffer(*audioBuffer)
+                    && encodeBufferAsWavBase64(*audioBuffer, strip->getSourceSampleRate(), embeddedWav))
+                {
                     stripXml->setAttribute(kEmbeddedSampleAttr, embeddedWav);
+                }
+                else
+                {
+                    DBG("Preset save strip " << i << ": skipped embedded sample (invalid path or embed too large)");
+                }
             }
         }
 
@@ -548,17 +625,27 @@ void savePreset(int presetIndex,
     if (auto* crossfade = parameters.getRawParameterValue("crossfadeLength"))
         globalsXml->setAttribute("crossfadeLength", *crossfade);
 
-        if (preset.writeTo(presetFile))
+        if (writePresetAtomically(preset, presetFile))
+        {
             DBG("Preset " << (presetIndex + 1) << " saved: " << presetFile.getFullPathName());
+            return true;
+        }
+
+        DBG("Preset save failed for slot " << (presetIndex + 1) << ": write failed");
+        return false;
     }
     catch (const std::exception& e)
     {
         DBG("Preset save failed for slot " << (presetIndex + 1) << ": " << e.what());
+        return false;
     }
     catch (...)
     {
         DBG("Preset save failed for slot " << (presetIndex + 1) << ": unknown exception");
+        return false;
     }
+
+    return false;
 }
 
 bool loadPreset(int presetIndex,
@@ -577,33 +664,39 @@ bool loadPreset(int presetIndex,
         auto presetDir = getPresetDirectory();
         auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
 
-    if (!presetFile.existsAsFile())
-    {
-        if (writeDefaultPresetFile(presetFile, presetIndex))
-            DBG("Preset " << (presetIndex + 1) << " missing - created default preset file");
-        else
+        if (!presetFile.existsAsFile())
         {
-            DBG("Preset " << (presetIndex + 1) << " not found and could not be created");
-            return false;
+            if (writeDefaultPresetFile(presetFile, presetIndex))
+                DBG("Preset " << (presetIndex + 1) << " missing - created default preset file");
+            else
+            {
+                DBG("Preset " << (presetIndex + 1) << " not found and could not be created");
+                return false;
+            }
         }
-    }
 
-    auto preset = juce::XmlDocument::parse(presetFile);
-    if (!preset || preset->getTagName() != "mlrVSTPreset")
-    {
-        // Attempt self-heal for corrupt files.
-        if (!writeDefaultPresetFile(presetFile, presetIndex))
+        if (!isPresetFileSizeValid(presetFile, kMaxPresetXmlBytes))
         {
-            DBG("Invalid preset file and recovery failed");
+            DBG("Preset " << (presetIndex + 1) << " rejected (invalid file size)");
             return false;
         }
-        preset = juce::XmlDocument::parse(presetFile);
-        if (!preset || preset->getTagName() != "mlrVSTPreset")
+
+        auto preset = parsePresetXmlSafely(presetFile, kMaxPresetXmlBytes);
+        if (!preset)
         {
-            DBG("Invalid preset file after recovery");
-            return false;
+            // Attempt self-heal for malformed files.
+            if (!writeDefaultPresetFile(presetFile, presetIndex))
+            {
+                DBG("Invalid preset file and recovery failed");
+                return false;
+            }
+            preset = parsePresetXmlSafely(presetFile, kMaxPresetXmlBytes);
+            if (!preset)
+            {
+                DBG("Invalid preset file after recovery");
+                return false;
+            }
         }
-    }
 
         const auto globalSnapshot = captureGlobalParameters(parameters);
 
@@ -650,9 +743,9 @@ bool loadPreset(int presetIndex,
         if (strip == nullptr)
             continue;
 
-        const juce::String samplePath = stripXml->getStringAttribute("samplePath");
+        const juce::String samplePath = stripXml->getStringAttribute("samplePath").trim();
         bool loadedStripAudio = false;
-        if (samplePath.isNotEmpty())
+        if (samplePath.isNotEmpty() && isValidStoredSamplePath(samplePath))
         {
             juce::File sampleFile(samplePath);
             if (sampleFile.existsAsFile())
@@ -949,9 +1042,9 @@ juce::String getPresetName(int presetIndex)
         return {};
     auto presetDir = getPresetDirectory();
     auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
-    if (presetFile.existsAsFile())
+    if (presetFile.existsAsFile() && isPresetFileSizeValid(presetFile, kMaxPresetNameXmlBytes))
     {
-        if (auto preset = juce::XmlDocument::parse(presetFile))
+        if (auto preset = parsePresetXmlSafely(presetFile, kMaxPresetNameXmlBytes))
         {
             const auto storedName = preset->getStringAttribute("name").trim();
             if (storedName.isNotEmpty())
@@ -976,8 +1069,8 @@ bool setPresetName(int presetIndex, const juce::String& presetName)
                 return false;
         }
 
-        auto preset = juce::XmlDocument::parse(presetFile);
-        if (!preset || preset->getTagName() != "mlrVSTPreset")
+        auto preset = parsePresetXmlSafely(presetFile, kMaxPresetNameXmlBytes);
+        if (!preset)
             return false;
 
         const auto trimmed = presetName.trim();
@@ -986,7 +1079,7 @@ bool setPresetName(int presetIndex, const juce::String& presetName)
         else
             preset->removeAttribute("name");
 
-        return preset->writeTo(presetFile);
+        return writePresetAtomically(*preset, presetFile);
     }
     catch (...)
     {
