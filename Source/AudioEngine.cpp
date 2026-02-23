@@ -3941,6 +3941,34 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     // Pre-calculate loop-invariant values
     double sampleRateRatio = sourceSampleRate / currentSampleRate;
     const double triggerOffsetRatioLocal = juce::jlimit(0.0, 0.999999, triggerOffsetRatio);
+    const bool stutterSliceLockActive = (momentaryStutterTimingActive.load(std::memory_order_acquire) != 0);
+    auto lockPositionToTriggerSlice = [&](double positionInLoopRaw) -> double
+    {
+        if (!stutterSliceLockActive)
+            return positionInLoopRaw;
+
+        const double loopLenSafe = juce::jmax(1.0, loopLength);
+        const double sliceLength = loopLenSafe / static_cast<double>(ModernAudioEngine::MaxColumns);
+        if (!(sliceLength > 1.0e-9))
+            return positionInLoopRaw;
+
+        double posWrapped = std::fmod(positionInLoopRaw, loopLenSafe);
+        if (posWrapped < 0.0)
+            posWrapped += loopLenSafe;
+
+        double sliceStart = std::fmod(triggerOffsetRatioLocal * loopLenSafe, loopLenSafe);
+        if (sliceStart < 0.0)
+            sliceStart += loopLenSafe;
+
+        double rel = std::fmod(posWrapped - sliceStart, sliceLength);
+        if (rel < 0.0)
+            rel += sliceLength;
+
+        double locked = sliceStart + rel;
+        if (locked >= loopLenSafe)
+            locked -= loopLenSafe;
+        return locked;
+    };
     
     // STEP SEQUENCER MODE - handle entirely separately (before main loop)
     if (playMode == PlayMode::Step)
@@ -4082,7 +4110,11 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     // While any scratch gesture is active, PPQ position lock is suspended.
     const bool scratchBypassPpq = (scrubActive || tapeStopActive || scratchGestureActive);
     const double speedForSync = static_cast<double>(playbackSpeed.load());
-    const bool speedBypassPpq = std::abs(speedForSync - 1.0) > 1.0e-3;
+    const bool stutterTimingActive = (momentaryStutterTimingActive.load(std::memory_order_acquire) != 0);
+    const double stutterPpqRateScale = stutterTimingActive
+        ? juce::jmax(0.0, std::abs(speedForSync))
+        : 1.0;
+    const bool speedBypassPpq = !stutterTimingActive && (std::abs(speedForSync - 1.0) > 1.0e-3);
     const bool bypassPpqSync = scratchBypassPpq || speedBypassPpq;
 
     if (speedPpqBypassActive != speedBypassPpq)
@@ -4110,7 +4142,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             {
                 const double timelineBeats = currentPpq + ppqTimelineOffsetBeats;
                 const double timelinePosition = (timelineBeats / beatsForLoop) * sampleLength;
-                playbackPosition = loopStartSamples + mapLoopPositionForMode(timelinePosition);
+                playbackPosition = loopStartSamples + lockPositionToTriggerSlice(
+                    mapLoopPositionForMode(timelinePosition));
             }
             else if (triggerPpqPosition >= 0.0)
             {
@@ -4118,7 +4151,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 const double ppqElapsed = currentPpq - triggerPpqPosition;
                 const double triggerOffset = triggerOffsetRatioLocal * loopLength;
                 const double rawPos = triggerOffset + (ppqElapsed * samplesPerBeat * autoWarpSpeed);
-                playbackPosition = loopStartSamples + mapLoopPositionForMode(rawPos);
+                playbackPosition = loopStartSamples + lockPositionToTriggerSlice(
+                    mapLoopPositionForMode(rawPos));
             }
         }
         speedPpqBypassActive = speedBypassPpq;
@@ -4126,8 +4160,9 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
 
     // SIMPLE PPQ-LOCKED PLAYBACK
     // Position = time_since_trigger + column_offset
+    const bool useTimelineAnchorForPlayback = ppqTimelineAnchored && !stutterTimingActive;
     if (positionInfo.getPpqPosition().hasValue() && !bypassPpqSync && playing
-        && (triggerPpqPosition >= 0.0 || ppqTimelineAnchored))
+        && (triggerPpqPosition >= 0.0 || useTimelineAnchorForPlayback))
     {
         double currentPpq = applySwingToPpq(*positionInfo.getPpqPosition());
         double positionInLoop = 0.0;
@@ -4135,12 +4170,12 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         double samplesElapsed = 0.0;
         double ppqElapsed = 0.0;
 
-        if (ppqTimelineAnchored)
+        if (useTimelineAnchorForPlayback)
         {
             // Use unwrapped phase so Ping-Pong can produce outbound+return.
             const double timelineBeats = currentPpq + ppqTimelineOffsetBeats;
             const double timelinePosition = (timelineBeats / beatsForLoop) * sampleLength;
-            positionInLoop = mapLoopPositionForMode(timelinePosition);
+            positionInLoop = lockPositionToTriggerSlice(mapLoopPositionForMode(timelinePosition));
             playbackPosition = loopStartSamples + positionInLoop;
         }
         else
@@ -4154,10 +4189,10 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             }
 
             const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
-            samplesElapsed = ppqElapsed * samplesPerBeat * autoWarpSpeed;
+            samplesElapsed = ppqElapsed * samplesPerBeat * autoWarpSpeed * stutterPpqRateScale;
             columnOffsetSamples = triggerOffsetRatioLocal * loopLength;
             const double totalPosition = columnOffsetSamples + samplesElapsed;
-            positionInLoop = mapLoopPositionForMode(totalPosition);
+            positionInLoop = lockPositionToTriggerSlice(mapLoopPositionForMode(totalPosition));
             playbackPosition = loopStartSamples + positionInLoop;
         }
         
@@ -4171,7 +4206,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         double timelineSamples = currentPpq * samplesPerBeat * autoWarpSpeed;
         
         // Use timeline position directly - no column offset!
-        double positionInLoop = mapLoopPositionForMode(timelineSamples);
+        double positionInLoop = lockPositionToTriggerSlice(mapLoopPositionForMode(timelineSamples));
         playbackPosition = loopStartSamples + positionInLoop;
     }
     else if (playing)
@@ -4195,7 +4230,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
 
         double totalPosition = triggerOffset + (swungElapsedSamples * playbackSpeed.load());
         
-        double positionInLoop = mapLoopPositionForMode(totalPosition);
+        double positionInLoop = lockPositionToTriggerSlice(mapLoopPositionForMode(totalPosition));
         
         playbackPosition = loopStartSamples + positionInLoop;
     }
@@ -4558,8 +4593,9 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         else
         {
             // NORMAL MODE: Calculate position for this sample
+            const bool useTimelineAnchorForCalc = ppqTimelineAnchored && !stutterTimingActive;
             bool ppqSyncActiveForCalc = positionInfo.getPpqPosition().hasValue() && !bypassPpqSync && playing
-                                      && (triggerPpqPosition >= 0.0 || ppqTimelineAnchored);
+                                      && (triggerPpqPosition >= 0.0 || useTimelineAnchorForCalc);
             
             if (ppqSyncActiveForCalc)
             {
@@ -4573,7 +4609,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 const double ppqAtSampleRaw = basePpq + (static_cast<double>(i) * ppqPerSample);
                 const double currentPpq = applySwingToPpq(ppqAtSampleRaw);
                 double rawBase = 0.0;
-                if (ppqTimelineAnchored)
+                if (useTimelineAnchorForCalc)
                 {
                     const double timelineBeats = currentPpq + ppqTimelineOffsetBeats;
                     const double timelineRate = juce::jmax(0.0, std::abs(rateMultiplier));
@@ -4586,7 +4622,10 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
                     const double ppqElapsed = currentPpq - triggerPpqPosition;
                     const double columnOffsetSamples = triggerOffsetRatioLocal * loopLength;
-                    rawBase = columnOffsetSamples + (ppqElapsed * samplesPerBeat * autoWarpSpeed);
+                    const double sampleRateScale = stutterTimingActive
+                        ? juce::jmax(0.0, std::abs(static_cast<double>(currentSpeed)))
+                        : 1.0;
+                    rawBase = columnOffsetSamples + (ppqElapsed * samplesPerBeat * autoWarpSpeed * sampleRateScale);
                 }
                 else
                 {
@@ -4596,7 +4635,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     rawBase = triggerOffset + (samplesElapsed * effectiveSpeed);
                 }
 
-                positionInLoop = mapLoopPositionForMode(rawBase);
+                positionInLoop = lockPositionToTriggerSlice(mapLoopPositionForMode(rawBase));
                 }
                 else
                 {
@@ -4605,7 +4644,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 int64_t samplesElapsed = currentGlobalSample - triggerSample;
                 
                 double triggerOffset = triggerOffsetRatioLocal * loopLength;
-                    positionInLoop = mapLoopPositionForMode(triggerOffset + (samplesElapsed * effectiveSpeed));
+                    positionInLoop = lockPositionToTriggerSlice(
+                        mapLoopPositionForMode(triggerOffset + (samplesElapsed * effectiveSpeed)));
                 }
                 
             }
@@ -4966,7 +5006,8 @@ void EnhancedAudioStrip::trigger(int column, double tempo, bool quantized)
 }
 
 void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globalSample,
-                                         const juce::AudioPlayHead::PositionInfo& positionInfo)
+                                         const juce::AudioPlayHead::PositionInfo& positionInfo,
+                                         bool stutterRetrigger)
 {
     juce::ScopedLock lock(bufferLock);
     const bool wasPlaying = playing;
@@ -5008,7 +5049,9 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
         const double rawTriggerTargetPos = getTriggerTargetPositionForColumn(column, loopStartSamples, loopLengthSamples);
         const bool transientModeActive = transientSliceMode.load(std::memory_order_acquire);
-        const int zeroSnapRadius = transientModeActive ? 0 : juce::jmax(8, static_cast<int>(currentSampleRate * 0.0007)); // ~0.7ms
+        const int zeroSnapRadius = (transientModeActive || stutterRetrigger)
+            ? 0
+            : juce::jmax(8, static_cast<int>(currentSampleRate * 0.0007)); // ~0.7ms
         const double triggerTargetPos = (zeroSnapRadius > 0)
             ? snapToNearestZeroCrossing(rawTriggerTargetPos, zeroSnapRadius)
             : rawTriggerTargetPos;
@@ -5047,7 +5090,9 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
     const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
     const double rawTargetPosition = getTriggerTargetPositionForColumn(column, loopStartSamples, loopLengthSamples);
     const bool transientModeActive = transientSliceMode.load(std::memory_order_acquire);
-    const int zeroSnapRadius = transientModeActive ? 0 : juce::jmax(8, static_cast<int>(currentSampleRate * 0.0007)); // ~0.7ms
+    const int zeroSnapRadius = (transientModeActive || stutterRetrigger)
+        ? 0
+        : juce::jmax(8, static_cast<int>(currentSampleRate * 0.0007)); // ~0.7ms
     const double newTargetPosition = (zeroSnapRadius > 0)
         ? snapToNearestZeroCrossing(rawTargetPosition, zeroSnapRadius)
         : rawTargetPosition;
@@ -5056,7 +5101,11 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
     // on sustained material without altering PPQ timeline math.
     if (wasPlaying && sampleLength > 1.0 && playMode != PlayMode::Step && playMode != PlayMode::Grain)
     {
-        const float triggerFadeMs = triggerFadeInMs.load(std::memory_order_acquire);
+        const float configuredFadeMs = triggerFadeInMs.load(std::memory_order_acquire);
+        // Hold-stutter retriggers need a much tighter attack than general trigger fades.
+        const float triggerFadeMs = stutterRetrigger
+            ? juce::jlimit(0.1f, 1.0f, juce::jmin(configuredFadeMs, 0.7f))
+            : configuredFadeMs;
         if (retriggerBlendActive && retriggerBlendSamplesRemaining > 0 && retriggerBlendTotalSamples > 0)
         {
             const float progress = 1.0f - (static_cast<float>(retriggerBlendSamplesRemaining)
@@ -5256,7 +5305,10 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
     playing = true;
     
     // Configurable trigger fade-in for sustained/phase-misaligned retriggers.
-    const float triggerFadeMs = triggerFadeInMs.load(std::memory_order_acquire);
+    const float configuredFadeMs = triggerFadeInMs.load(std::memory_order_acquire);
+    const float triggerFadeMs = stutterRetrigger
+        ? juce::jlimit(0.1f, 1.0f, juce::jmin(configuredFadeMs, 0.7f))
+        : configuredFadeMs;
     int fadeSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
     if (!wasPlaying)
         crossfader.startFade(true, fadeSamples, true);
@@ -6267,7 +6319,7 @@ void EnhancedAudioStrip::setPan(float panValue)
 
 void EnhancedAudioStrip::setPlaybackSpeed(float speed)
 {
-    speed = juce::jlimit(0.0f, 4.0f, speed);
+    speed = juce::jlimit(0.0f, 8.0f, speed);
     playbackSpeed = static_cast<double>(speed);
     displaySpeedAtomic.store(speed, std::memory_order_release);
     smoothedSpeed.setTargetValue(speed);
@@ -6275,7 +6327,7 @@ void EnhancedAudioStrip::setPlaybackSpeed(float speed)
 
 void EnhancedAudioStrip::setPlaybackSpeedImmediate(float speed)
 {
-    speed = juce::jlimit(0.0f, 4.0f, speed);
+    speed = juce::jlimit(0.0f, 8.0f, speed);
     playbackSpeed = static_cast<double>(speed);
     displaySpeedAtomic.store(speed, std::memory_order_release);
     smoothedSpeed.setCurrentAndTargetValue(speed);
@@ -6654,7 +6706,7 @@ void EnhancedAudioStrip::setFilterAlgorithm(FilterAlgorithm algorithm)
 double EnhancedAudioStrip::applySwingToPpq(double ppq) const
 {
     const double swing = static_cast<double>(swingAmount.load(std::memory_order_acquire));
-    if (swing <= 1.0e-6)
+    if (swing <= 1.0e-4)
         return ppq;
 
     const auto division = getSwingDivision();
@@ -7648,6 +7700,13 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             const double divisionBeats = juce::jlimit(
                 0.03125, 4.0, momentaryStutterDivisionBeats.load(std::memory_order_acquire));
             const double startPpq = momentaryStutterStartPpq.load(std::memory_order_acquire);
+            const auto snapToCurrentStutterGrid = [&](double blockStartPpqValue) -> double
+            {
+                if (blockStartPpqValue <= startPpq + 1.0e-12)
+                    return startPpq;
+                const double stepsFromStart = std::ceil(((blockStartPpqValue - startPpq) - 1.0e-12) / divisionBeats);
+                return startPpq + (juce::jmax(0.0, stepsFromStart) * divisionBeats);
+            };
 
             if (blockEndPpq > startPpq)
             {
@@ -7664,39 +7723,61 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     const int stutterColumn = juce::jlimit(
                         0, MaxColumns - 1, momentaryStutterColumns[idx].load(std::memory_order_acquire));
 
+                    // Phase-locked scheduling:
+                    // keep continuity via cached next PPQ, but snap to startPpq+N*division
+                    // whenever division/grid alignment changes (prevents drift).
                     double nextPpq = momentaryStutterNextPpq[idx].load(std::memory_order_acquire);
-                    if (!std::isfinite(nextPpq))
-                        nextPpq = startPpq;
-                    if (nextPpq < startPpq)
+                    if (!std::isfinite(nextPpq) || nextPpq < startPpq - 1.0e-9)
                         nextPpq = startPpq;
 
-                    // Catch up to current block without drifting trigger phase.
-                    if (nextPpq < blockStartPpq - 1.0e-9)
-                    {
-                        const double delta = blockStartPpq - nextPpq;
-                        if (delta > divisionBeats)
-                        {
-                            const double steps = std::floor(delta / divisionBeats);
-                            nextPpq += steps * divisionBeats;
-                        }
-                        while (nextPpq < blockStartPpq - 1.0e-9)
-                            nextPpq += divisionBeats;
-                    }
+                    const double stepsFromStart = (nextPpq - startPpq) / divisionBeats;
+                    const double nearestGridStep = std::round(stepsFromStart);
+                    const bool alignedToCurrentDivision = std::isfinite(stepsFromStart)
+                        && std::abs(stepsFromStart - nearestGridStep) <= 1.0e-6;
+                    if (!alignedToCurrentDivision || nextPpq < blockStartPpq - 1.0e-12)
+                        nextPpq = snapToCurrentStutterGrid(blockStartPpq);
+
+                    if (!std::isfinite(nextPpq))
+                        nextPpq = startPpq;
 
                     int lastOffsetSamples = -1;
                     int safety = 0;
+                    const double mappedBlockStartPpq = strip->applySwingToPpq(blockStartPpq);
+                    if (!std::isfinite(mappedBlockStartPpq))
+                    {
+                        momentaryStutterNextPpq[idx].store(nextPpq, std::memory_order_release);
+                        continue;
+                    }
+
                     while (nextPpq < blockEndPpq && safety++ < 1024)
                     {
-                        const int offsetSamples = juce::jlimit(
-                            0, numSamples - 1, static_cast<int>(std::llround((nextPpq - blockStartPpq) * samplesPerBeat)));
+                        const double mappedTriggerPpq = strip->applySwingToPpq(nextPpq);
+                        if (!std::isfinite(mappedTriggerPpq))
+                        {
+                            nextPpq += divisionBeats;
+                            continue;
+                        }
+
+                        const int offsetSamples = static_cast<int>(std::llround(
+                            (mappedTriggerPpq - mappedBlockStartPpq) * samplesPerBeat));
+                        if (offsetSamples < 0)
+                        {
+                            // Swing mapping can place early boundaries before this block; skip them.
+                            nextPpq += divisionBeats;
+                            continue;
+                        }
+                        if (offsetSamples >= numSamples)
+                            break;
+
                         if (offsetSamples != lastOffsetSamples)
                         {
                             QuantisedTrigger t;
                             t.targetSample = blockStart + offsetSamples;
-                            t.targetPPQ = nextPpq;
+                            t.targetPPQ = mappedTriggerPpq;
                             t.stripIndex = stripIdx;
                             t.column = stutterColumn;
                             t.clearPendingOnFire = false;
+                            t.isMomentaryStutter = true;
                             eventsInBlock.push_back(t);
                             lastOffsetSamples = offsetSamples;
                         }
@@ -7709,8 +7790,9 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             }
         }
 
-        // Stutter-lock: while hold-stutter is active on a strip, discard any
-        // competing trigger events that target a different column.
+        // Stutter-lock: while hold-stutter is active, armed strips must only
+        // consume stutter-origin triggers (prevents stale queued events from
+        // re-anchoring timing mid-hold).
         if (momentaryStutterActive.load(std::memory_order_acquire) != 0)
         {
             eventsInBlock.erase(
@@ -7721,6 +7803,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                             return false;
                         if (momentaryStutterStripEnabled[static_cast<size_t>(t.stripIndex)].load(std::memory_order_acquire) == 0)
                             return false;
+                        if (!t.isMomentaryStutter)
+                            return true;
                         const int stutterColumn = juce::jlimit(
                             0, MaxColumns - 1, momentaryStutterColumns[static_cast<size_t>(t.stripIndex)].load(std::memory_order_acquire));
                         return t.column != stutterColumn;
@@ -7773,7 +7857,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 }
 
                 const int64_t triggerSample = blockStart + eventOffset;
-                strip->triggerAtSample(event.column, tempoNow, triggerSample, triggerPosInfo);
+                strip->triggerAtSample(event.column, tempoNow, triggerSample, triggerPosInfo, event.isMomentaryStutter);
                 if (event.clearPendingOnFire)
                     quantizeClock.clearPendingTriggersForStrip(event.stripIndex);
             }
@@ -8037,6 +8121,9 @@ void ModernAudioEngine::setMomentaryStutterStrip(int stripIndex, int column, boo
         momentaryStutterNextPpq[idx].store(momentaryStutterStartPpq.load(std::memory_order_acquire), std::memory_order_release);
     if (!enabled)
         momentaryStutterNextPpq[idx].store(0.0, std::memory_order_release);
+
+    if (auto* strip = getStrip(stripIndex))
+        strip->setMomentaryStutterTimingActive(enabled);
 }
 
 void ModernAudioEngine::clearMomentaryStutterStrips()
@@ -8045,7 +8132,16 @@ void ModernAudioEngine::clearMomentaryStutterStrips()
     {
         momentaryStutterStripEnabled[static_cast<size_t>(i)].store(0, std::memory_order_release);
         momentaryStutterNextPpq[static_cast<size_t>(i)].store(0.0, std::memory_order_release);
+        if (auto* strip = getStrip(i))
+            strip->setMomentaryStutterTimingActive(false);
     }
+}
+
+void ModernAudioEngine::clearPendingQuantizedTriggersForStrip(int stripIndex)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    quantizeClock.clearPendingTriggersForStrip(stripIndex);
 }
 
 void ModernAudioEngine::scheduleQuantizedTrigger(int stripIndex, int column, double currentPPQ)

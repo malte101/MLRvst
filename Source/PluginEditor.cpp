@@ -3778,6 +3778,23 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     quantizeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
         processor.parameters, "quantize", quantizeSelector);
 
+    innerLoopLengthLabel.setText("Inner Loop", juce::dontSendNotification);
+    innerLoopLengthLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(innerLoopLengthLabel);
+
+    innerLoopLengthBox.addItem("1", 1);
+    innerLoopLengthBox.addItem("1/2", 2);
+    innerLoopLengthBox.addItem("1/4", 3);
+    innerLoopLengthBox.addItem("1/8", 4);
+    innerLoopLengthBox.addItem("1/16", 5);
+    innerLoopLengthBox.setSelectedId(1);
+    addAndMakeVisible(innerLoopLengthBox);
+    styleUiCombo(innerLoopLengthBox);
+    innerLoopLengthBox.setTooltip("Divides inner-loop size selected from the monome grid.");
+
+    innerLoopLengthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "innerLoopLength", innerLoopLengthBox);
+
     swingDivisionLabel.setText("Swing grid", juce::dontSendNotification);
     swingDivisionLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(swingDivisionLabel);
@@ -4494,6 +4511,13 @@ void GlobalControlPanel::resized()
     quantizeLabel.setBounds(quantizeArea.removeFromTop(16));
     quantizeArea.removeFromTop(2);
     quantizeSelector.setBounds(quantizeArea.removeFromTop(28));
+    controlsArea.removeFromLeft(spacing);
+
+    // Inner loop length divisor
+    auto innerLoopArea = controlsArea.removeFromLeft(dropdownWidth);
+    innerLoopLengthLabel.setBounds(innerLoopArea.removeFromTop(16));
+    innerLoopArea.removeFromTop(2);
+    innerLoopLengthBox.setBounds(innerLoopArea.removeFromTop(28));
     controlsArea.removeFromLeft(spacing);
 
     // Quality - compact dropdown

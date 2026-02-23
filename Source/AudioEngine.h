@@ -105,6 +105,7 @@ struct QuantisedTrigger
     int stripIndex = -1;
     int column = 0;
     bool clearPendingOnFire = true;
+    bool isMomentaryStutter = false;
 };
 
 class QuantizationClock
@@ -422,7 +423,8 @@ public:
     // Playback control
     void trigger(int column, double tempo, bool quantized = false);
     void triggerAtSample(int column, double tempo, int64_t globalSample, 
-                        const juce::AudioPlayHead::PositionInfo& positionInfo);  // Sample-accurate trigger with PPQ sync
+                        const juce::AudioPlayHead::PositionInfo& positionInfo,
+                        bool stutterRetrigger = false);  // Sample-accurate trigger with PPQ sync
     void stop(bool immediate = false);
     void syncToGlobalPhase(double globalPhase, double tempo);  // NEW: Sync playback to global clock
     void calculatePositionFromGlobalSample(int64_t globalSample, double tempo);  // Calculate from global clock
@@ -472,6 +474,10 @@ public:
     float getPan() const { return pan.load(); }
     void setPlaybackSpeed(float speed);
     void setPlaybackSpeedImmediate(float speed);
+    void setMomentaryStutterTimingActive(bool active)
+    {
+        momentaryStutterTimingActive.store(active ? 1 : 0, std::memory_order_release);
+    }
     void setPitchSmoothingTime(float seconds);  // Update speed smoothing ramp time (0-1 seconds)
     float getPlaybackSpeed() const { return static_cast<float>(playbackSpeed.load()); }
     float getDisplaySpeed() const { return displaySpeedAtomic.load(std::memory_order_acquire); }
@@ -827,6 +833,7 @@ private:
     int64_t lastObservedGlobalSample = 0;
     double lastObservedTempo = 120.0;
     bool speedPpqBypassActive = false;
+    std::atomic<int> momentaryStutterTimingActive{0};
     double stopLoopPosition = 0.0;    // Position in loop when stopped (for visual sync)
     bool lastHostPlayingState = true; // Track host transport state changes (start true to detect first stop)
     bool wasPlayingBeforeStop = false; // Track if strip was playing when host stopped (for auto-resume)
@@ -1144,6 +1151,7 @@ public:
     void setMomentaryStutterStartPpq(double ppq);
     void setMomentaryStutterStrip(int stripIndex, int column, bool enabled);
     void clearMomentaryStutterStrips();
+    void clearPendingQuantizedTriggersForStrip(int stripIndex);
     
     // Pattern recording
     void startPatternRecording(int patternIndex);

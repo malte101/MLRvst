@@ -289,6 +289,7 @@ private:
     // Cached parameter pointers to avoid string lookups in processBlock
     std::atomic<float>* masterVolumeParam = nullptr;
     std::atomic<float>* quantizeParam = nullptr;
+    std::atomic<float>* innerLoopLengthParam = nullptr;
     std::atomic<float>* grainQualityParam = nullptr;
     std::atomic<float>* pitchSmoothingParam = nullptr;
     std::atomic<float>* inputMonitorParam = nullptr;
@@ -359,10 +360,13 @@ private:
     void loadPersistentControlPages();
     void savePersistentControlPages() const;
     int getQuantizeDivision() const;
+    float getInnerLoopLengthFactor() const;
     void queueLoopChange(int stripIndex, bool clearLoop, int startColumn, int endColumn, bool reverseDirection, int markerColumn = -1);
     void applyPendingLoopChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
     void applyPendingBarChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
+    void applyPendingStutterStart(const juce::AudioPlayHead::PositionInfo& posInfo);
     void applyPendingStutterRelease(const juce::AudioPlayHead::PositionInfo& posInfo);
+    void performMomentaryStutterStartNow(double hostPpqNow, int64_t nowSample);
     void performMomentaryStutterReleaseNow(double hostPpqNow, int64_t nowSample);
     void captureMomentaryStutterMacroBaseline();
     void applyMomentaryStutterMacro(const juce::AudioPlayHead::PositionInfo& posInfo);
@@ -413,6 +417,14 @@ private:
     bool momentaryStutterMacroBaselineCaptured = false;
     bool momentaryStutterMacroCapturePending = false;
     double momentaryStutterMacroStartPpq = 0.0;
+    uint8_t momentaryStutterLastComboMask = 0;
+    bool momentaryStutterTwoButtonStepBaseValid = false;
+    int momentaryStutterTwoButtonStepBase = 0;
+    std::atomic<int> momentaryStutterPlaybackActive{0};
+    std::atomic<int> pendingStutterStartActive{0};
+    std::atomic<double> pendingStutterStartPpq{-1.0};
+    std::atomic<double> pendingStutterStartDivisionBeats{1.0};
+    std::atomic<int64_t> pendingStutterStartSampleTarget{-1};
     std::atomic<int> pendingStutterReleaseActive{0};
     std::atomic<double> pendingStutterReleasePpq{-1.0};
     std::atomic<int> pendingStutterReleaseQuantizeDivision{8};

@@ -24,6 +24,7 @@ struct GlobalParameterSnapshot
 {
     float masterVolume = 1.0f;
     float quantizeChoice = 5.0f;
+    float innerLoopLengthChoice = 0.0f;
     float grainQuality = 2.0f;
     float pitchSmoothing = 0.05f;
     float inputMonitor = 1.0f;
@@ -105,6 +106,8 @@ GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeSta
         snapshot.masterVolume = *p;
     if (auto* p = parameters.getRawParameterValue("quantize"))
         snapshot.quantizeChoice = *p;
+    if (auto* p = parameters.getRawParameterValue("innerLoopLength"))
+        snapshot.innerLoopLengthChoice = *p;
     if (auto* p = parameters.getRawParameterValue("quality"))
         snapshot.grainQuality = *p;
     if (auto* p = parameters.getRawParameterValue("pitchSmoothing"))
@@ -126,6 +129,8 @@ void restoreGlobalParameters(juce::AudioProcessorValueTreeState& parameters, con
         param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, snapshot.masterVolume));
     if (auto* param = parameters.getParameter("quantize"))
         param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, snapshot.quantizeChoice / 9.0f));
+    if (auto* param = parameters.getParameter("innerLoopLength"))
+        param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, snapshot.innerLoopLengthChoice / 4.0f));
     if (auto* param = parameters.getParameter("quality"))
         param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, snapshot.grainQuality / 3.0f));
     if (auto* param = parameters.getParameter("pitchSmoothing"))
@@ -359,6 +364,7 @@ bool writeDefaultPresetFile(const juce::File& presetFile, int presetIndex)
     auto* globalsXml = preset.createNewChildElement("Globals");
     globalsXml->setAttribute("masterVolume", 0.7);
     globalsXml->setAttribute("quantize", 5);
+    globalsXml->setAttribute("innerLoopLength", 0);
     globalsXml->setAttribute("crossfadeLength", 10.0);
 
     return writePresetAtomically(preset, presetFile);
@@ -624,6 +630,8 @@ bool savePreset(int presetIndex,
         globalsXml->setAttribute("masterVolume", *masterVol);
     if (auto* quantize = parameters.getRawParameterValue("quantize"))
         globalsXml->setAttribute("quantize", static_cast<int>(*quantize));
+    if (auto* innerLoopLength = parameters.getRawParameterValue("innerLoopLength"))
+        globalsXml->setAttribute("innerLoopLength", static_cast<int>(*innerLoopLength));
     if (auto* crossfade = parameters.getRawParameterValue("crossfadeLength"))
         globalsXml->setAttribute("crossfadeLength", *crossfade);
 

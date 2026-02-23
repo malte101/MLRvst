@@ -617,6 +617,8 @@ private:
     juce::Label masterVolumeLabel;
     juce::ComboBox quantizeSelector;
     juce::Label quantizeLabel;
+    juce::ComboBox innerLoopLengthBox;
+    juce::Label innerLoopLengthLabel;
     juce::ComboBox resamplingQualityBox;
     juce::Label qualityLabel;
     juce::ComboBox swingDivisionBox;
@@ -641,6 +643,7 @@ private:
     
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterVolumeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> quantizeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> innerLoopLengthAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> grainQualityAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> inputMonitorAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> crossfadeLengthAttachment;

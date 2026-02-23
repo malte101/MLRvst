@@ -145,6 +145,42 @@ double stutterDivisionBeatsFromBit(int bit)
     return kDivisionBeats[static_cast<size_t>(idx)];
 }
 
+double stutterDivisionBeatsFromBitForMacro(int bit, bool preferStraight)
+{
+    const double base = stutterDivisionBeatsFromBit(bit);
+    if (!preferStraight)
+        return base;
+
+    switch (juce::jlimit(0, kStutterButtonCount - 1, bit))
+    {
+        case 1: return 0.5;   // 1/8 instead of 1/4T
+        case 3: return 0.25;  // 1/16 instead of 1/8T
+        case 6: return 0.125; // 1/32 instead of 1/32T
+        default: return base;
+    }
+}
+
+template <size_t N>
+double snapDivisionToGrid(double divisionBeats, const std::array<double, N>& grid)
+{
+    if (!std::isfinite(divisionBeats))
+        return grid[0];
+
+    double best = grid[0];
+    double bestDist = std::abs(divisionBeats - best);
+    for (size_t i = 1; i < N; ++i)
+    {
+        const double cand = grid[i];
+        const double dist = std::abs(divisionBeats - cand);
+        if (dist < bestDist)
+        {
+            best = cand;
+            bestDist = dist;
+        }
+    }
+    return best;
+}
+
 double wrapUnitPhase(double phase)
 {
     if (!std::isfinite(phase))
@@ -883,6 +919,7 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
 {
     masterVolumeParam = parameters.getRawParameterValue("masterVolume");
     quantizeParam = parameters.getRawParameterValue("quantize");
+    innerLoopLengthParam = parameters.getRawParameterValue("innerLoopLength");
     grainQualityParam = parameters.getRawParameterValue("quality");
     pitchSmoothingParam = parameters.getRawParameterValue("pitchSmoothing");
     inputMonitorParam = parameters.getRawParameterValue("inputMonitor");
@@ -1017,6 +1054,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         juce::StringArray{"1", "1/2", "1/2T", "1/4", "1/4T", 
                           "1/8", "1/8T", "1/16", "1/16T", "1/32"},
         5));  // Default to 1/8
+
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "innerLoopLength",
+        "Inner Loop Length",
+        juce::StringArray{"1", "1/2", "1/4", "1/8", "1/16"},
+        0));
     
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "quality",
@@ -1223,6 +1266,7 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     applyPendingLoopChanges(posInfo);
     applyPendingBarChanges(posInfo);
     applyPendingStutterRelease(posInfo);
+    applyPendingStutterStart(posInfo);
 
     // Update strip parameters
     for (int i = 0; i < MaxStrips; ++i)
@@ -1474,6 +1518,15 @@ int MlrVSTAudioProcessor::getQuantizeDivision() const
     const int quantizeChoice = quantizeParamLocal ? static_cast<int>(*quantizeParamLocal) : 5;
     const int divisionMap[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32};
     return (quantizeChoice >= 0 && quantizeChoice < 10) ? divisionMap[quantizeChoice] : 8;
+}
+
+float MlrVSTAudioProcessor::getInnerLoopLengthFactor() const
+{
+    const int choice = innerLoopLengthParam
+        ? juce::jlimit(0, 4, static_cast<int>(*innerLoopLengthParam))
+        : 0;
+    static constexpr std::array<float, 5> kFactors { 1.0f, 0.5f, 0.25f, 0.125f, 0.0625f };
+    return kFactors[static_cast<size_t>(choice)];
 }
 
 void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int startColumn, int endColumn, bool reverseDirection, int markerColumn)
@@ -1792,6 +1845,85 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
     }
 }
 
+void MlrVSTAudioProcessor::applyPendingStutterStart(const juce::AudioPlayHead::PositionInfo& posInfo)
+{
+    if (!audioEngine || pendingStutterStartActive.load(std::memory_order_acquire) == 0)
+        return;
+
+    double currentPpq = audioEngine->getTimelineBeat();
+    if (posInfo.getPpqPosition().hasValue())
+        currentPpq = *posInfo.getPpqPosition();
+
+    double targetPpq = pendingStutterStartPpq.load(std::memory_order_acquire);
+    const int64_t currentSample = audioEngine->getGlobalSampleCount();
+
+    // Match inner-loop quantized scheduling:
+    // resolve target grid on audio thread to avoid GUI/playhead clock skew.
+    if (!(std::isfinite(targetPpq) && targetPpq >= 0.0))
+    {
+        if (!(std::isfinite(currentPpq) && currentPpq >= 0.0))
+            return;
+
+        const double division = juce::jlimit(
+            0.03125, 4.0, pendingStutterStartDivisionBeats.load(std::memory_order_acquire));
+        targetPpq = std::ceil(currentPpq / division) * division;
+        if (targetPpq <= (currentPpq + 1.0e-6))
+            targetPpq += division;
+        targetPpq = std::round(targetPpq / division) * division;
+        pendingStutterStartPpq.store(targetPpq, std::memory_order_release);
+        pendingStutterStartSampleTarget.store(-1, std::memory_order_release);
+        return;
+    }
+
+    if (!(std::isfinite(currentPpq) && currentPpq >= 0.0))
+        return;
+
+    if (currentPpq + 1.0e-6 < targetPpq)
+        return;
+
+    double applyPpq = targetPpq;
+
+    bool hasAnyPlayingStrip = false;
+    bool anchorsReady = true;
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        auto* strip = audioEngine->getStrip(i);
+        if (!strip || !strip->hasAudio() || !strip->isPlaying())
+            continue;
+        hasAnyPlayingStrip = true;
+        if (!strip->isPpqTimelineAnchored())
+        {
+            anchorsReady = false;
+            break;
+        }
+    }
+
+    // Mirror inner-loop quantized-apply safety: if anchor isn't valid on this grid,
+    // roll to the next stutter grid instead of entering off-sync.
+    if (hasAnyPlayingStrip && !anchorsReady
+        && std::isfinite(currentPpq)
+        && std::isfinite(targetPpq))
+    {
+        const double division = juce::jlimit(
+            0.03125, 4.0, pendingStutterStartDivisionBeats.load(std::memory_order_acquire));
+        double nextTarget = std::ceil(currentPpq / division) * division;
+        if (nextTarget <= (currentPpq + 1.0e-6))
+            nextTarget += division;
+        nextTarget = std::round(nextTarget / division) * division;
+        pendingStutterStartPpq.store(nextTarget, std::memory_order_release);
+        pendingStutterStartSampleTarget.store(-1, std::memory_order_release);
+        return;
+    }
+
+    pendingStutterStartActive.store(0, std::memory_order_release);
+    pendingStutterStartPpq.store(-1.0, std::memory_order_release);
+    pendingStutterStartSampleTarget.store(-1, std::memory_order_release);
+
+    if (!std::isfinite(applyPpq))
+        applyPpq = audioEngine->getTimelineBeat();
+    performMomentaryStutterStartNow(applyPpq, currentSample);
+}
+
 void MlrVSTAudioProcessor::applyPendingStutterRelease(const juce::AudioPlayHead::PositionInfo& posInfo)
 {
     if (!audioEngine || pendingStutterReleaseActive.load(std::memory_order_acquire) == 0)
@@ -1854,7 +1986,10 @@ void MlrVSTAudioProcessor::captureMomentaryStutterMacroBaseline()
 
         saved.valid = true;
         saved.pan = strip->getPan();
-        saved.playbackSpeed = strip->getPlaybackSpeed();
+        if (auto* speedParam = stripSpeedParams[idx])
+            saved.playbackSpeed = speedParam->load(std::memory_order_acquire);
+        else
+            saved.playbackSpeed = strip->getPlaybackSpeed();
         saved.pitchShift = strip->getPitchShift();
         saved.filterEnabled = strip->isFilterEnabled();
         saved.filterFrequency = strip->getFilterFrequency();
@@ -1869,7 +2004,9 @@ void MlrVSTAudioProcessor::captureMomentaryStutterMacroBaseline()
 
 void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead::PositionInfo& posInfo)
 {
-    if (!audioEngine || !momentaryStutterHoldActive)
+    if (!audioEngine
+        || !momentaryStutterHoldActive
+        || momentaryStutterPlaybackActive.load(std::memory_order_acquire) == 0)
         return;
 
     if (!posInfo.getPpqPosition().hasValue())
@@ -1893,12 +2030,27 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
     const int bitCount = countStutterBits(comboMask);
     const int highestBit = highestStutterBit(comboMask);
     const int lowestBit = lowestStutterBit(comboMask);
+    const bool comboChanged = (comboMask != momentaryStutterLastComboMask);
     const int seed = (static_cast<int>(comboMask) * 97)
         + (bitCount * 19)
         + (highestBit * 11)
         + (lowestBit * 5);
     const int variant = seed % 8;
-    const int lengthBars = 1 + ((seed / 13) % 4);
+    const bool singleButton = (bitCount <= 1);
+    const bool multiButton = (bitCount > 1);
+    const bool twoButton = (bitCount == 2);
+    const bool allowPitchSpeedMacro = (bitCount > 2);
+    const bool allowPitchMacro = (bitCount > 2);
+    const bool applySpeedMacro = (bitCount > 1);
+    const bool threeButton = (bitCount == 3);
+    const bool hardStepMode = (variant >= 4);
+
+    int lengthBars = 1 + ((seed / 13) % 4);
+    if (threeButton)
+    {
+        // Keep 3-button scenes longer and include explicit 2-bar phrases.
+        lengthBars = (((seed / 31) + highestBit + lowestBit) & 0x1) == 0 ? 2 : 4;
+    }
     const double cycleBeats = 4.0 * static_cast<double>(lengthBars);
     if (cycleBeats <= 0.0 || !std::isfinite(cycleBeats))
         return;
@@ -1906,15 +2058,23 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
     const double cycleBeatPosRaw = std::fmod(ppqNow - momentaryStutterMacroStartPpq, cycleBeats);
     const double cycleBeatPos = cycleBeatPosRaw < 0.0 ? cycleBeatPosRaw + cycleBeats : cycleBeatPosRaw;
     const double phase = wrapUnitPhase(cycleBeatPos / cycleBeats);
-    const int stepsPerBar = 8;
+    const int threeButtonContour = threeButton
+        ? (((seed / 29) + variant + highestBit + (lowestBit * 2)) % 4)
+        : 0;
+    int stepsPerBar = 8;
+    if (multiButton)
+    {
+        const int rhythmClass = ((seed / 7) + highestBit + lowestBit) % 3;
+        if (rhythmClass == 1)
+            stepsPerBar = 10;
+        else if (rhythmClass == 2)
+            stepsPerBar = 7;
+    }
     const int totalSteps = juce::jmax(8, stepsPerBar * lengthBars);
     const int stepIndex = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(phase * static_cast<double>(totalSteps))));
     const int stepLoop = stepIndex % 8;
     const float normStep = static_cast<float>(stepLoop) / 7.0f;
 
-    const bool singleButton = (bitCount <= 1);
-    const bool multiButton = (bitCount > 1);
-    const bool allowPitchSpeedMacro = (bitCount > 2);
     const uint8_t maskBit10 = static_cast<uint8_t>(1u << 1);
     const uint8_t maskBit12 = static_cast<uint8_t>(1u << 3);
     const uint8_t maskBit13 = static_cast<uint8_t>(1u << 4);
@@ -1935,6 +2095,13 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
     float cutoffNorm = 0.85f;
     float targetResonance = 1.2f;
     float targetMorph = 0.25f;
+    float panDepthShape = 1.0f;
+    float twoButtonSemitoneStep = 0.0f;
+    float twoButtonSemitoneSpeedRatio = 1.0f;
+    bool twoButtonUseFilter = true;
+    bool twoButtonDirectionUp = true;
+    int twoButtonStepAbs = 0;
+    double dynamicStutterDivisionBeats = stutterDivisionBeatsFromBitForMacro(highestBit, multiButton);
 
     if (variant < 4)
     {
@@ -2027,9 +2194,10 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
             {{ 0.0f, 4.0f, 7.0f, 11.0f, 7.0f, 4.0f, 2.0f, 0.0f }}
         }};
 
-        const auto& speedPattern = kSpeedPatterns[static_cast<size_t>(variant)];
-        const auto& panPatternTable = kPanPatterns[static_cast<size_t>((variant + highestBit) % 8)];
-        const auto& pitchPatternTable = kPitchPatterns[static_cast<size_t>((variant + lowestBit) % 8)];
+        const int patternBank = ((seed / 5) + (bitCount * 3) + highestBit + lowestBit) % 8;
+        const auto& speedPattern = kSpeedPatterns[static_cast<size_t>((variant + patternBank) % 8)];
+        const auto& panPatternTable = kPanPatterns[static_cast<size_t>((variant + highestBit + patternBank) % 8)];
+        const auto& pitchPatternTable = kPitchPatterns[static_cast<size_t>((variant + lowestBit + (patternBank * 2)) % 8)];
 
         switch (variant % 4)
         {
@@ -2057,10 +2225,152 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         targetMorph = juce::jlimit(0.02f, 0.98f, targetMorph + (0.14f * heldRamp));
     }
 
+    if (allowPitchSpeedMacro)
+    {
+        // Hard-step speed scenes are always available for >2-button holds.
+        static constexpr std::array<std::array<float, 8>, 4> kHardSpeedScenes {{
+            {{ 0.30f, 0.55f, 1.15f, 2.20f, 3.40f, 2.40f, 1.20f, 0.45f }},
+            {{ 1.00f, 0.35f, 0.70f, 1.60f, 3.20f, 2.20f, 1.10f, 0.40f }},
+            {{ 3.40f, 2.40f, 1.60f, 1.00f, 0.50f, 0.75f, 1.35f, 2.20f }},
+            {{ 0.28f, 0.50f, 0.85f, 1.50f, 2.60f, 3.60f, 1.80f, 0.42f }}
+        }};
+        const int hardSceneIdx = ((seed / 9) + highestBit + (lowestBit * 2)) % 4;
+        const float hardStepSpeed = kHardSpeedScenes[static_cast<size_t>(hardSceneIdx)][static_cast<size_t>(stepLoop)];
+        float hardMix = (variant >= 4) ? 0.76f : 0.42f;
+        hardMix += 0.22f * heldRamp;
+        if (threeButton)
+            hardMix += 0.12f;
+        hardMix = juce::jlimit(0.0f, 1.0f, hardMix);
+        speedMult = juce::jmap(hardMix, speedMult, hardStepSpeed);
+    }
+
+    if (threeButton)
+    {
+        // 3-button combos start from a stronger base before contour shaping.
+        shapeIntensity = juce::jlimit(0.2f, 1.0f, shapeIntensity + 0.20f + (0.25f * heldRamp));
+        speedMult = juce::jlimit(0.25f, 4.0f, speedMult * (1.08f + (0.42f * heldRamp)));
+        panPattern = juce::jlimit(-1.0f, 1.0f, panPattern * (1.20f + (0.35f * heldRamp)));
+        pitchPattern = juce::jlimit(-14.0f, 14.0f, pitchPattern * (1.04f + (0.18f * heldRamp)));
+    }
+
+    if (!allowPitchSpeedMacro && hardStepMode)
+    {
+        // Hard-step depth envelope for 1/2-button stutters.
+        // 1-button: subtle pan-only growth.
+        // 2-button: stronger growth for pan + filter shape over hold time.
+        const float hardDepth = juce::jlimit(0.0f, 1.0f, std::pow(heldRamp, 1.35f));
+        if (singleButton)
+        {
+            panDepthShape = juce::jlimit(0.08f, 0.24f, 0.08f + (0.16f * hardDepth));
+        }
+        else
+        {
+            const float twoButtonDepth = juce::jlimit(0.28f, 1.0f, 0.28f + (0.72f * hardDepth));
+            panDepthShape = twoButtonDepth;
+            const float stepPolarity = ((stepLoop & 1) == 0) ? 1.0f : -1.0f;
+            cutoffNorm = juce::jlimit(0.0f, 1.0f, cutoffNorm + (0.16f * twoButtonDepth * stepPolarity));
+            targetMorph = juce::jlimit(0.0f, 1.0f, targetMorph + (0.18f * twoButtonDepth * stepPolarity));
+            targetResonance = juce::jlimit(0.2f, 2.1f, targetResonance + (0.45f * twoButtonDepth));
+        }
+    }
+    else if (singleButton)
+    {
+        // One-button stutter should remain mostly clean and centered.
+        panDepthShape = 0.10f;
+    }
+
+    if (twoButton)
+    {
+        // Two-finger mode:
+        // - use fixed PPQ-safe retrigger divisions,
+        // - include both slow linear ramps and dramatic fast exponential ramps,
+        // - always starts from the current speed baseline at step 0.
+        const int twoButtonMode = ((seed / 7) + (highestBit * 3) + lowestBit) & 0x7;
+        twoButtonDirectionUp = ((twoButtonMode & 0x1) == 0);
+        twoButtonUseFilter = (twoButtonMode <= 3); // Keep higher-intensity modes filter-free.
+        const float phaseNorm = juce::jlimit(0.0f, 1.0f, static_cast<float>(phase));
+
+        // Keep some slower linear ramps and add aggressive/faster variants.
+        if (twoButtonMode <= 1)
+            dynamicStutterDivisionBeats = 0.5;   // 1/8 (slower)
+        else if (twoButtonMode <= 3)
+            dynamicStutterDivisionBeats = 0.25;  // 1/16 (fast)
+        else if (twoButtonMode <= 5)
+            dynamicStutterDivisionBeats = 0.125; // 1/32 (dramatic)
+        else
+            dynamicStutterDivisionBeats = 0.0625; // 1/64 (extreme)
+
+        const double elapsedBeats = juce::jmax(0.0, ppqNow - momentaryStutterMacroStartPpq);
+        const double stepPos = elapsedBeats / juce::jmax(0.03125, dynamicStutterDivisionBeats);
+        const int globalTwoButtonStep = juce::jmax(0, static_cast<int>(std::floor((std::isfinite(stepPos) ? stepPos : 0.0) + 1.0e-6)));
+        if (comboChanged || !momentaryStutterTwoButtonStepBaseValid)
+        {
+            momentaryStutterTwoButtonStepBase = globalTwoButtonStep;
+            momentaryStutterTwoButtonStepBaseValid = true;
+        }
+        twoButtonStepAbs = juce::jmax(0, globalTwoButtonStep - momentaryStutterTwoButtonStepBase);
+        const int semitoneStride = (twoButtonMode >= 4) ? 2 : 1;
+        // Slow ramps can span up to 3 octaves; fast ramps are capped to 1 octave.
+        const int twoButtonMaxSemitones = (twoButtonMode <= 1) ? 36 : 12;
+        int pacedStepAbs = twoButtonStepAbs;
+        if (twoButtonMode >= 2)
+        {
+            // Dynamic pacing: faster stutter divisions ramp pitch more slowly per trigger.
+            const float paceScale = juce::jlimit(0.125f, 1.0f,
+                static_cast<float>(dynamicStutterDivisionBeats / 0.5));
+            const float pacedContinuous = static_cast<float>(twoButtonStepAbs) * paceScale;
+            pacedStepAbs = juce::jmax(0, static_cast<int>(std::floor(pacedContinuous + 1.0e-4f)));
+        }
+
+        const int linearSemitoneStep = juce::jlimit(0, twoButtonMaxSemitones, pacedStepAbs * semitoneStride);
+        int semitoneStep = linearSemitoneStep;
+        if (twoButtonMode >= 2)
+        {
+            // Fast modes use exponential semitone rise/fall so ramps feel more dramatic.
+            const float expoK = (twoButtonMode >= 6) ? 0.74f
+                : (twoButtonMode >= 4 ? 0.58f
+                                      : (twoButtonMode >= 2 ? 0.36f : 0.30f));
+            const float expoNorm = juce::jlimit(0.0f, 1.0f,
+                1.0f - std::exp(-expoK * static_cast<float>(pacedStepAbs)));
+            const int maxExpoStep = juce::jmax(1, twoButtonMaxSemitones / semitoneStride);
+            const int expoStepIndex = juce::jlimit(0, maxExpoStep, static_cast<int>(std::round(expoNorm * static_cast<float>(maxExpoStep))));
+            const int expoSemitoneStep = juce::jlimit(0, twoButtonMaxSemitones, expoStepIndex * semitoneStride);
+            semitoneStep = juce::jmax(linearSemitoneStep, expoSemitoneStep);
+        }
+        twoButtonSemitoneStep = static_cast<float>(twoButtonDirectionUp ? semitoneStep : -semitoneStep);
+
+        const float panDepthStep = juce::jlimit(0.0f, 1.0f, static_cast<float>(semitoneStep) / 16.0f);
+        panDepthShape = panDepthStep;
+        // Quantized semitone-step speed ratio (1 or 2 semitones per retrigger depending on mode).
+        twoButtonSemitoneSpeedRatio = std::pow(2.0f, twoButtonSemitoneStep / 12.0f);
+
+        if (twoButtonUseFilter)
+        {
+            // Two-finger filter curves always start OPEN at stutter start.
+            // mode 0: LP closes over phrase; mode 1: HP rises from open over phrase.
+            const float curve = std::pow(phaseNorm, 1.35f);
+            targetResonance = juce::jlimit(0.2f, 1.3f, 0.72f + (0.28f * curve));
+            if (twoButtonMode == 0)
+            {
+                targetMorph = 0.0f; // low-pass
+                cutoffNorm = juce::jlimit(0.0f, 1.0f, 1.0f - (0.72f * curve)); // open at start
+            }
+            else
+            {
+                targetMorph = 1.0f; // high-pass
+                cutoffNorm = juce::jlimit(0.0f, 1.0f, 0.04f + (0.64f * curve)); // open at start
+            }
+        }
+    }
+    else
+    {
+        momentaryStutterTwoButtonStepBaseValid = false;
+        momentaryStutterTwoButtonStepBase = 0;
+    }
+
     // Multi-button combos add infinite ramp movement layers (looping every cycle)
     // that continue until release: retrigger-rate sweeps + coordinated speed/filter ramps.
-    double dynamicStutterDivisionBeats = stutterDivisionBeatsFromBit(highestBit);
-    if (multiButton)
+    if (multiButton && !twoButton)
     {
         const float phaseNorm = static_cast<float>(phase);
         const float rampUp = juce::jlimit(0.0f, 1.0f, phaseNorm);
@@ -2069,9 +2379,9 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         const float heldDrive = juce::jlimit(0.20f, 1.0f, 0.35f + (0.65f * heldRamp));
 
         const double baseDivision = juce::jlimit(0.0625, 1.0, dynamicStutterDivisionBeats);
-        const double minFastDivision = allowPitchSpeedMacro ? 0.0416666667 : 0.0625;
-        const double fastDivision = juce::jlimit(minFastDivision, 1.0, baseDivision * 0.42);
-        const double slowDivision = juce::jlimit(0.0625, 2.0, baseDivision * 1.85);
+        const double minFastDivision = allowPitchSpeedMacro ? 0.0625 : 0.125;
+        const double fastDivision = juce::jlimit(minFastDivision, 1.0, baseDivision * (threeButton ? 0.30 : 0.42));
+        const double slowDivision = juce::jlimit(0.0625, 2.0, baseDivision * (threeButton ? 2.25 : 1.85));
 
         const int rampMode = ((seed / 17) + bitCount + highestBit + lowestBit) % 4;
         switch (rampMode)
@@ -2137,11 +2447,98 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         }
     }
 
+    if (threeButton)
+    {
+        // Musical 3-button contours: exponential risers/fallers and curved macro motion.
+        const float phaseNorm = juce::jlimit(0.0f, 1.0f, static_cast<float>(phase));
+        const bool fastContour = (threeButtonContour <= 1);
+        const float expPowerFast = fastContour
+            ? (0.62f + (0.34f * heldRamp))
+            : (1.12f + (0.48f * heldRamp));
+        const float expPowerSlow = fastContour
+            ? (0.78f + (0.30f * heldRamp))
+            : (1.04f + (0.44f * heldRamp));
+        const float expRise = std::pow(phaseNorm, expPowerFast);
+        const float expFall = std::pow(1.0f - phaseNorm, expPowerFast);
+        const float arc = (phaseNorm < 0.5f)
+            ? std::pow(phaseNorm * 2.0f, expPowerSlow)
+            : std::pow((1.0f - phaseNorm) * 2.0f, expPowerSlow);
+        const float contourDrive = juce::jlimit(0.0f, 1.0f, 0.38f + (0.62f * heldRamp));
+        const double longPatternSlow = fastContour
+            ? (lengthBars >= 2 ? 1.58 : 1.26)
+            : (lengthBars >= 2 ? 2.04 : 1.52);
+        const double longPatternFast = fastContour
+            ? (lengthBars >= 2 ? 0.19 : 0.28)
+            : (lengthBars >= 2 ? 0.40 : 0.50);
+
+        switch (threeButtonContour)
+        {
+            case 0: // Exponential riser
+            {
+                speedMult = juce::jlimit(0.25f, 4.0f, juce::jmap(expRise, 1.00f, 4.00f));
+                pitchPattern = juce::jlimit(-14.0f, 14.0f, juce::jmap(expRise, -1.0f, 14.0f));
+                cutoffNorm = juce::jlimit(0.0f, 1.0f, juce::jmap(expRise, 0.12f, 0.70f));
+                targetMorph = 1.0f;
+                targetResonance = juce::jlimit(0.2f, 2.4f, 0.72f + (0.72f * expRise));
+                panDepthShape = juce::jlimit(0.0f, 1.0f, juce::jmap(expRise, 0.02f, 1.0f));
+                dynamicStutterDivisionBeats = juce::jmap(static_cast<double>(expRise),
+                    juce::jmin(2.0, dynamicStutterDivisionBeats * longPatternSlow),
+                    juce::jmax(0.0625, dynamicStutterDivisionBeats * longPatternFast));
+                break;
+            }
+            case 1: // Exponential faller
+            {
+                speedMult = juce::jlimit(0.25f, 4.0f, juce::jmap(expFall, 0.55f, 3.85f));
+                pitchPattern = juce::jlimit(-14.0f, 14.0f, juce::jmap(expFall, -13.0f, 10.0f));
+                cutoffNorm = juce::jlimit(0.0f, 1.0f, juce::jmap(expFall, 0.18f, 0.92f));
+                targetMorph = 0.0f;
+                targetResonance = juce::jlimit(0.2f, 2.4f, 0.68f + (0.64f * expFall));
+                panDepthShape = juce::jlimit(0.0f, 1.0f, juce::jmap(expFall, 0.05f, 1.0f));
+                dynamicStutterDivisionBeats = juce::jmap(static_cast<double>(expFall),
+                    juce::jmax(0.0625, dynamicStutterDivisionBeats * longPatternFast),
+                    juce::jmin(2.0, dynamicStutterDivisionBeats * longPatternSlow));
+                break;
+            }
+            case 2: // Rise then fall arc
+            {
+                speedMult = juce::jlimit(0.25f, 4.0f, juce::jmap(arc, 0.70f, 3.95f));
+                pitchPattern = juce::jlimit(-14.0f, 14.0f, juce::jmap(arc, -5.0f, 13.0f));
+                cutoffNorm = juce::jlimit(0.0f, 1.0f, juce::jmap(arc, 0.16f, 0.76f));
+                targetMorph = (phaseNorm < 0.5f) ? 1.0f : 0.0f;
+                targetResonance = juce::jlimit(0.2f, 2.4f, 0.72f + (0.58f * arc));
+                panDepthShape = juce::jlimit(0.0f, 1.0f, juce::jmap(arc, 0.05f, 1.0f));
+                dynamicStutterDivisionBeats = juce::jmap(static_cast<double>(arc),
+                    juce::jmin(2.0, dynamicStutterDivisionBeats * (longPatternSlow - 0.20)),
+                    juce::jmax(0.0625, dynamicStutterDivisionBeats * (longPatternFast + 0.05)));
+                break;
+            }
+            case 3:
+            default: // Fall then rise arc
+            {
+                const float invArc = 1.0f - arc;
+                speedMult = juce::jlimit(0.25f, 4.0f, juce::jmap(invArc, 0.62f, 3.70f));
+                pitchPattern = juce::jlimit(-14.0f, 14.0f, juce::jmap(invArc, -11.0f, 10.0f));
+                cutoffNorm = juce::jlimit(0.0f, 1.0f, juce::jmap(invArc, 0.20f, 0.88f));
+                targetMorph = (phaseNorm < 0.5f) ? 0.0f : 1.0f;
+                targetResonance = juce::jlimit(0.2f, 2.4f, 0.66f + (0.58f * invArc));
+                panDepthShape = juce::jlimit(0.0f, 1.0f, juce::jmap(invArc, 0.05f, 1.0f));
+                dynamicStutterDivisionBeats = juce::jmap(static_cast<double>(invArc),
+                    juce::jmin(2.0, dynamicStutterDivisionBeats * (longPatternSlow - 0.10)),
+                    juce::jmax(0.0625, dynamicStutterDivisionBeats * (longPatternFast + 0.08)));
+                break;
+            }
+        }
+
+        // Make contour ramps react faster as the hold deepens.
+        speedMult = juce::jlimit(0.25f, 4.0f, speedMult * (1.0f + (0.35f * contourDrive)));
+    }
+
     // Musical safety guard:
     // 2-button combos should stay expressive but avoid ultra-harsh ringing/noise at high stutter rates.
     if (!allowPitchSpeedMacro)
     {
-        dynamicStutterDivisionBeats = juce::jlimit(0.125, 4.0, dynamicStutterDivisionBeats);
+        const double minDivision = twoButton ? 0.0625 : 0.125;
+        dynamicStutterDivisionBeats = juce::jlimit(minDivision, 4.0, dynamicStutterDivisionBeats);
         targetResonance = juce::jlimit(0.2f, 1.4f, targetResonance);
     }
 
@@ -2161,8 +2558,6 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         dynamicStutterDivisionBeats = juce::jlimit(0.125, 4.0, dynamicStutterDivisionBeats);
         targetMorph = 0.0f;
         targetResonance = juce::jlimit(0.2f, 1.2f, targetResonance);
-        pitchPattern = 0.0f;
-        speedMult = 1.0f;
     }
 
     if (combo11And13)
@@ -2170,8 +2565,6 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         dynamicStutterDivisionBeats = juce::jlimit(0.125, 4.0, dynamicStutterDivisionBeats);
         targetMorph = 0.0f;
         targetResonance = juce::jlimit(0.2f, 1.1f, targetResonance);
-        pitchPattern = 0.0f;
-        speedMult = 1.0f;
     }
 
     if (combo12And13And15)
@@ -2182,22 +2575,167 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         targetResonance = juce::jlimit(0.2f, 1.8f, targetResonance);
     }
 
+    if (multiButton)
+    {
+        static constexpr std::array<double, 5> kTwoButtonGrid { 1.0, 0.5, 0.25, 0.125, 0.0625 };
+        static constexpr std::array<double, 5> kThreeButtonGrid { 1.0, 0.5, 0.25, 0.125, 0.0625 };
+        static constexpr std::array<double, 4> kDenseButtonGrid { 0.5, 0.25, 0.125, 0.0625 };
+
+        if (bitCount == 2)
+            dynamicStutterDivisionBeats = snapDivisionToGrid(dynamicStutterDivisionBeats, kTwoButtonGrid);
+        else if (bitCount == 3)
+            dynamicStutterDivisionBeats = snapDivisionToGrid(dynamicStutterDivisionBeats, kThreeButtonGrid);
+        else
+            dynamicStutterDivisionBeats = snapDivisionToGrid(dynamicStutterDivisionBeats, kDenseButtonGrid);
+    }
+
+    const bool veryFastDivision = dynamicStutterDivisionBeats <= 0.1250001;
+    const bool ultraFastDivision = dynamicStutterDivisionBeats <= 0.0835001;
+    if (multiButton && veryFastDivision)
+    {
+        const float speedFloor = ultraFastDivision ? 0.72f : 0.60f;
+        const float speedCeil = allowPitchSpeedMacro
+            ? (ultraFastDivision ? 1.95f : (threeButton ? 2.60f : 2.20f))
+            : (twoButton ? (ultraFastDivision ? 2.15f : 2.85f) : 1.25f);
+        speedMult = juce::jlimit(speedFloor, speedCeil, speedMult);
+        pitchPattern = juce::jlimit(-6.0f, 6.0f, pitchPattern);
+        targetResonance = juce::jlimit(0.2f, ultraFastDivision ? 0.85f : 1.05f, targetResonance);
+        if (targetMorph > 0.70f)
+            targetMorph = ultraFastDivision ? 0.58f : 0.70f;
+    }
+
+    if (multiButton && targetMorph > 0.82f && cutoffNorm > 0.78f)
+        targetResonance = juce::jmin(targetResonance, 0.9f);
+
+    if (multiButton)
+    {
+        // Keep cutoff+morph inside audible zones to avoid click-only/no-audio states.
+        if (targetMorph >= 0.70f)
+            cutoffNorm = juce::jlimit(0.04f, 0.72f, cutoffNorm);
+        else if (targetMorph <= 0.30f)
+            cutoffNorm = juce::jlimit(0.16f, 0.98f, cutoffNorm);
+        else
+            cutoffNorm = juce::jlimit(0.08f, 0.94f, cutoffNorm);
+
+        if ((targetMorph >= 0.72f && cutoffNorm >= 0.62f)
+            || (targetMorph <= 0.16f && cutoffNorm <= 0.22f))
+            targetResonance = juce::jmin(targetResonance, 0.82f);
+    }
+
+    if (applySpeedMacro && !twoButton)
+    {
+        // Stutter speed is hard-stepped by PPQ phase step index (no smooth glides).
+        const float cycleStepNorm = (totalSteps > 1)
+            ? juce::jlimit(0.0f, 1.0f, static_cast<float>(stepIndex) / static_cast<float>(totalSteps - 1))
+            : 0.0f;
+        const int rampShape = threeButton ? threeButtonContour : (variant & 0x3);
+        float rampNorm = cycleStepNorm;
+        switch (rampShape)
+        {
+            case 0: // up
+                rampNorm = cycleStepNorm;
+                break;
+            case 1: // down
+                rampNorm = 1.0f - cycleStepNorm;
+                break;
+            case 2: // up then down
+                rampNorm = (cycleStepNorm < 0.5f)
+                    ? (cycleStepNorm * 2.0f)
+                    : ((1.0f - cycleStepNorm) * 2.0f);
+                break;
+            case 3: // down then up
+            default:
+                rampNorm = (cycleStepNorm < 0.5f)
+                    ? (1.0f - (cycleStepNorm * 2.0f))
+                    : ((cycleStepNorm - 0.5f) * 2.0f);
+                break;
+        }
+        const float expShape = threeButton
+            ? (0.90f + (0.95f * heldRamp))
+            : (1.20f + (1.10f * heldRamp) + (twoButton ? 0.20f : 0.0f));
+        const float shapedRamp = std::pow(juce::jlimit(0.0f, 1.0f, rampNorm), expShape);
+        const float minHardSpeedMult = threeButton ? 0.45f : 0.55f;
+        const float maxHardSpeedMult = threeButton ? 3.9f : 3.1f;
+        const float hardStepSpeedMult = juce::jmap(shapedRamp, minHardSpeedMult, maxHardSpeedMult);
+        const float hardStepBlend = threeButton ? 0.96f : (twoButton ? 0.88f : 0.84f);
+        speedMult = juce::jmap(hardStepBlend, speedMult, hardStepSpeedMult);
+    }
+
     const float intensity = juce::jlimit(0.20f, 1.0f, comboIntensity * shapeIntensity);
     const float speedIntensityScale = juce::jlimit(0.35f, 1.0f, 0.42f + (0.58f * intensity));
-    const float shapedSpeedMult = 1.0f + ((speedMult - 1.0f) * speedIntensityScale);
-    const float panOffsetBase = juce::jlimit(-1.0f, 1.0f, panPattern * intensity);
-    const float pitchOffsetBase = juce::jlimit(-18.0f, 18.0f, pitchPattern * (0.60f + (0.35f * intensity)));
+    const float shapedSpeedMult = twoButton
+        ? juce::jlimit(0.03125f, 8.0f, twoButtonSemitoneSpeedRatio)
+        : (1.0f + ((speedMult - 1.0f) * speedIntensityScale));
+    const float pitchOffsetBasePattern = juce::jlimit(-12.0f, 12.0f, pitchPattern * (0.55f + (0.30f * intensity)));
+    // Keep pitch secondary: speed carries the primary riser/faller motion.
+    const float speedToPitchDepth = allowPitchMacro ? (threeButton ? 3.0f : 2.0f) : 0.0f;
+    const float pitchOffsetFromSpeedShape = juce::jlimit(-12.0f, 12.0f, (shapedSpeedMult - 1.0f) * speedToPitchDepth);
+    const float pitchOffsetBase = juce::jlimit(
+        -12.0f, 12.0f, pitchOffsetBasePattern + ((allowPitchMacro && !twoButton) ? pitchOffsetFromSpeedShape : 0.0f));
+
+    // Pan is always hard-stepped and locked to the active stutter subdivision.
+    const double panDivisionBeats = juce::jmax(0.03125, dynamicStutterDivisionBeats);
+    const double panStepPos = (ppqNow - momentaryStutterMacroStartPpq) / panDivisionBeats;
+    const int panStepIndex = static_cast<int>(std::floor(std::isfinite(panStepPos) ? panStepPos : 0.0));
+    const int panMode = ((seed / 23) + bitCount + highestBit + lowestBit) & 0x3;
+    static constexpr std::array<float, 8> kPanSeqA { -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f };
+    static constexpr std::array<float, 8> kPanSeqB { -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f };
+    float panHardStep = -1.0f;
+    switch (panMode)
+    {
+        case 0:
+            panHardStep = (panStepIndex & 1) ? 1.0f : -1.0f;
+            break;
+        case 1:
+            panHardStep = ((panStepIndex >> 1) & 1) ? 1.0f : -1.0f;
+            break;
+        case 2:
+            panHardStep = kPanSeqA[static_cast<size_t>(juce::jmax(0, panStepIndex) & 7)];
+            break;
+        case 3:
+        default:
+            panHardStep = kPanSeqB[static_cast<size_t>(juce::jmax(0, panStepIndex) & 7)];
+            break;
+    }
+    if (twoButton)
+        panHardStep = (panStepIndex & 1) ? 1.0f : -1.0f;
+    if (panPattern < 0.0f)
+        panHardStep = -panHardStep;
+    const float panDriveBase = juce::jlimit(0.72f, 1.0f,
+        0.72f + (0.28f * intensity) + (threeButton ? 0.10f : 0.0f) + (veryFastDivision ? 0.08f : 0.0f));
+    float panDepth = 1.0f;
+    if (threeButton)
+        panDepth = juce::jlimit(0.18f, 1.0f, panDepthShape);
+    else if (singleButton)
+        panDepth = juce::jlimit(0.05f, 0.28f, panDepthShape);
+    else if (twoButton)
+        panDepth = juce::jlimit(0.0f, 1.0f, panDepthShape);
+    else
+        panDepth = juce::jlimit(0.28f, 1.0f, panDepthShape);
+    const float panDrive = twoButton
+        ? juce::jlimit(0.0f, 1.0f, panDriveBase * panDepth)
+        : juce::jlimit(0.18f, 1.0f, panDriveBase * panDepth);
+    const float panOffsetBase = juce::jlimit(-1.0f, 1.0f, panHardStep * panDrive);
 
     cutoffNorm = juce::jlimit(0.0f, 1.0f, cutoffNorm);
-    targetResonance = juce::jlimit(0.2f, 8.0f, targetResonance * comboIntensity);
+    const float resonanceScale = threeButton
+        ? juce::jlimit(0.75f, 1.15f, comboIntensity + 0.18f)
+        : comboIntensity;
+    targetResonance = juce::jlimit(0.2f, threeButton ? 2.4f : 8.0f, targetResonance * resonanceScale);
     targetMorph = juce::jlimit(0.0f, 1.0f, targetMorph);
 
     auto filterAlgorithm = filterAlgorithmFromIndex((variant + bitCount + highestBit + lowestBit) % 6);
     if (combo10And13 || combo11And13 || combo12And13And15
-        || (!allowPitchSpeedMacro && highestBit >= 5 && targetMorph > 0.74f))
+        || (!allowPitchSpeedMacro && highestBit >= 5 && targetMorph > 0.74f)
+        || (multiButton && veryFastDivision))
         filterAlgorithm = EnhancedAudioStrip::FilterAlgorithm::Tpt12;
     const float targetCutoff = cutoffFromNormalized(cutoffNorm);
     audioEngine->setMomentaryStutterDivision(juce::jlimit(0.03125, 4.0, dynamicStutterDivisionBeats));
+    const double speedStepDivisionBeats = juce::jmax(0.03125, dynamicStutterDivisionBeats);
+    const double speedStepPos = (ppqNow - momentaryStutterMacroStartPpq) / speedStepDivisionBeats;
+    const int speedStepAbs = juce::jmax(0, static_cast<int>(std::floor(std::isfinite(speedStepPos) ? speedStepPos : 0.0)));
+    const bool stutterStartStep = (speedStepAbs == 0);
+    const bool firstSpeedStep = applySpeedMacro && (speedStepAbs == 0);
 
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -2211,25 +2749,60 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
             continue;
 
         const float stripOffset = static_cast<float>(i - (MaxStrips / 2));
-        const float stripPanScale = juce::jlimit(0.35f, 1.0f, 0.55f + (0.05f * static_cast<float>(bitCount))
-            + (0.04f * static_cast<float>(i)));
+        const float stripPanScale = juce::jlimit(0.45f, threeButton ? 1.35f : 1.15f,
+            0.65f + (0.08f * static_cast<float>(bitCount)) + (0.05f * static_cast<float>(i)));
         const float stripPitchSpread = (allowPitchSpeedMacro && bitCount > 2) ? (stripOffset * 0.35f) : 0.0f;
-        const float stripSpeedSpread = (allowPitchSpeedMacro && bitCount > 3) ? (stripOffset * 0.02f) : 0.0f;
+        const float stripSpeedSpread = (applySpeedMacro && bitCount > 3) ? (stripOffset * 0.025f) : 0.0f;
         const float stripMorphOffset = static_cast<float>(0.08 * std::sin(
             juce::MathConstants<double>::twoPi * wrapUnitPhase(phase + (0.13 * static_cast<double>(i)))));
 
-        const float savedSpeed = juce::jlimit(0.25f, 4.0f, saved.playbackSpeed);
-        const float targetSpeed = juce::jlimit(0.35f, 4.0f, (savedSpeed * shapedSpeedMult) + stripSpeedSpread);
-
-        strip->setPlaybackSpeed(allowPitchSpeedMacro ? targetSpeed : savedSpeed);
+        const float savedSpeed = juce::jlimit(0.0f, 4.0f, saved.playbackSpeed);
+        const float speedBaseline = twoButton
+            ? ((stripSpeedParams[idx] != nullptr)
+                ? juce::jlimit(0.0f, 4.0f, stripSpeedParams[idx]->load(std::memory_order_acquire))
+                : savedSpeed)
+            : savedSpeed;
+        const float stutterSpeedFloor = applySpeedMacro
+            ? (ultraFastDivision ? 0.72f : (veryFastDivision ? 0.56f : 0.30f))
+            : speedBaseline;
+        const float stutterSpeedCeil = applySpeedMacro
+            ? (ultraFastDivision ? (threeButton ? 2.10f : 1.95f)
+                                 : (veryFastDivision ? (threeButton ? 2.80f : 2.35f)
+                                                     : (threeButton ? 4.0f : 3.2f)))
+            : speedBaseline;
+        const float modulatedTargetSpeed = twoButton
+            // Two-finger speed always starts at current strip speed and moves
+            // up/down in semitone steps relative to that baseline.
+            ? juce::jlimit(0.03125f, 8.0f, speedBaseline * shapedSpeedMult)
+            : juce::jlimit(stutterSpeedFloor, stutterSpeedCeil,
+                (speedBaseline * shapedSpeedMult) + stripSpeedSpread);
+        const bool holdBaselineSpeed = twoButton ? (twoButtonStepAbs == 0) : firstSpeedStep;
+        const float targetSpeed = holdBaselineSpeed ? speedBaseline : modulatedTargetSpeed;
+        if (applySpeedMacro)
+            strip->setPlaybackSpeedImmediate(targetSpeed);
+        else
+            strip->setPlaybackSpeed(speedBaseline);
         strip->setPan(juce::jlimit(-1.0f, 1.0f, saved.pan + (panOffsetBase * stripPanScale)));
-        strip->setPitchShift(allowPitchSpeedMacro
-            ? juce::jlimit(-24.0f, 24.0f, saved.pitchShift + pitchOffsetBase + stripPitchSpread)
-            : saved.pitchShift);
-
-        if (singleButton)
+        float targetPitch = saved.pitchShift;
+        if (twoButton && applySpeedMacro)
         {
-            // Single-button stutter is intended as a clean rhythmic retrigger: no filter color.
+            // Guarantee full 3-octave contour even when speed reaches hard limits:
+            // carry residual semitone motion into pitch shift.
+            const float ratioBase = juce::jmax(0.03125f, speedBaseline);
+            const float ratioActual = juce::jmax(0.03125f, targetSpeed / ratioBase);
+            const float actualSemitoneFromSpeed = 12.0f * std::log2(ratioActual);
+            const float residualSemitone = twoButtonSemitoneStep - actualSemitoneFromSpeed;
+            targetPitch = juce::jlimit(-24.0f, 24.0f, saved.pitchShift + residualSemitone);
+        }
+        else if (allowPitchMacro)
+        {
+            targetPitch = juce::jlimit(-12.0f, 12.0f, saved.pitchShift + pitchOffsetBase + stripPitchSpread);
+        }
+        strip->setPitchShift(targetPitch);
+
+        if (singleButton || (twoButton && !twoButtonUseFilter))
+        {
+            // Clean stutter variants: no filter color.
             strip->setFilterAlgorithm(saved.filterAlgorithm);
             strip->setFilterFrequency(saved.filterFrequency);
             strip->setFilterResonance(saved.filterResonance);
@@ -2240,11 +2813,24 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         {
             strip->setFilterEnabled(true);
             strip->setFilterAlgorithm(filterAlgorithm);
-            strip->setFilterFrequency(targetCutoff);
-            strip->setFilterResonance(targetResonance);
-            strip->setFilterMorph(juce::jlimit(0.0f, 1.0f, targetMorph + stripMorphOffset));
+            if (stutterStartStep)
+            {
+                // Start every stutter with filter fully open and minimum resonance,
+                // then apply macro movement from subsequent stutter steps.
+                strip->setFilterMorph(0.0f);
+                strip->setFilterFrequency(20000.0f);
+                strip->setFilterResonance(0.1f);
+            }
+            else
+            {
+                strip->setFilterFrequency(targetCutoff);
+                strip->setFilterResonance(targetResonance);
+                strip->setFilterMorph(juce::jlimit(0.0f, 1.0f, targetMorph + stripMorphOffset));
+            }
         }
     }
+
+    momentaryStutterLastComboMask = comboMask;
 }
 
 void MlrVSTAudioProcessor::restoreMomentaryStutterMacroBaseline()
@@ -2262,7 +2848,7 @@ void MlrVSTAudioProcessor::restoreMomentaryStutterMacroBaseline()
         if (auto* strip = audioEngine->getStrip(i))
         {
             strip->setPan(saved.pan);
-            strip->setPlaybackSpeed(saved.playbackSpeed);
+            strip->setPlaybackSpeedImmediate(saved.playbackSpeed);
             strip->setPitchShift(saved.pitchShift);
             strip->setFilterAlgorithm(saved.filterAlgorithm);
             strip->setFilterFrequency(saved.filterFrequency);
@@ -2276,6 +2862,9 @@ void MlrVSTAudioProcessor::restoreMomentaryStutterMacroBaseline()
 
     momentaryStutterMacroBaselineCaptured = false;
     momentaryStutterMacroCapturePending = false;
+    momentaryStutterLastComboMask = 0;
+    momentaryStutterTwoButtonStepBaseValid = false;
+    momentaryStutterTwoButtonStepBase = 0;
 }
 
 juce::File MlrVSTAudioProcessor::getDefaultSampleDirectory(int stripIndex, SamplePathMode mode) const
@@ -2942,6 +3531,14 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
     momentaryStutterMacroBaselineCaptured = false;
     momentaryStutterMacroCapturePending = false;
     momentaryStutterMacroStartPpq = 0.0;
+    momentaryStutterLastComboMask = 0;
+    momentaryStutterTwoButtonStepBaseValid = false;
+    momentaryStutterTwoButtonStepBase = 0;
+    momentaryStutterPlaybackActive.store(0, std::memory_order_release);
+    pendingStutterStartActive.store(0, std::memory_order_release);
+    pendingStutterStartPpq.store(-1.0, std::memory_order_release);
+    pendingStutterStartDivisionBeats.store(1.0, std::memory_order_release);
+    pendingStutterStartSampleTarget.store(-1, std::memory_order_release);
     for (auto& saved : momentaryStutterSavedState)
         saved = MomentaryStutterSavedStripState{};
     pendingStutterReleaseActive.store(0, std::memory_order_release);
