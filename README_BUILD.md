@@ -31,3 +31,15 @@ make package-release
 ```
 
 Release artifacts are written to `release/`.
+
+## macOS Signing + Notarization
+
+```bash
+make sign-notarize \
+  CONFIG=Release \
+  BUILD_DIR=cmake-build-release \
+  SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+  NOTARY_PROFILE="mlrvst-notary"
+```
+
+This signs and notarizes VST3/AU bundles and writes distributable zip files to `release/notarized-*`.

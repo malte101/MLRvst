@@ -40,7 +40,7 @@ YELLOW=\033[1;33m
 RED=\033[0;31m
 BLUE=\033[0;34m
 
-.PHONY: all clean configure build install help check-juce vst3 au standalone package-release
+.PHONY: all clean configure build install help check-juce vst3 au standalone package-release sign-notarize
 
 # Default target
 all: check-juce configure build
@@ -58,6 +58,7 @@ help:
 	@echo "  make standalone    - Build standalone app only"
 	@echo "  make install       - Install plugins to system"
 	@echo "  make package-release - Build + package release zips with notices (macOS)"
+	@echo "  make sign-notarize - Sign + notarize VST3/AU (macOS)"
 	@echo "  make clean         - Clean build directory"
 	@echo "  make distclean     - Remove all build artifacts"
 	@echo "  make check-juce    - Check if JUCE is available"
@@ -67,6 +68,8 @@ help:
 	@echo "  CONFIG=Debug       - Build debug version"
 	@echo "  CONFIG=Release     - Build release version (default)"
 	@echo "  VERBOSE=1          - Show detailed build output"
+	@echo "  SIGNING_IDENTITY=...  - Developer ID Application identity"
+	@echo "  NOTARY_PROFILE=...    - notarytool keychain profile"
 	@echo ""
 	@echo "$(GREEN)Examples:$(NO_COLOR)"
 	@echo "  make CONFIG=Debug VERBOSE=1"
@@ -163,6 +166,26 @@ ifeq ($(DETECTED_OS),Darwin)
 	@echo "$(GREEN)✓ Release packages created in ./release$(NO_COLOR)"
 else
 	@echo "$(YELLOW)Release packaging script currently supports macOS only$(NO_COLOR)"
+endif
+
+# Sign + notarize plugin bundles for distribution (macOS)
+sign-notarize: build
+ifeq ($(DETECTED_OS),Darwin)
+	@if [ -z "$(SIGNING_IDENTITY)" ]; then \
+		echo "$(RED)ERROR: SIGNING_IDENTITY is required$(NO_COLOR)"; \
+		echo "$(YELLOW)Example: make sign-notarize SIGNING_IDENTITY='Developer ID Application: Your Name (TEAMID)' NOTARY_PROFILE='mlrvst-notary'$(NO_COLOR)"; \
+		exit 1; \
+	fi
+	@echo "$(BLUE)Signing and notarizing release bundles...$(NO_COLOR)"
+	@SIGNING_IDENTITY="$(SIGNING_IDENTITY)" \
+	 NOTARY_PROFILE="$(NOTARY_PROFILE)" \
+	 APPLE_ID="$(APPLE_ID)" \
+	 APPLE_APP_PASSWORD="$(APPLE_APP_PASSWORD)" \
+	 TEAM_ID="$(TEAM_ID)" \
+	 ./scripts/sign_and_notarize_macos.sh --build-dir $(BUILD_DIR) --config $(CONFIG)
+	@echo "$(GREEN)✓ Signing/notarization complete$(NO_COLOR)"
+else
+	@echo "$(YELLOW)Signing/notarization script currently supports macOS only$(NO_COLOR)"
 endif
 
 # Clean build directory
