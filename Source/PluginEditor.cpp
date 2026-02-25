@@ -843,15 +843,40 @@ void StripControl::setupComponents()
     
     // Step sequencer display with matching rainbow color
     stepDisplay.setStripColor(stripColor);
-    stepDisplay.onStepClicked = [this](int stepIndex)
+    stepDisplay.onStepSet = [this](int stepIndex, bool enabled)
     {
-        // Toggle step when clicked
         if (auto* engine = processor.getAudioEngine())
         {
             if (auto* strip = engine->getStrip(stripIndex))
             {
-                strip->toggleStepAtIndex(stepIndex);
+                const int totalSteps = strip->getStepTotalSteps();
+                if (stepIndex >= 0 && stepIndex < totalSteps)
+                    strip->stepPattern[static_cast<size_t>(stepIndex)] = enabled;
             }
+        }
+    };
+    stepDisplay.onStepSubdivisionSet = [this](int stepIndex, int subdivisions)
+    {
+        if (auto* engine = processor.getAudioEngine())
+        {
+            if (auto* strip = engine->getStrip(stripIndex))
+                strip->setStepSubdivisionAtIndex(stepIndex, subdivisions);
+        }
+    };
+    stepDisplay.onStepVelocityRangeSet = [this](int stepIndex, float startVelocity, float endVelocity)
+    {
+        if (auto* engine = processor.getAudioEngine())
+        {
+            if (auto* strip = engine->getStrip(stripIndex))
+                strip->setStepSubdivisionVelocityRangeAtIndex(stepIndex, startVelocity, endVelocity);
+        }
+    };
+    stepDisplay.onStepProbabilitySet = [this](int stepIndex, float probability)
+    {
+        if (auto* engine = processor.getAudioEngine())
+        {
+            if (auto* strip = engine->getStrip(stripIndex))
+                strip->setStepProbabilityAtIndex(stepIndex, probability);
         }
     };
     addChildComponent(stepDisplay);  // Hidden initially
@@ -901,7 +926,6 @@ void StripControl::setupComponents()
             scratchSlider.setVisible(!isStepMode);
             scratchLabel.setVisible(!isStepMode);
             patternLengthBox.setVisible(isStepMode);
-            patternLengthLabel.setVisible(isStepMode);
             updateGrainOverlayVisibility();
             
             // Don't manually start - let process() auto-start when DAW plays
@@ -1314,6 +1338,51 @@ void StripControl::setupComponents()
             strip->setStepPatternBars(juce::jmax(1, patternLengthBox.getSelectedId()));
     };
     addAndMakeVisible(patternLengthBox);
+
+    auto setupStepEnvelopeSlider = [this](juce::Slider& slider, juce::Label& label,
+                                          const char* text, double min, double max, double def, double skewMid)
+    {
+        slider.setLookAndFeel(&knobLookAndFeel);
+        slider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+        slider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+        slider.setRange(min, max, 0.1);
+        slider.setSkewFactorFromMidPoint(skewMid);
+        slider.setValue(def, juce::dontSendNotification);
+        slider.setPopupDisplayEnabled(true, false, this);
+        slider.setTextValueSuffix(" ms");
+        slider.setColour(juce::Slider::trackColourId, stripColor.withAlpha(0.9f));
+        slider.setColour(juce::Slider::thumbColourId, stripColor.brighter(0.35f));
+        enableAltClickReset(slider, def);
+        addAndMakeVisible(slider);
+
+        label.setText(text, juce::dontSendNotification);
+        label.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+        label.setJustificationType(juce::Justification::centred);
+        label.setColour(juce::Label::textColourId, stripColor.brighter(0.35f));
+        addAndMakeVisible(label);
+    };
+
+    setupStepEnvelopeSlider(stepAttackSlider, stepAttackLabel, "A", 0.0, 400.0, 0.0, 12.0);
+    setupStepEnvelopeSlider(stepDecaySlider, stepDecayLabel, "D", 1.0, 4000.0, 4000.0, 700.0);
+    setupStepEnvelopeSlider(stepReleaseSlider, stepReleaseLabel, "R", 1.0, 4000.0, 110.0, 180.0);
+    stepAttackSlider.setTooltip("Step envelope attack");
+    stepDecaySlider.setTooltip("Step envelope decay");
+    stepReleaseSlider.setTooltip("Step envelope release");
+    stepAttackSlider.onValueChange = [this]()
+    {
+        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
+            strip->setStepEnvelopeAttackMs(static_cast<float>(stepAttackSlider.getValue()));
+    };
+    stepDecaySlider.onValueChange = [this]()
+    {
+        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
+            strip->setStepEnvelopeDecayMs(static_cast<float>(stepDecaySlider.getValue()));
+    };
+    stepReleaseSlider.onValueChange = [this]()
+    {
+        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
+            strip->setStepEnvelopeReleaseMs(static_cast<float>(stepReleaseSlider.getValue()));
+    };
     
     // Labels below knobs
     volumeLabel.setText("VOL", juce::dontSendNotification);
@@ -1339,12 +1408,6 @@ void StripControl::setupComponents()
     scratchLabel.setJustificationType(juce::Justification::centred);
     scratchLabel.setColour(juce::Label::textColourId, stripColor.brighter(0.3f));
     addAndMakeVisible(scratchLabel);
-
-    patternLengthLabel.setText("LEN", juce::dontSendNotification);
-    patternLengthLabel.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
-    patternLengthLabel.setJustificationType(juce::Justification::centred);
-    patternLengthLabel.setColour(juce::Label::textColourId, stripColor.brighter(0.3f));
-    addAndMakeVisible(patternLengthLabel);
 
     // Label showing current beats setting
     tempoLabel.setText("AUTO", juce::dontSendNotification);
@@ -1552,7 +1615,12 @@ void StripControl::setupComponents()
     recordLengthLabel.setVisible(false);
 
     patternLengthBox.setVisible(false);
-    patternLengthLabel.setVisible(false);
+    stepAttackSlider.setVisible(false);
+    stepDecaySlider.setVisible(false);
+    stepReleaseSlider.setVisible(false);
+    stepAttackLabel.setVisible(false);
+    stepDecayLabel.setVisible(false);
+    stepReleaseLabel.setVisible(false);
     updateGrainOverlayVisibility();
 }
 
@@ -1562,6 +1630,7 @@ void StripControl::updateGrainOverlayVisibility()
                           && processor.getAudioEngine()
                           && processor.getAudioEngine()->getStrip(stripIndex)
                           && processor.getAudioEngine()->getStrip(stripIndex)->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain;
+    const bool isStepMode = showingStepDisplay;
     grainOverlayVisible = isGrainMode;
     const bool showPitchPage = isGrainMode && grainSubPage == GrainSubPage::Pitch;
     const bool showSpacePage = isGrainMode && grainSubPage == GrainSubPage::Space;
@@ -1576,6 +1645,13 @@ void StripControl::updateGrainOverlayVisibility()
     scratchSlider.setVisible(!showingStepDisplay);
     speedLabel.setVisible(!showingStepDisplay);
     scratchLabel.setVisible(!showingStepDisplay);
+    patternLengthBox.setVisible(isStepMode && !isGrainMode);
+    stepAttackSlider.setVisible(isStepMode && !isGrainMode);
+    stepDecaySlider.setVisible(isStepMode && !isGrainMode);
+    stepReleaseSlider.setVisible(isStepMode && !isGrainMode);
+    stepAttackLabel.setVisible(isStepMode && !isGrainMode);
+    stepDecayLabel.setVisible(isStepMode && !isGrainMode);
+    stepReleaseLabel.setVisible(isStepMode && !isGrainMode);
     recordLengthLabel.setVisible(false);
 
     grainSizeSlider.setVisible(isGrainMode);
@@ -2058,8 +2134,10 @@ void StripControl::hideAllPrimaryControls()
     auto hide = [](juce::Component& c){ c.setVisible(false); };
     hide(loadButton); hide(transientSliceButton); hide(playModeBox); hide(directionModeBox); hide(groupSelector);
     hide(volumeSlider); hide(panSlider); hide(speedSlider); hide(scratchSlider); hide(patternLengthBox);
+    hide(stepAttackSlider); hide(stepDecaySlider); hide(stepReleaseSlider);
     hide(tempoLabel); hide(recordBarsBox); hide(recordButton); hide(recordBarsLabel);
-    hide(volumeLabel); hide(panLabel); hide(speedLabel); hide(scratchLabel); hide(patternLengthLabel);
+    hide(volumeLabel); hide(panLabel); hide(speedLabel); hide(scratchLabel);
+    hide(stepAttackLabel); hide(stepDecayLabel); hide(stepReleaseLabel);
     hide(recordLengthLabel);
 }
 
@@ -2265,6 +2343,8 @@ void StripControl::resized()
     
     const bool isGrainMode = grainOverlayVisible;
     const bool isGrainSpacePage = isGrainMode && grainSubPage == GrainSubPage::Space;
+    const bool isStepMode = showingStepDisplay;
+    patternLengthBox.setBounds({});
 
     const int rowGap = isGrainMode ? 0 : 1;
 
@@ -2309,6 +2389,12 @@ void StripControl::resized()
         recordBarsBox.setBounds(recBarsRow.removeFromLeft(70));
         recBarsRow.removeFromLeft(8);
         recordButton.setBounds(recBarsRow.removeFromLeft(46));
+        if (isStepMode)
+        {
+            recBarsRow.removeFromLeft(6);
+            const int lenWidth = juce::jlimit(44, 72, recBarsRow.getWidth());
+            patternLengthBox.setBounds(recBarsRow.removeFromLeft(lenWidth));
+        }
         controlsArea.removeFromTop(2);
     }
     else if (showRecordBars)
@@ -2317,6 +2403,19 @@ void StripControl::resized()
         recordBarsBox.setBounds(recBarsRow.removeFromLeft(66));
         recBarsRow.removeFromLeft(8);
         recordButton.setBounds(recBarsRow.removeFromLeft(42));
+        if (isStepMode)
+        {
+            recBarsRow.removeFromLeft(6);
+            const int lenWidth = juce::jlimit(42, 68, recBarsRow.getWidth());
+            patternLengthBox.setBounds(recBarsRow.removeFromLeft(lenWidth));
+        }
+        controlsArea.removeFromTop(2);
+    }
+    else if (isStepMode && controlsArea.getHeight() >= 14)
+    {
+        auto lenRow = controlsArea.removeFromTop(16);
+        const int lenWidth = juce::jlimit(42, 68, lenRow.getWidth());
+        patternLengthBox.setBounds(lenRow.removeFromLeft(lenWidth));
         controlsArea.removeFromTop(2);
     }
     
@@ -2333,18 +2432,28 @@ void StripControl::resized()
         grainDensitySlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
         speedSlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
     }
+    else if (isStepMode)
+    {
+        // Keep VOL/PAN anchored to the same slots as loop mode.
+        volumeSlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
+        panSlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
+        stepAttackSlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
+
+        knobsRow.removeFromLeft(4);
+        const int rightGap = 2;
+        const int rightKnobWidth = juce::jmax(10, (knobsRow.getWidth() - rightGap) / 2);
+        stepDecaySlider.setBounds(knobsRow.removeFromLeft(rightKnobWidth).reduced(1));
+        knobsRow.removeFromLeft(rightGap);
+        stepReleaseSlider.setBounds(knobsRow.reduced(1));
+    }
     else
     {
         volumeSlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
         panSlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
         speedSlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
-    }
-    knobsRow.removeFromLeft(4);
-    const bool isStepMode = showingStepDisplay;
-    if (isStepMode)
-        patternLengthBox.setBounds(knobsRow.reduced(2));
-    else
+        knobsRow.removeFromLeft(4);
         scratchSlider.setBounds(knobsRow.reduced(2));
+    }
 
     const int labelsRowHeight = isGrainMode ? (isGrainSpacePage ? 9 : 10) : 9;
     auto labelsRow = controlsArea.removeFromTop(labelsRowHeight);
@@ -2362,22 +2471,34 @@ void StripControl::resized()
         grainDensityLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
         speedLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
     }
+    else if (isStepMode)
+    {
+        volumeLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
+        panLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
+        stepAttackLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
+
+        labelsRow.removeFromLeft(4);
+        const int rightGap = 2;
+        const int rightLabelWidth = juce::jmax(8, (labelsRow.getWidth() - rightGap) / 2);
+        stepDecayLabel.setBounds(labelsRow.removeFromLeft(rightLabelWidth));
+        labelsRow.removeFromLeft(rightGap);
+        stepReleaseLabel.setBounds(labelsRow);
+    }
     else
     {
         volumeLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
         panLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
         speedLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
-    }
-    labelsRow.removeFromLeft(4);
-    if (isStepMode)
-        patternLengthLabel.setBounds(labelsRow);
-    else
+        labelsRow.removeFromLeft(4);
         scratchLabel.setBounds(labelsRow);
+    }
     if (!isGrainMode)
     {
-        // Recording loop length label (small, at bottom)
         if (controlsArea.getHeight() >= 10)
+        {
+            // Recording loop length label (small, at bottom)
             recordLengthLabel.setBounds(controlsArea.removeFromTop(10));
+        }
         return;
     }
 
@@ -2554,7 +2675,6 @@ void StripControl::updateFromEngine()
         waveform.setVisible(!isStepMode);
         stepDisplay.setVisible(isStepMode);
         patternLengthBox.setVisible(isStepMode);
-        patternLengthLabel.setVisible(isStepMode);
         updateGrainOverlayVisibility();
         resized();
     }
@@ -2563,6 +2683,10 @@ void StripControl::updateFromEngine()
     if (showingStepDisplay)
     {
         stepDisplay.setStepPattern(strip->stepPattern, strip->getStepTotalSteps());
+        stepDisplay.setStepSubdivisions(strip->stepSubdivisions);
+        stepDisplay.setStepSubdivisionVelocityRange(strip->stepSubdivisionStartVelocity,
+                                                    strip->stepSubdivisionRepeatVelocity);
+        stepDisplay.setStepProbability(strip->stepProbability);
         stepDisplay.setCurrentStep(strip->currentStep);
         stepDisplay.setPlaying(strip->isPlaying());
 
@@ -2651,6 +2775,12 @@ void StripControl::updateFromEngine()
     // Sync scratch slider from engine
     scratchSlider.setValue(strip->getScratchAmount(), juce::dontSendNotification);
     patternLengthBox.setSelectedId(strip->getStepPatternBars(), juce::dontSendNotification);
+    if (!stepAttackSlider.isMouseButtonDown())
+        stepAttackSlider.setValue(strip->getStepEnvelopeAttackMs(), juce::dontSendNotification);
+    if (!stepDecaySlider.isMouseButtonDown())
+        stepDecaySlider.setValue(strip->getStepEnvelopeDecayMs(), juce::dontSendNotification);
+    if (!stepReleaseSlider.isMouseButtonDown())
+        stepReleaseSlider.setValue(strip->getStepEnvelopeReleaseMs(), juce::dontSendNotification);
     {
         const float recordingBarsBeats = static_cast<float>(juce::jlimit(1, 8, strip->getRecordingBars()) * 4);
         float beats = strip->getBeatsPerLoop();

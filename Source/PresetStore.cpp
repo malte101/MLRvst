@@ -197,6 +197,13 @@ void resetStripToDefaultState(int stripIndex,
     strip.setStepPage(0);
     strip.currentStep = 0;
     strip.stepPattern.fill(false);
+    strip.stepSubdivisions.fill(1);
+    strip.stepSubdivisionStartVelocity.fill(1.0f);
+    strip.stepSubdivisionRepeatVelocity.fill(1.0f);
+    strip.stepProbability.fill(1.0f);
+    strip.setStepEnvelopeAttackMs(0.0f);
+    strip.setStepEnvelopeDecayMs(4000.0f);
+    strip.setStepEnvelopeReleaseMs(110.0f);
     strip.setGrainSizeMs(1240.0f);
     strip.setGrainDensity(0.05f);
     strip.setGrainPitch(0.0f);
@@ -247,6 +254,63 @@ void decodeStepPatternBits(const juce::String& text, std::array<bool, 64>& bits)
     const int len = juce::jmin(64, text.length());
     for (int i = 0; i < len; ++i)
         bits[static_cast<size_t>(i)] = (text[i] == '1');
+}
+
+juce::String encodeStepSubdivisions(const std::array<int, 64>& subdivisions)
+{
+    juce::String out;
+    out.preallocateBytes(64 * 3);
+    for (size_t i = 0; i < subdivisions.size(); ++i)
+    {
+        if (i > 0)
+            out << ",";
+        out << juce::jlimit(1, EnhancedAudioStrip::MaxStepSubdivisions, subdivisions[i]);
+    }
+    return out;
+}
+
+void decodeStepSubdivisions(const juce::String& text, std::array<int, 64>& subdivisions)
+{
+    subdivisions.fill(1);
+    if (text.isEmpty())
+        return;
+
+    juce::StringArray tokens;
+    tokens.addTokens(text, ",", "");
+    tokens.trim();
+    tokens.removeEmptyStrings();
+    const int len = juce::jmin(static_cast<int>(subdivisions.size()), tokens.size());
+    for (int i = 0; i < len; ++i)
+        subdivisions[static_cast<size_t>(i)] = juce::jlimit(
+            1, EnhancedAudioStrip::MaxStepSubdivisions, tokens[i].getIntValue());
+}
+
+juce::String encodeStepSubdivisionRepeatVelocity(const std::array<float, 64>& repeatVelocity)
+{
+    juce::String out;
+    out.preallocateBytes(64 * 8);
+    for (size_t i = 0; i < repeatVelocity.size(); ++i)
+    {
+        if (i > 0)
+            out << ",";
+        out << juce::String(juce::jlimit(0.0f, 1.0f, repeatVelocity[i]), 5);
+    }
+    return out;
+}
+
+void decodeStepSubdivisionRepeatVelocity(const juce::String& text, std::array<float, 64>& repeatVelocity)
+{
+    repeatVelocity.fill(1.0f);
+    if (text.isEmpty())
+        return;
+
+    juce::StringArray tokens;
+    tokens.addTokens(text, ",", "");
+    tokens.trim();
+    tokens.removeEmptyStrings();
+    const int len = juce::jmin(static_cast<int>(repeatVelocity.size()), tokens.size());
+    for (int i = 0; i < len; ++i)
+        repeatVelocity[static_cast<size_t>(i)] = juce::jlimit(0.0f, 1.0f, tokens[i].getFloatValue());
 }
 
 juce::String encodeModSteps(const std::array<float, ModernAudioEngine::ModTotalSteps>& steps)
@@ -550,6 +614,16 @@ bool savePreset(int presetIndex,
         stripXml->setAttribute("stepViewPage", strip->getStepPage());
         stripXml->setAttribute("stepCurrent", strip->currentStep);
         stripXml->setAttribute("stepPatternBits", encodeStepPatternBits(strip->stepPattern));
+        stripXml->setAttribute("stepSubdivisions", encodeStepSubdivisions(strip->stepSubdivisions));
+        stripXml->setAttribute("stepSubdivisionStartVelocity",
+                               encodeStepSubdivisionRepeatVelocity(strip->stepSubdivisionStartVelocity));
+        stripXml->setAttribute("stepSubdivisionRepeatVelocity",
+                               encodeStepSubdivisionRepeatVelocity(strip->stepSubdivisionRepeatVelocity));
+        stripXml->setAttribute("stepProbability",
+                               encodeStepSubdivisionRepeatVelocity(strip->stepProbability));
+        stripXml->setAttribute("stepAttackMs", strip->getStepEnvelopeAttackMs());
+        stripXml->setAttribute("stepDecayMs", strip->getStepEnvelopeDecayMs());
+        stripXml->setAttribute("stepReleaseMs", strip->getStepEnvelopeReleaseMs());
 
         stripXml->setAttribute("grainSizeMs", strip->getGrainSizeMs());
         stripXml->setAttribute("grainDensity", strip->getGrainDensity());
@@ -893,6 +967,19 @@ bool loadPreset(int presetIndex,
         strip->setStepPage(clampedInt(stripXml->getIntAttribute("stepViewPage", 0), 0, 3, 0));
         strip->currentStep = juce::jmax(0, stripXml->getIntAttribute("stepCurrent", 0));
         decodeStepPatternBits(stripXml->getStringAttribute("stepPatternBits"), strip->stepPattern);
+        decodeStepSubdivisions(stripXml->getStringAttribute("stepSubdivisions"), strip->stepSubdivisions);
+        decodeStepSubdivisionRepeatVelocity(
+            stripXml->getStringAttribute("stepSubdivisionStartVelocity"),
+            strip->stepSubdivisionStartVelocity);
+        decodeStepSubdivisionRepeatVelocity(
+            stripXml->getStringAttribute("stepSubdivisionRepeatVelocity"),
+            strip->stepSubdivisionRepeatVelocity);
+        decodeStepSubdivisionRepeatVelocity(
+            stripXml->getStringAttribute("stepProbability"),
+            strip->stepProbability);
+        strip->setStepEnvelopeAttackMs(clampedFloat(stripXml->getDoubleAttribute("stepAttackMs", 0.0), 0.0f, 0.0f, 400.0f));
+        strip->setStepEnvelopeDecayMs(clampedFloat(stripXml->getDoubleAttribute("stepDecayMs", 4000.0), 4000.0f, 1.0f, 4000.0f));
+        strip->setStepEnvelopeReleaseMs(clampedFloat(stripXml->getDoubleAttribute("stepReleaseMs", 110.0), 110.0f, 1.0f, 4000.0f));
 
         strip->setGrainSizeMs(static_cast<float>(stripXml->getDoubleAttribute("grainSizeMs", 1240.0)));
         strip->setGrainDensity(static_cast<float>(stripXml->getDoubleAttribute("grainDensity", 0.05)));

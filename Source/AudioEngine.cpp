@@ -1158,6 +1158,10 @@ EnhancedAudioStrip::EnhancedAudioStrip(int newStripIndex)
     const auto seed = static_cast<uint32_t>(juce::Time::currentTimeMillis())
                     ^ (stripSeed * 0x9e3779b9u);
     randomGenerator.seed(seed);
+    stepSubdivisions.fill(1);
+    stepSubdivisionStartVelocity.fill(1.0f);
+    stepSubdivisionRepeatVelocity.fill(1.0f);
+    stepProbability.fill(1.0f);
     for (int i = 0; i < ModernAudioEngine::MaxColumns; ++i)
         transientSliceSamples[static_cast<size_t>(i)] = i;
     resetGrainState();
@@ -1177,6 +1181,9 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     
     // Initialize step sampler
     stepSampler.prepareToPlay(sampleRate, maxBlockSize);
+    stepSampler.setAmpAttackMs(stepEnvelopeAttackMs.load(std::memory_order_acquire));
+    stepSampler.setAmpDecayMs(stepEnvelopeDecayMs.load(std::memory_order_acquire));
+    stepSampler.setAmpReleaseMs(stepEnvelopeReleaseMs.load(std::memory_order_acquire));
     
     // Initialize smoothed parameters (50ms ramp time)
     smoothedVolume.reset(sampleRate, 0.05);
@@ -3973,6 +3980,10 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     // STEP SEQUENCER MODE - handle entirely separately (before main loop)
     if (playMode == PlayMode::Step)
     {
+        stepSampler.setAmpAttackMs(stepEnvelopeAttackMs.load(std::memory_order_acquire));
+        stepSampler.setAmpDecayMs(stepEnvelopeDecayMs.load(std::memory_order_acquire));
+        stepSampler.setAmpReleaseMs(stepEnvelopeReleaseMs.load(std::memory_order_acquire));
+
         // DON'T copy strip parameters to StepSampler here!
         // StepSampler parameters are controlled directly by monome buttons
         // (volume, pan, speed are set in PluginProcessor button handlers)
@@ -4061,9 +4072,25 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             if (totalSteps > 16)
                 setStepPage(currentStep / 16);
 
+            stepSubdivisionSixteenth = sixteenthIndex;
+            stepSubdivisionTriggerIndex = 0;
+            stepSubdivisionGateOpen = false;
+
             if (stepPattern[static_cast<size_t>(currentStep)])
             {
-                stepSampler.triggerNote(1.0f);
+                const float probability = getStepProbabilityAtIndex(currentStep);
+                if (probability >= 0.999f)
+                {
+                    stepSubdivisionGateOpen = true;
+                }
+                else if (probability > 0.0f)
+                {
+                    std::uniform_real_distribution<float> chance(0.0f, 1.0f);
+                    stepSubdivisionGateOpen = (chance(randomGenerator) <= probability);
+                }
+
+                if (stepSubdivisionGateOpen)
+                    stepSampler.triggerNote(getStepSubdivisionStartVelocityAtIndex(currentStep));
             }
         };
 
@@ -4084,7 +4111,31 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 if (sixteenthNow != lastSixteenth)
                     triggerStepForSixteenth(sixteenthNow, ppqAtProcessed);
 
-                const double nextBoundaryPpq = (static_cast<double>(sixteenthNow) + 1.0) / 4.0;
+                double nextBoundaryPpq = (static_cast<double>(sixteenthNow) + 1.0) / 4.0;
+                double scheduledSubBoundaryPpq = std::numeric_limits<double>::quiet_NaN();
+
+                if (stepSubdivisionGateOpen
+                    && sixteenthNow == stepSubdivisionSixteenth)
+                {
+                    const int subdivisions = getStepSubdivisionAtIndex(currentStep);
+                    if (subdivisions > 1)
+                    {
+                        const int nextSubIndex = stepSubdivisionTriggerIndex + 1;
+                        if (nextSubIndex < subdivisions)
+                        {
+                            const double sixteenthStartPpq = static_cast<double>(sixteenthNow) / 4.0;
+                            const double subStepLengthPpq = 0.25 / static_cast<double>(subdivisions);
+                            const double candidateBoundaryPpq = sixteenthStartPpq
+                                + (static_cast<double>(nextSubIndex) * subStepLengthPpq);
+                            if (candidateBoundaryPpq < nextBoundaryPpq - 1.0e-12)
+                            {
+                                nextBoundaryPpq = candidateBoundaryPpq;
+                                scheduledSubBoundaryPpq = candidateBoundaryPpq;
+                            }
+                        }
+                    }
+                }
+
                 const double samplesToBoundary = (nextBoundaryPpq - ppqAtProcessed) * samplesPerBeatLocal;
 
                 int segmentSamples = numSamples - processed;
@@ -4096,6 +4147,34 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
 
                 stepSampler.process(output, startSample + processed, segmentSamples);
                 processed += segmentSamples;
+
+                if (processed < numSamples && std::isfinite(scheduledSubBoundaryPpq))
+                {
+                    const double ppqAfterProcessedRaw = ppqStartRaw
+                        + (static_cast<double>(processed) / samplesPerBeatLocal);
+                    const double ppqAfterProcessed = applySwingToPpq(ppqAfterProcessedRaw);
+                    if (ppqAfterProcessed + 1.0e-9 >= scheduledSubBoundaryPpq
+                        && sixteenthNow == stepSubdivisionSixteenth
+                        && stepSubdivisionGateOpen)
+                    {
+                        const int subdivisions = getStepSubdivisionAtIndex(currentStep);
+                        const int triggerSubIndex = juce::jlimit(
+                            1,
+                            juce::jmax(1, subdivisions - 1),
+                            stepSubdivisionTriggerIndex + 1);
+                        const float startVelocity = getStepSubdivisionStartVelocityAtIndex(currentStep);
+                        const float repeatVelocity = getStepSubdivisionRepeatVelocityAtIndex(currentStep);
+                        const float t = (subdivisions <= 1)
+                            ? 1.0f
+                            : (static_cast<float>(triggerSubIndex) / static_cast<float>(subdivisions - 1));
+                        const float velocity = juce::jlimit(
+                            0.0f,
+                            1.0f,
+                            startVelocity + ((repeatVelocity - startVelocity) * t));
+                        ++stepSubdivisionTriggerIndex;
+                        stepSampler.triggerNote(velocity);
+                    }
+                }
             }
         }
         else
@@ -6142,6 +6221,9 @@ void EnhancedAudioStrip::startStepSequencer()
     stepSamplePlaying = false;  // No sample playing initially
     stepRandomWalkPos = 0;
     stepRandomSliceBeatGroup = -1;
+    stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+    stepSubdivisionTriggerIndex = 0;
+    stepSubdivisionGateOpen = true;
     randomSliceNextTriggerBeat = -1.0;
     
     DBG("Step sequencer started for strip " << stripIndex);
@@ -8863,7 +8945,13 @@ void EnhancedAudioStrip::setStepPatternBars(int bars)
 
     const int totalSteps = clampedBars * 16;
     for (int i = totalSteps; i < static_cast<int>(stepPattern.size()); ++i)
+    {
         stepPattern[static_cast<size_t>(i)] = false;
+        stepSubdivisions[static_cast<size_t>(i)] = 1;
+        stepSubdivisionStartVelocity[static_cast<size_t>(i)] = 1.0f;
+        stepSubdivisionRepeatVelocity[static_cast<size_t>(i)] = 1.0f;
+        stepProbability[static_cast<size_t>(i)] = 1.0f;
+    }
 
     if (currentStep >= totalSteps)
         currentStep = 0;
@@ -8891,6 +8979,105 @@ void EnhancedAudioStrip::toggleStepAtIndex(int absoluteStep)
 {
     const int clamped = juce::jlimit(0, getStepTotalSteps() - 1, absoluteStep);
     stepPattern[static_cast<size_t>(clamped)] = !stepPattern[static_cast<size_t>(clamped)];
+}
+
+int EnhancedAudioStrip::getStepSubdivisionAtIndex(int absoluteStep) const
+{
+    const int totalSteps = getStepTotalSteps();
+    if (totalSteps <= 0)
+        return 1;
+
+    const int clamped = juce::jlimit(0, totalSteps - 1, absoluteStep);
+    return juce::jlimit(1, MaxStepSubdivisions, stepSubdivisions[static_cast<size_t>(clamped)]);
+}
+
+void EnhancedAudioStrip::setStepSubdivisionAtIndex(int absoluteStep, int subdivisions)
+{
+    const int totalSteps = getStepTotalSteps();
+    if (totalSteps <= 0)
+        return;
+
+    const int clampedStep = juce::jlimit(0, totalSteps - 1, absoluteStep);
+    const int clampedSubdivisions = juce::jlimit(1, MaxStepSubdivisions, subdivisions);
+    stepSubdivisions[static_cast<size_t>(clampedStep)] = clampedSubdivisions;
+}
+
+float EnhancedAudioStrip::getStepSubdivisionStartVelocityAtIndex(int absoluteStep) const
+{
+    const int totalSteps = getStepTotalSteps();
+    if (totalSteps <= 0)
+        return 1.0f;
+
+    const int clamped = juce::jlimit(0, totalSteps - 1, absoluteStep);
+    return juce::jlimit(0.0f, 1.0f, stepSubdivisionStartVelocity[static_cast<size_t>(clamped)]);
+}
+
+float EnhancedAudioStrip::getStepSubdivisionRepeatVelocityAtIndex(int absoluteStep) const
+{
+    const int totalSteps = getStepTotalSteps();
+    if (totalSteps <= 0)
+        return 1.0f;
+
+    const int clamped = juce::jlimit(0, totalSteps - 1, absoluteStep);
+    return juce::jlimit(0.0f, 1.0f, stepSubdivisionRepeatVelocity[static_cast<size_t>(clamped)]);
+}
+
+void EnhancedAudioStrip::setStepSubdivisionVelocityRangeAtIndex(int absoluteStep,
+                                                                float startVelocity,
+                                                                float endVelocity)
+{
+    const int totalSteps = getStepTotalSteps();
+    if (totalSteps <= 0)
+        return;
+
+    const int clampedStep = juce::jlimit(0, totalSteps - 1, absoluteStep);
+    stepSubdivisionStartVelocity[static_cast<size_t>(clampedStep)] = juce::jlimit(0.0f, 1.0f, startVelocity);
+    stepSubdivisionRepeatVelocity[static_cast<size_t>(clampedStep)] = juce::jlimit(0.0f, 1.0f, endVelocity);
+}
+
+void EnhancedAudioStrip::setStepSubdivisionRepeatVelocityAtIndex(int absoluteStep, float velocity)
+{
+    const int totalSteps = getStepTotalSteps();
+    if (totalSteps <= 0)
+        return;
+
+    const int clampedStep = juce::jlimit(0, totalSteps - 1, absoluteStep);
+    stepSubdivisionRepeatVelocity[static_cast<size_t>(clampedStep)] = juce::jlimit(0.0f, 1.0f, velocity);
+}
+
+float EnhancedAudioStrip::getStepProbabilityAtIndex(int absoluteStep) const
+{
+    const int totalSteps = getStepTotalSteps();
+    if (totalSteps <= 0)
+        return 1.0f;
+
+    const int clamped = juce::jlimit(0, totalSteps - 1, absoluteStep);
+    return juce::jlimit(0.0f, 1.0f, stepProbability[static_cast<size_t>(clamped)]);
+}
+
+void EnhancedAudioStrip::setStepProbabilityAtIndex(int absoluteStep, float probability)
+{
+    const int totalSteps = getStepTotalSteps();
+    if (totalSteps <= 0)
+        return;
+
+    const int clampedStep = juce::jlimit(0, totalSteps - 1, absoluteStep);
+    stepProbability[static_cast<size_t>(clampedStep)] = juce::jlimit(0.0f, 1.0f, probability);
+}
+
+void EnhancedAudioStrip::setStepEnvelopeAttackMs(float ms)
+{
+    stepEnvelopeAttackMs.store(juce::jlimit(0.0f, 400.0f, ms), std::memory_order_release);
+}
+
+void EnhancedAudioStrip::setStepEnvelopeDecayMs(float ms)
+{
+    stepEnvelopeDecayMs.store(juce::jlimit(1.0f, 4000.0f, ms), std::memory_order_release);
+}
+
+void EnhancedAudioStrip::setStepEnvelopeReleaseMs(float ms)
+{
+    stepEnvelopeReleaseMs.store(juce::jlimit(1.0f, 4000.0f, ms), std::memory_order_release);
 }
 
 std::array<bool, 16> EnhancedAudioStrip::getVisibleStepPattern() const

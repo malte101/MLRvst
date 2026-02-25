@@ -366,10 +366,18 @@ public:
     std::atomic<float> pan{0.0f};
     
     // Step sequencer state (PUBLIC for GUI access)
+    static constexpr int MaxStepSubdivisions = 16;
     int currentStep = 0;                        // Current absolute step index (0-63)
     std::array<bool, 64> stepPattern = {};      // Up to 4 bars (16 steps per bar)
+    std::array<int, 64> stepSubdivisions = {};  // Per-step retrigger count (1..MaxStepSubdivisions)
+    std::array<float, 64> stepSubdivisionStartVelocity = {};  // 0..1 gain for first substep hit
+    std::array<float, 64> stepSubdivisionRepeatVelocity = {}; // 0..1 gain target for repeated substeps
+    std::array<float, 64> stepProbability = {}; // 0..1 trigger chance per step
     std::atomic<int> stepPatternBars{1};        // 1..4 bars
     std::atomic<int> stepViewPage{0};           // Visible 16-step page (0..bars-1)
+    std::atomic<float> stepEnvelopeAttackMs{0.0f};
+    std::atomic<float> stepEnvelopeDecayMs{4000.0f};
+    std::atomic<float> stepEnvelopeReleaseMs{110.0f};
     
     PlayMode playMode = PlayMode::Loop;
     DirectionMode directionMode = DirectionMode::Normal;
@@ -451,6 +459,20 @@ public:
     int getVisibleStepOffset() const;
     void toggleStepAtVisibleColumn(int column);
     void toggleStepAtIndex(int absoluteStep);
+    int getStepSubdivisionAtIndex(int absoluteStep) const;
+    void setStepSubdivisionAtIndex(int absoluteStep, int subdivisions);
+    float getStepSubdivisionStartVelocityAtIndex(int absoluteStep) const;
+    float getStepSubdivisionRepeatVelocityAtIndex(int absoluteStep) const;
+    void setStepSubdivisionVelocityRangeAtIndex(int absoluteStep, float startVelocity, float endVelocity);
+    void setStepSubdivisionRepeatVelocityAtIndex(int absoluteStep, float velocity);
+    float getStepProbabilityAtIndex(int absoluteStep) const;
+    void setStepProbabilityAtIndex(int absoluteStep, float probability);
+    void setStepEnvelopeAttackMs(float ms);
+    float getStepEnvelopeAttackMs() const { return stepEnvelopeAttackMs.load(std::memory_order_acquire); }
+    void setStepEnvelopeDecayMs(float ms);
+    float getStepEnvelopeDecayMs() const { return stepEnvelopeDecayMs.load(std::memory_order_acquire); }
+    void setStepEnvelopeReleaseMs(float ms);
+    float getStepEnvelopeReleaseMs() const { return stepEnvelopeReleaseMs.load(std::memory_order_acquire); }
     
     void setBeatsPerLoop(float beats);  // Manual override: how many beats is this loop?
     void setBeatsPerLoopAtPpq(float beats, double hostPpqNow);
@@ -608,6 +630,8 @@ public:
             activePattern = -1;
             lastStepTime = -1.0;
             currentStep = 0;
+            stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+            stepSubdivisionTriggerIndex = 0;
 
             // If the strip already has loop sample content but step sampler
             // is empty, bootstrap step mode from that content.
@@ -656,6 +680,8 @@ public:
             stepSampler.allNotesOff();
             lastStepTime = -1.0;
             stepSamplePlaying = false;
+            stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+            stepSubdivisionTriggerIndex = 0;
             scrubActive = false;
             tapeStopActive = false;
             scratchGestureActive = false;
@@ -969,6 +995,9 @@ private:
     int64_t stepRandomSliceBeatGroup = -1;
     int stepRandomSliceBase = 0;
     int stepRandomSliceDirection = 1;
+    int64_t stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+    int stepSubdivisionTriggerIndex = 0;
+    bool stepSubdivisionGateOpen = true;
     
 public:
     

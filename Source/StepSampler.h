@@ -37,6 +37,7 @@ public:
         
         // Initialize filter to low-pass at 1000Hz
         updateFilter();
+        updateAmpEnvelopeParameters();
     }
     
     ~StepSampler()
@@ -50,6 +51,9 @@ public:
     {
         synth.setCurrentPlaybackSampleRate(newSampleRate);
         this->sampleRate = newSampleRate;
+        ampEnvelope.setSampleRate(newSampleRate);
+        ampEnvelope.reset();
+        updateAmpEnvelopeParameters();
         
         // Prepare filter
         juce::dsp::ProcessSpec spec;
@@ -79,8 +83,8 @@ public:
                 *reader,                // Audio reader
                 allNotes,               // All MIDI notes
                 60,                     // Root note (C4)
-                0.001,                  // Attack: 1ms (instant)
-                0.05,                   // Release: 50ms (short tail)
+                0.001,                  // Keep internal attack minimal
+                0.005,                  // Keep internal release minimal
                 10.0                    // Max sample length (seconds)
             ));
             
@@ -205,8 +209,8 @@ public:
                 *reader,
                 allNotes,
                 60,        // Root note
-                0.001,     // Attack: 1ms
-                0.05,      // Release: 50ms
+                0.001,     // Keep internal attack minimal
+                0.005,     // Keep internal release minimal
                 10.0       // Max length
             ));
             
@@ -235,7 +239,8 @@ public:
         synth.noteOn(1,      // MIDI channel
                     midiNote, // Note number (with pitch offset)
                     velocity); // Velocity (0-1)
-        
+
+        ampEnvelope.noteOn();
         isPlaying = true;
     }
     
@@ -243,12 +248,14 @@ public:
     {
         // Stop all notes (since we might have different pitches)
         synth.allNotesOff(0, true);
+        ampEnvelope.noteOff();
         isPlaying = false;
     }
     
     void allNotesOff()
     {
         synth.allNotesOff(0, true);
+        ampEnvelope.noteOff();
         isPlaying = false;
     }
     
@@ -276,6 +283,28 @@ public:
             pitchOffset = juce::jlimit(-24, 24, pitchOffset);  // ±2 octaves
         }
     }
+
+    void setAmpAttackMs(float ms)
+    {
+        ampAttackMs = juce::jlimit(0.0f, 400.0f, ms);
+        updateAmpEnvelopeParameters();
+    }
+
+    void setAmpDecayMs(float ms)
+    {
+        ampDecayMs = juce::jlimit(1.0f, 4000.0f, ms);
+        updateAmpEnvelopeParameters();
+    }
+
+    void setAmpReleaseMs(float ms)
+    {
+        ampReleaseMs = juce::jlimit(1.0f, 4000.0f, ms);
+        updateAmpEnvelopeParameters();
+    }
+
+    float getAmpAttackMs() const { return ampAttackMs; }
+    float getAmpDecayMs() const { return ampDecayMs; }
+    float getAmpReleaseMs() const { return ampReleaseMs; }
     
     // Filter control methods
     void setFilterEnabled(bool enabled) 
@@ -322,6 +351,15 @@ public:
         // Render synth to temp buffer
         juce::MidiBuffer midiMessages;  // Empty
         synth.renderNextBlock(tempBuffer, midiMessages, 0, numSamples);
+
+        // Per-step envelope (A/D/R) for step mode dynamics.
+        const int channels = tempBuffer.getNumChannels();
+        for (int sample = 0; sample < numSamples; ++sample)
+        {
+            const float env = ampEnvelope.getNextSample();
+            for (int ch = 0; ch < channels; ++ch)
+                tempBuffer.getWritePointer(ch)[sample] *= env;
+        }
         
         // Apply filter BEFORE volume/pan
         if (filterEnabled && tempBuffer.getNumChannels() > 0)
@@ -366,6 +404,11 @@ private:
     double sampleRate = 44100.0;
     bool hasAudio = false;
     bool isPlaying = false;
+    juce::ADSR ampEnvelope;
+    juce::ADSR::Parameters ampEnvelopeParams;
+    float ampAttackMs = 0.0f;
+    float ampDecayMs = 4000.0f;
+    float ampReleaseMs = 110.0f;
     
     // Volume and pan (connected to strip controls)
     float volume = 1.0f;
@@ -405,5 +448,14 @@ private:
         }
         
         *filter.state = *coeffs;
+    }
+
+    void updateAmpEnvelopeParameters()
+    {
+        ampEnvelopeParams.attack = juce::jlimit(0.0f, 0.4f, ampAttackMs * 0.001f);
+        ampEnvelopeParams.decay = juce::jlimit(0.001f, 4.0f, ampDecayMs * 0.001f);
+        ampEnvelopeParams.sustain = 0.0f;
+        ampEnvelopeParams.release = juce::jlimit(0.001f, 4.0f, ampReleaseMs * 0.001f);
+        ampEnvelope.setParameters(ampEnvelopeParams);
     }
 };

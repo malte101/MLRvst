@@ -3580,6 +3580,13 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
             strip->setStepPage(0);
             strip->currentStep = 0;
             strip->stepPattern.fill(false);
+            strip->stepSubdivisionStartVelocity.fill(1.0f);
+            strip->stepSubdivisions.fill(1);
+            strip->stepSubdivisionRepeatVelocity.fill(1.0f);
+            strip->stepProbability.fill(1.0f);
+            strip->setStepEnvelopeAttackMs(0.0f);
+            strip->setStepEnvelopeDecayMs(4000.0f);
+            strip->setStepEnvelopeReleaseMs(110.0f);
             strip->setGrainSizeMs(1240.0f);
             strip->setGrainDensity(0.05f);
             strip->setGrainPitch(0.0f);

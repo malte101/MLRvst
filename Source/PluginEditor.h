@@ -383,6 +383,9 @@ private:
     juce::Slider speedSlider;       // Compact rotary
     juce::Slider scratchSlider;     // Compact rotary - scratch amount
     juce::ComboBox patternLengthBox; // Step mode pattern length (16..64)
+    juce::Slider stepAttackSlider;  // Step mode attack (ms)
+    juce::Slider stepDecaySlider;   // Step mode decay (ms)
+    juce::Slider stepReleaseSlider; // Step mode release (ms)
     juce::Label tempoLabel;         // Shows current beats setting
     juce::ComboBox recordBarsBox;   // Selects input recording buffer bars for this strip
     juce::TextButton recordButton;  // Captures recent input into this strip
@@ -392,7 +395,9 @@ private:
     juce::Label panLabel;           // Label below knob
     juce::Label speedLabel;         // Label below knob
     juce::Label scratchLabel;       // Label below knob
-    juce::Label patternLengthLabel; // Label below pattern length selector
+    juce::Label stepAttackLabel;    // Step envelope labels
+    juce::Label stepDecayLabel;
+    juce::Label stepReleaseLabel;
     juce::ComboBox playModeBox;     // Play mode selector (OneShot/Loop/Gate/Step)
     juce::ComboBox directionModeBox; // Direction mode selector (Normal/Reverse/PingPong/Random)
     juce::TextButton transientSliceButton; // Toggle time slices vs transient slices
