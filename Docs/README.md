@@ -8,6 +8,8 @@ For the GitHub project overview, start with the root README:
 
 ## Main Guides
 
+- `USER_MANUAL.md`
+  - End-user operation guide (GUI + monome workflows)
 - `BUILD.md`
   - Platform build steps
   - Build options
