@@ -155,34 +155,59 @@ float shapeModCurvePhase(float phase01, float bend, ModernAudioEngine::ModCurveS
 
     switch (shape)
     {
-        case ModernAudioEngine::ModCurveShape::SCurve:
+        case ModernAudioEngine::ModCurveShape::Linear:
+            return t;
+        case ModernAudioEngine::ModCurveShape::ExponentialUp:
         {
-            const float blend = juce::jmap(amount, 0.0f, 0.95f);
-            float s = (t * t) * (3.0f - (2.0f * t));
-            if (b >= 0.0f)
-                s = std::pow(s, juce::jmap(amount, 1.0f, 5.5f));
-            else
-                s = 1.0f - std::pow(1.0f - s, juce::jmap(amount, 1.0f, 5.5f));
-            return juce::jlimit(0.0f, 1.0f, juce::jmap(blend, t, s));
+            const float exp = 1.0f + (15.0f * amount);
+            return std::pow(t, exp);
         }
-        case ModernAudioEngine::ModCurveShape::Snap:
+        case ModernAudioEngine::ModCurveShape::ExponentialDown:
         {
-            const float exp = juce::jmap(amount, 1.0f, 10.0f);
-            return b >= 0.0f ? std::pow(t, exp) : (1.0f - std::pow(1.0f - t, exp));
+            const float exp = 1.0f + (15.0f * amount);
+            return 1.0f - std::pow(1.0f - t, exp);
         }
-        case ModernAudioEngine::ModCurveShape::Stair:
+        case ModernAudioEngine::ModCurveShape::Sine:
         {
-            const int steps = juce::jlimit(3, 24, static_cast<int>(std::round(3.0f + (amount * 21.0f))));
-            const float q = std::round(t * static_cast<float>(steps)) / static_cast<float>(steps);
-            return b >= 0.0f ? q : (1.0f - q);
+            const float phase = juce::jlimit(0.0f, 1.0f, t + (b * 0.45f));
+            return 0.5f - (0.5f * std::cos(phase * juce::MathConstants<float>::pi));
         }
-        case ModernAudioEngine::ModCurveShape::Power:
+        case ModernAudioEngine::ModCurveShape::Square:
+        {
+            const float duty = juce::jlimit(0.02f, 0.98f, 0.5f + (b * 0.45f));
+            return (t >= duty) ? 1.0f : 0.0f;
+        }
         default:
-        {
-            const float exp = juce::jmap(amount, 1.0f, 7.0f);
-            return b >= 0.0f ? std::pow(t, exp) : (1.0f - std::pow(1.0f - t, exp));
-        }
+            return t;
     }
+}
+
+float shapeSubdivisionBendPhase(float phase01, float bend)
+{
+    const float t = juce::jlimit(0.0f, 1.0f, phase01);
+    const float b = juce::jlimit(-1.0f, 1.0f, bend);
+    const float amount = std::abs(b);
+    const float exp = 1.0f + (18.0f * amount);
+    return b >= 0.0f ? std::pow(t, exp) : (1.0f - std::pow(1.0f - t, exp));
+}
+
+float sampleStepSubdivisionValue(float startValue,
+                                 float endValue,
+                                 int subdivisions,
+                                 float stepPhase01)
+{
+    const float start = juce::jlimit(0.0f, 1.0f, startValue);
+    const float end = juce::jlimit(0.0f, 1.0f, endValue);
+    const int subdiv = juce::jlimit(1, ModernAudioEngine::ModMaxStepSubdivisions, subdivisions);
+    const float phase = juce::jlimit(0.0f, 0.999999f, stepPhase01);
+
+    if (subdiv <= 1)
+        return start;
+
+    const float subdivPos = phase * static_cast<float>(subdiv);
+    const int subdivIndex = juce::jlimit(0, subdiv - 1, static_cast<int>(std::floor(subdivPos)));
+    const float t = static_cast<float>(subdivIndex) / static_cast<float>(juce::jmax(1, subdiv - 1));
+    return juce::jlimit(0.0f, 1.0f, start + ((end - start) * t));
 }
 
 inline float safetyClip0dB(float sample)
@@ -7269,15 +7294,20 @@ ModernAudioEngine::ModernAudioEngine()
         seq.editPage.store(0, std::memory_order_release);
         seq.smoothingMs.store(0.0f, std::memory_order_release);
         seq.curveBend.store(0.0f, std::memory_order_release);
-        seq.curveShape.store(static_cast<int>(ModCurveShape::Power), std::memory_order_release);
+        seq.curveShape.store(static_cast<int>(ModCurveShape::Linear), std::memory_order_release);
         seq.pitchScaleQuantize.store(0, std::memory_order_release);
         seq.pitchScale.store(static_cast<int>(PitchScale::Chromatic), std::memory_order_release);
         seq.smoothedRaw = 0.0f;
         seq.grainDezipperedRaw = 0.0f;
         seq.pitchDezipperedRaw = 0.0f;
         seq.lastGlobalStep.store(0, std::memory_order_release);
-        for (auto& step : seq.steps)
-            step.store(0.0f, std::memory_order_release);
+        for (size_t stepIndex = 0; stepIndex < seq.steps.size(); ++stepIndex)
+        {
+            seq.steps[stepIndex].store(0.0f, std::memory_order_release);
+            seq.stepSubdivisions[stepIndex].store(1, std::memory_order_release);
+            seq.stepEndValues[stepIndex].store(0.0f, std::memory_order_release);
+            seq.stepCurveShapes[stepIndex].store(static_cast<int>(ModCurveShape::Linear), std::memory_order_release);
+        }
     }
 
     for (int i = 0; i < MaxStrips; ++i)
@@ -7480,20 +7510,40 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 strip->clearGrainSizeModulation();
 
                 const int nextStep = (globalStep + 1) % totalSteps;
-                const float rawA = juce::jlimit(0.0f, 1.0f, seq.steps[static_cast<size_t>(globalStep)].load(std::memory_order_acquire));
-                const float rawB = juce::jlimit(0.0f, 1.0f, seq.steps[static_cast<size_t>(nextStep)].load(std::memory_order_acquire));
+                const float startA = juce::jlimit(
+                    0.0f, 1.0f, seq.steps[static_cast<size_t>(globalStep)].load(std::memory_order_acquire));
+                const int subdivisionsA = juce::jlimit(
+                    1,
+                    ModMaxStepSubdivisions,
+                    seq.stepSubdivisions[static_cast<size_t>(globalStep)].load(std::memory_order_acquire));
+                float endA = juce::jlimit(
+                    0.0f, 1.0f, seq.stepEndValues[static_cast<size_t>(globalStep)].load(std::memory_order_acquire));
+                if (subdivisionsA <= 1)
+                    endA = startA;
+                const float nextStart = juce::jlimit(
+                    0.0f, 1.0f, seq.steps[static_cast<size_t>(nextStep)].load(std::memory_order_acquire));
                 const float smoothingMs = juce::jmax(0.0f, seq.smoothingMs.load(std::memory_order_acquire));
                 const float curveBend = juce::jlimit(-1.0f, 1.0f, seq.curveBend.load(std::memory_order_acquire));
                 const bool loopSpeedImmediate = (target == ModTarget::Speed
                     && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Loop);
                 const bool curveMode = (seq.curveMode.load(std::memory_order_acquire) != 0);
+                const bool hasLocalSubdivisionRamp = (subdivisionsA > 1);
                 const auto curveShape = static_cast<ModCurveShape>(juce::jlimit(
-                    0, static_cast<int>(ModCurveShape::Stair), seq.curveShape.load(std::memory_order_acquire)));
+                    0, static_cast<int>(ModCurveShape::Square),
+                    seq.stepCurveShapes[static_cast<size_t>(globalStep)].load(std::memory_order_acquire)));
+                const float phase = static_cast<float>(juce::jlimit(0.0, 1.0, stepPhase));
+                const float shapedPhase = curveMode
+                    ? shapeModCurvePhase(phase, curveBend, curveShape)
+                    : phase;
+                const float subdivisionPhase = (curveMode && hasLocalSubdivisionRamp)
+                    ? shapeSubdivisionBendPhase(phase, curveBend)
+                    : phase;
+                const float rawA = sampleStepSubdivisionValue(
+                    startA, endA, subdivisionsA, subdivisionPhase);
                 float shapedRaw = rawA;
-                if (curveMode)
+                if (curveMode && !hasLocalSubdivisionRamp)
                 {
-                    const float shapedPhase = shapeModCurvePhase(static_cast<float>(stepPhase), curveBend, curveShape);
-                    shapedRaw = juce::jlimit(0.0f, 1.0f, rawA + ((rawB - rawA) * shapedPhase));
+                    shapedRaw = juce::jlimit(0.0f, 1.0f, startA + ((nextStart - startA) * shapedPhase));
                 }
 
                 float smoothedRaw = shapedRaw;
@@ -7766,17 +7816,37 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             const double wrappedPos = (wrapped < 0.0) ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
             const int stepA = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
             const int stepB = (stepA + 1) % totalSteps;
-            const float rawA = juce::jlimit(0.0f, 1.0f, seq.steps[static_cast<size_t>(stepA)].load(std::memory_order_acquire));
-            const float rawB = juce::jlimit(0.0f, 1.0f, seq.steps[static_cast<size_t>(stepB)].load(std::memory_order_acquire));
-            if (seq.curveMode.load(std::memory_order_acquire) == 0)
-                return rawA;
-
-            const float phase = static_cast<float>(juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(stepA)));
+            const float startA = juce::jlimit(
+                0.0f, 1.0f, seq.steps[static_cast<size_t>(stepA)].load(std::memory_order_acquire));
+            const int subdivisionsA = juce::jlimit(
+                1,
+                ModMaxStepSubdivisions,
+                seq.stepSubdivisions[static_cast<size_t>(stepA)].load(std::memory_order_acquire));
+            float endA = juce::jlimit(
+                0.0f, 1.0f, seq.stepEndValues[static_cast<size_t>(stepA)].load(std::memory_order_acquire));
+            if (subdivisionsA <= 1)
+                endA = startA;
+            const float stepPhase = static_cast<float>(juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(stepA)));
             const float bend = juce::jlimit(-1.0f, 1.0f, seq.curveBend.load(std::memory_order_acquire));
             const auto shape = static_cast<ModCurveShape>(juce::jlimit(
-                0, static_cast<int>(ModCurveShape::Stair), seq.curveShape.load(std::memory_order_acquire)));
-            const float shapedPhase = shapeModCurvePhase(phase, bend, shape);
-            return juce::jlimit(0.0f, 1.0f, rawA + ((rawB - rawA) * shapedPhase));
+                0, static_cast<int>(ModCurveShape::Square),
+                seq.stepCurveShapes[static_cast<size_t>(stepA)].load(std::memory_order_acquire)));
+            const bool curveMode = (seq.curveMode.load(std::memory_order_acquire) != 0);
+            const float shapedPhase = curveMode
+                ? shapeModCurvePhase(stepPhase, bend, shape)
+                : stepPhase;
+            const bool hasLocalSubdivisionRamp = (subdivisionsA > 1);
+            const float subdivisionPhase = (curveMode && hasLocalSubdivisionRamp)
+                ? shapeSubdivisionBendPhase(stepPhase, bend)
+                : stepPhase;
+            const float rawA = sampleStepSubdivisionValue(
+                startA, endA, subdivisionsA, subdivisionPhase);
+            if (!curveMode || subdivisionsA > 1)
+                return rawA;
+
+            const float rawB = juce::jlimit(
+                0.0f, 1.0f, seq.steps[static_cast<size_t>(stepB)].load(std::memory_order_acquire));
+            return juce::jlimit(0.0f, 1.0f, startA + ((rawB - startA) * shapedPhase));
         };
 
         for (int stripIdx = 0; stripIdx < MaxStrips; ++stripIdx)
@@ -8559,6 +8629,9 @@ bool ModernAudioEngine::modTargetSupportsBipolar(ModTarget target)
 ModernAudioEngine::ModSequencerState ModernAudioEngine::getModSequencerState(int stripIndex) const
 {
     ModSequencerState state{};
+    state.stepSubdivisions.fill(1);
+    state.stepEndValues.fill(0.0f);
+    state.stepCurveShapes.fill(static_cast<int>(ModCurveShape::Linear));
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return state;
 
@@ -8572,12 +8645,31 @@ ModernAudioEngine::ModSequencerState ModernAudioEngine::getModSequencerState(int
     state.editPage = juce::jlimit(0, MaxModBars - 1, seq.editPage.load(std::memory_order_acquire));
     state.smoothingMs = juce::jmax(0.0f, seq.smoothingMs.load(std::memory_order_acquire));
     state.curveBend = juce::jlimit(-1.0f, 1.0f, seq.curveBend.load(std::memory_order_acquire));
-    state.curveShape = juce::jlimit(0, static_cast<int>(ModCurveShape::Stair), seq.curveShape.load(std::memory_order_acquire));
+    state.curveShape = juce::jlimit(0, static_cast<int>(ModCurveShape::Square), seq.curveShape.load(std::memory_order_acquire));
     state.pitchScaleQuantize = (seq.pitchScaleQuantize.load(std::memory_order_acquire) != 0);
     state.pitchScale = juce::jlimit(0, static_cast<int>(PitchScale::PentatonicMinor), seq.pitchScale.load(std::memory_order_acquire));
     const int pageOffset = state.editPage * ModSteps;
     for (int i = 0; i < ModSteps; ++i)
-        state.steps[static_cast<size_t>(i)] = seq.steps[static_cast<size_t>(pageOffset + i)].load(std::memory_order_acquire);
+    {
+        const int absoluteStep = pageOffset + i;
+        const float startValue = juce::jlimit(
+            0.0f, 1.0f, seq.steps[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+        const int subdivisions = juce::jlimit(
+            1, ModMaxStepSubdivisions, seq.stepSubdivisions[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+        float endValue = juce::jlimit(
+            0.0f, 1.0f, seq.stepEndValues[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+        const int curveShape = juce::jlimit(
+            0,
+            static_cast<int>(ModCurveShape::Square),
+            seq.stepCurveShapes[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+        if (subdivisions <= 1)
+            endValue = startValue;
+
+        state.steps[static_cast<size_t>(i)] = startValue;
+        state.stepSubdivisions[static_cast<size_t>(i)] = subdivisions;
+        state.stepEndValues[static_cast<size_t>(i)] = endValue;
+        state.stepCurveShapes[static_cast<size_t>(i)] = curveShape;
+    }
     return state;
 }
 
@@ -8672,16 +8764,31 @@ void ModernAudioEngine::setModStepValue(int stripIndex, int step, float value01)
     auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
     const int page = juce::jlimit(0, MaxModBars - 1, seq.editPage.load(std::memory_order_acquire));
     const int idx = (page * ModSteps) + step;
-    seq.steps[static_cast<size_t>(idx)].store(
-        juce::jlimit(0.0f, 1.0f, value01), std::memory_order_release);
+    const float clampedValue = juce::jlimit(0.0f, 1.0f, value01);
+    const int activeCurveShape = juce::jlimit(
+        0,
+        static_cast<int>(ModCurveShape::Square),
+        seq.curveShape.load(std::memory_order_acquire));
+    seq.steps[static_cast<size_t>(idx)].store(clampedValue, std::memory_order_release);
+    seq.stepSubdivisions[static_cast<size_t>(idx)].store(1, std::memory_order_release);
+    seq.stepEndValues[static_cast<size_t>(idx)].store(clampedValue, std::memory_order_release);
+    seq.stepCurveShapes[static_cast<size_t>(idx)].store(activeCurveShape, std::memory_order_release);
 }
 
 void ModernAudioEngine::setModStepValueAbsolute(int stripIndex, int absoluteStep, float value01)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
         return;
-    modSequencers[static_cast<size_t>(stripIndex)].steps[static_cast<size_t>(absoluteStep)].store(
-        juce::jlimit(0.0f, 1.0f, value01), std::memory_order_release);
+    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const float clampedValue = juce::jlimit(0.0f, 1.0f, value01);
+    const int activeCurveShape = juce::jlimit(
+        0,
+        static_cast<int>(ModCurveShape::Square),
+        seq.curveShape.load(std::memory_order_acquire));
+    seq.steps[static_cast<size_t>(absoluteStep)].store(clampedValue, std::memory_order_release);
+    seq.stepSubdivisions[static_cast<size_t>(absoluteStep)].store(1, std::memory_order_release);
+    seq.stepEndValues[static_cast<size_t>(absoluteStep)].store(clampedValue, std::memory_order_release);
+    seq.stepCurveShapes[static_cast<size_t>(absoluteStep)].store(activeCurveShape, std::memory_order_release);
 }
 
 float ModernAudioEngine::getModStepValue(int stripIndex, int step) const
@@ -8701,6 +8808,100 @@ float ModernAudioEngine::getModStepValueAbsolute(int stripIndex, int absoluteSte
     return modSequencers[static_cast<size_t>(stripIndex)].steps[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire);
 }
 
+void ModernAudioEngine::setModStepShape(int stripIndex, int step, int subdivisions, float endValue01)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || step < 0 || step >= ModSteps)
+        return;
+
+    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const int page = juce::jlimit(0, MaxModBars - 1, seq.editPage.load(std::memory_order_acquire));
+    const int absoluteStep = (page * ModSteps) + step;
+    setModStepShapeAbsolute(stripIndex, absoluteStep, subdivisions, endValue01);
+}
+
+void ModernAudioEngine::setModStepShapeAbsolute(int stripIndex, int absoluteStep, int subdivisions, float endValue01)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
+        return;
+
+    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const int clampedSubdivisions = juce::jlimit(1, ModMaxStepSubdivisions, subdivisions);
+    const float startValue = juce::jlimit(
+        0.0f, 1.0f, seq.steps[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+    float clampedEndValue = juce::jlimit(0.0f, 1.0f, endValue01);
+    if (clampedSubdivisions <= 1)
+        clampedEndValue = startValue;
+
+    seq.stepSubdivisions[static_cast<size_t>(absoluteStep)].store(clampedSubdivisions, std::memory_order_release);
+    seq.stepEndValues[static_cast<size_t>(absoluteStep)].store(clampedEndValue, std::memory_order_release);
+}
+
+int ModernAudioEngine::getModStepSubdivisionAbsolute(int stripIndex, int absoluteStep) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
+        return 1;
+
+    return juce::jlimit(
+        1,
+        ModMaxStepSubdivisions,
+        modSequencers[static_cast<size_t>(stripIndex)].stepSubdivisions[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+}
+
+float ModernAudioEngine::getModStepEndValueAbsolute(int stripIndex, int absoluteStep) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
+        return 0.0f;
+
+    const auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const int subdivisions = juce::jlimit(
+        1,
+        ModMaxStepSubdivisions,
+        seq.stepSubdivisions[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+    const float startValue = juce::jlimit(
+        0.0f, 1.0f, seq.steps[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+    if (subdivisions <= 1)
+        return startValue;
+
+    return juce::jlimit(
+        0.0f, 1.0f, seq.stepEndValues[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+}
+
+void ModernAudioEngine::setModStepCurveShape(int stripIndex, int step, ModCurveShape shape)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || step < 0 || step >= ModSteps)
+        return;
+
+    const auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const int page = juce::jlimit(0, MaxModBars - 1, seq.editPage.load(std::memory_order_acquire));
+    const int absoluteStep = (page * ModSteps) + step;
+    setModStepCurveShapeAbsolute(stripIndex, absoluteStep, shape);
+}
+
+void ModernAudioEngine::setModStepCurveShapeAbsolute(int stripIndex, int absoluteStep, ModCurveShape shape)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
+        return;
+
+    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const int clampedShape = juce::jlimit(
+        0,
+        static_cast<int>(ModCurveShape::Square),
+        static_cast<int>(shape));
+    seq.stepCurveShapes[static_cast<size_t>(absoluteStep)].store(clampedShape, std::memory_order_release);
+}
+
+ModernAudioEngine::ModCurveShape ModernAudioEngine::getModStepCurveShapeAbsolute(int stripIndex, int absoluteStep) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
+        return ModCurveShape::Linear;
+
+    const auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    return static_cast<ModCurveShape>(juce::jlimit(
+        0,
+        static_cast<int>(ModCurveShape::Square),
+        seq.stepCurveShapes[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire)));
+}
+
 void ModernAudioEngine::toggleModStep(int stripIndex, int step)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips || step < 0 || step >= ModSteps)
@@ -8710,15 +8911,33 @@ void ModernAudioEngine::toggleModStep(int stripIndex, int step)
     const int idx = (page * ModSteps) + step;
     auto& cell = seq.steps[static_cast<size_t>(idx)];
     const float prev = cell.load(std::memory_order_acquire);
-    cell.store(prev >= 0.5f ? 0.0f : 1.0f, std::memory_order_release);
+    const float nextValue = (prev >= 0.5f) ? 0.0f : 1.0f;
+    const int activeCurveShape = juce::jlimit(
+        0,
+        static_cast<int>(ModCurveShape::Square),
+        seq.curveShape.load(std::memory_order_acquire));
+    cell.store(nextValue, std::memory_order_release);
+    seq.stepSubdivisions[static_cast<size_t>(idx)].store(1, std::memory_order_release);
+    seq.stepEndValues[static_cast<size_t>(idx)].store(nextValue, std::memory_order_release);
+    seq.stepCurveShapes[static_cast<size_t>(idx)].store(activeCurveShape, std::memory_order_release);
 }
 
 void ModernAudioEngine::clearModSteps(int stripIndex)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    for (auto& step : modSequencers[static_cast<size_t>(stripIndex)].steps)
-        step.store(0.0f, std::memory_order_release);
+    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const int activeCurveShape = juce::jlimit(
+        0,
+        static_cast<int>(ModCurveShape::Square),
+        seq.curveShape.load(std::memory_order_acquire));
+    for (size_t i = 0; i < seq.steps.size(); ++i)
+    {
+        seq.steps[i].store(0.0f, std::memory_order_release);
+        seq.stepSubdivisions[i].store(1, std::memory_order_release);
+        seq.stepEndValues[i].store(0.0f, std::memory_order_release);
+        seq.stepCurveShapes[i].store(activeCurveShape, std::memory_order_release);
+    }
 }
 
 int ModernAudioEngine::getModCurrentStep(int stripIndex) const
@@ -8819,16 +9038,16 @@ void ModernAudioEngine::setModCurveShape(int stripIndex, ModCurveShape shape)
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
     modSequencers[static_cast<size_t>(stripIndex)].curveShape.store(
-        juce::jlimit(0, static_cast<int>(ModCurveShape::Stair), static_cast<int>(shape)),
+        juce::jlimit(0, static_cast<int>(ModCurveShape::Square), static_cast<int>(shape)),
         std::memory_order_release);
 }
 
 ModernAudioEngine::ModCurveShape ModernAudioEngine::getModCurveShape(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
-        return ModCurveShape::Power;
+        return ModCurveShape::Linear;
     return static_cast<ModCurveShape>(juce::jlimit(
-        0, static_cast<int>(ModCurveShape::Stair),
+        0, static_cast<int>(ModCurveShape::Square),
         modSequencers[static_cast<size_t>(stripIndex)].curveShape.load(std::memory_order_acquire)));
 }
 

@@ -195,6 +195,75 @@ bool modTargetAllowsBipolar(ModernAudioEngine::ModTarget target)
     return ModernAudioEngine::modTargetSupportsBipolar(target);
 }
 
+enum class StepCellModifierGesture
+{
+    None = 0,
+    Divide,
+    RampUp,
+    RampDown
+};
+
+StepCellModifierGesture getStepCellModifierGesture(const juce::ModifierKeys& mods)
+{
+    // Keep modifier priority aligned with StepSequencerDisplay cell editing.
+    if (mods.isCommandDown())
+        return StepCellModifierGesture::Divide;
+    if (mods.isCtrlDown())
+        return StepCellModifierGesture::RampUp;
+    if (mods.isAltDown())
+        return StepCellModifierGesture::RampDown;
+    return StepCellModifierGesture::None;
+}
+
+float shapeCurvePhaseUi(float phase01, float bend, ModernAudioEngine::ModCurveShape shape);
+
+float sampleModSubdivisionValueUi(float startValue,
+                                  float endValue,
+                                  int subdivisions,
+                                  float phase01)
+{
+    const float start = juce::jlimit(0.0f, 1.0f, startValue);
+    const float end = juce::jlimit(0.0f, 1.0f, endValue);
+    const int subdiv = juce::jlimit(1, ModernAudioEngine::ModMaxStepSubdivisions, subdivisions);
+    const float phase = juce::jlimit(0.0f, 0.999999f, phase01);
+
+    if (subdiv <= 1)
+        return start;
+
+    const float subdivPos = phase * static_cast<float>(subdiv);
+    const int subdivIndex = juce::jlimit(0, subdiv - 1, static_cast<int>(std::floor(subdivPos)));
+    const float t = static_cast<float>(subdivIndex) / static_cast<float>(juce::jmax(1, subdiv - 1));
+    return juce::jlimit(0.0f, 1.0f, start + ((end - start) * t));
+}
+
+void computeSingleModCellRamp(float sourceStart,
+                              float sourceEnd,
+                              int deltaY,
+                              bool rampUpMode,
+                              float& outStart,
+                              float& outEnd)
+{
+    const float clampedStart = juce::jlimit(0.0f, 1.0f, sourceStart);
+    const float clampedEnd = juce::jlimit(0.0f, 1.0f, sourceEnd);
+    float peak = juce::jlimit(0.0f, 1.0f, juce::jmax(clampedStart, clampedEnd));
+    if (peak < 0.001f)
+        peak = 1.0f;
+
+    const float depth = juce::jlimit(0.0f, 1.0f, 0.5f + (static_cast<float>(-deltaY) / 160.0f));
+    const float low = juce::jlimit(0.0f, 1.0f, peak * (1.0f - depth));
+
+    if (rampUpMode)
+    {
+        outStart = low;
+        outEnd = peak;
+    }
+    else
+    {
+        outStart = peak;
+        outEnd = low;
+    }
+}
+
 int pitchScaleToComboId(ModernAudioEngine::PitchScale scale)
 {
     switch (scale)
@@ -225,10 +294,11 @@ int curveShapeToComboId(ModernAudioEngine::ModCurveShape shape)
 {
     switch (shape)
     {
-        case ModernAudioEngine::ModCurveShape::Power: return 1;
-        case ModernAudioEngine::ModCurveShape::SCurve: return 2;
-        case ModernAudioEngine::ModCurveShape::Snap: return 3;
-        case ModernAudioEngine::ModCurveShape::Stair: return 4;
+        case ModernAudioEngine::ModCurveShape::Linear: return 1;
+        case ModernAudioEngine::ModCurveShape::ExponentialUp: return 2;
+        case ModernAudioEngine::ModCurveShape::ExponentialDown: return 3;
+        case ModernAudioEngine::ModCurveShape::Sine: return 4;
+        case ModernAudioEngine::ModCurveShape::Square: return 5;
         default: return 1;
     }
 }
@@ -237,11 +307,12 @@ ModernAudioEngine::ModCurveShape comboIdToCurveShape(int id)
 {
     switch (id)
     {
-        case 2: return ModernAudioEngine::ModCurveShape::SCurve;
-        case 3: return ModernAudioEngine::ModCurveShape::Snap;
-        case 4: return ModernAudioEngine::ModCurveShape::Stair;
+        case 2: return ModernAudioEngine::ModCurveShape::ExponentialUp;
+        case 3: return ModernAudioEngine::ModCurveShape::ExponentialDown;
+        case 4: return ModernAudioEngine::ModCurveShape::Sine;
+        case 5: return ModernAudioEngine::ModCurveShape::Square;
         case 1:
-        default: return ModernAudioEngine::ModCurveShape::Power;
+        default: return ModernAudioEngine::ModCurveShape::Linear;
     }
 }
 
@@ -253,34 +324,40 @@ float shapeCurvePhaseUi(float phase01, float bend, ModernAudioEngine::ModCurveSh
 
     switch (shape)
     {
-        case ModernAudioEngine::ModCurveShape::SCurve:
+        case ModernAudioEngine::ModCurveShape::Linear:
+            return t;
+        case ModernAudioEngine::ModCurveShape::ExponentialUp:
         {
-            const float blend = juce::jmap(amount, 0.0f, 0.95f);
-            float s = (t * t) * (3.0f - (2.0f * t));
-            if (b >= 0.0f)
-                s = std::pow(s, juce::jmap(amount, 1.0f, 5.5f));
-            else
-                s = 1.0f - std::pow(1.0f - s, juce::jmap(amount, 1.0f, 5.5f));
-            return juce::jlimit(0.0f, 1.0f, juce::jmap(blend, t, s));
+            const float exp = 1.0f + (15.0f * amount);
+            return std::pow(t, exp);
         }
-        case ModernAudioEngine::ModCurveShape::Snap:
+        case ModernAudioEngine::ModCurveShape::ExponentialDown:
         {
-            const float exp = juce::jmap(amount, 1.0f, 10.0f);
-            return b >= 0.0f ? std::pow(t, exp) : (1.0f - std::pow(1.0f - t, exp));
+            const float exp = 1.0f + (15.0f * amount);
+            return 1.0f - std::pow(1.0f - t, exp);
         }
-        case ModernAudioEngine::ModCurveShape::Stair:
+        case ModernAudioEngine::ModCurveShape::Sine:
         {
-            const int steps = juce::jlimit(3, 24, static_cast<int>(std::round(3.0f + (amount * 21.0f))));
-            const float q = std::round(t * static_cast<float>(steps)) / static_cast<float>(steps);
-            return b >= 0.0f ? q : (1.0f - q);
+            const float phase = juce::jlimit(0.0f, 1.0f, t + (b * 0.45f));
+            return 0.5f - (0.5f * std::cos(phase * juce::MathConstants<float>::pi));
         }
-        case ModernAudioEngine::ModCurveShape::Power:
+        case ModernAudioEngine::ModCurveShape::Square:
+        {
+            const float duty = juce::jlimit(0.02f, 0.98f, 0.5f + (b * 0.45f));
+            return (t >= duty) ? 1.0f : 0.0f;
+        }
         default:
-        {
-            const float exp = juce::jmap(amount, 1.0f, 7.0f);
-            return b >= 0.0f ? std::pow(t, exp) : (1.0f - std::pow(1.0f - t, exp));
-        }
+            return t;
     }
+}
+
+float shapeSubdivisionBendPhaseUi(float phase01, float bend)
+{
+    const float t = juce::jlimit(0.0f, 1.0f, phase01);
+    const float b = juce::jlimit(-1.0f, 1.0f, bend);
+    const float amount = std::abs(b);
+    const float exp = 1.0f + (18.0f * amount);
+    return b >= 0.0f ? std::pow(t, exp) : (1.0f - std::pow(1.0f - t, exp));
 }
 
 struct GateRateEntry
@@ -1601,11 +1678,13 @@ void StripControl::setupComponents()
     modCurveTypeLabel.setColour(juce::Label::textColourId, kTextMuted);
     addAndMakeVisible(modCurveTypeLabel);
 
-    modCurveTypeBox.addItem("Pow", 1);
-    modCurveTypeBox.addItem("S", 2);
-    modCurveTypeBox.addItem("Snap", 3);
-    modCurveTypeBox.addItem("Stair", 4);
+    modCurveTypeBox.addItem("Normal", 1);
+    modCurveTypeBox.addItem("Exp+", 2);
+    modCurveTypeBox.addItem("Exp-", 3);
+    modCurveTypeBox.addItem("Sine", 4);
+    modCurveTypeBox.addItem("Square", 5);
     modCurveTypeBox.setSelectedId(1, juce::dontSendNotification);
+    modCurveTypeBox.setTooltip("Curve draw type in Curve mode: Normal, Exp+/-, Sine, Square.");
     modCurveTypeBox.onChange = [this]()
     {
         if (auto* engine = processor.getAudioEngine())
@@ -1770,6 +1849,8 @@ void StripControl::paintModulationLane(juce::Graphics& g)
     const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, engine->getModLengthBars(stripIndex));
     const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
     const int activeStep = juce::jlimit(0, totalSteps - 1, engine->getModCurrentGlobalStep(stripIndex));
+    if (totalSteps <= 0)
+        return;
 
     g.setColour(juce::Colour(0xff1f1f1f));
     g.fillRoundedRectangle(lane.toFloat(), 6.0f);
@@ -1783,9 +1864,9 @@ void StripControl::paintModulationLane(juce::Graphics& g)
     const float right = juce::jmax(left, static_cast<float>(drawLane.getRight() - 1) - dotPad);
     const float top = static_cast<float>(drawLane.getY()) + 2.0f;
     const float bottom = static_cast<float>(drawLane.getBottom()) - 2.0f;
-    const float width = right - left;
+    const float width = juce::jmax(1.0f, right - left);
     const float height = bottom - top;
-    const float xStep = juce::jmax(0.25f, width / static_cast<float>(juce::jmax(1, totalSteps - 1)));
+    const float stepWidth = juce::jmax(0.25f, width / static_cast<float>(juce::jmax(1, totalSteps)));
     const float centerY = top + (height * 0.5f);
 
     if (seq.bipolar)
@@ -1794,78 +1875,200 @@ void StripControl::paintModulationLane(juce::Graphics& g)
         g.drawLine(left, centerY, right, centerY, 1.0f);
     }
 
-    std::vector<float> displayVals(static_cast<size_t>(totalSteps));
-    for (int i = 0; i < totalSteps; ++i)
-        displayVals[static_cast<size_t>(i)] = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(stripIndex, i));
-
-    std::vector<juce::Point<float>> points(static_cast<size_t>(totalSteps));
-    for (int i = 0; i < totalSteps; ++i)
+    auto valueToY = [&](float v) -> float
     {
-        const float v = displayVals[static_cast<size_t>(i)];
-        const float n = seq.bipolar ? ((v * 2.0f) - 1.0f) : v;
-        const float y = seq.bipolar
+        const float clamped = juce::jlimit(0.0f, 1.0f, v);
+        const float n = seq.bipolar ? ((clamped * 2.0f) - 1.0f) : clamped;
+        return seq.bipolar
             ? (centerY - (n * (height * 0.48f)))
             : (bottom - (n * height));
-        points[static_cast<size_t>(i)] = {left + (xStep * static_cast<float>(i)), y};
+    };
+
+    std::vector<float> startValues(static_cast<size_t>(totalSteps));
+    std::vector<float> endValues(static_cast<size_t>(totalSteps));
+    std::vector<int> subdivisions(static_cast<size_t>(totalSteps));
+    std::vector<ModernAudioEngine::ModCurveShape> stepCurveShapes(static_cast<size_t>(totalSteps),
+                                                                   ModernAudioEngine::ModCurveShape::Linear);
+    for (int i = 0; i < totalSteps; ++i)
+    {
+        const float startValue = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(stripIndex, i));
+        const int subdiv = juce::jlimit(
+            1, ModernAudioEngine::ModMaxStepSubdivisions, engine->getModStepSubdivisionAbsolute(stripIndex, i));
+        float endValue = juce::jlimit(0.0f, 1.0f, engine->getModStepEndValueAbsolute(stripIndex, i));
+        const auto stepCurveShape = engine->getModStepCurveShapeAbsolute(stripIndex, i);
+        if (subdiv <= 1)
+            endValue = startValue;
+        startValues[static_cast<size_t>(i)] = startValue;
+        endValues[static_cast<size_t>(i)] = endValue;
+        subdivisions[static_cast<size_t>(i)] = subdiv;
+        stepCurveShapes[static_cast<size_t>(i)] = stepCurveShape;
+    }
+
+    const float activeStepX = left + (stepWidth * static_cast<float>(activeStep));
+    g.setColour(kAccent.withAlpha(0.10f));
+    g.fillRect(activeStepX, top, juce::jmax(1.0f, stepWidth), juce::jmax(1.0f, height));
+
+    const float bend = juce::jlimit(-1.0f, 1.0f, seq.curveBend);
+    std::vector<juce::Point<float>> stepMarkerPoints(static_cast<size_t>(totalSteps));
+    for (int i = 0; i < totalSteps; ++i)
+    {
+        const float markerPhase = seq.curveMode ? shapeSubdivisionBendPhaseUi(0.5f, bend) : 0.5f;
+        const float markerValue = (subdivisions[static_cast<size_t>(i)] > 1)
+            ? sampleModSubdivisionValueUi(
+                startValues[static_cast<size_t>(i)],
+                endValues[static_cast<size_t>(i)],
+                subdivisions[static_cast<size_t>(i)],
+                markerPhase)
+            : startValues[static_cast<size_t>(i)];
+        const float x = left + (stepWidth * (static_cast<float>(i) + 0.5f));
+        stepMarkerPoints[static_cast<size_t>(i)] = { x, valueToY(markerValue) };
     }
 
     if (seq.curveMode)
     {
-        juce::Path p;
-        p.startNewSubPath(points[0]);
-        const float bend = juce::jlimit(-1.0f, 1.0f, seq.curveBend);
-        const auto curveShape = static_cast<ModernAudioEngine::ModCurveShape>(
-            juce::jlimit(0, static_cast<int>(ModernAudioEngine::ModCurveShape::Stair), seq.curveShape));
-        constexpr int segmentsPerStep = 8;
-        for (int i = 0; i < (totalSteps - 1); ++i)
+        juce::Path rawPath;
+        std::vector<float> sampledX;
+        std::vector<float> sampledValues;
+        sampledX.reserve(static_cast<size_t>(totalSteps * 10));
+        sampledValues.reserve(static_cast<size_t>(totalSteps * 10));
+        bool started = false;
+        for (int i = 0; i < totalSteps; ++i)
         {
-            const float a = displayVals[static_cast<size_t>(i)];
-            const float b = displayVals[static_cast<size_t>(i + 1)];
-            const float x0 = points[static_cast<size_t>(i)].x;
-            for (int s = 1; s <= segmentsPerStep; ++s)
+            const int subdiv = subdivisions[static_cast<size_t>(i)];
+            const bool hasLocalRamp = (subdiv > 1);
+            const int segmentCount = hasLocalRamp ? juce::jlimit(2, 64, subdiv * 4) : 8;
+            const float startValue = startValues[static_cast<size_t>(i)];
+            const float endValue = endValues[static_cast<size_t>(i)];
+            const float nextStart = startValues[static_cast<size_t>((i + 1) % totalSteps)];
+
+            for (int s = 0; s <= segmentCount; ++s)
             {
-                const float t = static_cast<float>(s) / static_cast<float>(segmentsPerStep);
-                const float shapedT = shapeCurvePhaseUi(t, bend, curveShape);
-                const float v = juce::jlimit(0.0f, 1.0f, a + ((b - a) * shapedT));
-                const float n = seq.bipolar ? ((v * 2.0f) - 1.0f) : v;
-                const float y = seq.bipolar
-                    ? (centerY - (n * (height * 0.48f)))
-                    : (bottom - (n * height));
-                const float x = x0 + (xStep * t);
-                p.lineTo(x, y);
+                if (i > 0 && s == 0)
+                    continue;
+
+                const float t = static_cast<float>(s) / static_cast<float>(segmentCount);
+                const float shapedT = shapeCurvePhaseUi(
+                    t,
+                    bend,
+                    stepCurveShapes[static_cast<size_t>(i)]);
+                const float bendT = shapeSubdivisionBendPhaseUi(t, bend);
+                const float value = hasLocalRamp
+                    ? sampleModSubdivisionValueUi(startValue,
+                                                  endValue,
+                                                  subdiv,
+                                                  bendT)
+                    : juce::jlimit(0.0f, 1.0f,
+                                   startValue + ((nextStart - startValue) * shapedT));
+                const float x = juce::jlimit(left, right, left + (stepWidth * (static_cast<float>(i) + t)));
+                const float y = valueToY(value);
+
+                if (!started)
+                {
+                    rawPath.startNewSubPath(x, y);
+                    started = true;
+                }
+                else
+                {
+                    rawPath.lineTo(x, y);
+                }
+                sampledX.push_back(x);
+                sampledValues.push_back(value);
             }
         }
 
-        g.setColour(stripColor.withAlpha(0.9f));
-        g.strokePath(p, juce::PathStrokeType(2.0f));
+        const float smoothingMs = juce::jlimit(0.0f, 250.0f, seq.smoothingMs);
+        const bool showSmoothedOverlay = (smoothingMs > 0.05f && sampledValues.size() > 2);
+
+        g.setColour(stripColor.withAlpha(showSmoothedOverlay ? 0.58f : 0.9f));
+        g.strokePath(rawPath, juce::PathStrokeType(showSmoothedOverlay ? 1.6f : 2.0f));
+
+        if (showSmoothedOverlay)
+        {
+            // Approximate post-curve smoothing for visual feedback in curve mode.
+            const float refStepMs = 125.0f;
+            const float totalMs = refStepMs * static_cast<float>(totalSteps);
+            const int sampleCount = static_cast<int>(sampledValues.size());
+            const float dtMs = totalMs / static_cast<float>(juce::jmax(1, sampleCount - 1));
+            const float alpha = 1.0f - std::exp(-dtMs / juce::jmax(1.0f, smoothingMs));
+
+            float smoothed = sampledValues.front();
+            juce::Path smoothPath;
+            smoothPath.startNewSubPath(sampledX.front(), valueToY(smoothed));
+            for (size_t idx = 1; idx < sampledValues.size(); ++idx)
+            {
+                smoothed += (sampledValues[idx] - smoothed) * juce::jlimit(0.0f, 1.0f, alpha);
+                smoothPath.lineTo(sampledX[idx], valueToY(smoothed));
+            }
+
+            g.setColour(juce::Colour(0xff101010).withAlpha(0.68f));
+            g.strokePath(smoothPath, juce::PathStrokeType(3.4f));
+            g.setColour(kAccent.brighter(0.35f).withAlpha(0.92f));
+            g.strokePath(smoothPath, juce::PathStrokeType(2.2f));
+
+            auto badge = juce::Rectangle<float>(right - 76.0f, top + 1.0f, 74.0f, 13.0f);
+            g.setColour(juce::Colour(0xff111111).withAlpha(0.74f));
+            g.fillRoundedRectangle(badge, 3.0f);
+            g.setColour(kAccent.withAlpha(0.26f));
+            g.drawRoundedRectangle(badge, 3.0f, 1.0f);
+            g.setColour(juce::Colour(0xfff8e7c2).withAlpha(0.92f));
+            g.setFont(8.0f);
+            g.drawText("Smth " + juce::String(static_cast<int>(std::round(smoothingMs))) + "ms",
+                       badge.toNearestInt(), juce::Justification::centred, false);
+        }
     }
     else
     {
-        const float barWidth = juce::jmax(2.0f, xStep * 0.68f);
         for (int i = 0; i < totalSteps; ++i)
         {
-            const auto point = points[static_cast<size_t>(i)];
-            const float x = point.x - (barWidth * 0.5f);
-            float y0 = bottom;
-            float y1 = point.y;
-            if (seq.bipolar)
+            const float stepX = left + (stepWidth * static_cast<float>(i));
+            const int subdiv = subdivisions[static_cast<size_t>(i)];
+            const float startValue = startValues[static_cast<size_t>(i)];
+            const float endValue = endValues[static_cast<size_t>(i)];
+            const float slotWidth = stepWidth / static_cast<float>(juce::jmax(1, subdiv));
+            const float barWidth = juce::jmax(1.0f, slotWidth * 0.72f);
+
+            for (int s = 0; s < subdiv; ++s)
             {
-                y0 = centerY;
-                y1 = point.y;
+                const float t = (subdiv <= 1)
+                    ? 1.0f
+                    : (static_cast<float>(s + 1) / static_cast<float>(subdiv));
+                const float value = (subdiv <= 1)
+                    ? startValue
+                    : juce::jlimit(0.0f, 1.0f, startValue + ((endValue - startValue) * t));
+
+                float y0 = seq.bipolar ? centerY : bottom;
+                const float y1 = valueToY(value);
+                const float x = stepX + (slotWidth * (static_cast<float>(s) + 0.5f)) - (barWidth * 0.5f);
+                const float yTop = juce::jmin(y0, y1);
+                const float h = juce::jmax(1.0f, std::abs(y1 - y0));
+                const float shade = (subdiv <= 1)
+                    ? 0.55f
+                    : juce::jmap(static_cast<float>(s) / static_cast<float>(juce::jmax(1, subdiv - 1)), 0.72f, 0.44f);
+                g.setColour(stripColor.withAlpha(shade));
+                g.fillRoundedRectangle(x, yTop, barWidth, h, 1.5f);
             }
-            const float yTop = juce::jmin(y0, y1);
-            const float h = juce::jmax(1.0f, std::abs(y1 - y0));
-            g.setColour(stripColor.withAlpha(0.55f));
-            g.fillRoundedRectangle(x, yTop, barWidth, h, 1.5f);
         }
     }
 
     for (int i = 0; i < totalSteps; ++i)
     {
-        const auto point = points[static_cast<size_t>(i)];
+        const auto point = stepMarkerPoints[static_cast<size_t>(i)];
         const bool isActive = (i == activeStep);
         g.setColour(isActive ? kAccent : stripColor.withMultipliedBrightness(0.8f));
         g.fillEllipse(point.x - (dotSize * 0.5f), point.y - (dotSize * 0.5f), dotSize, dotSize);
+
+        const int subdiv = subdivisions[static_cast<size_t>(i)];
+        if (subdiv > 1 && stepWidth > 14.0f)
+        {
+            auto label = juce::Rectangle<float>(
+                left + (stepWidth * static_cast<float>(i)),
+                top + 1.0f,
+                juce::jmax(8.0f, stepWidth),
+                juce::jmax(8.0f, juce::jmin(12.0f, height * 0.25f)));
+            g.setColour(juce::Colour(0xfff0f0f0).withAlpha(0.72f));
+            g.setFont(juce::jmax(7.0f, juce::jmin(10.0f, stepWidth * 0.34f)));
+            g.drawText("x" + juce::String(subdiv), label.toNearestInt(), juce::Justification::centred, false);
+        }
     }
 }
 
@@ -1938,106 +2141,47 @@ int StripControl::getModulationStepFromPoint(juce::Point<int> p) const
 void StripControl::applyModulationCellDuplicateFromDrag(int deltaY)
 {
     auto* engine = processor.getAudioEngine();
-    if (!engine || stripIndex >= MlrVSTAudioProcessor::MaxStrips || modTransformStep < 0 || modTransformStep >= modTransformStepCount)
+    if (!engine || stripIndex >= MlrVSTAudioProcessor::MaxStrips || modTransformStep < 0)
         return;
 
-    // Cmd/Ctrl drag edits local virtual density while keeping the cycle duration fixed.
-    // Drag up: more virtual steps around the selected cell.
-    // Drag down: fewer virtual steps around the selected cell.
-    const int sourceCount = juce::jmax(2, modTransformStepCount);
-    const int stepDelta = juce::jlimit(-(sourceCount - 2), 32, (-deltaY) / 14);
-    const int targetCount = juce::jlimit(2, sourceCount + 32, sourceCount + stepDelta);
-    if (targetCount == sourceCount)
-    {
-        for (int i = 0; i < sourceCount; ++i)
-            engine->setModStepValueAbsolute(stripIndex, i, modTransformSourceSteps[static_cast<size_t>(i)]);
-        return;
-    }
-
-    std::vector<float> expanded;
-    expanded.reserve(static_cast<size_t>(juce::jmax(sourceCount, targetCount)));
-    for (int i = 0; i < sourceCount; ++i)
-        expanded.push_back(modTransformSourceSteps[static_cast<size_t>(i)]);
-
-    int pivot = juce::jlimit(0, static_cast<int>(expanded.size()) - 1, modTransformStep);
-    if (targetCount > sourceCount)
-    {
-        const int extraNodes = targetCount - sourceCount;
-        for (int n = 0; n < extraNodes; ++n)
-        {
-            const float v = expanded[static_cast<size_t>(pivot)];
-            expanded.insert(expanded.begin() + (pivot + 1), v);
-            ++pivot;
-        }
-    }
-    else
-    {
-        const int removeNodes = sourceCount - targetCount;
-        for (int n = 0; n < removeNodes && expanded.size() > 2; ++n)
-        {
-            const int left = pivot - 1;
-            const int right = pivot + 1;
-            int removeIdx = -1;
-            if (right < static_cast<int>(expanded.size()) && left >= 0)
-                removeIdx = (n % 2 == 0) ? right : left;
-            else if (right < static_cast<int>(expanded.size()))
-                removeIdx = right;
-            else if (left >= 0)
-                removeIdx = left;
-            if (removeIdx < 0)
-                break;
-            expanded.erase(expanded.begin() + removeIdx);
-            if (removeIdx < pivot)
-                --pivot;
-        }
-    }
-
-    const int expandedCount = static_cast<int>(expanded.size());
-    if (expandedCount <= 0)
+    const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, engine->getModLengthBars(stripIndex));
+    const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
+    if (modTransformStep >= totalSteps)
         return;
 
-    for (int i = 0; i < sourceCount; ++i)
-    {
-        const double phase = (static_cast<double>(i) * static_cast<double>(expandedCount))
-                           / static_cast<double>(sourceCount);
-        const int idxA = juce::jlimit(0, expandedCount - 1, static_cast<int>(std::floor(phase)));
-        const int idxB = (idxA + 1) % expandedCount;
-        const float frac = static_cast<float>(phase - static_cast<double>(idxA));
-        const float v = expanded[static_cast<size_t>(idxA)]
-                      + ((expanded[static_cast<size_t>(idxB)] - expanded[static_cast<size_t>(idxA)]) * frac);
-        engine->setModStepValueAbsolute(stripIndex, i, juce::jlimit(0.0f, 1.0f, v));
-    }
+    const int nextSubdivision = juce::jlimit(
+        1,
+        ModernAudioEngine::ModMaxStepSubdivisions,
+        modTransformStartSubdivision + ((-deltaY) / 14));
+    const float endValue = (nextSubdivision > 1) ? modTransformStartEndValue : modTransformStartValue;
+    engine->setModStepShapeAbsolute(stripIndex, modTransformStep, nextSubdivision, endValue);
 }
 
 void StripControl::applyModulationCellCurveFromDrag(int deltaY, bool rampUpMode)
 {
     auto* engine = processor.getAudioEngine();
-    if (!engine || stripIndex >= MlrVSTAudioProcessor::MaxStrips || modTransformStep < 0 || modTransformStep >= modTransformStepCount)
+    if (!engine || stripIndex >= MlrVSTAudioProcessor::MaxStrips || modTransformStep < 0)
         return;
 
-    const float srcV = modTransformSourceSteps[static_cast<size_t>(modTransformStep)];
-    const float dragNorm = juce::jlimit(-1.0f, 1.0f, static_cast<float>(-deltaY) / 120.0f);
-    float exponent = 1.0f;
-    if (dragNorm >= 0.0f)
-        exponent = 1.0f + (dragNorm * 5.0f);             // stronger curve when dragging up
-    else
-        exponent = 1.0f / (1.0f + ((-dragNorm) * 0.75f)); // flatter curve when dragging down
+    const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, engine->getModLengthBars(stripIndex));
+    const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
+    if (modTransformStep >= totalSteps)
+        return;
 
-    const float clampedSrc = juce::jlimit(0.0f, 1.0f, srcV);
-    float shaped = clampedSrc;
-    if (rampUpMode)
+    int subdivisions = modTransformStartSubdivision;
+    if (subdivisions <= 1)
     {
-        // Control-drag: ramp up / ease-out style (pushes value upward with drag).
-        shaped = 1.0f - std::pow(1.0f - clampedSrc, exponent);
-    }
-    else
-    {
-        // Option-drag: ramp down / ease-in style (pushes value downward with drag).
-        shaped = std::pow(clampedSrc, exponent);
+        subdivisions = juce::jlimit(
+            2,
+            ModernAudioEngine::ModMaxStepSubdivisions,
+            2 + (std::abs(deltaY) / 14));
     }
 
-    shaped = juce::jlimit(0.0f, 1.0f, shaped);
-    engine->setModStepValueAbsolute(stripIndex, modTransformStep, shaped);
+    float startValue = modTransformStartValue;
+    float endValue = modTransformStartEndValue;
+    computeSingleModCellRamp(modTransformStartValue, modTransformStartEndValue, deltaY, rampUpMode, startValue, endValue);
+    engine->setModStepValueAbsolute(stripIndex, modTransformStep, startValue);
+    engine->setModStepShapeAbsolute(stripIndex, modTransformStep, subdivisions, endValue);
 }
 
 void StripControl::mouseDown(const juce::MouseEvent& e)
@@ -2062,27 +2206,44 @@ void StripControl::mouseDown(const juce::MouseEvent& e)
         const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
 
         const auto mods = e.mods;
-        const bool commandDown = mods.isCommandDown();
-        const bool controlDown = mods.isCtrlDown();
-        const bool optionDown = mods.isAltDown();
+        const auto modifierGesture = getStepCellModifierGesture(mods);
         const int clickedStep = getModulationStepFromPoint(e.getPosition());
-        if (clickedStep >= 0 && (commandDown || controlDown || optionDown))
+        if (clickedStep >= 0 && modifierGesture != StepCellModifierGesture::None)
         {
-            modTransformStepCount = totalSteps;
-            for (int i = 0; i < modTransformStepCount; ++i)
-                modTransformSourceSteps[static_cast<size_t>(i)] = engine->getModStepValueAbsolute(stripIndex, i);
             modTransformStartY = e.y;
             modTransformStep = clickedStep;
-            if (commandDown)
-                modTransformMode = ModTransformMode::DuplicateCell;
-            else if (controlDown)
-                modTransformMode = ModTransformMode::ShapeUpCell;
-            else
-                modTransformMode = ModTransformMode::ShapeDownCell;
+            modTransformStartValue = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(stripIndex, clickedStep));
+            modTransformStartSubdivision = juce::jlimit(
+                1,
+                ModernAudioEngine::ModMaxStepSubdivisions,
+                engine->getModStepSubdivisionAbsolute(stripIndex, clickedStep));
+            modTransformStartEndValue = juce::jlimit(
+                0.0f, 1.0f, engine->getModStepEndValueAbsolute(stripIndex, clickedStep));
+            switch (modifierGesture)
+            {
+                case StepCellModifierGesture::Divide:
+                    modTransformMode = ModTransformMode::DuplicateCell;
+                    break;
+                case StepCellModifierGesture::RampUp:
+                    modTransformMode = ModTransformMode::ShapeUpCell;
+                    break;
+                case StepCellModifierGesture::RampDown:
+                    modTransformMode = ModTransformMode::ShapeDownCell;
+                    break;
+                case StepCellModifierGesture::None:
+                default:
+                    modTransformMode = ModTransformMode::None;
+                    break;
+            }
+
+            if (modTransformMode == ModTransformMode::ShapeUpCell)
+                applyModulationCellCurveFromDrag(0, true);
+            else if (modTransformMode == ModTransformMode::ShapeDownCell)
+                applyModulationCellCurveFromDrag(0, false);
             return;
         }
 
-        if (mods.isRightButtonDown() && !commandDown && !controlDown && !optionDown)
+        if (mods.isRightButtonDown() && modifierGesture == StepCellModifierGesture::None)
         {
             for (int i = 0; i < totalSteps; ++i)
                 engine->setModStepValueAbsolute(stripIndex, i, neutralValue);
@@ -5584,10 +5745,18 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
     };
     addAndMakeVisible(pitchScaleBox);
 
+    gestureHintLabel.setText("Cell mods (same as Step): Cmd=Divide  Ctrl=Ramp+  Opt=Ramp-", juce::dontSendNotification);
+    gestureHintLabel.setColour(juce::Label::textColourId, kTextMuted);
+    gestureHintLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
+    gestureHintLabel.setJustificationType(juce::Justification::centredLeft);
+    gestureHintLabel.setTooltip("Modifier drags on mod cells mirror step-sequencer cells.");
+    addAndMakeVisible(gestureHintLabel);
+
     for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
     {
         auto& b = stepButtons[static_cast<size_t>(i)];
         b.setButtonText(juce::String(i + 1));
+        b.setTooltip("Click: toggle step. Cmd+drag: divide. Ctrl+drag: ramp up. Opt+drag: ramp down.");
         b.onClick = [this, i]()
         {
             if (suppressNextStepClick)
@@ -5595,6 +5764,8 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
                 suppressNextStepClick = false;
                 return;
             }
+            if (getStepCellModifierGesture(juce::ModifierKeys::getCurrentModifiersRealtime()) != StepCellModifierGesture::None)
+                return;
             if (auto* engine = processor.getAudioEngine())
                 engine->toggleModStep(selectedStrip, i);
             refreshFromEngine();
@@ -5649,6 +5820,8 @@ void ModulationControlPanel::resized()
     pitchScaleBox.setBounds(scaleRow.removeFromLeft(112));
     scaleRow.removeFromLeft(4);
 
+    bounds.removeFromTop(4);
+    gestureHintLabel.setBounds(bounds.removeFromTop(16));
     bounds.removeFromTop(6);
     const int gap = 4;
     const int w = juce::jmax(20, (bounds.getWidth() - (gap * (ModernAudioEngine::ModSteps - 1))) / ModernAudioEngine::ModSteps);
@@ -5664,30 +5837,51 @@ void ModulationControlPanel::timerCallback()
 
 void ModulationControlPanel::mouseDown(const juce::MouseEvent& e)
 {
-    if (!processor.getAudioEngine())
+    auto* engine = processor.getAudioEngine();
+    if (!engine)
         return;
 
     const int step = stepIndexForComponent(e.eventComponent);
     if (step < 0)
         return;
 
-    const bool commandDown = e.mods.isCommandDown();
-    const bool controlDown = e.mods.isCtrlDown();
-    const bool optionDown = e.mods.isAltDown();
-    if (commandDown || controlDown || optionDown)
+    const auto modifierGesture = getStepCellModifierGesture(e.mods);
+    if (modifierGesture != StepCellModifierGesture::None)
     {
-        const auto state = processor.getAudioEngine()->getModSequencerState(selectedStrip);
-        gestureSourceSteps = state.steps;
-        if (commandDown)
-            gestureMode = EditGestureMode::DuplicateCell;
-        else if (controlDown)
-            gestureMode = EditGestureMode::ShapeUpCell;
-        else
-            gestureMode = EditGestureMode::ShapeDownCell;
+        const auto state = engine->getModSequencerState(selectedStrip);
+        gestureSourceValue = juce::jlimit(0.0f, 1.0f, state.steps[static_cast<size_t>(step)]);
+        gestureSourceSubdivision = juce::jlimit(
+            1,
+            ModernAudioEngine::ModMaxStepSubdivisions,
+            state.stepSubdivisions[static_cast<size_t>(step)]);
+        gestureSourceEndValue = juce::jlimit(0.0f, 1.0f, state.stepEndValues[static_cast<size_t>(step)]);
+        switch (modifierGesture)
+        {
+            case StepCellModifierGesture::Divide:
+                gestureMode = EditGestureMode::DuplicateCell;
+                break;
+            case StepCellModifierGesture::RampUp:
+                gestureMode = EditGestureMode::ShapeUpCell;
+                break;
+            case StepCellModifierGesture::RampDown:
+                gestureMode = EditGestureMode::ShapeDownCell;
+                break;
+            case StepCellModifierGesture::None:
+            default:
+                gestureMode = EditGestureMode::None;
+                break;
+        }
         gestureActive = true;
         gestureStartY = e.getScreenPosition().y;
         gestureStep = step;
         suppressNextStepClick = true;
+
+        if (gestureMode == EditGestureMode::ShapeUpCell)
+            applyShapeGesture(0, true);
+        else if (gestureMode == EditGestureMode::ShapeDownCell)
+            applyShapeGesture(0, false);
+
+        refreshFromEngine();
     }
 }
 
@@ -5730,68 +5924,12 @@ void ModulationControlPanel::applyDuplicateGesture(int deltaY)
     if (!engine || gestureStep < 0 || gestureStep >= ModernAudioEngine::ModSteps)
         return;
 
-    const int stepDelta = juce::jlimit(-(ModernAudioEngine::ModSteps - 2), 32, (-deltaY) / 14);
-    const int targetCount = juce::jlimit(2, ModernAudioEngine::ModSteps + 32, ModernAudioEngine::ModSteps + stepDelta);
-    if (targetCount == ModernAudioEngine::ModSteps)
-    {
-        for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
-            engine->setModStepValue(selectedStrip, i, gestureSourceSteps[static_cast<size_t>(i)]);
-        return;
-    }
-
-    std::vector<float> expanded;
-    expanded.reserve(static_cast<size_t>(juce::jmax(ModernAudioEngine::ModSteps, targetCount)));
-    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
-        expanded.push_back(gestureSourceSteps[static_cast<size_t>(i)]);
-
-    int pivot = juce::jlimit(0, static_cast<int>(expanded.size()) - 1, gestureStep);
-    if (targetCount > ModernAudioEngine::ModSteps)
-    {
-        const int extraNodes = targetCount - ModernAudioEngine::ModSteps;
-        for (int n = 0; n < extraNodes; ++n)
-        {
-            const float v = expanded[static_cast<size_t>(pivot)];
-            expanded.insert(expanded.begin() + (pivot + 1), v);
-            ++pivot;
-        }
-    }
-    else
-    {
-        const int removeNodes = ModernAudioEngine::ModSteps - targetCount;
-        for (int n = 0; n < removeNodes && expanded.size() > 2; ++n)
-        {
-            const int left = pivot - 1;
-            const int right = pivot + 1;
-            int removeIdx = -1;
-            if (right < static_cast<int>(expanded.size()) && left >= 0)
-                removeIdx = (n % 2 == 0) ? right : left;
-            else if (right < static_cast<int>(expanded.size()))
-                removeIdx = right;
-            else if (left >= 0)
-                removeIdx = left;
-            if (removeIdx < 0)
-                break;
-            expanded.erase(expanded.begin() + removeIdx);
-            if (removeIdx < pivot)
-                --pivot;
-        }
-    }
-
-    const int expandedCount = static_cast<int>(expanded.size());
-    if (expandedCount <= 0)
-        return;
-
-    for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
-    {
-        const double phase = (static_cast<double>(i) * static_cast<double>(expandedCount))
-                           / static_cast<double>(ModernAudioEngine::ModSteps);
-        const int idxA = juce::jlimit(0, expandedCount - 1, static_cast<int>(std::floor(phase)));
-        const int idxB = (idxA + 1) % expandedCount;
-        const float frac = static_cast<float>(phase - static_cast<double>(idxA));
-        const float v = expanded[static_cast<size_t>(idxA)]
-                      + ((expanded[static_cast<size_t>(idxB)] - expanded[static_cast<size_t>(idxA)]) * frac);
-        engine->setModStepValue(selectedStrip, i, juce::jlimit(0.0f, 1.0f, v));
-    }
+    const int nextSubdivision = juce::jlimit(
+        1,
+        ModernAudioEngine::ModMaxStepSubdivisions,
+        gestureSourceSubdivision + ((-deltaY) / 14));
+    const float endValue = (nextSubdivision > 1) ? gestureSourceEndValue : gestureSourceValue;
+    engine->setModStepShape(selectedStrip, gestureStep, nextSubdivision, endValue);
 }
 
 void ModulationControlPanel::applyShapeGesture(int deltaY, bool rampUpMode)
@@ -5800,21 +5938,20 @@ void ModulationControlPanel::applyShapeGesture(int deltaY, bool rampUpMode)
     if (!engine || gestureStep < 0 || gestureStep >= ModernAudioEngine::ModSteps)
         return;
 
-    const float srcV = gestureSourceSteps[static_cast<size_t>(gestureStep)];
-    const float dragNorm = juce::jlimit(-1.0f, 1.0f, static_cast<float>(-deltaY) / 120.0f);
-    float exponent = 1.0f;
-    if (dragNorm >= 0.0f)
-        exponent = 1.0f + (dragNorm * 5.0f);
-    else
-        exponent = 1.0f / (1.0f + ((-dragNorm) * 0.75f));
-    const float clampedSrc = juce::jlimit(0.0f, 1.0f, srcV);
-    float shaped = clampedSrc;
-    if (rampUpMode)
-        shaped = 1.0f - std::pow(1.0f - clampedSrc, exponent);
-    else
-        shaped = std::pow(clampedSrc, exponent);
-    shaped = juce::jlimit(0.0f, 1.0f, shaped);
-    engine->setModStepValue(selectedStrip, gestureStep, shaped);
+    int subdivisions = gestureSourceSubdivision;
+    if (subdivisions <= 1)
+    {
+        subdivisions = juce::jlimit(
+            2,
+            ModernAudioEngine::ModMaxStepSubdivisions,
+            2 + (std::abs(deltaY) / 14));
+    }
+
+    float startValue = gestureSourceValue;
+    float endValue = gestureSourceEndValue;
+    computeSingleModCellRamp(gestureSourceValue, gestureSourceEndValue, deltaY, rampUpMode, startValue, endValue);
+    engine->setModStepValue(selectedStrip, gestureStep, startValue);
+    engine->setModStepShape(selectedStrip, gestureStep, subdivisions, endValue);
 }
 
 void ModulationControlPanel::refreshFromEngine()
@@ -5844,11 +5981,25 @@ void ModulationControlPanel::refreshFromEngine()
     for (int i = 0; i < ModernAudioEngine::ModSteps; ++i)
     {
         auto& b = stepButtons[static_cast<size_t>(i)];
-        const bool on = state.steps[static_cast<size_t>(i)] >= 0.5f;
-        juce::Colour c = on ? kAccent.withMultipliedBrightness(0.9f) : juce::Colour(0xff2f2f2f);
+        const float value = juce::jlimit(0.0f, 1.0f, state.steps[static_cast<size_t>(i)]);
+        const int subdivisions = juce::jlimit(
+            1,
+            ModernAudioEngine::ModMaxStepSubdivisions,
+            state.stepSubdivisions[static_cast<size_t>(i)]);
+        const float endValue = juce::jlimit(0.0f, 1.0f, state.stepEndValues[static_cast<size_t>(i)]);
+        const auto offColour = juce::Colour(0xff2f2f2f);
+        const auto onColour = kAccent.withMultipliedBrightness(0.9f);
+        juce::Colour c = offColour.interpolatedWith(onColour, value);
+        if (subdivisions > 1)
+            c = c.interpolatedWith(juce::Colour(0xfff0f6ff), 0.16f);
         if (i == activeStep)
-            c = on ? juce::Colour(0xffffcf75) : juce::Colour(0xff5a4a2f);
+            c = c.interpolatedWith(juce::Colour(0xffffcf75), 0.55f);
         b.setColour(juce::TextButton::buttonColourId, c);
+        b.setTooltip("Step " + juce::String(i + 1)
+                     + ": " + juce::String(static_cast<int>(std::round(value * 100.0f))) + "%\n"
+                     + "Shape: x" + juce::String(subdivisions)
+                     + "  end " + juce::String(static_cast<int>(std::round(endValue * 100.0f))) + "%\n"
+                     + "Click: toggle step. Cmd+drag: divide. Ctrl+drag: ramp up. Opt+drag: ramp down.");
     }
 }
 

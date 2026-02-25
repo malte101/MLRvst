@@ -1345,6 +1345,34 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             }
             return juce::jlimit(0, 6, static_cast<int>(std::round((1.0f - v) * 6.0f)));
         };
+        auto curveLevelForRow = [&](int row, bool isPoint)
+        {
+            // Value-encoded intensity: high values (top rows) are more solid,
+            // low values (bottom rows) are dimmer.
+            const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / 6.0f));
+            const int base = juce::jlimit(1, 15, static_cast<int>(std::round(juce::jmap(rowValue01, 2.0f, 12.0f))));
+            return juce::jlimit(1, 15, isPoint ? (base + 2) : base);
+        };
+        auto stepLevelForRow = [&](int row, int pointRow, int baseRow)
+        {
+            const int minRow = juce::jmin(baseRow, pointRow);
+            const int maxRow = juce::jmax(baseRow, pointRow);
+            if (row < minRow || row > maxRow)
+                return 0;
+
+            const float barRange = static_cast<float>(std::abs(pointRow - baseRow));
+            const float fromBase = static_cast<float>(std::abs(row - baseRow));
+            const float t = (barRange > 0.0f) ? (fromBase / barRange) : 1.0f; // 0 at base, 1 at point
+            const float shapedT = std::pow(juce::jlimit(0.0f, 1.0f, t), 0.72f);
+
+            const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / 6.0f));
+            const float minLevel = seq.bipolar ? 3.0f : 2.0f;
+            const float maxLevel = 9.0f + (4.0f * rowValue01); // 9..13, brighter for higher values
+            int level = static_cast<int>(std::round(minLevel + ((maxLevel - minLevel) * shapedT)));
+            if (row == pointRow)
+                level += 2;
+            return juce::jlimit(1, 15, level);
+        };
 
         for (int x = 0; x < 16; ++x)
         {
@@ -1354,24 +1382,23 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
 
             if (seq.curveMode)
             {
-                int level = (displayRow == pointRow) ? 10 : 1;
+                int level = 0;
+                if (displayRow == pointRow)
+                    level = juce::jmax(level, curveLevelForRow(displayRow, true));
                 if (x < 15)
                 {
                     const int nextRow = valueToRow(seq.steps[static_cast<size_t>(x + 1)]);
                     const int minRow = juce::jmin(pointRow, nextRow);
                     const int maxRow = juce::jmax(pointRow, nextRow);
                     if (displayRow >= minRow && displayRow <= maxRow)
-                        level = juce::jmax(level, 6);
+                        level = juce::jmax(level, curveLevelForRow(displayRow, false));
                 }
                 newLedState[x][GROUP_ROW] = level;
             }
             else
             {
                 const int baseRow = seq.bipolar ? 3 : 6;
-                const int minRow = juce::jmin(baseRow, pointRow);
-                const int maxRow = juce::jmax(baseRow, pointRow);
-                if (displayRow >= minRow && displayRow <= maxRow)
-                    newLedState[x][GROUP_ROW] = (displayRow == pointRow) ? 10 : 5;
+                newLedState[x][GROUP_ROW] = stepLevelForRow(displayRow, pointRow, baseRow);
             }
 
             if (stripPlaying && x == activeStep)
@@ -1680,6 +1707,34 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                 }
                 return juce::jlimit(0, 6, static_cast<int>(std::round((1.0f - v) * 6.0f)));
             };
+            auto curveLevelForRow = [&](int row, bool isPoint)
+            {
+                // Value-encoded intensity: high values (top rows) are more solid,
+                // low values (bottom rows) are dimmer.
+                const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / 6.0f));
+                const int base = juce::jlimit(1, 15, static_cast<int>(std::round(juce::jmap(rowValue01, 2.0f, 12.0f))));
+                return juce::jlimit(1, 15, isPoint ? (base + 2) : base);
+            };
+            auto stepLevelForRow = [&](int row, int pointRow, int baseRow)
+            {
+                const int minRow = juce::jmin(baseRow, pointRow);
+                const int maxRow = juce::jmax(baseRow, pointRow);
+                if (row < minRow || row > maxRow)
+                    return 0;
+
+                const float barRange = static_cast<float>(std::abs(pointRow - baseRow));
+                const float fromBase = static_cast<float>(std::abs(row - baseRow));
+                const float t = (barRange > 0.0f) ? (fromBase / barRange) : 1.0f; // 0 at base, 1 at point
+                const float shapedT = std::pow(juce::jlimit(0.0f, 1.0f, t), 0.72f);
+
+                const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / 6.0f));
+                const float minLevel = seq.bipolar ? 3.0f : 2.0f;
+                const float maxLevel = 9.0f + (4.0f * rowValue01); // 9..13, brighter for higher values
+                int level = static_cast<int>(std::round(minLevel + ((maxLevel - minLevel) * shapedT)));
+                if (row == pointRow)
+                    level += 2;
+                return juce::jlimit(1, 15, level);
+            };
 
             for (int x = 0; x < 16; ++x)
             {
@@ -1690,14 +1745,16 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                 if (seq.curveMode)
                 {
                     // Draw point + interpolated line to next point for readable curve graph.
-                    int level = (displayRow == pointRow) ? 10 : 1;
+                    int level = 0;
+                    if (displayRow == pointRow)
+                        level = juce::jmax(level, curveLevelForRow(displayRow, true));
                     if (x < 15)
                     {
                         const int nextRow = valueToRow(seq.steps[static_cast<size_t>(x + 1)]);
                         const int minRow = juce::jmin(pointRow, nextRow);
                         const int maxRow = juce::jmax(pointRow, nextRow);
                         if (displayRow >= minRow && displayRow <= maxRow)
-                            level = juce::jmax(level, 6);
+                            level = juce::jmax(level, curveLevelForRow(displayRow, false));
                     }
                     newLedState[x][y] = level;
                 }
@@ -1705,10 +1762,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                 {
                     // Step-slider mode: vertical bar to value.
                     const int baseRow = seq.bipolar ? 3 : 6;
-                    const int minRow = juce::jmin(baseRow, pointRow);
-                    const int maxRow = juce::jmax(baseRow, pointRow);
-                    if (displayRow >= minRow && displayRow <= maxRow)
-                        newLedState[x][y] = (displayRow == pointRow) ? 10 : 5;
+                    newLedState[x][y] = stepLevelForRow(displayRow, pointRow, baseRow);
                 }
 
                 if (stripPlaying && x == activeStep)

@@ -196,6 +196,21 @@ install(TARGETS mlrVST
     RUNTIME DESTINATION bin
 )
 
+if(APPLE)
+    set(MLRVST_MAC_INSTALL_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/scripts/install_macos_plugins.sh")
+    if(EXISTS "${MLRVST_MAC_INSTALL_SCRIPT}")
+        add_custom_target(install_plugins_user
+            COMMAND "${MLRVST_MAC_INSTALL_SCRIPT}" --user --build-dir "${CMAKE_BINARY_DIR}"
+            USES_TERMINAL
+            COMMENT "Install mlrVST plugin bundles to user plugin folders")
+
+        add_custom_target(install_plugins_system
+            COMMAND "${MLRVST_MAC_INSTALL_SCRIPT}" --system --build-dir "${CMAKE_BINARY_DIR}"
+            USES_TERMINAL
+            COMMENT "Install mlrVST plugin bundles to system plugin folders (sudo may prompt)")
+    endif()
+endif()
+
 # Print configuration
 message(STATUS "")
 message(STATUS "═══════════════════════════════════════════════════════")
@@ -215,9 +230,11 @@ if(APPLE)
     message(STATUS "  VST3: ${CMAKE_BINARY_DIR}/mlrVST_artefacts/Release/VST3/mlrVST.vst3")
     message(STATUS "  AU:   ${CMAKE_BINARY_DIR}/mlrVST_artefacts/Release/AU/mlrVST.component")
     message(STATUS "")
-    message(STATUS "To install system-wide manually (admin required):")
-    message(STATUS "  sudo cp -R ${CMAKE_BINARY_DIR}/mlrVST_artefacts/Release/VST3/mlrVST.vst3 /Library/Audio/Plug-Ins/VST3/")
-    message(STATUS "  sudo cp -R ${CMAKE_BINARY_DIR}/mlrVST_artefacts/Release/AU/mlrVST.component /Library/Audio/Plug-Ins/Components/")
+    message(STATUS "To install plugin bundles:")
+    message(STATUS "  cmake --build ${CMAKE_BINARY_DIR} --target install_plugins_user")
+    message(STATUS "  cmake --build ${CMAKE_BINARY_DIR} --target install_plugins_system")
+    message(STATUS "  # or")
+    message(STATUS "  scripts/install_macos_plugins.sh --system --build-dir ${CMAKE_BINARY_DIR}")
     message(STATUS "")
     message(STATUS "Build artifacts will be in:")
     message(STATUS "  ${CMAKE_BINARY_DIR}/mlrVST_artefacts/")

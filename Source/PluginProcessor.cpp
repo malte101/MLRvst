@@ -3843,7 +3843,7 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
         audioEngine->setModEditPage(i, 0);
         audioEngine->setModSmoothingMs(i, 0.0f);
         audioEngine->setModCurveBend(i, 0.0f);
-        audioEngine->setModCurveShape(i, ModernAudioEngine::ModCurveShape::Power);
+        audioEngine->setModCurveShape(i, ModernAudioEngine::ModCurveShape::Linear);
         audioEngine->setModPitchScaleQuantize(i, false);
         audioEngine->setModPitchScale(i, ModernAudioEngine::PitchScale::Chromatic);
         for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)

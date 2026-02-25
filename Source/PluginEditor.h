@@ -492,8 +492,9 @@ private:
     ModTransformMode modTransformMode = ModTransformMode::None;
     int modTransformStartY = 0;
     int modTransformStep = -1;
-    int modTransformStepCount = ModernAudioEngine::ModSteps;
-    std::array<float, ModernAudioEngine::ModTotalSteps> modTransformSourceSteps{};
+    int modTransformStartSubdivision = 1;
+    float modTransformStartValue = 0.0f;
+    float modTransformStartEndValue = 0.0f;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(StripControl)
 };
@@ -820,6 +821,7 @@ private:
     juce::ComboBox pageBox;
     juce::Label smoothLabel;
     juce::Slider smoothSlider;
+    juce::Label gestureHintLabel;
     juce::ToggleButton pitchScaleToggle;
     juce::Label pitchScaleLabel;
     juce::ComboBox pitchScaleBox;
@@ -829,7 +831,9 @@ private:
     bool suppressNextStepClick = false;
     int gestureStartY = 0;
     int gestureStep = -1;
-    std::array<float, ModernAudioEngine::ModSteps> gestureSourceSteps{};
+    int gestureSourceSubdivision = 1;
+    float gestureSourceValue = 0.0f;
+    float gestureSourceEndValue = 0.0f;
 
     void refreshFromEngine();
     int stepIndexForComponent(juce::Component* c) const;

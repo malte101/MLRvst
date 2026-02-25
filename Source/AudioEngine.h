@@ -1094,6 +1094,7 @@ public:
     static constexpr int ModSteps = 16;
     static constexpr int MaxModBars = 8;
     static constexpr int ModTotalSteps = ModSteps * MaxModBars;
+    static constexpr int ModMaxStepSubdivisions = 16;
 
     enum class ModTarget
     {
@@ -1134,6 +1135,9 @@ public:
         bool pitchScaleQuantize = false;
         int pitchScale = 0;
         std::array<float, ModSteps> steps{};
+        std::array<int, ModSteps> stepSubdivisions{};
+        std::array<float, ModSteps> stepEndValues{};
+        std::array<int, ModSteps> stepCurveShapes{};
     };
 
     enum class PitchScale
@@ -1147,10 +1151,11 @@ public:
 
     enum class ModCurveShape
     {
-        Power = 0,
-        SCurve,
-        Snap,
-        Stair
+        Linear = 0,
+        ExponentialUp,
+        ExponentialDown,
+        Sine,
+        Square
     };
     
     ModernAudioEngine();
@@ -1209,6 +1214,13 @@ public:
     float getModStepValue(int stripIndex, int step) const;
     void setModStepValueAbsolute(int stripIndex, int absoluteStep, float value01);
     float getModStepValueAbsolute(int stripIndex, int absoluteStep) const;
+    void setModStepShape(int stripIndex, int step, int subdivisions, float endValue01);
+    void setModStepShapeAbsolute(int stripIndex, int absoluteStep, int subdivisions, float endValue01);
+    int getModStepSubdivisionAbsolute(int stripIndex, int absoluteStep) const;
+    float getModStepEndValueAbsolute(int stripIndex, int absoluteStep) const;
+    void setModStepCurveShape(int stripIndex, int step, ModCurveShape shape);
+    void setModStepCurveShapeAbsolute(int stripIndex, int absoluteStep, ModCurveShape shape);
+    ModCurveShape getModStepCurveShapeAbsolute(int stripIndex, int absoluteStep) const;
     void toggleModStep(int stripIndex, int step);
     void clearModSteps(int stripIndex);
     int getModCurrentStep(int stripIndex) const;
@@ -1279,10 +1291,13 @@ private:
         std::atomic<int> editPage{0};
         std::atomic<float> smoothingMs{0.0f};
         std::atomic<float> curveBend{0.0f};
-        std::atomic<int> curveShape{static_cast<int>(ModCurveShape::Power)};
+        std::atomic<int> curveShape{static_cast<int>(ModCurveShape::Linear)};
         std::atomic<int> pitchScaleQuantize{0};
         std::atomic<int> pitchScale{static_cast<int>(PitchScale::Chromatic)};
         std::array<std::atomic<float>, ModTotalSteps> steps;
+        std::array<std::atomic<int>, ModTotalSteps> stepSubdivisions;
+        std::array<std::atomic<float>, ModTotalSteps> stepEndValues;
+        std::array<std::atomic<int>, ModTotalSteps> stepCurveShapes;
         float smoothedRaw = 0.0f;
         float grainDezipperedRaw = 0.0f;
         float pitchDezipperedRaw = 0.0f;
