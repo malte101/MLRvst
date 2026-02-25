@@ -1,188 +1,319 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="2500" height="1800" viewBox="0 0 2500 1800">
+<svg xmlns="http://www.w3.org/2000/svg" width="3200" height="2350" viewBox="0 0 3200 2350">
   <defs>
     <style>
-      .title { font: 700 40px 'Arial', sans-serif; fill: #0f172a; }
+      .title { font: 700 44px 'Arial', sans-serif; fill: #0f172a; }
       .subtitle { font: 500 18px 'Arial', sans-serif; fill: #334155; }
-      .small { font: 500 14px 'Arial', sans-serif; fill: #334155; }
-      .label { font: 600 16px 'Arial', sans-serif; fill: #0f172a; }
+      .section { font: 700 24px 'Arial', sans-serif; fill: #0f172a; }
+      .label { font: 600 15px 'Arial', sans-serif; fill: #0f172a; }
       .tiny { font: 600 11px 'Arial', sans-serif; fill: #0f172a; }
-      .cellText { font: 600 11px 'Arial', sans-serif; fill: #0f172a; }
-      .boxTitle { font: 700 20px 'Arial', sans-serif; fill: #0f172a; }
-      .boxText { font: 500 15px 'Arial', sans-serif; fill: #1e293b; }
-      .muted { fill: #64748b; }
+      .body { font: 500 15px 'Arial', sans-serif; fill: #1e293b; }
+      .muted { font: 500 13px 'Arial', sans-serif; fill: #64748b; }
+      .chip { font: 700 13px 'Arial', sans-serif; fill: #0f172a; }
+      .rowBandNormal { fill: #e0f2fe; }
+      .rowBandPattern { fill: #dcfce7; }
+      .rowBandScratch { fill: #ffedd5; }
+      .rowBandStutter { fill: #fce7f3; }
+      .rowBandStrip { fill: #e5e7eb; }
+      .rowBandControl { fill: #dbeafe; }
+      .rowBandControlAux { fill: #ede9fe; }
+      .rowBandQuant { fill: #fef3c7; }
+      .card { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .cardStrong { fill: #ffffff; stroke: #94a3b8; stroke-width: 2.2; }
+      .gridStroke { stroke: #94a3b8; stroke-width: 1; }
+      .gridHeavy { stroke: #64748b; stroke-width: 1.8; }
     </style>
-    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L0,6 L9,3 z" fill="#2563eb"/>
-    </marker>
   </defs>
 
-  <rect x="0" y="0" width="2500" height="1800" fill="#f8fafc"/>
+  <rect x="0" y="0" width="3200" height="2350" fill="#f3f6fb"/>
 
-  <text x="70" y="70" class="title">mlrVST Monome Grid Schematic (16x8, Current)</text>
-  <text x="70" y="100" class="subtitle">Control-row page order is user-reorderable. Default order shown here: SPD PAN VOL GRN SWG GATE BRW GRP FLT PIT MOD PST STEP.</text>
+  <text x="70" y="72" class="title">mlrVST Monome Grid Schematics (16x8) - Structured Reference</text>
+  <text x="70" y="104" class="subtitle">Current code-path mapping. Row-7 page order is user-reorderable; default order in this sheet: SPD PAN VOL GRN SWG GATE BRW GRP FLT PIT MOD PST STEP.</text>
 
-  <!-- Grid background -->
-  <rect x="70" y="160" width="980" height="520" rx="14" fill="#e2e8f0" stroke="#94a3b8" stroke-width="2"/>
+  <!-- LEFT: MAIN GRID MAP -->
+  <rect x="70" y="170" width="1320" height="980" rx="14" class="cardStrong"/>
+  <text x="92" y="206" class="section">A) Physical Grid Map</text>
+  <text x="92" y="232" class="muted">Rows: y0 system/group row, y1..y6 strip rows, y7 control-page row.</text>
 
-  <!-- Column headers -->
-  <g>
-    <text x="110" y="150" class="label">x0</text>
-    <text x="168" y="150" class="label">x1</text>
-    <text x="226" y="150" class="label">x2</text>
-    <text x="284" y="150" class="label">x3</text>
-    <text x="342" y="150" class="label">x4</text>
-    <text x="400" y="150" class="label">x5</text>
-    <text x="458" y="150" class="label">x6</text>
-    <text x="516" y="150" class="label">x7</text>
-    <text x="574" y="150" class="label">x8</text>
-    <text x="632" y="150" class="label">x9</text>
-    <text x="690" y="150" class="label">x10</text>
-    <text x="748" y="150" class="label">x11</text>
-    <text x="806" y="150" class="label">x12</text>
-    <text x="864" y="150" class="label">x13</text>
-    <text x="922" y="150" class="label">x14</text>
-    <text x="980" y="150" class="label">x15</text>
+  <!-- Grid frame -->
+  <rect x="220" y="280" width="1024" height="512" rx="8" fill="#f8fafc" stroke="#64748b" stroke-width="2"/>
+
+  <!-- Row highlight bands -->
+  <!-- y0 segmented -->
+  <rect x="220" y="280" width="256" height="64" class="rowBandNormal"/>
+  <rect x="476" y="280" width="256" height="64" class="rowBandPattern"/>
+  <rect x="732" y="280" width="64" height="64" class="rowBandScratch"/>
+  <rect x="796" y="280" width="448" height="64" class="rowBandStutter"/>
+
+  <!-- y1..y6 strip rows -->
+  <rect x="220" y="344" width="1024" height="384" class="rowBandStrip"/>
+
+  <!-- y7 segmented -->
+  <rect x="220" y="728" width="832" height="64" class="rowBandControl"/>
+  <rect x="1052" y="728" width="128" height="64" class="rowBandControlAux"/>
+  <rect x="1180" y="728" width="64" height="64" class="rowBandQuant"/>
+
+  <!-- Grid lines -->
+  <g class="gridStroke">
+    <line x1="220" y1="280" x2="220" y2="792"/>
+    <line x1="284" y1="280" x2="284" y2="792"/>
+    <line x1="348" y1="280" x2="348" y2="792"/>
+    <line x1="412" y1="280" x2="412" y2="792"/>
+    <line x1="476" y1="280" x2="476" y2="792"/>
+    <line x1="540" y1="280" x2="540" y2="792"/>
+    <line x1="604" y1="280" x2="604" y2="792"/>
+    <line x1="668" y1="280" x2="668" y2="792"/>
+    <line x1="732" y1="280" x2="732" y2="792"/>
+    <line x1="796" y1="280" x2="796" y2="792"/>
+    <line x1="860" y1="280" x2="860" y2="792"/>
+    <line x1="924" y1="280" x2="924" y2="792"/>
+    <line x1="988" y1="280" x2="988" y2="792"/>
+    <line x1="1052" y1="280" x2="1052" y2="792"/>
+    <line x1="1116" y1="280" x2="1116" y2="792"/>
+    <line x1="1180" y1="280" x2="1180" y2="792"/>
+    <line x1="1244" y1="280" x2="1244" y2="792"/>
+
+    <line x1="220" y1="280" x2="1244" y2="280"/>
+    <line x1="220" y1="344" x2="1244" y2="344"/>
+    <line x1="220" y1="408" x2="1244" y2="408"/>
+    <line x1="220" y1="472" x2="1244" y2="472"/>
+    <line x1="220" y1="536" x2="1244" y2="536"/>
+    <line x1="220" y1="600" x2="1244" y2="600"/>
+    <line x1="220" y1="664" x2="1244" y2="664"/>
+    <line x1="220" y1="728" x2="1244" y2="728"/>
+    <line x1="220" y1="792" x2="1244" y2="792"/>
   </g>
 
-  <!-- Row labels -->
-  <g>
-    <text x="20" y="193" class="label">y0</text>
-    <text x="20" y="251" class="label">y1</text>
-    <text x="20" y="309" class="label">y2</text>
-    <text x="20" y="367" class="label">y3</text>
-    <text x="20" y="425" class="label">y4</text>
-    <text x="20" y="483" class="label">y5</text>
-    <text x="20" y="541" class="label">y6</text>
-    <text x="20" y="599" class="label">y7</text>
+  <g class="gridHeavy">
+    <line x1="220" y1="280" x2="1244" y2="280"/>
+    <line x1="220" y1="344" x2="1244" y2="344"/>
+    <line x1="220" y1="728" x2="1244" y2="728"/>
+    <line x1="220" y1="792" x2="1244" y2="792"/>
   </g>
 
-  <!-- Highlighted areas -->
-  <g>
-    <!-- row 0 normal-page zones -->
-    <rect x="92" y="170" width="232" height="58" fill="#bfdbfe" stroke="#64748b"/>
-    <rect x="324" y="170" width="232" height="58" fill="#d9f99d" stroke="#64748b"/>
-    <rect x="556" y="170" width="58" height="58" fill="#fed7aa" stroke="#64748b"/>
-    <rect x="614" y="170" width="406" height="58" fill="#fbcfe8" stroke="#64748b"/>
+  <!-- x labels -->
+  <text x="245" y="268" class="tiny">x0</text>
+  <text x="309" y="268" class="tiny">x1</text>
+  <text x="373" y="268" class="tiny">x2</text>
+  <text x="437" y="268" class="tiny">x3</text>
+  <text x="501" y="268" class="tiny">x4</text>
+  <text x="565" y="268" class="tiny">x5</text>
+  <text x="629" y="268" class="tiny">x6</text>
+  <text x="693" y="268" class="tiny">x7</text>
+  <text x="757" y="268" class="tiny">x8</text>
+  <text x="821" y="268" class="tiny">x9</text>
+  <text x="881" y="268" class="tiny">x10</text>
+  <text x="945" y="268" class="tiny">x11</text>
+  <text x="1009" y="268" class="tiny">x12</text>
+  <text x="1073" y="268" class="tiny">x13</text>
+  <text x="1137" y="268" class="tiny">x14</text>
+  <text x="1201" y="268" class="tiny">x15</text>
 
-    <!-- strip rows -->
-    <rect x="92" y="228" width="928" height="348" fill="#e5e7eb" stroke="#64748b"/>
+  <!-- y labels -->
+  <text x="165" y="318" class="label">y0</text>
+  <text x="158" y="382" class="label">y1</text>
+  <text x="158" y="446" class="label">y2</text>
+  <text x="158" y="510" class="label">y3</text>
+  <text x="158" y="574" class="label">y4</text>
+  <text x="158" y="638" class="label">y5</text>
+  <text x="158" y="702" class="label">y6</text>
+  <text x="158" y="766" class="label">y7</text>
 
-    <!-- row 7 control row -->
-    <rect x="92" y="576" width="754" height="58" fill="#bae6fd" stroke="#64748b"/>
-    <rect x="846" y="576" width="116" height="58" fill="#ddd6fe" stroke="#64748b"/>
-    <rect x="962" y="576" width="58" height="58" fill="#fde68a" stroke="#64748b"/>
+  <!-- in-grid labels -->
+  <text x="232" y="318" class="tiny">Groups 1..4</text>
+  <text x="490" y="318" class="tiny">Pattern 1..4</text>
+  <text x="737" y="318" class="tiny">Scratch</text>
+  <text x="808" y="318" class="tiny">Stutter: 1/4, 1/4T, 1/8, 1/8T, 1/16, 1/32, 1/32T</text>
 
-    <!-- grid lines -->
-    <g stroke="#94a3b8" stroke-width="1">
-      <line x1="92" y1="170" x2="92" y2="634"/>
-      <line x1="150" y1="170" x2="150" y2="634"/>
-      <line x1="208" y1="170" x2="208" y2="634"/>
-      <line x1="266" y1="170" x2="266" y2="634"/>
-      <line x1="324" y1="170" x2="324" y2="634"/>
-      <line x1="382" y1="170" x2="382" y2="634"/>
-      <line x1="440" y1="170" x2="440" y2="634"/>
-      <line x1="498" y1="170" x2="498" y2="634"/>
-      <line x1="556" y1="170" x2="556" y2="634"/>
-      <line x1="614" y1="170" x2="614" y2="634"/>
-      <line x1="672" y1="170" x2="672" y2="634"/>
-      <line x1="730" y1="170" x2="730" y2="634"/>
-      <line x1="788" y1="170" x2="788" y2="634"/>
-      <line x1="846" y1="170" x2="846" y2="634"/>
-      <line x1="904" y1="170" x2="904" y2="634"/>
-      <line x1="962" y1="170" x2="962" y2="634"/>
-      <line x1="1020" y1="170" x2="1020" y2="634"/>
+  <text x="232" y="382" class="tiny">Strip 1 lane</text>
+  <text x="232" y="446" class="tiny">Strip 2 lane</text>
+  <text x="232" y="510" class="tiny">Strip 3 lane</text>
+  <text x="232" y="574" class="tiny">Strip 4 lane</text>
+  <text x="232" y="638" class="tiny">Strip 5 lane</text>
+  <text x="232" y="702" class="tiny">Strip 6 lane</text>
 
-      <line x1="92" y1="170" x2="1020" y2="170"/>
-      <line x1="92" y1="228" x2="1020" y2="228"/>
-      <line x1="92" y1="286" x2="1020" y2="286"/>
-      <line x1="92" y1="344" x2="1020" y2="344"/>
-      <line x1="92" y1="402" x2="1020" y2="402"/>
-      <line x1="92" y1="460" x2="1020" y2="460"/>
-      <line x1="92" y1="518" x2="1020" y2="518"/>
-      <line x1="92" y1="576" x2="1020" y2="576"/>
-      <line x1="92" y1="634" x2="1020" y2="634"/>
-    </g>
-  </g>
+  <text x="232" y="766" class="tiny">Pages x0..x12</text>
+  <text x="1064" y="766" class="tiny">Step -/+</text>
+  <text x="1192" y="766" class="tiny">Quant</text>
 
-  <!-- Grid text -->
-  <text x="110" y="204" class="cellText">Groups 1..4</text>
-  <text x="338" y="204" class="cellText">Pattern 1..4</text>
-  <text x="566" y="204" class="cellText">Scratch</text>
-  <text x="624" y="204" class="cellText">Stutter rates: 9=1/4, 10=1/4T, 11=1/8, 12=1/8T, 13=1/16, 14=1/32, 15=1/32T</text>
+  <!-- control-row tiny map -->
+  <text x="220" y="824" class="muted">x0 SPD   x1 PAN   x2 VOL   x3 GRN   x4 SWG   x5 GATE   x6 BRW   x7 GRP   x8 FLT   x9 PIT   x10 MOD   x11 PST   x12 STEP   x13 -1st   x14 +1st   x15 QTZ</text>
 
-  <text x="105" y="257" class="small">Strip 1</text>
-  <text x="105" y="315" class="small">Strip 2</text>
-  <text x="105" y="373" class="small">Strip 3</text>
-  <text x="105" y="431" class="small">Strip 4</text>
-  <text x="105" y="489" class="small">Strip 5</text>
-  <text x="105" y="547" class="small">Strip 6</text>
+  <!-- row notes -->
+  <rect x="92" y="850" width="1260" height="280" rx="10" class="card"/>
+  <text x="110" y="882" class="label">Row Notes</text>
+  <text x="110" y="910" class="body">- y0 on Normal page: groups + pattern controls + scratch/stutter system controls.</text>
+  <text x="110" y="936" class="body">- y0 on Step Edit page: tool selectors (x0..x7) and strip selectors (x8..x13).</text>
+  <text x="110" y="962" class="body">- y1..y6 always address strips; exact behavior depends on current page/mode.</text>
+  <text x="110" y="988" class="body">- y7 x13/x14 are pitch +/- only in Step Edit page; otherwise they are page-adjacent utility cells.</text>
+  <text x="110" y="1014" class="body">- y7 x15 toggles quantize and shows metronome pulse/downbeat on LEDs.</text>
+  <text x="110" y="1040" class="body">- Main page still allows step toggling when a strip is in Step mode.</text>
 
-  <text x="245" y="404" class="label">Rows y1..y6 = strip lanes (mode-dependent)</text>
-  <text x="245" y="427" class="small">Normal page: trigger/play cells. Step strips can still be toggled from main page.</text>
+  <!-- LEFT LOWER: RULES -->
+  <rect x="70" y="1170" width="1320" height="500" rx="14" class="cardStrong"/>
+  <text x="92" y="1206" class="section">B) Interaction, Timing, and Gesture Rules</text>
+  <text x="92" y="1234" class="body">- Control pages can be Momentary (hold) or Latched (toggle), configured in Global Controls.</text>
+  <text x="92" y="1262" class="body">- Loop-mode two-button gesture on same strip: press A then B to set inner loop A..B.</text>
+  <text x="92" y="1290" class="body">- If B is left of A, loop direction is reverse.</text>
+  <text x="92" y="1318" class="body">- If inner loop is active, next trigger clears loop and retriggers at pressed column (quantized).</text>
+  <text x="92" y="1346" class="body">- Scratch hold (y0 x8) is a normal-page momentary macro.</text>
+  <text x="92" y="1374" class="body">- Stutter hold (y0 x9..x15) supports multi-button combinations while held.</text>
+  <text x="92" y="1402" class="body">- Browser favorites: tap recalls folder; hold ~3s stores current folder into slot.</text>
+  <text x="92" y="1430" class="body">- Browser Prev/Next on empty strip loads first file in current browsing folder context.</text>
+  <text x="92" y="1458" class="body">- Step editor concepts are mirrored in GUI modifiers: Cmd divide, Ctrl ramp+, Opt ramp-, Shift toggle.</text>
+  <text x="92" y="1486" class="body">- Cmd+Shift in GUI toggles Step Selection tool, and selection is preserved across tool toggles.</text>
 
-  <text x="102" y="611" class="cellText">Control pages x0..x12</text>
-  <text x="852" y="611" class="cellText">Step +/-</text>
-  <text x="968" y="611" class="cellText">Quant</text>
+  <rect x="92" y="1512" width="1260" height="136" rx="10" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1.5"/>
+  <text x="110" y="1540" class="label">LED Semantics (common)</text>
+  <text x="110" y="1566" class="body">- High level = active/current value; mid level = background/fill; low level = inactive but available.</text>
+  <text x="110" y="1592" class="body">- Blink often indicates transport-linked states (recording, loaded preset, stutter active, metronome pulse).</text>
+  <text x="110" y="1618" class="body">- In step and modulation views, current play position is emphasized over static programmed values.</text>
 
-  <!-- Control row default labels -->
-  <text x="94"  y="656" class="tiny muted">x0 SPD</text>
-  <text x="152" y="656" class="tiny muted">x1 PAN</text>
-  <text x="210" y="656" class="tiny muted">x2 VOL</text>
-  <text x="268" y="656" class="tiny muted">x3 GRN</text>
-  <text x="326" y="656" class="tiny muted">x4 SWG</text>
-  <text x="384" y="656" class="tiny muted">x5 GATE</text>
-  <text x="442" y="656" class="tiny muted">x6 BRW</text>
-  <text x="500" y="656" class="tiny muted">x7 GRP</text>
-  <text x="558" y="656" class="tiny muted">x8 FLT</text>
-  <text x="616" y="656" class="tiny muted">x9 PIT</text>
-  <text x="674" y="656" class="tiny muted">x10 MOD</text>
-  <text x="732" y="656" class="tiny muted">x11 PST</text>
-  <text x="790" y="656" class="tiny muted">x12 STEP</text>
-  <text x="848" y="656" class="tiny muted">x13 -1st</text>
-  <text x="906" y="656" class="tiny muted">x14 +1st</text>
-  <text x="964" y="656" class="tiny muted">x15 QTZ</text>
+  <!-- LEFT BOTTOM: LEGEND + SOURCES -->
+  <rect x="70" y="1690" width="1320" height="560" rx="14" class="cardStrong"/>
+  <text x="92" y="1726" class="section">C) Legend and Color Keys</text>
 
-  <!-- Right callout boxes -->
-  <rect x="1100" y="170" width="1320" height="320" rx="12" fill="#ffffff" stroke="#93c5fd" stroke-width="2"/>
-  <text x="1120" y="200" class="boxTitle">Normal Page (NORM)</text>
-  <text x="1120" y="230" class="boxText">• y0: x0..3 group mute, x4..7 pattern control, x8 scratch hold, x9..15 stutter hold.</text>
-  <text x="1120" y="255" class="boxText">• y1..6: strip triggers (0..15).</text>
-  <text x="1120" y="280" class="boxText">• If strip is in Step mode, main-page presses still toggle visible step cells.</text>
-  <text x="1120" y="305" class="boxText">• Loop mode two-button gesture: press A then B on same strip to set inner loop A..B.</text>
-  <text x="1120" y="330" class="boxText">  If B &lt; A, reverse direction loop is set.</text>
-  <text x="1120" y="355" class="boxText">• Next press while inner loop is active clears loop and retriggers at pressed column (quantized).</text>
-  <text x="1120" y="380" class="boxText">• Row 7 opens control pages (momentary or latch depends on Global Controls &gt; Momentary).</text>
-  <text x="1120" y="405" class="boxText">• x15 on row 7 toggles quantize and also carries metronome pulse LED.</text>
+  <rect x="92" y="1750" width="24" height="24" class="rowBandNormal" stroke="#64748b"/>
+  <text x="128" y="1768" class="body">Group controls zone</text>
+  <rect x="92" y="1782" width="24" height="24" class="rowBandPattern" stroke="#64748b"/>
+  <text x="128" y="1800" class="body">Pattern controls zone</text>
+  <rect x="92" y="1814" width="24" height="24" class="rowBandScratch" stroke="#64748b"/>
+  <text x="128" y="1832" class="body">Scratch hold zone</text>
+  <rect x="92" y="1846" width="24" height="24" class="rowBandStutter" stroke="#64748b"/>
+  <text x="128" y="1864" class="body">Stutter hold zone</text>
+  <rect x="92" y="1878" width="24" height="24" class="rowBandStrip" stroke="#64748b"/>
+  <text x="128" y="1896" class="body">Strip lane rows</text>
+  <rect x="92" y="1910" width="24" height="24" class="rowBandControl" stroke="#64748b"/>
+  <text x="128" y="1928" class="body">Control pages band</text>
+  <rect x="92" y="1942" width="24" height="24" class="rowBandControlAux" stroke="#64748b"/>
+  <text x="128" y="1960" class="body">Step +/- utility cells</text>
+  <rect x="92" y="1974" width="24" height="24" class="rowBandQuant" stroke="#64748b"/>
+  <text x="128" y="1992" class="body">Quantize toggle / metronome pulse cell</text>
 
-  <rect x="1100" y="510" width="1320" height="430" rx="12" fill="#ffffff" stroke="#86efac" stroke-width="2"/>
-  <text x="1120" y="540" class="boxTitle">Step Edit Page (row7 x12 by default)</text>
-  <text x="1120" y="570" class="boxText">• y0, x0..7 tools: Velocity, Divide, Ramp+, Ramp-, Probability, Attack, Decay, Pitch.</text>
-  <text x="1120" y="595" class="boxText">• y0, x8..13: select target strip for step editing.</text>
-  <text x="1120" y="620" class="boxText">• y1..6: edit 16 visible steps of the selected strip.</text>
-  <text x="1120" y="645" class="boxText">• Velocity tool: bottom row y6 disables steps (explicit off row).</text>
-  <text x="1120" y="670" class="boxText">• Divide tool minimum is x2; Ramp tools auto-create divide x2 when needed.</text>
-  <text x="1120" y="695" class="boxText">• Attack/Decay tools set strip step envelope; Pitch tool sets strip pitch -24..+24 semitones.</text>
-  <text x="1120" y="720" class="boxText">• y7 x13/x14: selected-strip pitch -/+ 1 semitone; y7 x15: quantize toggle.</text>
-  <text x="1120" y="745" class="boxText">• GUI step editor shortcuts match monome concepts: Cmd divide, Ctrl ramp+, Opt ramp-, Shift toggle.</text>
-  <text x="1120" y="770" class="boxText">• Cmd+Shift in GUI toggles Select tool; selected-step edits apply over full selected range.</text>
+  <text x="92" y="2036" class="label">Source Files Used</text>
+  <text x="92" y="2064" class="muted">Source/MonomeController.cpp</text>
+  <text x="92" y="2088" class="muted">Source/MonomeMixActions.cpp</text>
+  <text x="92" y="2112" class="muted">Source/MonomeFileBrowserActions.cpp</text>
+  <text x="92" y="2136" class="muted">Source/MonomeGroupAssignActions.cpp</text>
+  <text x="92" y="2160" class="muted">Source/MonomeFilterActions.cpp</text>
+  <text x="92" y="2184" class="muted">Source/StepSequencerDisplay.h</text>
+  <text x="92" y="2208" class="muted">Source/PluginEditor.cpp</text>
 
-  <rect x="1100" y="960" width="1320" height="430" rx="12" fill="#ffffff" stroke="#fda4af" stroke-width="2"/>
-  <text x="1120" y="990" class="boxTitle">Other Control Pages</text>
-  <text x="1120" y="1020" class="boxText">Browser (BRW): x0 Prev, x1 Next, x2 spacer, x3..8 favorites, x11..14 bars 1/2/4/8, x15 capture.</text>
-  <text x="1120" y="1045" class="boxText">• Favorite slots: tap=recall folder, hold ~3s=save current folder to slot.</text>
-  <text x="1120" y="1070" class="boxText">• Empty strip behavior: Prev/Next loads first file in active folder context.</text>
-  <text x="1120" y="1095" class="boxText">Group (GRP): x0 none, x1..4 groups, x6..11 direction modes, x13..15 strip mode Loop/Step/Grain.</text>
-  <text x="1120" y="1120" class="boxText">Modulation (MOD): y0..6 acts as value graph; x selects step, y sets value (bipolar aware).</text>
-  <text x="1120" y="1145" class="boxText">Preset (PST): full 16x7 grid is preset slots. Tap=load, hold=save, double-tap=delete.</text>
-  <text x="1120" y="1170" class="boxText">Mix pages (SPD/PIT/PAN/VOL/SWG/GATE/GRN/FLT) map x-position to per-strip parameter values.</text>
-  <text x="1120" y="1195" class="boxText">Top row is reserved in most non-normal pages, except Modulation, Preset, and Step Edit.</text>
-  <text x="1120" y="1220" class="boxText">Control page order can be changed in the Monome Pages panel and is persisted.</text>
+  <!-- RIGHT TOP: PAGE ORDER -->
+  <rect x="1450" y="170" width="1680" height="300" rx="14" class="cardStrong"/>
+  <text x="1472" y="206" class="section">D) Control Row Default Order (y7)</text>
+  <text x="1472" y="232" class="muted">This order is user-editable in Monome Pages panel and persisted in settings.</text>
 
-  <!-- Arrows -->
-  <line x1="620" y1="198" x2="1090" y2="245" stroke="#2563eb" stroke-width="3" marker-end="url(#arrow)"/>
-  <line x1="500" y1="610" x2="1090" y2="575" stroke="#16a34a" stroke-width="3" marker-end="url(#arrow)"/>
-  <line x1="360" y1="410" x2="1090" y2="1115" stroke="#dc2626" stroke-width="3" marker-end="url(#arrow)"/>
+  <!-- chips row 1 -->
+  <rect x="1472" y="252" width="190" height="60" rx="10" fill="#dbeafe" stroke="#93c5fd"/>
+  <text x="1484" y="288" class="chip">x0  SPD</text>
+  <rect x="1676" y="252" width="190" height="60" rx="10" fill="#dbeafe" stroke="#93c5fd"/>
+  <text x="1688" y="288" class="chip">x1  PAN</text>
+  <rect x="1880" y="252" width="190" height="60" rx="10" fill="#dbeafe" stroke="#93c5fd"/>
+  <text x="1892" y="288" class="chip">x2  VOL</text>
+  <rect x="2084" y="252" width="190" height="60" rx="10" fill="#dbeafe" stroke="#93c5fd"/>
+  <text x="2096" y="288" class="chip">x3  GRN</text>
+  <rect x="2288" y="252" width="190" height="60" rx="10" fill="#dbeafe" stroke="#93c5fd"/>
+  <text x="2300" y="288" class="chip">x4  SWG</text>
+  <rect x="2492" y="252" width="190" height="60" rx="10" fill="#dbeafe" stroke="#93c5fd"/>
+  <text x="2504" y="288" class="chip">x5  GATE</text>
+  <rect x="2696" y="252" width="190" height="60" rx="10" fill="#fef3c7" stroke="#f59e0b"/>
+  <text x="2708" y="288" class="chip">x6  BRW</text>
+  <rect x="2900" y="252" width="190" height="60" rx="10" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="2912" y="288" class="chip">x7  GRP</text>
+
+  <!-- chips row 2 -->
+  <rect x="1472" y="326" width="190" height="60" rx="10" fill="#e0e7ff" stroke="#818cf8"/>
+  <text x="1484" y="362" class="chip">x8  FLT</text>
+  <rect x="1676" y="326" width="190" height="60" rx="10" fill="#dbeafe" stroke="#93c5fd"/>
+  <text x="1688" y="362" class="chip">x9  PIT</text>
+  <rect x="1880" y="326" width="190" height="60" rx="10" fill="#fee2e2" stroke="#f87171"/>
+  <text x="1892" y="362" class="chip">x10 MOD</text>
+  <rect x="2084" y="326" width="190" height="60" rx="10" fill="#f5f3ff" stroke="#a78bfa"/>
+  <text x="2096" y="362" class="chip">x11 PST</text>
+  <rect x="2288" y="326" width="190" height="60" rx="10" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="2300" y="362" class="chip">x12 STEP</text>
+  <rect x="2492" y="326" width="190" height="60" rx="10" fill="#ede9fe" stroke="#a78bfa"/>
+  <text x="2504" y="362" class="chip">x13 -1st</text>
+  <rect x="2696" y="326" width="190" height="60" rx="10" fill="#ede9fe" stroke="#a78bfa"/>
+  <text x="2708" y="362" class="chip">x14 +1st</text>
+  <rect x="2900" y="326" width="190" height="60" rx="10" fill="#fef3c7" stroke="#f59e0b"/>
+  <text x="2912" y="362" class="chip">x15 QTZ</text>
+
+  <!-- RIGHT MAIN: MODE CARDS -->
+  <!-- Row 1 -->
+  <rect x="1450" y="500" width="825" height="500" rx="14" class="card"/>
+  <text x="1472" y="536" class="section">E1) Normal Page (NORM)</text>
+  <text x="1472" y="566" class="body">- y0 x0..3: group mute/unmute.</text>
+  <text x="1472" y="592" class="body">- y0 x4..7: pattern record/play/stop.</text>
+  <text x="1472" y="618" class="body">- y0 x8: momentary scratch hold.</text>
+  <text x="1472" y="644" class="body">- y0 x9..15: stutter division holds.</text>
+  <text x="1472" y="670" class="body">- y1..6: strip triggers, quantized as configured.</text>
+  <text x="1472" y="696" class="body">- Loop mode: A then B sets inner loop range.</text>
+  <text x="1472" y="722" class="body">- Inner-loop active: next trigger clears + retriggers.</text>
+  <text x="1472" y="748" class="body">- Step strips can still toggle visible steps here.</text>
+  <text x="1472" y="774" class="body">- Grain strips show anchor/secondary/play markers on LEDs.</text>
+
+  <rect x="2305" y="500" width="825" height="500" rx="14" class="card"/>
+  <text x="2327" y="536" class="section">E2) Step Edit Page (STEP)</text>
+  <text x="2327" y="566" class="body">- y0 x0..7 tools: Vel, Divide, Ramp+, Ramp-, Prob, A, D, Pitch.</text>
+  <text x="2327" y="592" class="body">- y0 x8..13: select editing strip.</text>
+  <text x="2327" y="618" class="body">- y1..6 x0..15: edit visible 16 steps of selected strip.</text>
+  <text x="2327" y="644" class="body">- Velocity tool: y6 is explicit step-off row.</text>
+  <text x="2327" y="670" class="body">- Divide tool minimum = x2.</text>
+  <text x="2327" y="696" class="body">- Ramp tools auto-create divide x2 when needed.</text>
+  <text x="2327" y="722" class="body">- y7 x13/x14 pitch semitone -/+ for selected strip.</text>
+  <text x="2327" y="748" class="body">- y7 x15 quantize toggle.</text>
+  <text x="2327" y="774" class="body">- GUI parity: Cmd divide, Ctrl ramp+, Opt ramp-, Shift toggle, Cmd+Shift select tool.</text>
+
+  <!-- Row 2 -->
+  <rect x="1450" y="1030" width="825" height="500" rx="14" class="card"/>
+  <text x="1472" y="1066" class="section">E3) Browser Page (BRW)</text>
+  <text x="1472" y="1096" class="body">- Per-strip row controls:</text>
+  <text x="1472" y="1122" class="body">  x0 Prev sample, x1 Next sample.</text>
+  <text x="1472" y="1148" class="body">  x2 spacer (unused).</text>
+  <text x="1472" y="1174" class="body">  x3..x8 favorite folder slots (6 slots).</text>
+  <text x="1472" y="1200" class="body">  x11..x14 recording bars 1/2/4/8.</text>
+  <text x="1472" y="1226" class="body">  x15 capture recent input audio to strip.</text>
+  <text x="1472" y="1252" class="body">- Favorite slot tap recalls path; hold ~3s stores path.</text>
+  <text x="1472" y="1278" class="body">- Missing folders are safely rejected and flagged by LED burst.</text>
+  <text x="1472" y="1304" class="body">- Empty strip Prev/Next loads first file in current folder context.</text>
+
+  <rect x="2305" y="1030" width="825" height="500" rx="14" class="card"/>
+  <text x="2327" y="1066" class="section">E4) Group Page (GRP)</text>
+  <text x="2327" y="1096" class="body">- Per-strip row layout:</text>
+  <text x="2327" y="1122" class="body">  x0 none, x1..x4 assign Group 1..4.</text>
+  <text x="2327" y="1148" class="body">  x5 spacer.</text>
+  <text x="2327" y="1174" class="body">  x6..x11 direction modes:</text>
+  <text x="2327" y="1200" class="body">    Normal, Reverse, PingPong, Random, RandomWalk, RandomSlice.</text>
+  <text x="2327" y="1226" class="body">  x12 spacer.</text>
+  <text x="2327" y="1252" class="body">  x13..x15 strip play mode: Loop, Step, Grain.</text>
+  <text x="2327" y="1278" class="body">- Group LEDs indicate assigned group and mode states.</text>
+  <text x="2327" y="1304" class="body">- Group mute on Normal page is independent from assignment page editing.</text>
+
+  <!-- Row 3 -->
+  <rect x="1450" y="1560" width="825" height="500" rx="14" class="card"/>
+  <text x="1472" y="1596" class="section">E5) Mod / Preset / Filter Notes</text>
+  <text x="1472" y="1626" class="body">- MOD page: x indexes steps, y sets values (bipolar-aware graph).</text>
+  <text x="1472" y="1652" class="body">- Selected MOD strip follows last pressed strip row.</text>
+  <text x="1472" y="1678" class="body">- PST page: full 16x7 grid maps to 112 preset slots.</text>
+  <text x="1472" y="1704" class="body">- PST gestures: tap load, hold save, double-tap delete.</text>
+  <text x="1472" y="1730" class="body">- FLT page rows map current filter subpage parameters.</text>
+  <text x="1472" y="1756" class="body">- Filter subpages: Frequency, Resonance, Type.</text>
+  <text x="1472" y="1782" class="body">- Top row is reserved/disabled in most non-normal pages.</text>
+  <text x="1472" y="1808" class="body">- Step Edit, Modulation, and Preset pages are top-row exceptions.</text>
+
+  <rect x="2305" y="1560" width="825" height="500" rx="14" class="card"/>
+  <text x="2327" y="1596" class="section">E6) Parameter Pages Quick Map</text>
+  <text x="2327" y="1626" class="body">- SPD: rhythmic speed / pitch-set behavior in step mode.</text>
+  <text x="2327" y="1652" class="body">- PIT: semitone set mapping (-12..+12).</text>
+  <text x="2327" y="1678" class="body">- PAN: left-to-right bipolar mapping.</text>
+  <text x="2327" y="1704" class="body">- VOL: 0..1 level mapping.</text>
+  <text x="2327" y="1730" class="body">- SWG: swing amount 0..1.</text>
+  <text x="2327" y="1756" class="body">- GATE: gate amount 0..1.</text>
+  <text x="2327" y="1782" class="body">- GRN: row-addressed grain parameter banks for selected strip.</text>
+  <text x="2327" y="1808" class="body">- FLT: frequency/resonance/type edit page for strip filter.</text>
+  <text x="2327" y="1834" class="body">- All pages still use y1..y6 strip rows as data lanes.</text>
 
   <!-- Footer -->
-  <text x="70" y="1760" class="small muted">Generated from Source/MonomeController.cpp, Source/MonomeMixActions.cpp, Source/MonomeFileBrowserActions.cpp, Source/MonomeGroupAssignActions.cpp, Source/PluginEditor.cpp, Source/StepSequencerDisplay.h</text>
+  <text x="70" y="2320" class="muted">Schematic generated from current source behavior: MonomeController, Monome*Actions, StepSequencerDisplay, and related editor mappings.</text>
 </svg>
