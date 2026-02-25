@@ -928,7 +928,7 @@ bool loadPreset(int presetIndex,
             strip->restoreSampleAnalysisCache(cachedTransient, cachedRms, cachedZeroCross, analysisSampleCount);
         }
         strip->setTransientSliceMode(stripXml->getBoolAttribute("transientSliceMode", false));
-        strip->setPitchShift(clampedFloat(stripXml->getDoubleAttribute("pitchShift", 0.0), 0.0f, -12.0f, 12.0f));
+        strip->setPitchShift(clampedFloat(stripXml->getDoubleAttribute("pitchShift", 0.0), 0.0f, -24.0f, 24.0f));
         strip->setRecordingBars(clampedInt(stripXml->getIntAttribute("recordingBars", 1), 1, 8, 1));
         const bool restoreFilterEnabled = stripXml->getBoolAttribute("filterEnabled", false);
         strip->setFilterFrequency(clampedFloat(stripXml->getDoubleAttribute("filterFrequency", 20000.0), 20000.0f, 20.0f, 20000.0f));

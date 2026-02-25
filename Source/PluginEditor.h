@@ -476,7 +476,7 @@ private:
     void applyModulationPoint(juce::Point<int> p);
     int getModulationStepFromPoint(juce::Point<int> p) const;
     void applyModulationCellDuplicateFromDrag(int deltaY);
-    void applyModulationCellCurveFromDrag(int deltaY);
+    void applyModulationCellCurveFromDrag(int deltaY, bool rampUpMode);
     void hideAllPrimaryControls();
     void hideAllGrainControls();
     void updateGrainOverlayVisibility();
@@ -486,7 +486,8 @@ private:
     {
         None = 0,
         DuplicateCell,
-        ShapeCell
+        ShapeUpCell,
+        ShapeDownCell
     };
     ModTransformMode modTransformMode = ModTransformMode::None;
     int modTransformStartY = 0;
@@ -797,7 +798,8 @@ private:
     {
         None = 0,
         DuplicateCell,
-        ShapeCell
+        ShapeUpCell,
+        ShapeDownCell
     };
 
     MlrVSTAudioProcessor& processor;
@@ -832,7 +834,7 @@ private:
     void refreshFromEngine();
     int stepIndexForComponent(juce::Component* c) const;
     void applyDuplicateGesture(int deltaY);
-    void applyShapeGesture(int deltaY);
+    void applyShapeGesture(int deltaY, bool rampUpMode);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ModulationControlPanel)
 };

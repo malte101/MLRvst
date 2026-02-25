@@ -194,8 +194,16 @@ public:
         Loop,
         Step
     };
+    static constexpr int BrowserFavoriteSlots = 6;
     juce::File getDefaultSampleDirectory(int stripIndex, SamplePathMode mode) const;
     void setDefaultSampleDirectory(int stripIndex, SamplePathMode mode, const juce::File& directory);
+    juce::File getCurrentBrowserDirectoryForStrip(int stripIndex) const;
+    juce::File getBrowserFavoriteDirectory(int slot) const;
+    bool isBrowserFavoritePadHeld(int stripIndex, int slot) const;
+    bool isBrowserFavoriteSaveBurstActive(int slot, uint32_t nowMs) const;
+    bool isBrowserFavoriteMissingBurstActive(int slot, uint32_t nowMs) const;
+    void beginBrowserFavoritePadHold(int stripIndex, int slot);
+    void endBrowserFavoritePadHold(int stripIndex, int slot);
     
     // Control mode (for GUI to check if level/pan/etc controls are active)
     enum class ControlMode
@@ -212,12 +220,13 @@ public:
         FileBrowser,
         GroupAssign,
         Modulation,
-        Preset
+        Preset,
+        StepEdit
     };
     ControlMode getCurrentControlMode() const { return currentControlMode; }
     bool isControlModeActive() const { return controlModeActive; }
     static juce::String getControlModeName(ControlMode mode);
-    static constexpr int NumControlRowPages = 12;
+    static constexpr int NumControlRowPages = 13;
     using ControlPageOrder = std::array<ControlMode, NumControlRowPages>;
     ControlPageOrder getControlPageOrder() const;
     ControlMode getControlModeForControlButton(int buttonIndex) const;
@@ -229,6 +238,27 @@ public:
     void setSwingDivisionSelection(int mode);
     int getSwingDivisionSelection() const { return swingDivisionSelection.load(std::memory_order_acquire); }
     int getLastMonomePressedStripRow() const { return lastMonomePressedStripRow.load(std::memory_order_acquire); }
+    bool isStepEditModeActive() const
+    {
+        return controlModeActive && currentControlMode == ControlMode::StepEdit;
+    }
+    int getStepEditToolIndex() const
+    {
+        switch (stepEditTool)
+        {
+            case StepEditTool::Gate: return 0;
+            case StepEditTool::Velocity: return 1;
+            case StepEditTool::Divide: return 2;
+            case StepEditTool::RampUp: return 3;
+            case StepEditTool::RampDown: return 4;
+            case StepEditTool::Probability: return 5;
+            case StepEditTool::Attack: return 6;
+            case StepEditTool::Decay: return 7;
+            case StepEditTool::Release: return 8;
+            default: return 0;
+        }
+    }
+    int getStepEditSelectedStrip() const { return juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip); }
     
     // Preset management
     void savePreset(int presetIndex);
@@ -256,6 +286,19 @@ private:
         Frequency,    // Button 0 on group row
         Resonance,    // Button 1 on group row
         Type          // Button 2 on group row
+    };
+
+    enum class StepEditTool
+    {
+        Gate,
+        Velocity,
+        Divide,
+        RampUp,
+        RampDown,
+        Probability,
+        Attack,
+        Decay,
+        Release
     };
     
     std::unique_ptr<ModernAudioEngine> audioEngine;
@@ -325,8 +368,11 @@ private:
         ControlMode::Filter,
         ControlMode::Pitch,
         ControlMode::Modulation,
-        ControlMode::Preset
+        ControlMode::Preset,
+        ControlMode::StepEdit
     };
+    StepEditTool stepEditTool = StepEditTool::Gate;
+    int stepEditSelectedStrip = 0;
     std::atomic<bool> controlPageMomentary{true};
     std::atomic<int> swingDivisionSelection{1}; // 0=1/4,1=1/8,2=1/16,3=Triplet
     
@@ -337,6 +383,15 @@ private:
     juce::File lastSampleFolder;
     std::array<juce::File, MaxStrips> defaultLoopDirectories;
     std::array<juce::File, MaxStrips> defaultStepDirectories;
+    std::array<juce::File, BrowserFavoriteSlots> browserFavoriteDirectories;
+    std::array<std::array<bool, BrowserFavoriteSlots>, MaxStrips> browserFavoritePadHeld{};
+    std::array<std::array<bool, BrowserFavoriteSlots>, MaxStrips> browserFavoritePadHoldSaveTriggered{};
+    std::array<std::array<uint32_t, BrowserFavoriteSlots>, MaxStrips> browserFavoritePadPressStartMs{};
+    std::array<uint32_t, BrowserFavoriteSlots> browserFavoriteSaveBurstUntilMs{};
+    std::array<uint32_t, BrowserFavoriteSlots> browserFavoriteMissingBurstUntilMs{};
+    static constexpr uint32_t browserFavoriteHoldSaveMs = 3000;
+    static constexpr uint32_t browserFavoriteSaveBurstDurationMs = 320;
+    static constexpr uint32_t browserFavoriteMissingBurstDurationMs = 260;
     
     // Current file per strip for proper next/prev browsing
     juce::File currentStripFiles[8];
@@ -351,6 +406,10 @@ private:
     
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     void cacheParameterPointers();
+    SamplePathMode getSamplePathModeForStrip(int stripIndex) const;
+    bool saveBrowserFavoriteDirectoryFromStrip(int stripIndex, int slot);
+    bool recallBrowserFavoriteDirectoryForStrip(int stripIndex, int slot);
+    bool isAudioFileSupported(const juce::File& file) const;
     void loadDefaultPathsFromState(const juce::ValueTree& state);
     void appendDefaultPathsToState(juce::ValueTree& state) const;
     void loadControlPagesFromState(const juce::ValueTree& state);

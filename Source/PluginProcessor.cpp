@@ -59,6 +59,7 @@ juce::String controlModeToKey(MlrVSTAudioProcessor::ControlMode mode)
         case MlrVSTAudioProcessor::ControlMode::GroupAssign: return "group";
         case MlrVSTAudioProcessor::ControlMode::Modulation: return "modulation";
         case MlrVSTAudioProcessor::ControlMode::Preset: return "preset";
+        case MlrVSTAudioProcessor::ControlMode::StepEdit: return "stepedit";
         case MlrVSTAudioProcessor::ControlMode::Normal:
         default: return "normal";
     }
@@ -79,6 +80,7 @@ bool controlModeFromKey(const juce::String& key, MlrVSTAudioProcessor::ControlMo
     if (normalized == "group") { mode = MlrVSTAudioProcessor::ControlMode::GroupAssign; return true; }
     if (normalized == "mod" || normalized == "modulation") { mode = MlrVSTAudioProcessor::ControlMode::Modulation; return true; }
     if (normalized == "preset") { mode = MlrVSTAudioProcessor::ControlMode::Preset; return true; }
+    if (normalized == "stepedit" || normalized == "step_edit" || normalized == "step") { mode = MlrVSTAudioProcessor::ControlMode::StepEdit; return true; }
     return false;
 }
 
@@ -959,6 +961,7 @@ juce::String MlrVSTAudioProcessor::getControlModeName(ControlMode mode)
         case ControlMode::GroupAssign: return "Group";
         case ControlMode::Modulation: return "Modulation";
         case ControlMode::Preset: return "Preset";
+        case ControlMode::StepEdit: return "Step Edit";
         case ControlMode::Normal:
         default: return "Normal";
     }
@@ -1120,7 +1123,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         layout.add(std::make_unique<juce::AudioParameterFloat>(
             "stripPitch" + juce::String(i),
             "Strip " + juce::String(i + 1) + " Pitch",
-            juce::NormalisableRange<float>(-12.0f, 12.0f, 0.01f),
+            juce::NormalisableRange<float>(-24.0f, 24.0f, 0.01f),
             0.0f));
     }
     
@@ -2876,6 +2879,141 @@ juce::File MlrVSTAudioProcessor::getDefaultSampleDirectory(int stripIndex, Sampl
     return mode == SamplePathMode::Step ? defaultStepDirectories[idx] : defaultLoopDirectories[idx];
 }
 
+MlrVSTAudioProcessor::SamplePathMode MlrVSTAudioProcessor::getSamplePathModeForStrip(int stripIndex) const
+{
+    if (!audioEngine || stripIndex < 0 || stripIndex >= MaxStrips)
+        return SamplePathMode::Loop;
+
+    if (auto* strip = audioEngine->getStrip(stripIndex))
+    {
+        if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+            return SamplePathMode::Step;
+    }
+
+    return SamplePathMode::Loop;
+}
+
+juce::File MlrVSTAudioProcessor::getCurrentBrowserDirectoryForStrip(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return {};
+
+    const auto isValidDir = [](const juce::File& dir)
+    {
+        return dir != juce::File() && dir.exists() && dir.isDirectory();
+    };
+
+    const auto mode = getSamplePathModeForStrip(stripIndex);
+    auto selectedDir = getDefaultSampleDirectory(stripIndex, mode);
+    if (isValidDir(selectedDir))
+        return selectedDir;
+
+    const auto fallbackMode = (mode == SamplePathMode::Step)
+        ? SamplePathMode::Loop
+        : SamplePathMode::Step;
+    auto fallbackDir = getDefaultSampleDirectory(stripIndex, fallbackMode);
+    if (isValidDir(fallbackDir))
+        return fallbackDir;
+
+    const auto currentFile = currentStripFiles[stripIndex];
+    auto currentDir = currentFile.getParentDirectory();
+    if (isValidDir(currentDir))
+        return currentDir;
+
+    // Cross-strip fallback so empty step strips can still browse immediately.
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        if (isValidDir(defaultStepDirectories[static_cast<size_t>(i)]))
+            return defaultStepDirectories[static_cast<size_t>(i)];
+        if (isValidDir(defaultLoopDirectories[static_cast<size_t>(i)]))
+            return defaultLoopDirectories[static_cast<size_t>(i)];
+
+        const auto otherCurrentDir = currentStripFiles[i].getParentDirectory();
+        if (isValidDir(otherCurrentDir))
+            return otherCurrentDir;
+    }
+
+    for (const auto& favoriteDir : browserFavoriteDirectories)
+    {
+        if (isValidDir(favoriteDir))
+            return favoriteDir;
+    }
+
+    if (isValidDir(lastSampleFolder))
+        return lastSampleFolder;
+
+    // Last-resort fallback: allow browsing from home even with no configured paths.
+    const auto homeDir = juce::File::getSpecialLocation(juce::File::userHomeDirectory);
+    if (isValidDir(homeDir))
+        return homeDir;
+
+    return {};
+}
+
+juce::File MlrVSTAudioProcessor::getBrowserFavoriteDirectory(int slot) const
+{
+    if (slot < 0 || slot >= BrowserFavoriteSlots)
+        return {};
+
+    return browserFavoriteDirectories[static_cast<size_t>(slot)];
+}
+
+bool MlrVSTAudioProcessor::isBrowserFavoritePadHeld(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || slot < 0 || slot >= BrowserFavoriteSlots)
+        return false;
+
+    return browserFavoritePadHeld[static_cast<size_t>(stripIndex)][static_cast<size_t>(slot)];
+}
+
+bool MlrVSTAudioProcessor::isBrowserFavoriteSaveBurstActive(int slot, uint32_t nowMs) const
+{
+    if (slot < 0 || slot >= BrowserFavoriteSlots)
+        return false;
+
+    return nowMs < browserFavoriteSaveBurstUntilMs[static_cast<size_t>(slot)];
+}
+
+bool MlrVSTAudioProcessor::isBrowserFavoriteMissingBurstActive(int slot, uint32_t nowMs) const
+{
+    if (slot < 0 || slot >= BrowserFavoriteSlots)
+        return false;
+
+    return nowMs < browserFavoriteMissingBurstUntilMs[static_cast<size_t>(slot)];
+}
+
+void MlrVSTAudioProcessor::beginBrowserFavoritePadHold(int stripIndex, int slot)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || slot < 0 || slot >= BrowserFavoriteSlots)
+        return;
+
+    const auto stripIdx = static_cast<size_t>(stripIndex);
+    const auto slotIdx = static_cast<size_t>(slot);
+    browserFavoritePadHeld[stripIdx][slotIdx] = true;
+    browserFavoritePadHoldSaveTriggered[stripIdx][slotIdx] = false;
+    browserFavoritePadPressStartMs[stripIdx][slotIdx] = juce::Time::getMillisecondCounter();
+}
+
+void MlrVSTAudioProcessor::endBrowserFavoritePadHold(int stripIndex, int slot)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || slot < 0 || slot >= BrowserFavoriteSlots)
+        return;
+
+    const auto stripIdx = static_cast<size_t>(stripIndex);
+    const auto slotIdx = static_cast<size_t>(slot);
+    const bool wasHeld = browserFavoritePadHeld[stripIdx][slotIdx];
+    const bool holdSaveTriggered = browserFavoritePadHoldSaveTriggered[stripIdx][slotIdx];
+
+    if (wasHeld && !holdSaveTriggered)
+    {
+        if (!recallBrowserFavoriteDirectoryForStrip(stripIndex, slot))
+            browserFavoriteMissingBurstUntilMs[slotIdx] = juce::Time::getMillisecondCounter() + browserFavoriteMissingBurstDurationMs;
+    }
+
+    browserFavoritePadHeld[stripIdx][slotIdx] = false;
+    browserFavoritePadHoldSaveTriggered[stripIdx][slotIdx] = false;
+}
+
 void MlrVSTAudioProcessor::setDefaultSampleDirectory(int stripIndex, SamplePathMode mode, const juce::File& directory)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
@@ -2904,6 +3042,53 @@ void MlrVSTAudioProcessor::setDefaultSampleDirectory(int stripIndex, SamplePathM
     savePersistentDefaultPaths();
 }
 
+bool MlrVSTAudioProcessor::saveBrowserFavoriteDirectoryFromStrip(int stripIndex, int slot)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || slot < 0 || slot >= BrowserFavoriteSlots)
+        return false;
+
+    const auto directory = getCurrentBrowserDirectoryForStrip(stripIndex);
+    if (!directory.exists() || !directory.isDirectory())
+        return false;
+
+    browserFavoriteDirectories[static_cast<size_t>(slot)] = directory;
+    savePersistentDefaultPaths();
+    return true;
+}
+
+bool MlrVSTAudioProcessor::recallBrowserFavoriteDirectoryForStrip(int stripIndex, int slot)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || slot < 0 || slot >= BrowserFavoriteSlots)
+        return false;
+
+    const auto slotIdx = static_cast<size_t>(slot);
+    const auto directory = browserFavoriteDirectories[slotIdx];
+    if (!directory.exists() || !directory.isDirectory())
+    {
+        browserFavoriteDirectories[slotIdx] = juce::File();
+        savePersistentDefaultPaths();
+        return false;
+    }
+
+    const auto mode = getSamplePathModeForStrip(stripIndex);
+    setDefaultSampleDirectory(stripIndex, mode, directory);
+    lastSampleFolder = directory;
+    return true;
+}
+
+bool MlrVSTAudioProcessor::isAudioFileSupported(const juce::File& file) const
+{
+    if (!file.existsAsFile())
+        return false;
+
+    return file.hasFileExtension(".wav")
+        || file.hasFileExtension(".aif")
+        || file.hasFileExtension(".aiff")
+        || file.hasFileExtension(".mp3")
+        || file.hasFileExtension(".ogg")
+        || file.hasFileExtension(".flac");
+}
+
 void MlrVSTAudioProcessor::appendDefaultPathsToState(juce::ValueTree& state) const
 {
     auto paths = state.getOrCreateChildWithName("DefaultPaths", nullptr);
@@ -2914,6 +3099,12 @@ void MlrVSTAudioProcessor::appendDefaultPathsToState(juce::ValueTree& state) con
         const auto stepKey = "stepDir" + juce::String(i);
         paths.setProperty(loopKey, defaultLoopDirectories[idx].getFullPathName(), nullptr);
         paths.setProperty(stepKey, defaultStepDirectories[idx].getFullPathName(), nullptr);
+    }
+
+    for (int slot = 0; slot < BrowserFavoriteSlots; ++slot)
+    {
+        const auto key = "favoriteDir" + juce::String(slot);
+        paths.setProperty(key, browserFavoriteDirectories[static_cast<size_t>(slot)].getFullPathName(), nullptr);
     }
 }
 
@@ -2955,6 +3146,16 @@ void MlrVSTAudioProcessor::loadDefaultPathsFromState(const juce::ValueTree& stat
             defaultStepDirectories[idx] = stepDir;
         else
             defaultStepDirectories[idx] = juce::File();
+    }
+
+    for (int slot = 0; slot < BrowserFavoriteSlots; ++slot)
+    {
+        const auto key = "favoriteDir" + juce::String(slot);
+        juce::File favoriteDir(paths.getProperty(key).toString());
+        if (favoriteDir.exists() && favoriteDir.isDirectory())
+            browserFavoriteDirectories[static_cast<size_t>(slot)] = favoriteDir;
+        else
+            browserFavoriteDirectories[static_cast<size_t>(slot)] = juce::File();
     }
 
     savePersistentDefaultPaths();
@@ -3008,7 +3209,8 @@ void MlrVSTAudioProcessor::loadControlPagesFromState(const juce::ValueTree& stat
         ControlMode::Filter,
         ControlMode::Pitch,
         ControlMode::Modulation,
-        ControlMode::Preset
+        ControlMode::Preset,
+        ControlMode::StepEdit
     };
 
     for (const auto mode : defaultOrder)
@@ -3075,6 +3277,15 @@ void MlrVSTAudioProcessor::loadPersistentDefaultPaths()
         else
             defaultStepDirectories[idx] = juce::File();
     }
+
+    for (int slot = 0; slot < BrowserFavoriteSlots; ++slot)
+    {
+        juce::File favoriteDir(xml->getStringAttribute("favoriteDir" + juce::String(slot)));
+        if (favoriteDir.exists() && favoriteDir.isDirectory())
+            browserFavoriteDirectories[static_cast<size_t>(slot)] = favoriteDir;
+        else
+            browserFavoriteDirectories[static_cast<size_t>(slot)] = juce::File();
+    }
 }
 
 void MlrVSTAudioProcessor::savePersistentDefaultPaths() const
@@ -3093,6 +3304,9 @@ void MlrVSTAudioProcessor::savePersistentDefaultPaths() const
         xml.setAttribute("loopDir" + juce::String(i), defaultLoopDirectories[idx].getFullPathName());
         xml.setAttribute("stepDir" + juce::String(i), defaultStepDirectories[idx].getFullPathName());
     }
+
+    for (int slot = 0; slot < BrowserFavoriteSlots; ++slot)
+        xml.setAttribute("favoriteDir" + juce::String(slot), browserFavoriteDirectories[static_cast<size_t>(slot)].getFullPathName());
 
     xml.writeTo(settingsFile);
 }
@@ -3383,30 +3597,36 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
     auto* strip = audioEngine->getStrip(stripIndex);
     if (!strip) return;
     
-    // Get current file for this strip
-    juce::File currentFile = currentStripFiles[stripIndex];
-    
-    // Determine folder to browse
-    juce::File folderToUse;
-    if (currentFile.existsAsFile())
-        folderToUse = currentFile.getParentDirectory();
-    else if (lastSampleFolder.exists() && lastSampleFolder.isDirectory())
-        folderToUse = lastSampleFolder;
-    else
+    // Get current file for this strip.
+    // If strip has no loaded audio, force first-file fallback regardless of any
+    // stale path cached in currentStripFiles.
+    juce::File currentFile = strip->hasAudio() ? currentStripFiles[stripIndex] : juce::File();
+
+    // Determine folder to browse from strip-specific browser path context.
+    juce::File folderToUse = getCurrentBrowserDirectoryForStrip(stripIndex);
+    if (!folderToUse.exists() || !folderToUse.isDirectory())
         return;
     
     // Get all audio files in folder
     juce::Array<juce::File> audioFiles;
     for (auto& file : folderToUse.findChildFiles(juce::File::findFiles, false))
     {
-        if (file.hasFileExtension(".wav") || file.hasFileExtension(".aif") || 
-            file.hasFileExtension(".aiff") || file.hasFileExtension(".mp3") ||
-            file.hasFileExtension(".ogg") || file.hasFileExtension(".flac"))
+        if (isAudioFileSupported(file))
         {
             audioFiles.add(file);
         }
     }
-    
+
+    // If no files at top level, allow browsing into nested pack folders.
+    if (audioFiles.size() == 0)
+    {
+        for (auto& file : folderToUse.findChildFiles(juce::File::findFiles, true))
+        {
+            if (isAudioFileSupported(file))
+                audioFiles.add(file);
+        }
+    }
+
     if (audioFiles.size() == 0) return;
     audioFiles.sort();
     
@@ -3423,17 +3643,22 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
             }
         }
     }
-    
-    // If not found, start at beginning
+
+    juce::File fileToLoad;
     if (currentIndex < 0)
-        currentIndex = 0;
-    
-    // Calculate new index with wraparound
-    int newIndex = currentIndex + direction;
-    if (newIndex < 0) newIndex = audioFiles.size() - 1;
-    if (newIndex >= audioFiles.size()) newIndex = 0;
-    
-    juce::File fileToLoad = audioFiles[newIndex];
+    {
+        // Requirement: if no sample is currently loaded on this strip,
+        // both Prev and Next should load the first file in the selected folder.
+        fileToLoad = audioFiles[0];
+    }
+    else
+    {
+        // Calculate new index with wraparound
+        int newIndex = currentIndex + direction;
+        if (newIndex < 0) newIndex = audioFiles.size() - 1;
+        if (newIndex >= audioFiles.size()) newIndex = 0;
+        fileToLoad = audioFiles[newIndex];
+    }
     
     if (!fileToLoad.existsAsFile())
     {
@@ -3442,6 +3667,10 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
     
     // Save playback state
     bool wasPlaying = strip->isPlaying();
+    const bool isStepMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+    // Step mode playback is host-clock driven and does not rely on the loop PPQ anchor.
+    // Do not block browse-load on missing timeline anchor in this mode.
+    const bool requiresTimelineAnchor = wasPlaying && !isStepMode;
     float savedSpeed = strip->getPlaybackSpeed();
     float savedVolume = strip->getVolume();
     float savedPan = strip->getPan();
@@ -3455,7 +3684,7 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
     double hostPpqBeforeLoad = 0.0;
     double hostTempoBeforeLoad = 0.0;
     const int64_t globalSampleBeforeLoad = audioEngine->getGlobalSampleCount();
-    if (wasPlaying)
+    if (requiresTimelineAnchor)
     {
         // Strict PPQ safety for file browsing:
         // do not load when hard PPQ resync cannot be guaranteed.
@@ -3481,7 +3710,7 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
         
         // If browsing while playing, hard-restore PPQ state with deterministic
         // host-time projection based on pre-load PPQ snapshot.
-        if (wasPlaying)
+        if (requiresTimelineAnchor)
         {
             const int64_t globalSampleNow = audioEngine->getGlobalSampleCount();
             const int64_t deltaSamples = juce::jmax<int64_t>(0, globalSampleNow - globalSampleBeforeLoad);

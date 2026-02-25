@@ -348,6 +348,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         return (gridY * PresetColumns) + gridX;
     };
     const bool presetModeActive = (controlModeActive && currentControlMode == ControlMode::Preset);
+    const bool stepEditModeActive = (controlModeActive && currentControlMode == ControlMode::StepEdit);
     
     static int loopSetFirstButton = -1;
     static int loopSetStrip = -1;
@@ -381,6 +382,38 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 }
 
                 updateMonomeLEDs();
+                return;
+            }
+
+            if (stepEditModeActive)
+            {
+                if (x >= 0 && x <= 7)
+                {
+                    switch (x)
+                    {
+                        case 0: stepEditTool = StepEditTool::Velocity; break;
+                        case 1: stepEditTool = StepEditTool::Divide; break;
+                        case 2: stepEditTool = StepEditTool::RampUp; break;
+                        case 3: stepEditTool = StepEditTool::RampDown; break;
+                        case 4: stepEditTool = StepEditTool::Probability; break;
+                        case 5: stepEditTool = StepEditTool::Attack; break;
+                        case 6: stepEditTool = StepEditTool::Decay; break;
+                        case 7: stepEditTool = StepEditTool::Release; break; // Pitch tool (reusing Release slot)
+                        default: break;
+                    }
+
+                    updateMonomeLEDs();
+                    return;
+                }
+
+                if (x >= 8 && x <= 13)
+                {
+                    stepEditSelectedStrip = juce::jlimit(0, MaxStrips - 1, x - 8);
+                    lastMonomePressedStripRow.store(stepEditSelectedStrip, std::memory_order_release);
+                    updateMonomeLEDs();
+                    return;
+                }
+
                 return;
             }
 
@@ -568,8 +601,53 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     }
                 }
 
+                if (controlModeActive && currentControlMode == ControlMode::StepEdit)
+                {
+                    if (stepEditTool == StepEditTool::Gate)
+                        stepEditTool = StepEditTool::Velocity;
+                    stepEditSelectedStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+                }
+
                 updateMonomeLEDs();  // Force immediate LED update
                 return;  // Don't process as strip trigger!
+            }
+            else if (stepEditModeActive && (x == 13 || x == 14))
+            {
+                const int selectedStripIndex = juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip);
+                if (auto* strip = audioEngine->getStrip(selectedStripIndex))
+                {
+                    float currentSemitones = strip->getPitchShift();
+                    if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+                    {
+                        if (auto* stepSampler = strip->getStepSampler())
+                            currentSemitones = static_cast<float>(stepSampler->getPitchOffset());
+                    }
+
+                    const float delta = (x == 13) ? -1.0f : 1.0f;
+                    const float nextSemitones = juce::jlimit(-24.0f, 24.0f, currentSemitones + delta);
+
+                    if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+                    {
+                        if (auto* stepSampler = strip->getStepSampler())
+                        {
+                            const float ratio = std::pow(2.0f, nextSemitones / 12.0f);
+                            stepSampler->setSpeed(ratio);
+                        }
+                    }
+                    else
+                    {
+                        strip->setPitchShift(nextSemitones);
+                    }
+
+                    if (auto* param = parameters.getParameter("stripPitch" + juce::String(selectedStripIndex)))
+                    {
+                        const float normalized = juce::jlimit(0.0f, 1.0f, param->convertTo0to1(nextSemitones));
+                        param->setValueNotifyingHost(normalized);
+                    }
+                }
+
+                updateMonomeLEDs();
+                return;
             }
             else if (x == 15)
             {
@@ -607,6 +685,171 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 return;
             }
 
+            if (stepEditModeActive)
+            {
+                if (stepEditTool == StepEditTool::Gate)
+                    stepEditTool = StepEditTool::Velocity;
+
+                const int selectedStripIndex = juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip);
+                auto* targetStrip = audioEngine->getStrip(selectedStripIndex);
+                if (!targetStrip)
+                {
+                    updateMonomeLEDs();
+                    return;
+                }
+
+                const float rowValue = juce::jlimit(0.0f, 1.0f, (6.0f - static_cast<float>(y)) / 5.0f);
+                const float columnNorm = juce::jlimit(0.0f, 1.0f, static_cast<float>(x) / 15.0f);
+                auto setStepEnabled = [targetStrip](int absoluteStep, bool shouldEnable)
+                {
+                    const int clampedStep = juce::jlimit(0, targetStrip->getStepTotalSteps() - 1, absoluteStep);
+                    if (targetStrip->stepPattern[static_cast<size_t>(clampedStep)] != shouldEnable)
+                        targetStrip->toggleStepAtIndex(clampedStep);
+                };
+
+                if (stepEditTool == StepEditTool::Attack)
+                {
+                    targetStrip->setStepEnvelopeAttackMs(columnNorm * 400.0f);
+                    updateMonomeLEDs();
+                    return;
+                }
+
+                if (stepEditTool == StepEditTool::Decay)
+                {
+                    targetStrip->setStepEnvelopeDecayMs(1.0f + (columnNorm * 3999.0f));
+                    updateMonomeLEDs();
+                    return;
+                }
+
+                if (stepEditTool == StepEditTool::Release)
+                {
+                    const float pitchSemitones = juce::jmap(columnNorm, -24.0f, 24.0f);
+                    if (targetStrip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+                    {
+                        if (auto* stepSampler = targetStrip->getStepSampler())
+                        {
+                            const float ratio = std::pow(2.0f, pitchSemitones / 12.0f);
+                            stepSampler->setSpeed(ratio);
+                        }
+                    }
+                    else
+                    {
+                        targetStrip->setPitchShift(pitchSemitones);
+                    }
+
+                    if (auto* param = parameters.getParameter("stripPitch" + juce::String(selectedStripIndex)))
+                    {
+                        const float normalized = juce::jlimit(0.0f, 1.0f, param->convertTo0to1(pitchSemitones));
+                        param->setValueNotifyingHost(normalized);
+                    }
+
+                    updateMonomeLEDs();
+                    return;
+                }
+
+                const int totalSteps = targetStrip->getStepTotalSteps();
+                const int absoluteStep = targetStrip->getVisibleStepOffset() + juce::jlimit(0, 15, x);
+                if (absoluteStep < 0 || absoluteStep >= totalSteps)
+                {
+                    updateMonomeLEDs();
+                    return;
+                }
+
+                const auto stepIdx = static_cast<size_t>(absoluteStep);
+                const bool wasEnabled = targetStrip->stepPattern[stepIdx];
+
+                switch (stepEditTool)
+                {
+                    case StepEditTool::Gate:
+                    {
+                        targetStrip->toggleStepAtIndex(absoluteStep);
+                        break;
+                    }
+
+                    case StepEditTool::Velocity:
+                    {
+                        // Bottom row (y=6) in volume tool is an explicit step-off command.
+                        const bool shouldEnable = (rowValue > 0.001f) && (y < (CONTROL_ROW - 1));
+                        setStepEnabled(absoluteStep, shouldEnable);
+                        const float stepVelocity = shouldEnable ? rowValue : 0.0f;
+                        targetStrip->setStepSubdivisionVelocityRangeAtIndex(absoluteStep, stepVelocity, stepVelocity);
+                        break;
+                    }
+
+                    case StepEditTool::Divide:
+                    {
+                        setStepEnabled(absoluteStep, true);
+                        const int maxSubs = juce::jmax(2, EnhancedAudioStrip::MaxStepSubdivisions);
+                        const int subdivisions = juce::jlimit(
+                            2,
+                            maxSubs,
+                            2 + static_cast<int>(std::round(rowValue
+                                * static_cast<float>(juce::jmax(0, maxSubs - 2)))));
+                        targetStrip->setStepSubdivisionAtIndex(absoluteStep, subdivisions);
+                        break;
+                    }
+
+                    case StepEditTool::RampUp:
+                    {
+                        setStepEnabled(absoluteStep, true);
+                        if (rowValue <= 0.001f)
+                            targetStrip->setStepSubdivisionAtIndex(absoluteStep, 2);
+                        else if (targetStrip->getStepSubdivisionAtIndex(absoluteStep) <= 1)
+                            targetStrip->setStepSubdivisionAtIndex(absoluteStep, 2);
+
+                        const float baseStart = targetStrip->getStepSubdivisionStartVelocityAtIndex(absoluteStep);
+                        const float baseEnd = targetStrip->getStepSubdivisionRepeatVelocityAtIndex(absoluteStep);
+                        float baseMax = juce::jmax(baseStart, baseEnd);
+                        if (baseMax < 0.001f)
+                            baseMax = wasEnabled ? 1.0f : juce::jmax(0.25f, rowValue);
+
+                        const float depth = rowValue;
+                        const float start = juce::jlimit(0.0f, 1.0f, (1.0f - depth) * baseMax);
+                        const float end = juce::jlimit(0.0f, 1.0f, baseMax);
+                        targetStrip->setStepSubdivisionVelocityRangeAtIndex(absoluteStep, start, end);
+                        break;
+                    }
+
+                    case StepEditTool::RampDown:
+                    {
+                        setStepEnabled(absoluteStep, true);
+                        if (rowValue <= 0.001f)
+                            targetStrip->setStepSubdivisionAtIndex(absoluteStep, 2);
+                        else if (targetStrip->getStepSubdivisionAtIndex(absoluteStep) <= 1)
+                            targetStrip->setStepSubdivisionAtIndex(absoluteStep, 2);
+
+                        const float baseStart = targetStrip->getStepSubdivisionStartVelocityAtIndex(absoluteStep);
+                        const float baseEnd = targetStrip->getStepSubdivisionRepeatVelocityAtIndex(absoluteStep);
+                        float baseMax = juce::jmax(baseStart, baseEnd);
+                        if (baseMax < 0.001f)
+                            baseMax = wasEnabled ? 1.0f : juce::jmax(0.25f, rowValue);
+
+                        const float depth = rowValue;
+                        const float start = juce::jlimit(0.0f, 1.0f, baseMax);
+                        const float end = juce::jlimit(0.0f, 1.0f, (1.0f - depth) * baseMax);
+                        targetStrip->setStepSubdivisionVelocityRangeAtIndex(absoluteStep, start, end);
+                        break;
+                    }
+
+                    case StepEditTool::Probability:
+                    {
+                        if (rowValue > 0.001f)
+                            setStepEnabled(absoluteStep, true);
+                        targetStrip->setStepProbabilityAtIndex(absoluteStep, rowValue);
+                        break;
+                    }
+
+                    case StepEditTool::Attack:
+                    case StepEditTool::Decay:
+                    case StepEditTool::Release:
+                    default:
+                        break;
+                }
+
+                updateMonomeLEDs();
+                return;
+            }
+
             int stripIndex = y - FIRST_STRIP_ROW;
             if (stripIndex < MaxStrips && x < 16)
             {
@@ -622,8 +865,11 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     return;
                 }
                 
-                // Loop length setting mode - ONLY if scratch is disabled
-                if (loopSetFirstButton >= 0 && loopSetStrip == stripIndex && strip->getScratchAmount() == 0.0f)
+                // Loop length setting mode - ONLY if scratch is disabled and strip is not in Step mode.
+                if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Step
+                    && loopSetFirstButton >= 0
+                    && loopSetStrip == stripIndex
+                    && strip->getScratchAmount() == 0.0f)
                 {
                     const int firstButton = juce::jlimit(0, MaxColumns - 1, loopSetFirstButton);
                     const int secondButton = juce::jlimit(0, MaxColumns - 1, x);
@@ -731,8 +977,12 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 }
                 else
                 {
-                    // Normal playback trigger (only if strip has sample)
-                    if (strip->hasAudio())
+                    // Normal playback trigger:
+                    // - Loop/Grain/Gate: requires loaded strip audio
+                    // - Step mode: allow direct step toggling on main page
+                    const bool canTriggerFromMainPage = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+                        || strip->hasAudio();
+                    if (canTriggerFromMainPage)
                     {
                         // Always notify strip of press for scratch hold-state.
                         // Actual scratch motion still starts when trigger fires,
@@ -743,9 +993,12 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                         // Trigger the strip (quantized or immediate)
                         triggerStrip(stripIndex, x);
                         
-                        // Set up for potential loop range setting
-                        loopSetFirstButton = x;
-                        loopSetStrip = stripIndex;
+                        // Set up for potential loop range setting (non-step modes only).
+                        if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Step)
+                        {
+                            loopSetFirstButton = x;
+                            loopSetStrip = stripIndex;
+                        }
                     }
                     // If no sample loaded, do nothing (just show visual feedback via LEDs)
                 }
@@ -771,6 +1024,32 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             deletedTap = false;
             lastTap = nowMs;
 
+            updateMonomeLEDs();
+            return;
+        }
+
+        if (y >= FIRST_STRIP_ROW && y < CONTROL_ROW)
+        {
+            int stripIndex = y - FIRST_STRIP_ROW;
+            if (stripIndex < MaxStrips && x >= 3 && x < (3 + BrowserFavoriteSlots))
+            {
+                const int slot = x - 3;
+                const bool browserModeActive = controlModeActive && currentControlMode == ControlMode::FileBrowser;
+                const bool favoriteWasHeld = isBrowserFavoritePadHeld(stripIndex, slot);
+                if (browserModeActive || favoriteWasHeld)
+                {
+                    if (auto* strip = audioEngine->getStrip(stripIndex))
+                    {
+                        MonomeFileBrowserActions::handleButtonRelease(*this, *strip, stripIndex, x);
+                        updateMonomeLEDs();
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (stepEditModeActive && y == GROUP_ROW)
+        {
             updateMonomeLEDs();
             return;
         }
@@ -802,6 +1081,12 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     audioEngine->setMomentaryStutterDivision(momentaryStutterDivisionBeats);
                 }
             }
+            updateMonomeLEDs();
+            return;
+        }
+
+        if (stepEditModeActive && y >= FIRST_STRIP_ROW && y < CONTROL_ROW)
+        {
             updateMonomeLEDs();
             return;
         }
@@ -875,11 +1160,40 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     const bool metroPulseOn = beatPhase < 0.22;                    // Short pulse at each beat
     const int beatIndexInBar = juce::jmax(0, static_cast<int>(std::floor(beatNow)) % 4);
     const bool metroDownbeat = (beatIndexInBar == 0);
+    const auto nowMs = juce::Time::getMillisecondCounter();
+
+    if (controlModeActive && currentControlMode == ControlMode::FileBrowser)
+    {
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+        {
+            const auto stripIdx = static_cast<size_t>(stripIndex);
+            for (int slot = 0; slot < BrowserFavoriteSlots; ++slot)
+            {
+                const auto slotIdx = static_cast<size_t>(slot);
+                if (!browserFavoritePadHeld[stripIdx][slotIdx] || browserFavoritePadHoldSaveTriggered[stripIdx][slotIdx])
+                    continue;
+
+                const uint32_t elapsed = nowMs - browserFavoritePadPressStartMs[stripIdx][slotIdx];
+                if (elapsed < browserFavoriteHoldSaveMs)
+                    continue;
+
+                const bool saved = saveBrowserFavoriteDirectoryFromStrip(stripIndex, slot);
+                browserFavoritePadHoldSaveTriggered[stripIdx][slotIdx] = true;
+                if (saved)
+                {
+                    browserFavoriteSaveBurstUntilMs[slotIdx] = nowMs + browserFavoriteSaveBurstDurationMs;
+                    browserFavoriteMissingBurstUntilMs[slotIdx] = 0;
+                }
+                else
+                {
+                    browserFavoriteMissingBurstUntilMs[slotIdx] = nowMs + browserFavoriteMissingBurstDurationMs;
+                }
+            }
+        }
+    }
 
     if (controlModeActive && currentControlMode == ControlMode::Preset)
     {
-        const auto nowMs = juce::Time::getMillisecondCounter();
-
         for (int y = 0; y < PresetRows; ++y)
         {
             for (int x = 0; x < PresetColumns; ++x)
@@ -944,7 +1258,52 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
 
     // ROW 0: Group status (0-3) + Pattern recorders (4-7)
     // BUT in Filter mode: Buttons 0,1,3 = sub-page selectors
-    if (controlModeActive
+    if (controlModeActive && currentControlMode == ControlMode::StepEdit)
+    {
+        for (int i = 0; i < 16; ++i)
+            newLedState[i][GROUP_ROW] = 0;
+
+        auto getStepToolColumn = [this]()
+        {
+            switch (stepEditTool)
+            {
+                case StepEditTool::Velocity: return 0;
+                case StepEditTool::Divide: return 1;
+                case StepEditTool::RampUp: return 2;
+                case StepEditTool::RampDown: return 3;
+                case StepEditTool::Probability: return 4;
+                case StepEditTool::Attack: return 5;
+                case StepEditTool::Decay: return 6;
+                case StepEditTool::Release: return 7;
+                case StepEditTool::Gate:
+                default: return -1;
+            }
+        };
+
+        const int toolColumn = getStepToolColumn();
+        for (int col = 0; col <= 7; ++col)
+            newLedState[col][GROUP_ROW] = (col == toolColumn) ? 15 : 4;
+
+        const int selectedStripIndex = juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip);
+
+        for (int col = 8; col <= 13; ++col)
+        {
+            const int stripIndex = col - 8;
+            if (stripIndex >= MaxStrips)
+                continue;
+
+            auto* strip = audioEngine->getStrip(stripIndex);
+            const bool inStepMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+            int level = inStepMode ? 6 : 3;
+            if (stripIndex == selectedStripIndex)
+                level = inStepMode ? 15 : 10;
+            newLedState[col][GROUP_ROW] = level;
+        }
+
+        newLedState[14][GROUP_ROW] = 0;
+        newLedState[15][GROUP_ROW] = 0;
+    }
+    else if (controlModeActive
         && currentControlMode != ControlMode::Normal
         && currentControlMode != ControlMode::Modulation
         && currentControlMode != ControlMode::Preset)
@@ -1109,6 +1468,127 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     {
         int y = FIRST_STRIP_ROW + stripIndex;
         auto* strip = audioEngine->getStrip(stripIndex);
+
+        if (controlModeActive && currentControlMode == ControlMode::StepEdit)
+        {
+            const int selectedStripIndex = juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip);
+            auto* selectedStrip = audioEngine->getStrip(selectedStripIndex);
+            if (!selectedStrip)
+            {
+                for (int x = 0; x < 16; ++x)
+                    newLedState[x][y] = 0;
+                continue;
+            }
+
+            const int totalSteps = selectedStrip->getStepTotalSteps();
+            const int visibleOffset = selectedStrip->getVisibleStepOffset();
+            const int visibleCurrentStep = selectedStrip->getVisibleCurrentStep();
+            const bool stripPlaying = selectedStrip->isPlaying()
+                && selectedStrip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step;
+            const float rowNorm = juce::jlimit(0.0f, 1.0f, (6.0f - static_cast<float>(y)) / 5.0f);
+
+            if (stepEditTool == StepEditTool::Attack
+                || stepEditTool == StepEditTool::Decay
+                || stepEditTool == StepEditTool::Release)
+            {
+                float normalized = 0.0f;
+                if (stepEditTool == StepEditTool::Attack)
+                    normalized = juce::jlimit(0.0f, 1.0f, selectedStrip->getStepEnvelopeAttackMs() / 400.0f);
+                else if (stepEditTool == StepEditTool::Decay)
+                    normalized = juce::jlimit(0.0f, 1.0f, (selectedStrip->getStepEnvelopeDecayMs() - 1.0f) / 3999.0f);
+                else
+                {
+                    float pitchSemitones = selectedStrip->getPitchShift();
+                    if (selectedStrip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+                    {
+                        if (auto* stepSampler = selectedStrip->getStepSampler())
+                            pitchSemitones = static_cast<float>(stepSampler->getPitchOffset());
+                    }
+                    normalized = juce::jlimit(0.0f, 1.0f, (pitchSemitones + 24.0f) / 48.0f);
+                }
+
+                const int activeCol = juce::jlimit(0, 15, static_cast<int>(std::round(normalized * 15.0f)));
+                for (int x = 0; x < 16; ++x)
+                {
+                    int level = (x == activeCol) ? 15 : ((x < activeCol) ? 6 : 1);
+                    if (stripPlaying && x == visibleCurrentStep)
+                        level = juce::jmax(level, 9);
+                    newLedState[x][y] = level;
+                }
+                continue;
+            }
+
+            for (int x = 0; x < 16; ++x)
+            {
+                const int absoluteStep = visibleOffset + x;
+                if (absoluteStep < 0 || absoluteStep >= totalSteps)
+                {
+                    newLedState[x][y] = 0;
+                    continue;
+                }
+
+                const auto idx = static_cast<size_t>(absoluteStep);
+                const bool enabled = selectedStrip->stepPattern[idx];
+                const int subdivision = selectedStrip->getStepSubdivisionAtIndex(absoluteStep);
+                const float startVelocity = selectedStrip->getStepSubdivisionStartVelocityAtIndex(absoluteStep);
+                const float endVelocity = selectedStrip->getStepSubdivisionRepeatVelocityAtIndex(absoluteStep);
+                const float maxVelocity = juce::jmax(startVelocity, endVelocity);
+                const float probability = selectedStrip->getStepProbabilityAtIndex(absoluteStep);
+
+                int level = 0;
+                if (stepEditTool == StepEditTool::Gate)
+                {
+                    level = (enabled && y == (CONTROL_ROW - 1)) ? 12 : 0;
+                }
+                else
+                {
+                    float value = 0.0f;
+                    switch (stepEditTool)
+                    {
+                        case StepEditTool::Gate:
+                        case StepEditTool::Attack:
+                        case StepEditTool::Decay:
+                        case StepEditTool::Release:
+                            break;
+                        case StepEditTool::Velocity:
+                            value = enabled ? maxVelocity : 0.0f;
+                            break;
+                        case StepEditTool::Divide:
+                            value = enabled
+                                ? static_cast<float>(subdivision - 1)
+                                    / static_cast<float>(juce::jmax(1, EnhancedAudioStrip::MaxStepSubdivisions - 1))
+                                : 0.0f;
+                            break;
+                        case StepEditTool::RampUp:
+                        {
+                            const float base = juce::jmax(0.001f, maxVelocity);
+                            value = enabled ? juce::jlimit(0.0f, 1.0f, 1.0f - (startVelocity / base)) : 0.0f;
+                            break;
+                        }
+                        case StepEditTool::RampDown:
+                        {
+                            const float base = juce::jmax(0.001f, maxVelocity);
+                            value = enabled ? juce::jlimit(0.0f, 1.0f, 1.0f - (endVelocity / base)) : 0.0f;
+                            break;
+                        }
+                        case StepEditTool::Probability:
+                            value = enabled ? probability : 0.0f;
+                            break;
+                    }
+
+                    if (value + 0.0001f >= rowNorm)
+                        level = enabled ? 11 : 7;
+                    else
+                        level = enabled ? 2 : 0;
+                }
+
+                if (stripPlaying && x == visibleCurrentStep)
+                    level = juce::jmax(level, (y == (CONTROL_ROW - 1)) ? 15 : 6);
+                newLedState[x][y] = level;
+            }
+
+            continue;
+        }
         
         if (!strip)
             continue;
@@ -1173,7 +1653,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
         else if (controlModeActive && currentControlMode == ControlMode::FileBrowser)
         {
-            MonomeFileBrowserActions::renderRow(*audioEngine, *strip, y, newLedState);
+            MonomeFileBrowserActions::renderRow(*this, *audioEngine, *strip, stripIndex, y, newLedState);
         }
         else if (controlModeActive && currentControlMode == ControlMode::GroupAssign)
         {
@@ -1349,6 +1829,43 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         const int activeButton = getControlButtonForMode(currentControlMode);
         if (activeButton >= 0 && activeButton < NumControlRowPages)
             newLedState[activeButton][CONTROL_ROW] = 15;
+    }
+
+    if (controlModeActive && currentControlMode == ControlMode::StepEdit)
+    {
+        const int selectedStripIndex = juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip);
+        bool hasSelectedStrip = false;
+        int pitchSemitones = 0;
+
+        if (auto* selectedStrip = audioEngine->getStrip(selectedStripIndex))
+        {
+            hasSelectedStrip = true;
+            pitchSemitones = static_cast<int>(std::round(selectedStrip->getPitchShift()));
+
+            if (selectedStrip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+            {
+                if (auto* stepSampler = selectedStrip->getStepSampler())
+                    pitchSemitones = stepSampler->getPitchOffset();
+            }
+        }
+
+        const bool canDown = hasSelectedStrip && pitchSemitones > -24;
+        const bool canUp = hasSelectedStrip && pitchSemitones < 24;
+
+        int downLevel = canDown ? 8 : 2;
+        int upLevel = canUp ? 8 : 2;
+        if (pitchSemitones < 0)
+            downLevel = canDown ? 13 : 3;
+        else if (pitchSemitones > 0)
+            upLevel = canUp ? 13 : 3;
+        else if (hasSelectedStrip)
+        {
+            downLevel = canDown ? 9 : 2;
+            upLevel = canUp ? 9 : 2;
+        }
+
+        newLedState[13][CONTROL_ROW] = downLevel;
+        newLedState[14][CONTROL_ROW] = upLevel;
     }
 
     // Metronome pulse on control-row quantize button (row 7, col 15):

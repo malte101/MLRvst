@@ -103,9 +103,10 @@ public:
 
     void setCurrentStep(int step)
     {
-        if (currentStep != step)
+        const int clampedStep = juce::jlimit(0, juce::jmax(0, totalSteps - 1), step);
+        if (currentStep != clampedStep)
         {
-            currentStep = step;
+            currentStep = clampedStep;
             repaint();
         }
     }
@@ -129,6 +130,35 @@ public:
     void setPlaybackPosition(float position)
     {
         playbackPosition = position;
+        repaint();
+    }
+
+    EditTool getActiveTool() const
+    {
+        return activeTool;
+    }
+
+    void setActiveTool(EditTool tool)
+    {
+        if (tool == EditTool::Draw)
+            tool = EditTool::Volume;
+
+        if (tool == activeTool)
+            return;
+
+        activeTool = tool;
+        dragMode = DragMode::None;
+        dragTool = activeTool;
+        dragTargets.clear();
+        dragAnchorStep = -1;
+        dragAnchorRect = {};
+        lastDrawStep = -1;
+        lassoRect = {};
+        selectClickCandidateStep = -1;
+        selectLassoActivated = false;
+        drawShiftToggleCandidateStep = -1;
+        drawShiftToggleDragged = false;
+        updateTimerState();
         repaint();
     }
 
@@ -185,7 +215,7 @@ public:
             && !commandDown
             && !optionDown
             && !shiftDown;
-        const bool drawModifierGesture = (activeTool == EditTool::Draw)
+        const bool drawModifierGesture = isDrawLikeTool(activeTool)
             && (editModifierDown || shiftDown);
         const bool selectionModifierGesture = (activeTool == EditTool::Select)
             && stepIsInSelection
@@ -221,14 +251,14 @@ public:
             return;
         }
 
-        if (activeTool == EditTool::Draw && commandDown)
+        if (isDrawLikeTool(activeTool) && commandDown)
         {
             beginEdit(stepIndex, event.y, EditTool::Divide);
             applyContinuousTool(event.y);
             return;
         }
 
-        if (activeTool == EditTool::Draw && controlDown)
+        if (isDrawLikeTool(activeTool) && controlDown)
         {
             if (!stepPattern[static_cast<size_t>(stepIndex)])
                 setStepEnabled(stepIndex, true, true);
@@ -237,7 +267,7 @@ public:
             return;
         }
 
-        if (activeTool == EditTool::Draw && optionDown)
+        if (isDrawLikeTool(activeTool) && optionDown)
         {
             if (!stepPattern[static_cast<size_t>(stepIndex)])
                 setStepEnabled(stepIndex, true, true);
@@ -246,7 +276,7 @@ public:
             return;
         }
 
-        if (activeTool == EditTool::Draw && shiftDown && !commandDown && !controlDown && !optionDown)
+        if (isDrawLikeTool(activeTool) && shiftDown && !commandDown && !controlDown && !optionDown)
         {
             drawShiftToggleCandidateStep = stepIndex;
             drawShiftToggleDragged = false;
@@ -260,7 +290,7 @@ public:
             return;
         }
 
-        if (activeTool == EditTool::Draw)
+        if (isDrawLikeTool(activeTool))
         {
             applyDrawVolumeAtStep(stepIndex, event.y, true);
             return;
@@ -303,7 +333,7 @@ public:
             }
         }
 
-        if (activeTool == EditTool::Draw
+        if (isDrawLikeTool(activeTool)
             && dragTool == EditTool::Volume
             && drawShiftToggleCandidateStep < 0)
         {
@@ -372,7 +402,7 @@ private:
 
     struct ToolbarLayout
     {
-        std::array<juce::Rectangle<float>, 7> toolButtons;
+        std::array<juce::Rectangle<float>, 6> toolButtons;
     };
 
     std::array<bool, 64> stepPattern = {};
@@ -387,9 +417,9 @@ private:
     float playbackPosition = -1.0f;
     juce::Colour stripColor = juce::Colour(0xff6f93c8);
 
-    EditTool activeTool = EditTool::Draw;
+    EditTool activeTool = EditTool::Volume;
     DragMode dragMode = DragMode::None;
-    EditTool dragTool = EditTool::Draw;
+    EditTool dragTool = EditTool::Volume;
     int dragStartY = 0;
     int dragAnchorStep = -1;
     juce::Rectangle<float> dragAnchorRect;
@@ -452,20 +482,41 @@ private:
         return layout;
     }
 
-    std::array<const char*, 7> getToolLabels() const
+    std::array<const char*, 6> getToolLabels() const
     {
-        return {"Draw", "Divide", "Vol", "Ramp+", "Ramp-", "Prob", "Select"};
+        return {"Vol", "Divide", "Ramp+", "Ramp-", "Prob", "Select"};
     }
 
     EditTool toolFromIndex(int index) const
     {
-        index = juce::jlimit(0, 6, index);
-        return static_cast<EditTool>(index);
+        switch (juce::jlimit(0, 5, index))
+        {
+            case 0: return EditTool::Volume;
+            case 1: return EditTool::Divide;
+            case 2: return EditTool::RampUp;
+            case 3: return EditTool::RampDown;
+            case 4: return EditTool::Probability;
+            case 5: return EditTool::Select;
+            default: break;
+        }
+        return EditTool::Volume;
     }
 
     int indexFromTool(EditTool tool) const
     {
-        return static_cast<int>(tool);
+        switch (tool)
+        {
+            case EditTool::Divide: return 1;
+            case EditTool::Volume:
+            case EditTool::Draw:
+                return 0;
+            case EditTool::RampUp: return 2;
+            case EditTool::RampDown: return 3;
+            case EditTool::Probability: return 4;
+            case EditTool::Select: return 5;
+            default: break;
+        }
+        return 1;
     }
 
     void drawToolbar(juce::Graphics& g, juce::Rectangle<float> toolbar)
@@ -545,6 +596,8 @@ private:
         const int stepsPerRow = 16;
         const float stepWidth = grid.getWidth() / static_cast<float>(stepsPerRow);
         const float stepHeight = grid.getHeight() / static_cast<float>(numRows);
+        const bool hasPlayStep = isPlaying && totalSteps > 0;
+        const int playStep = hasPlayStep ? juce::jlimit(0, totalSteps - 1, currentStep) : -1;
 
         g.setColour(juce::Colour(0xff24272c));
         g.fillRect(grid);
@@ -558,6 +611,7 @@ private:
                 grid.getY() + (row * stepHeight),
                 stepWidth - 2.0f,
                 stepHeight - 2.0f);
+            const bool isCurrentPlayStep = (i == playStep);
 
             const float probability = juce::jlimit(0.0f, 1.0f, stepProbability[static_cast<size_t>(i)]);
             const bool isEnabled = stepPattern[static_cast<size_t>(i)];
@@ -582,11 +636,18 @@ private:
                     g.setColour(juce::Colours::white.withAlpha(0.96f));
                     g.drawRect(stepRect.reduced(1.0f), 2.0f);
                 }
+
+                if (isCurrentPlayStep)
+                {
+                    g.setColour(juce::Colour(0xffffb347).withAlpha(0.96f));
+                    g.drawRect(stepRect.reduced(0.5f), 2.0f);
+                    g.fillRect(stepRect.withHeight(2.0f).reduced(1.0f, 0.0f));
+                }
                 continue;
             }
 
             juce::Colour stepColor;
-            if (i == currentStep && isPlaying)
+            if (isCurrentPlayStep)
                 stepColor = juce::Colour(0xfff29a36).withAlpha(0.82f);
             else
                 stepColor = stripColor.withMultipliedSaturation(0.8f).withMultipliedBrightness(0.9f)
@@ -727,6 +788,14 @@ private:
                 g.setFont(stepHeight < 18.0f ? 7.0f : 8.0f);
                 g.drawText(juce::String(p) + "%", pRect, juce::Justification::topRight, false);
             }
+
+            if (isCurrentPlayStep)
+            {
+                g.setColour(juce::Colour(0xffffe7be).withAlpha(0.97f));
+                g.drawRect(stepRect.reduced(0.5f), 2.0f);
+                g.setColour(juce::Colour(0xffffb347).withAlpha(0.92f));
+                g.fillRect(stepRect.withHeight(2.0f).reduced(1.0f, 0.0f));
+            }
         }
 
         g.setColour(juce::Colour(0xff4f4f4f));
@@ -763,7 +832,7 @@ private:
     {
         if (activeTool == EditTool::Select)
         {
-            activeTool = EditTool::Draw;
+            activeTool = EditTool::Volume;
         }
         else
         {
@@ -840,6 +909,11 @@ private:
         }
 
         return true;
+    }
+
+    bool isDrawLikeTool(EditTool tool) const
+    {
+        return tool == EditTool::Draw || tool == EditTool::Volume;
     }
 
     void pruneSelectionToVisibleSteps()

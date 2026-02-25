@@ -7390,6 +7390,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 continue;
 
             auto* strip = strips[i].get();
+            const bool stripIsStepMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+            auto* stepSampler = stripIsStepMode ? strip->getStepSampler() : nullptr;
             auto& seq = modSequencers[i];
             const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
             const bool stripPlaying = strip->isPlaying();
@@ -7415,6 +7417,13 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             float originalGrainCloud = 0.0f;
             float originalGrainEmitter = 0.0f;
             float originalGrainEnvelope = 0.0f;
+            float originalStepVol = 1.0f;
+            float originalStepPan = 0.0f;
+            float originalStepPitchSemitones = 0.0f;
+            float originalStepSpeed = 1.0f;
+            float originalStepFilterFreq = 1000.0f;
+            float originalStepFilterRes = 0.7f;
+            bool originalStepFilterEnabled = false;
             if (applyParamMod)
             {
                 originalVol = strip->getVolume();
@@ -7434,6 +7443,17 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 originalGrainCloud = strip->getGrainCloudDepth();
                 originalGrainEmitter = strip->getGrainEmitterDepth();
                 originalGrainEnvelope = strip->getGrainEnvelope();
+
+                if (stepSampler != nullptr)
+                {
+                    originalStepVol = stepSampler->getVolume();
+                    originalStepPan = stepSampler->getPan();
+                    originalStepPitchSemitones = static_cast<float>(stepSampler->getPitchOffset());
+                    originalStepSpeed = std::pow(2.0f, originalStepPitchSemitones / 12.0f);
+                    originalStepFilterFreq = stepSampler->getFilterFrequency();
+                    originalStepFilterRes = stepSampler->getFilterResonance();
+                    originalStepFilterEnabled = stepSampler->isFilterEnabled();
+                }
             }
 
             const int lengthBars = juce::jlimit(1, MaxModBars, seq.lengthBars.load(std::memory_order_acquire));
@@ -7534,16 +7554,26 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 switch (target)
                 {
                     case ModTarget::Volume:
-                        strip->setVolume(juce::jlimit(0.0f, 1.0f, originalVol * ((1.0f - depth) + modNorm)));
+                    {
+                        const float targetVol = juce::jlimit(0.0f, 1.0f, originalVol * ((1.0f - depth) + modNorm));
+                        strip->setVolume(targetVol);
+                        if (stepSampler != nullptr)
+                            stepSampler->setVolume(targetVol);
                         break;
+                    }
                     case ModTarget::Pan:
+                    {
                         // Mod lane polarity: up = left, down = right.
-                        strip->setPan(juce::jlimit(-1.0f, 1.0f, originalPan - modSigned));
+                        const float targetPan = juce::jlimit(-1.0f, 1.0f, originalPan - modSigned);
+                        strip->setPan(targetPan);
+                        if (stepSampler != nullptr)
+                            stepSampler->setPan(targetPan);
                         break;
+                    }
                     case ModTarget::Pitch:
                     {
                         float pitchDelta = 24.0f * modSigned;
-                        float targetPitch = originalPitch + pitchDelta;
+                        float targetPitch = (stepSampler != nullptr ? originalStepPitchSemitones : originalPitch) + pitchDelta;
                         const bool quantize = (seq.pitchScaleQuantize.load(std::memory_order_acquire) != 0);
                         if (quantize)
                         {
@@ -7551,14 +7581,20 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                                 0, static_cast<int>(PitchScale::PentatonicMinor), seq.pitchScale.load(std::memory_order_acquire)));
                             targetPitch = quantizePitchDeltaToScale(targetPitch, scale);
                         }
-                        strip->setPitchShift(juce::jlimit(-24.0f, 24.0f, targetPitch));
+                        targetPitch = juce::jlimit(-24.0f, 24.0f, targetPitch);
+                        strip->setPitchShift(targetPitch);
+                        if (stepSampler != nullptr)
+                            stepSampler->setSpeed(std::pow(2.0f, targetPitch / 12.0f));
                         break;
                     }
                     case ModTarget::Speed:
                     {
                         const float speedRatioRaw = quantizeSpeedRatioMusical(controlRaw);
                         const float speedRatio = std::pow(speedRatioRaw, depth);
-                        const float targetSpeed = juce::jlimit(0.125f, 4.0f, originalSpeed * speedRatio);
+                        const float speedBase = (stepSampler != nullptr) ? originalStepSpeed : originalSpeed;
+                        const float targetSpeed = juce::jlimit(0.125f, 4.0f, speedBase * speedRatio);
+                        if (stepSampler != nullptr)
+                            stepSampler->setSpeed(targetSpeed);
                         if (loopSpeedImmediate)
                             strip->setPlaybackSpeedImmediate(targetSpeed);
                         else
@@ -7568,13 +7604,25 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     case ModTarget::Cutoff:
                     {
                         const float targetFreq = 20.0f * std::pow(1000.0f, juce::jlimit(0.0f, 1.0f, modNorm));
-                        strip->setFilterFrequency(juce::jmap(depth, originalFilterFreq, targetFreq));
+                        const float mixedFreq = juce::jmap(depth, originalFilterFreq, targetFreq);
+                        strip->setFilterFrequency(mixedFreq);
+                        if (stepSampler != nullptr)
+                        {
+                            stepSampler->setFilterEnabled(true);
+                            stepSampler->setFilterFrequency(juce::jmap(depth, originalStepFilterFreq, targetFreq));
+                        }
                         break;
                     }
                     case ModTarget::Resonance:
                     {
                         const float targetRes = juce::jmap(juce::jlimit(0.0f, 1.0f, modNorm), 0.1f, 10.0f);
-                        strip->setFilterResonance(juce::jmap(depth, originalFilterRes, targetRes));
+                        const float mixedRes = juce::jmap(depth, originalFilterRes, targetRes);
+                        strip->setFilterResonance(mixedRes);
+                        if (stepSampler != nullptr)
+                        {
+                            stepSampler->setFilterEnabled(true);
+                            stepSampler->setFilterResonance(juce::jmap(depth, originalStepFilterRes, targetRes));
+                        }
                         break;
                     }
                     case ModTarget::GrainSize:
@@ -7675,6 +7723,16 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 strip->setGrainCloudDepth(originalGrainCloud);
                 strip->setGrainEmitterDepth(originalGrainEmitter);
                 strip->setGrainEnvelope(originalGrainEnvelope);
+
+                if (stepSampler != nullptr)
+                {
+                    stepSampler->setVolume(originalStepVol);
+                    stepSampler->setPan(originalStepPan);
+                    stepSampler->setSpeed(originalStepSpeed);
+                    stepSampler->setFilterFrequency(originalStepFilterFreq);
+                    stepSampler->setFilterResonance(originalStepFilterRes);
+                    stepSampler->setFilterEnabled(originalStepFilterEnabled);
+                }
             }
             else
             {

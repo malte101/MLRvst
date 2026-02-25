@@ -107,6 +107,7 @@ juce::String getMonomePageDisplayName(MlrVSTAudioProcessor::ControlMode mode)
         case MlrVSTAudioProcessor::ControlMode::Gate: return "Gate";
         case MlrVSTAudioProcessor::ControlMode::Modulation: return "Modulation";
         case MlrVSTAudioProcessor::ControlMode::Preset: return "Preset Loader";
+        case MlrVSTAudioProcessor::ControlMode::StepEdit: return "Step Edit";
         case MlrVSTAudioProcessor::ControlMode::GroupAssign: return "Group Assign";
         case MlrVSTAudioProcessor::ControlMode::FileBrowser: return "File Browser";
     }
@@ -129,6 +130,7 @@ juce::String getMonomePageShortName(MlrVSTAudioProcessor::ControlMode mode)
         case MlrVSTAudioProcessor::ControlMode::GroupAssign: return "GRP";
         case MlrVSTAudioProcessor::ControlMode::Modulation: return "MOD";
         case MlrVSTAudioProcessor::ControlMode::Preset: return "PST";
+        case MlrVSTAudioProcessor::ControlMode::StepEdit: return "STEP";
         case MlrVSTAudioProcessor::ControlMode::Normal:
         default: return "NORM";
     }
@@ -2007,7 +2009,7 @@ void StripControl::applyModulationCellDuplicateFromDrag(int deltaY)
     }
 }
 
-void StripControl::applyModulationCellCurveFromDrag(int deltaY)
+void StripControl::applyModulationCellCurveFromDrag(int deltaY, bool rampUpMode)
 {
     auto* engine = processor.getAudioEngine();
     if (!engine || stripIndex >= MlrVSTAudioProcessor::MaxStrips || modTransformStep < 0 || modTransformStep >= modTransformStepCount)
@@ -2015,20 +2017,26 @@ void StripControl::applyModulationCellCurveFromDrag(int deltaY)
 
     const float srcV = modTransformSourceSteps[static_cast<size_t>(modTransformStep)];
     const float dragNorm = juce::jlimit(-1.0f, 1.0f, static_cast<float>(-deltaY) / 120.0f);
-    float exponent = 1.0f; // Middle = linear
+    float exponent = 1.0f;
     if (dragNorm >= 0.0f)
+        exponent = 1.0f + (dragNorm * 5.0f);             // stronger curve when dragging up
+    else
+        exponent = 1.0f / (1.0f + ((-dragNorm) * 0.75f)); // flatter curve when dragging down
+
+    const float clampedSrc = juce::jlimit(0.0f, 1.0f, srcV);
+    float shaped = clampedSrc;
+    if (rampUpMode)
     {
-        // Drag up: progressively more exponential.
-        exponent = 1.0f + (dragNorm * 5.0f); // 1 .. 6
+        // Control-drag: ramp up / ease-out style (pushes value upward with drag).
+        shaped = 1.0f - std::pow(1.0f - clampedSrc, exponent);
     }
     else
     {
-        // Drag down: progressively less exponential.
-        exponent = 1.0f / (1.0f + ((-dragNorm) * 0.75f)); // 1 .. ~0.57
+        // Option-drag: ramp down / ease-in style (pushes value downward with drag).
+        shaped = std::pow(clampedSrc, exponent);
     }
 
-    const float shaped = juce::jlimit(0.0f, 1.0f,
-                                      std::pow(juce::jlimit(0.0f, 1.0f, srcV), exponent));
+    shaped = juce::jlimit(0.0f, 1.0f, shaped);
     engine->setModStepValueAbsolute(stripIndex, modTransformStep, shaped);
 }
 
@@ -2053,28 +2061,32 @@ void StripControl::mouseDown(const juce::MouseEvent& e)
         const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, engine->getModLengthBars(stripIndex));
         const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
 
-        if (e.mods.isRightButtonDown())
-        {
-            for (int i = 0; i < totalSteps; ++i)
-                engine->setModStepValueAbsolute(stripIndex, i, neutralValue);
-            modulationLastDrawStep = -1;
-            return;
-        }
-
         const auto mods = e.mods;
+        const bool commandDown = mods.isCommandDown();
+        const bool controlDown = mods.isCtrlDown();
+        const bool optionDown = mods.isAltDown();
         const int clickedStep = getModulationStepFromPoint(e.getPosition());
-        const bool duplicateGesture = mods.isCommandDown() || mods.isCtrlDown();
-        const bool shapeGesture = mods.isAltDown();
-        if ((duplicateGesture || shapeGesture) && clickedStep >= 0)
+        if (clickedStep >= 0 && (commandDown || controlDown || optionDown))
         {
             modTransformStepCount = totalSteps;
             for (int i = 0; i < modTransformStepCount; ++i)
                 modTransformSourceSteps[static_cast<size_t>(i)] = engine->getModStepValueAbsolute(stripIndex, i);
             modTransformStartY = e.y;
             modTransformStep = clickedStep;
-            modTransformMode = duplicateGesture
-                ? ModTransformMode::DuplicateCell
-                : ModTransformMode::ShapeCell;
+            if (commandDown)
+                modTransformMode = ModTransformMode::DuplicateCell;
+            else if (controlDown)
+                modTransformMode = ModTransformMode::ShapeUpCell;
+            else
+                modTransformMode = ModTransformMode::ShapeDownCell;
+            return;
+        }
+
+        if (mods.isRightButtonDown() && !commandDown && !controlDown && !optionDown)
+        {
+            for (int i = 0; i < totalSteps; ++i)
+                engine->setModStepValueAbsolute(stripIndex, i, neutralValue);
+            modulationLastDrawStep = -1;
             return;
         }
 
@@ -2114,8 +2126,10 @@ void StripControl::mouseDrag(const juce::MouseEvent& e)
             const int deltaY = e.y - modTransformStartY;
             if (modTransformMode == ModTransformMode::DuplicateCell)
                 applyModulationCellDuplicateFromDrag(deltaY);
-            else if (modTransformMode == ModTransformMode::ShapeCell)
-                applyModulationCellCurveFromDrag(deltaY);
+            else if (modTransformMode == ModTransformMode::ShapeUpCell)
+                applyModulationCellCurveFromDrag(deltaY, true);
+            else if (modTransformMode == ModTransformMode::ShapeDownCell)
+                applyModulationCellCurveFromDrag(deltaY, false);
             return;
         }
 
@@ -2237,7 +2251,7 @@ void StripControl::resized()
     // Waveform OR step display gets all remaining space
     waveform.setBounds(bounds);
     stepDisplay.setBounds(bounds);  // Same position, visibility toggled
-    modulationLaneBounds = bounds.reduced(8, 0);
+    modulationLaneBounds = bounds;  // Match waveform/step display exactly
     
     if (modulationLaneView)
     {
@@ -2690,6 +2704,27 @@ void StripControl::updateFromEngine()
         stepDisplay.setCurrentStep(strip->currentStep);
         stepDisplay.setPlaying(strip->isPlaying());
 
+        if (processor.isStepEditModeActive())
+        {
+            StepSequencerDisplay::EditTool mappedTool = StepSequencerDisplay::EditTool::Volume;
+            switch (processor.getStepEditToolIndex())
+            {
+                case 1: mappedTool = StepSequencerDisplay::EditTool::Volume; break;
+                case 2: mappedTool = StepSequencerDisplay::EditTool::Divide; break;
+                case 3: mappedTool = StepSequencerDisplay::EditTool::RampUp; break;
+                case 4: mappedTool = StepSequencerDisplay::EditTool::RampDown; break;
+                case 5: mappedTool = StepSequencerDisplay::EditTool::Probability; break;
+                case 0:
+                case 6:
+                case 7:
+                case 8:
+                default: mappedTool = StepSequencerDisplay::EditTool::Volume; break;
+            }
+
+            if (stepDisplay.getActiveTool() != mappedTool)
+                stepDisplay.setActiveTool(mappedTool);
+        }
+
         // No playback position indicator in step mode - just show steps
     }
     
@@ -3048,7 +3083,15 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     filterEnableButton.setClickingTogglesState(true);
     filterEnableButton.onClick = [this]() {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-            strip->setFilterEnabled(filterEnableButton.getToggleState());
+        {
+            const bool enabled = filterEnableButton.getToggleState();
+            strip->setFilterEnabled(enabled);
+            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+            {
+                if (auto* stepSampler = strip->getStepSampler())
+                    stepSampler->setFilterEnabled(enabled);
+            }
+        }
     };
     addAndMakeVisible(filterEnableButton);
     
@@ -3068,7 +3111,14 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     filterFreqSlider.setTextValueSuffix(" Hz");
     filterFreqSlider.onValueChange = [this]() {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
+        {
             strip->setFilterFrequency(static_cast<float>(filterFreqSlider.getValue()));
+            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+            {
+                if (auto* stepSampler = strip->getStepSampler())
+                    stepSampler->setFilterFrequency(static_cast<float>(filterFreqSlider.getValue()));
+            }
+        }
     };
     addAndMakeVisible(filterFreqSlider);
     
@@ -3087,7 +3137,14 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     filterResSlider.setTextValueSuffix(" Q");
     filterResSlider.onValueChange = [this]() {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
+        {
             strip->setFilterResonance(static_cast<float>(filterResSlider.getValue()));
+            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+            {
+                if (auto* stepSampler = strip->getStepSampler())
+                    stepSampler->setFilterResonance(static_cast<float>(filterResSlider.getValue()));
+            }
+        }
     };
     addAndMakeVisible(filterResSlider);
     
@@ -3121,7 +3178,29 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     filterMorphSlider.onValueChange = [this]()
     {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-            strip->setFilterMorph(static_cast<float>(filterMorphSlider.getValue()));
+        {
+            const float morphValue = static_cast<float>(filterMorphSlider.getValue());
+            strip->setFilterMorph(morphValue);
+            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+            {
+                EnhancedAudioStrip::FilterType stripType = EnhancedAudioStrip::FilterType::LowPass;
+                FilterType stepType = FilterType::LowPass;
+                if (morphValue >= 0.75f)
+                {
+                    stripType = EnhancedAudioStrip::FilterType::HighPass;
+                    stepType = FilterType::HighPass;
+                }
+                else if (morphValue >= 0.25f)
+                {
+                    stripType = EnhancedAudioStrip::FilterType::BandPass;
+                    stepType = FilterType::BandPass;
+                }
+
+                strip->setFilterType(stripType);
+                if (auto* stepSampler = strip->getStepSampler())
+                    stepSampler->setFilterType(stepType);
+            }
+        }
     };
     addAndMakeVisible(filterMorphSlider);
 
@@ -3310,12 +3389,30 @@ void FXStripControl::updateFromEngine()
     
     auto* strip = processor.getAudioEngine()->getStrip(stripIndex);
     if (!strip) return;
+
+    const bool isStepMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+    auto* stepSampler = isStepMode ? strip->getStepSampler() : nullptr;
     
     // Update from engine state
-    filterEnableButton.setToggleState(strip->isFilterEnabled(), juce::dontSendNotification);
-    filterFreqSlider.setValue(strip->getFilterFrequency(), juce::dontSendNotification);
-    filterResSlider.setValue(strip->getFilterResonance(), juce::dontSendNotification);
-    filterMorphSlider.setValue(strip->getFilterMorph(), juce::dontSendNotification);
+    const bool filterEnabled = (isStepMode && stepSampler) ? stepSampler->isFilterEnabled() : strip->isFilterEnabled();
+    const float filterFreq = (isStepMode && stepSampler) ? stepSampler->getFilterFrequency() : strip->getFilterFrequency();
+    const float filterRes = (isStepMode && stepSampler) ? stepSampler->getFilterResonance() : strip->getFilterResonance();
+    float filterMorph = strip->getFilterMorph();
+    if (isStepMode && stepSampler)
+    {
+        switch (stepSampler->getFilterType())
+        {
+            case FilterType::LowPass:  filterMorph = 0.0f; break;
+            case FilterType::BandPass: filterMorph = 0.5f; break;
+            case FilterType::HighPass: filterMorph = 1.0f; break;
+            default: break;
+        }
+    }
+
+    filterEnableButton.setToggleState(filterEnabled, juce::dontSendNotification);
+    filterFreqSlider.setValue(filterFreq, juce::dontSendNotification);
+    filterResSlider.setValue(filterRes, juce::dontSendNotification);
+    filterMorphSlider.setValue(filterMorph, juce::dontSendNotification);
     gateSpeedBox.setSelectedId(gateRateIdFromCycles(strip->getGateSpeed()), juce::dontSendNotification);
     gateEnvSlider.setValue(strip->getGateEnvelope(), juce::dontSendNotification);
 
@@ -3365,7 +3462,13 @@ void FXStripControl::updateFromEngine()
             const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
             const int step = juce::jlimit(0, totalSteps - 1, engine->getModCurrentGlobalStep(stripIndex));
             const float raw = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(stripIndex, step));
-            const float pulse = juce::jlimit(0.0f, 1.0f, (0.35f + (0.65f * (raw * depth))) * (((step & 1) == 0) ? 1.0f : 0.65f));
+            const bool bipolar = mod.bipolar && modTargetAllowsBipolar(mod.target);
+            const float modNorm = juce::jlimit(0.0f, 1.0f, raw * depth);
+            const float modBi = juce::jlimit(-1.0f, 1.0f, ((raw * 2.0f) - 1.0f) * depth);
+            const float intensity = bipolar ? std::abs(modBi) : modNorm;
+            const float stepPulse = ((step & 1) == 0) ? 1.0f : 0.65f;
+            const float pulse = juce::jlimit(0.0f, 1.0f,
+                                             (0.35f + (0.65f * juce::jmax(0.2f, intensity))) * stepPulse);
             const auto modColour = pickVisibleModColour(base).withAlpha(0.82f + (0.18f * pulse));
             if (mod.target == ModernAudioEngine::ModTarget::Cutoff)
                 setBaseSliderTint(filterFreqSlider, modColour);
@@ -5568,11 +5671,19 @@ void ModulationControlPanel::mouseDown(const juce::MouseEvent& e)
     if (step < 0)
         return;
 
-    if (e.mods.isCommandDown() || e.mods.isAltDown())
+    const bool commandDown = e.mods.isCommandDown();
+    const bool controlDown = e.mods.isCtrlDown();
+    const bool optionDown = e.mods.isAltDown();
+    if (commandDown || controlDown || optionDown)
     {
         const auto state = processor.getAudioEngine()->getModSequencerState(selectedStrip);
         gestureSourceSteps = state.steps;
-        gestureMode = e.mods.isCommandDown() ? EditGestureMode::DuplicateCell : EditGestureMode::ShapeCell;
+        if (commandDown)
+            gestureMode = EditGestureMode::DuplicateCell;
+        else if (controlDown)
+            gestureMode = EditGestureMode::ShapeUpCell;
+        else
+            gestureMode = EditGestureMode::ShapeDownCell;
         gestureActive = true;
         gestureStartY = e.getScreenPosition().y;
         gestureStep = step;
@@ -5588,8 +5699,10 @@ void ModulationControlPanel::mouseDrag(const juce::MouseEvent& e)
     const int deltaY = e.getScreenPosition().y - gestureStartY;
     if (gestureMode == EditGestureMode::DuplicateCell)
         applyDuplicateGesture(deltaY);
-    else if (gestureMode == EditGestureMode::ShapeCell)
-        applyShapeGesture(deltaY);
+    else if (gestureMode == EditGestureMode::ShapeUpCell)
+        applyShapeGesture(deltaY, true);
+    else if (gestureMode == EditGestureMode::ShapeDownCell)
+        applyShapeGesture(deltaY, false);
 
     refreshFromEngine();
 }
@@ -5681,7 +5794,7 @@ void ModulationControlPanel::applyDuplicateGesture(int deltaY)
     }
 }
 
-void ModulationControlPanel::applyShapeGesture(int deltaY)
+void ModulationControlPanel::applyShapeGesture(int deltaY, bool rampUpMode)
 {
     auto* engine = processor.getAudioEngine();
     if (!engine || gestureStep < 0 || gestureStep >= ModernAudioEngine::ModSteps)
@@ -5694,8 +5807,13 @@ void ModulationControlPanel::applyShapeGesture(int deltaY)
         exponent = 1.0f + (dragNorm * 5.0f);
     else
         exponent = 1.0f / (1.0f + ((-dragNorm) * 0.75f));
-
-    const float shaped = juce::jlimit(0.0f, 1.0f, std::pow(juce::jlimit(0.0f, 1.0f, srcV), exponent));
+    const float clampedSrc = juce::jlimit(0.0f, 1.0f, srcV);
+    float shaped = clampedSrc;
+    if (rampUpMode)
+        shaped = 1.0f - std::pow(1.0f - clampedSrc, exponent);
+    else
+        shaped = std::pow(clampedSrc, exponent);
+    shaped = juce::jlimit(0.0f, 1.0f, shaped);
     engine->setModStepValue(selectedStrip, gestureStep, shaped);
 }
 

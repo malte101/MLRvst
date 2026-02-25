@@ -127,6 +127,21 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
 {
     if (mode == speedMode)
     {
+        if (strip.playMode == EnhancedAudioStrip::PlayMode::Step)
+        {
+            const int semitones = musicalPitchSemitones[static_cast<size_t>(juce::jlimit(0, 15, x))];
+            if (auto* stepSampler = strip.getStepSampler())
+            {
+                const float ratio = std::pow(2.0f, static_cast<float>(semitones) / 12.0f);
+                stepSampler->setSpeed(ratio);
+            }
+
+            if (auto* param = processor.parameters.getParameter("stripPitch" + juce::String(stripIndex)))
+                param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(semitones)));
+
+            return;
+        }
+
         // Match Strip +/- behavior: speed is controlled by beats-per-loop,
         // where 4 beats == normal speed, lower beats == faster, higher == slower.
         const float speedRatio = rhythmicSpeeds[static_cast<size_t>(juce::jlimit(0, 15, x))];
@@ -205,6 +220,23 @@ void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][8], i
 
     if (mode == speedMode)
     {
+        if (isStepMode && stepSampler)
+        {
+            const int semitones = stepSampler->getPitchOffset();
+            const int activeCol = findNearestPitchColumn(semitones);
+
+            for (int x = 0; x < 16; ++x)
+            {
+                newLedState[x][y] = 4;
+                if (x == 8)
+                    newLedState[x][y] = 6;
+                if (x == activeCol)
+                    newLedState[x][y] = 15;
+            }
+
+            return;
+        }
+
         float beats = strip.getBeatsPerLoop();
         if (beats < 0.0f)
             beats = 4.0f; // Auto mode defaults to musical normal speed
