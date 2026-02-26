@@ -978,6 +978,7 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
     loadPersistentDefaultPaths();
     loadPersistentControlPages();
     setSwingDivisionSelection(swingDivisionSelection.load(std::memory_order_acquire));
+    resetStepEditVelocityGestures();
 
     for (auto& held : arcKeyHeld)
         held = 0;

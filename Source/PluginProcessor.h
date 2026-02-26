@@ -389,6 +389,14 @@ private:
     };
     StepEditTool stepEditTool = StepEditTool::Gate;
     int stepEditSelectedStrip = 0;
+    std::array<bool, MaxColumns> stepEditVelocityGestureActive{};
+    std::array<int, MaxColumns> stepEditVelocityGestureStrip{};
+    std::array<int, MaxColumns> stepEditVelocityGestureStep{};
+    std::array<float, MaxColumns> stepEditVelocityGestureAnchorStart{};
+    std::array<float, MaxColumns> stepEditVelocityGestureAnchorEnd{};
+    std::array<float, MaxColumns> stepEditVelocityGestureAnchorValue{};
+    std::array<uint32_t, MaxColumns> stepEditVelocityGestureLastActivityMs{};
+    static constexpr uint32_t stepEditVelocityGestureLatchMs = 180;
     std::atomic<bool> controlPageMomentary{true};
     std::atomic<int> swingDivisionSelection{1}; // 0=1/4,1=1/8,2=1/16,3=Triplet
     
@@ -425,6 +433,7 @@ private:
     void timerCallback() override;
     
     void handleMonomeKeyPress(int x, int y, int state);
+    void resetStepEditVelocityGestures();
     bool isArcModulationMode() const;
     void setArcControlMode(ArcControlMode mode);
     void handleMonomeArcDelta(int encoder, int delta);

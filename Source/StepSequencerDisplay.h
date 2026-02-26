@@ -1095,38 +1095,7 @@ private:
             std::sort(orderedTargets.begin(), orderedTargets.end());
 
         const int targetCount = static_cast<int>(orderedTargets.size());
-        float volumeShift = dragShiftRaw;
-        if (dragTool == EditTool::Volume && targetCount > 0)
-        {
-            float baseLow = 1.0f;
-            float baseHigh = 0.0f;
-            bool hasBase = false;
-
-            for (int targetIndex = 0; targetIndex < targetCount; ++targetIndex)
-            {
-                const int step = orderedTargets[static_cast<size_t>(targetIndex)];
-                if (step < 0 || step >= totalSteps)
-                    continue;
-
-                const size_t idx = static_cast<size_t>(step);
-                const float baseStart = juce::jlimit(0.0f, 1.0f, dragStartVelocityStart[idx]);
-                const float baseEnd = juce::jlimit(0.0f, 1.0f, dragStartVelocityEnd[idx]);
-                baseLow = juce::jmin(baseLow, juce::jmin(baseStart, baseEnd));
-                baseHigh = juce::jmax(baseHigh, juce::jmax(baseStart, baseEnd));
-                hasBase = true;
-            }
-
-            if (hasBase)
-            {
-                const float minShift = -baseLow;
-                const float maxShift = 1.0f - baseHigh;
-                volumeShift = juce::jlimit(minShift, maxShift, dragShiftRaw);
-            }
-            else
-            {
-                volumeShift = 0.0f;
-            }
-        }
+        const float volumeShift = dragShiftRaw;
 
         float rampMultiShift = rampOverflowShift;
         if (rampTool && targetCount > 1)
@@ -1199,11 +1168,6 @@ private:
                     const float newEnd = juce::jlimit(0.0f, 1.0f, baseEnd + volumeShift);
 
                     setVelocityRange(step, newStart, newEnd, true);
-
-                    const float maxVelocity = juce::jmax(newStart, newEnd);
-                    const bool shouldEnable = (maxVelocity > 0.001f);
-                    if (stepPattern[idx] != shouldEnable)
-                        setStepEnabled(step, shouldEnable, true);
                     break;
                 }
 

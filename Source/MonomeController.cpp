@@ -43,6 +43,17 @@ int stutterColumnFromMask(uint8_t mask)
 }
 }
 
+void MlrVSTAudioProcessor::resetStepEditVelocityGestures()
+{
+    stepEditVelocityGestureActive.fill(false);
+    stepEditVelocityGestureStrip.fill(0);
+    stepEditVelocityGestureStep.fill(0);
+    stepEditVelocityGestureAnchorStart.fill(1.0f);
+    stepEditVelocityGestureAnchorEnd.fill(1.0f);
+    stepEditVelocityGestureAnchorValue.fill(1.0f);
+    stepEditVelocityGestureLastActivityMs.fill(0);
+}
+
 void MlrVSTAudioProcessor::setMomentaryScratchHold(bool shouldEnable)
 {
     if (!audioEngine)
@@ -389,6 +400,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             {
                 if (x >= 0 && x <= 7)
                 {
+                    const auto previousTool = stepEditTool;
                     switch (x)
                     {
                         case 0: stepEditTool = StepEditTool::Velocity; break;
@@ -401,6 +413,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                         case 7: stepEditTool = StepEditTool::Release; break; // Pitch tool (reusing Release slot)
                         default: break;
                     }
+                    if (stepEditTool != previousTool)
+                        resetStepEditVelocityGestures();
 
                     updateMonomeLEDs();
                     return;
@@ -410,6 +424,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 {
                     stepEditSelectedStrip = juce::jlimit(0, MaxStrips - 1, x - 8);
                     lastMonomePressedStripRow.store(stepEditSelectedStrip, std::memory_order_release);
+                    resetStepEditVelocityGestures();
                     updateMonomeLEDs();
                     return;
                 }
@@ -581,6 +596,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         {
             if (x >= 0 && x < NumControlRowPages)
             {
+                const bool wasStepEditMode = (controlModeActive && currentControlMode == ControlMode::StepEdit);
                 const auto selectedMode = getControlModeForControlButton(x);
                 if (isControlPageMomentary())
                 {
@@ -606,6 +622,11 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     if (stepEditTool == StepEditTool::Gate)
                         stepEditTool = StepEditTool::Velocity;
                     stepEditSelectedStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+                    resetStepEditVelocityGestures();
+                }
+                else if (wasStepEditMode)
+                {
+                    resetStepEditVelocityGestures();
                 }
 
                 updateMonomeLEDs();  // Force immediate LED update
@@ -768,11 +789,56 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
                     case StepEditTool::Velocity:
                     {
+                        const int column = juce::jlimit(0, MaxColumns - 1, x);
+                        const uint32_t nowMs = juce::Time::getMillisecondCounter();
+                        const bool sameTarget = stepEditVelocityGestureActive[static_cast<size_t>(column)]
+                            && stepEditVelocityGestureStrip[static_cast<size_t>(column)] == selectedStripIndex
+                            && stepEditVelocityGestureStep[static_cast<size_t>(column)] == absoluteStep;
+                        const uint32_t elapsedMs = nowMs
+                            - stepEditVelocityGestureLastActivityMs[static_cast<size_t>(column)];
+                        const bool continueGesture = sameTarget
+                            && (elapsedMs <= stepEditVelocityGestureLatchMs);
+
+                        if (!continueGesture)
+                        {
+                            const float anchorStart = juce::jlimit(
+                                0.0f, 1.0f, targetStrip->getStepSubdivisionStartVelocityAtIndex(absoluteStep));
+                            const float anchorEnd = juce::jlimit(
+                                0.0f, 1.0f, targetStrip->getStepSubdivisionRepeatVelocityAtIndex(absoluteStep));
+                            stepEditVelocityGestureActive[static_cast<size_t>(column)] = true;
+                            stepEditVelocityGestureStrip[static_cast<size_t>(column)] = selectedStripIndex;
+                            stepEditVelocityGestureStep[static_cast<size_t>(column)] = absoluteStep;
+                            stepEditVelocityGestureAnchorStart[static_cast<size_t>(column)] = anchorStart;
+                            stepEditVelocityGestureAnchorEnd[static_cast<size_t>(column)] = anchorEnd;
+                            stepEditVelocityGestureAnchorValue[static_cast<size_t>(column)] = juce::jmax(anchorStart, anchorEnd);
+                        }
+
+                        stepEditVelocityGestureLastActivityMs[static_cast<size_t>(column)] = nowMs;
+
                         // Bottom row (y=6) in volume tool is an explicit step-off command.
-                        const bool shouldEnable = (rowValue > 0.001f) && (y < (CONTROL_ROW - 1));
+                        const bool explicitOff = (y >= (CONTROL_ROW - 1));
+                        if (explicitOff)
+                        {
+                            setStepEnabled(absoluteStep, false);
+                            targetStrip->setStepSubdivisionVelocityRangeAtIndex(absoluteStep, 0.0f, 0.0f);
+                            stepEditVelocityGestureActive[static_cast<size_t>(column)] = false;
+                            break;
+                        }
+
+                        const float dragShift = rowValue
+                            - stepEditVelocityGestureAnchorValue[static_cast<size_t>(column)];
+                        const float start = juce::jlimit(
+                            0.0f,
+                            1.0f,
+                            stepEditVelocityGestureAnchorStart[static_cast<size_t>(column)] + dragShift);
+                        const float end = juce::jlimit(
+                            0.0f,
+                            1.0f,
+                            stepEditVelocityGestureAnchorEnd[static_cast<size_t>(column)] + dragShift);
+
+                        targetStrip->setStepSubdivisionVelocityRangeAtIndex(absoluteStep, start, end);
+                        const bool shouldEnable = juce::jmax(start, end) > 0.001f;
                         setStepEnabled(absoluteStep, shouldEnable);
-                        const float stepVelocity = shouldEnable ? rowValue : 0.0f;
-                        targetStrip->setStepSubdivisionVelocityRangeAtIndex(absoluteStep, stepVelocity, stepVelocity);
                         break;
                     }
 
@@ -1125,8 +1191,11 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         // Release control mode in momentary behavior (control-page buttons)
         if (isControlPageMomentary() && y == CONTROL_ROW && (x >= 0 && x < NumControlRowPages))
         {
+            const bool wasStepEditMode = (controlModeActive && currentControlMode == ControlMode::StepEdit);
             currentControlMode = ControlMode::Normal;
             controlModeActive = false;
+            if (wasStepEditMode)
+                resetStepEditVelocityGestures();
             updateMonomeLEDs();  // Update LEDs when returning to normal
         }
         
