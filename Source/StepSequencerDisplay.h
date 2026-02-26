@@ -1077,6 +1077,9 @@ private:
     {
         const int deltaY = mouseY - dragStartY;
         const float valueFromY = getNormalizedDragValueFromY(mouseY);
+        const float depth = valueFromY;
+        const float dragHeight = juce::jmax(8.0f, dragAnchorRect.getHeight());
+        const float dragShiftRaw = static_cast<float>(-deltaY) / dragHeight;
         const bool rampTool = (dragTool == EditTool::RampUp || dragTool == EditTool::RampDown);
         float rampOverflowShift = 0.0f;
         if (rampTool)
@@ -1092,6 +1095,85 @@ private:
             std::sort(orderedTargets.begin(), orderedTargets.end());
 
         const int targetCount = static_cast<int>(orderedTargets.size());
+        float volumeShift = dragShiftRaw;
+        if (dragTool == EditTool::Volume && targetCount > 0)
+        {
+            float baseLow = 1.0f;
+            float baseHigh = 0.0f;
+            bool hasBase = false;
+
+            for (int targetIndex = 0; targetIndex < targetCount; ++targetIndex)
+            {
+                const int step = orderedTargets[static_cast<size_t>(targetIndex)];
+                if (step < 0 || step >= totalSteps)
+                    continue;
+
+                const size_t idx = static_cast<size_t>(step);
+                const float baseStart = juce::jlimit(0.0f, 1.0f, dragStartVelocityStart[idx]);
+                const float baseEnd = juce::jlimit(0.0f, 1.0f, dragStartVelocityEnd[idx]);
+                baseLow = juce::jmin(baseLow, juce::jmin(baseStart, baseEnd));
+                baseHigh = juce::jmax(baseHigh, juce::jmax(baseStart, baseEnd));
+                hasBase = true;
+            }
+
+            if (hasBase)
+            {
+                const float minShift = -baseLow;
+                const float maxShift = 1.0f - baseHigh;
+                volumeShift = juce::jlimit(minShift, maxShift, dragShiftRaw);
+            }
+            else
+            {
+                volumeShift = 0.0f;
+            }
+        }
+
+        float rampMultiShift = rampOverflowShift;
+        if (rampTool && targetCount > 1)
+        {
+            float baseLow = 1.0f;
+            float baseHigh = 0.0f;
+            bool hasBase = false;
+
+            for (int targetIndex = 0; targetIndex < targetCount; ++targetIndex)
+            {
+                const int step = orderedTargets[static_cast<size_t>(targetIndex)];
+                if (step < 0 || step >= totalSteps)
+                    continue;
+
+                const size_t idx = static_cast<size_t>(step);
+                const float baseStart = juce::jlimit(0.0f, 1.0f, dragStartVelocityStart[idx]);
+                const float baseEnd = juce::jlimit(0.0f, 1.0f, dragStartVelocityEnd[idx]);
+                const float baseMax = juce::jmax(baseStart, baseEnd);
+                const float t0 = static_cast<float>(targetIndex) / static_cast<float>(targetCount);
+                const float t1 = static_cast<float>(targetIndex + 1) / static_cast<float>(targetCount);
+
+                float segmentStart = 0.0f;
+                float segmentEnd = 0.0f;
+                if (dragTool == EditTool::RampUp)
+                {
+                    segmentStart = ((1.0f - depth) + (depth * t0)) * baseMax;
+                    segmentEnd = ((1.0f - depth) + (depth * t1)) * baseMax;
+                }
+                else
+                {
+                    segmentStart = (1.0f - (depth * t0)) * baseMax;
+                    segmentEnd = (1.0f - (depth * t1)) * baseMax;
+                }
+
+                baseLow = juce::jmin(baseLow, juce::jmin(segmentStart, segmentEnd));
+                baseHigh = juce::jmax(baseHigh, juce::jmax(segmentStart, segmentEnd));
+                hasBase = true;
+            }
+
+            if (hasBase)
+            {
+                const float minShift = -baseLow;
+                const float maxShift = 1.0f - baseHigh;
+                rampMultiShift = juce::jlimit(minShift, maxShift, rampOverflowShift);
+            }
+        }
+
         for (int targetIndex = 0; targetIndex < targetCount; ++targetIndex)
         {
             const int step = orderedTargets[static_cast<size_t>(targetIndex)];
@@ -1113,22 +1195,8 @@ private:
                     const size_t idx = static_cast<size_t>(step);
                     const float baseStart = juce::jlimit(0.0f, 1.0f, dragStartVelocityStart[idx]);
                     const float baseEnd = juce::jlimit(0.0f, 1.0f, dragStartVelocityEnd[idx]);
-                    const bool isRampShape = std::abs(baseEnd - baseStart) > 0.001f;
-                    float newStart = baseStart;
-                    float newEnd = baseEnd;
-
-                    if (isRampShape)
-                    {
-                        const float dragHeight = juce::jmax(8.0f, dragAnchorRect.getHeight());
-                        const float dragShift = static_cast<float>(-deltaY) / dragHeight;
-                        newStart = juce::jlimit(0.0f, 1.0f, baseStart + dragShift);
-                        newEnd = juce::jlimit(0.0f, 1.0f, baseEnd + dragShift);
-                    }
-                    else
-                    {
-                        newStart = valueFromY;
-                        newEnd = valueFromY;
-                    }
+                    const float newStart = juce::jlimit(0.0f, 1.0f, baseStart + volumeShift);
+                    const float newEnd = juce::jlimit(0.0f, 1.0f, baseEnd + volumeShift);
 
                     setVelocityRange(step, newStart, newEnd, true);
 
@@ -1145,6 +1213,7 @@ private:
                     const float baseStart = juce::jlimit(0.0f, 1.0f, dragStartVelocityStart[idx]);
                     const float baseEnd = juce::jlimit(0.0f, 1.0f, dragStartVelocityEnd[idx]);
                     const float baseMax = juce::jmax(baseStart, baseEnd);
+                    const float rampShift = (targetCount > 1) ? rampMultiShift : rampOverflowShift;
                     if (dragStartSubdivisions[idx] <= 1)
                     {
                         const int autoSubdivision = juce::jlimit(
@@ -1154,23 +1223,22 @@ private:
                         setSubdivision(step, autoSubdivision, true);
                     }
 
-                    const float depth = valueFromY;
                     if (targetCount > 1)
                     {
                         const float t0 = static_cast<float>(targetIndex) / static_cast<float>(targetCount);
                         const float t1 = static_cast<float>(targetIndex + 1) / static_cast<float>(targetCount);
                         const float start = juce::jlimit(0.0f, 1.0f,
                                                          ((((1.0f - depth) + (depth * t0)) * baseMax)
-                                                          + rampOverflowShift));
+                                                          + rampShift));
                         const float end = juce::jlimit(0.0f, 1.0f,
                                                        ((((1.0f - depth) + (depth * t1)) * baseMax)
-                                                        + rampOverflowShift));
+                                                        + rampShift));
                         setVelocityRange(step, start, end, true);
                     }
                     else
                     {
-                        const float start = juce::jlimit(0.0f, 1.0f, (((1.0f - depth) * baseMax) + rampOverflowShift));
-                        const float end = juce::jlimit(0.0f, 1.0f, baseMax + rampOverflowShift);
+                        const float start = juce::jlimit(0.0f, 1.0f, (((1.0f - depth) * baseMax) + rampShift));
+                        const float end = juce::jlimit(0.0f, 1.0f, baseMax + rampShift);
                         setVelocityRange(step, start, end, true);
                     }
                     break;
@@ -1182,6 +1250,7 @@ private:
                     const float baseStart = juce::jlimit(0.0f, 1.0f, dragStartVelocityStart[idx]);
                     const float baseEnd = juce::jlimit(0.0f, 1.0f, dragStartVelocityEnd[idx]);
                     const float baseMax = juce::jmax(baseStart, baseEnd);
+                    const float rampShift = (targetCount > 1) ? rampMultiShift : rampOverflowShift;
                     if (dragStartSubdivisions[idx] <= 1)
                     {
                         const int autoSubdivision = juce::jlimit(
@@ -1191,23 +1260,22 @@ private:
                         setSubdivision(step, autoSubdivision, true);
                     }
 
-                    const float depth = valueFromY;
                     if (targetCount > 1)
                     {
                         const float t0 = static_cast<float>(targetIndex) / static_cast<float>(targetCount);
                         const float t1 = static_cast<float>(targetIndex + 1) / static_cast<float>(targetCount);
                         const float start = juce::jlimit(0.0f, 1.0f,
                                                          (((1.0f - (depth * t0)) * baseMax)
-                                                          + rampOverflowShift));
+                                                          + rampShift));
                         const float end = juce::jlimit(0.0f, 1.0f,
                                                        (((1.0f - (depth * t1)) * baseMax)
-                                                        + rampOverflowShift));
+                                                        + rampShift));
                         setVelocityRange(step, start, end, true);
                     }
                     else
                     {
-                        const float start = juce::jlimit(0.0f, 1.0f, baseMax + rampOverflowShift);
-                        const float end = juce::jlimit(0.0f, 1.0f, (((1.0f - depth) * baseMax) + rampOverflowShift));
+                        const float start = juce::jlimit(0.0f, 1.0f, baseMax + rampShift);
+                        const float end = juce::jlimit(0.0f, 1.0f, (((1.0f - depth) * baseMax) + rampShift));
                         setVelocityRange(step, start, end, true);
                     }
                     break;
