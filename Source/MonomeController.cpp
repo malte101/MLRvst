@@ -1144,7 +1144,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 }
 void MlrVSTAudioProcessor::updateMonomeLEDs()
 {
-    if (!monomeConnection.isConnected() || !audioEngine)
+    if (!monomeConnection.isConnected() || !audioEngine || !monomeConnection.supportsGrid())
         return;
     
     const int GROUP_ROW = 0;

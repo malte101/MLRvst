@@ -334,7 +334,8 @@ void MonomeConnection::selectDevice(int deviceIndex)
         sendPing();
         
         // Clear all LEDs on connection
-        setAllLEDs(0);
+        if (supportsGrid())
+            setAllLEDs(0);
         
         connected = true;
         reconnectAttempts = 0;
@@ -499,6 +500,67 @@ void MonomeConnection::setLEDLevelMap(int xOffset, int yOffset, const std::array
     oscSender.send(msg);
 }
 
+void MonomeConnection::setArcRingMap(int encoder, const std::array<int, 64>& levels)
+{
+    if (!connected || !supportsArc())
+        return;
+
+    const int maxEncoders = juce::jmax(1, getArcEncoderCount());
+    const int clampedEncoder = juce::jlimit(0, maxEncoders - 1, encoder);
+
+    juce::OSCMessage msg(oscPrefix + "/ring/map");
+    msg.addInt32(clampedEncoder);
+    for (int level : levels)
+        msg.addInt32(juce::jlimit(0, 15, level));
+    oscSender.send(msg);
+}
+
+void MonomeConnection::setArcRingLevel(int encoder, int ledIndex, int level)
+{
+    if (!connected || !supportsArc())
+        return;
+
+    const int maxEncoders = juce::jmax(1, getArcEncoderCount());
+    const int clampedEncoder = juce::jlimit(0, maxEncoders - 1, encoder);
+    const int clampedLed = juce::jlimit(0, 63, ledIndex);
+    const int clampedLevel = juce::jlimit(0, 15, level);
+    oscSender.send(juce::OSCMessage(oscPrefix + "/ring/set", clampedEncoder, clampedLed, clampedLevel));
+}
+
+void MonomeConnection::setArcRingRange(int encoder, int start, int end, int level)
+{
+    if (!connected || !supportsArc())
+        return;
+
+    const int maxEncoders = juce::jmax(1, getArcEncoderCount());
+    const int clampedEncoder = juce::jlimit(0, maxEncoders - 1, encoder);
+    const int clampedStart = juce::jlimit(0, 63, start);
+    const int clampedEnd = juce::jlimit(0, 63, end);
+    const int clampedLevel = juce::jlimit(0, 15, level);
+    oscSender.send(juce::OSCMessage(oscPrefix + "/ring/range", clampedEncoder, clampedStart, clampedEnd, clampedLevel));
+}
+
+bool MonomeConnection::supportsGrid() const
+{
+    return !supportsArc();
+}
+
+bool MonomeConnection::supportsArc() const
+{
+    return currentDevice.type.containsIgnoreCase("arc");
+}
+
+int MonomeConnection::getArcEncoderCount() const
+{
+    if (!supportsArc())
+        return 0;
+    if (currentDevice.type.contains("2"))
+        return 2;
+    if (currentDevice.type.contains("4"))
+        return 4;
+    return 4;
+}
+
 // Tilt support
 void MonomeConnection::enableTilt(int sensor, bool enable)
 {
@@ -525,7 +587,8 @@ void MonomeConnection::oscMessageReceived(const juce::OSCMessage& message)
     // not correctly routed to this app yet.
     const bool isDeviceTraffic = address.startsWith("/sys")
         || address.startsWith(oscPrefix + "/grid")
-        || address.startsWith(oscPrefix + "/tilt");
+        || address.startsWith(oscPrefix + "/tilt")
+        || address.startsWith(oscPrefix + "/enc");
     if (isDeviceTraffic)
     {
         lastMessageTime = juce::Time::currentTimeMillis();
@@ -538,6 +601,8 @@ void MonomeConnection::oscMessageReceived(const juce::OSCMessage& message)
         handleGridMessage(message);
     else if (address.startsWith(oscPrefix + "/tilt"))
         handleTiltMessage(message);
+    else if (address.startsWith(oscPrefix + "/enc"))
+        handleArcMessage(message);
     else if (address.startsWith("/sys"))
         handleSystemMessage(message);
 }
@@ -844,6 +909,26 @@ void MonomeConnection::handleTiltMessage(const juce::OSCMessage& message)
     }
 }
 
+void MonomeConnection::handleArcMessage(const juce::OSCMessage& message)
+{
+    auto address = message.getAddressPattern().toString();
+
+    if (address == oscPrefix + "/enc/delta" && message.size() >= 2)
+    {
+        const int encoder = message[0].getInt32();
+        const int delta = message[1].getInt32();
+        if (onArcDelta)
+            onArcDelta(encoder, delta);
+    }
+    else if (address == oscPrefix + "/enc/key" && message.size() >= 2)
+    {
+        const int encoder = message[0].getInt32();
+        const int state = message[1].getInt32();
+        if (onArcKey)
+            onArcKey(encoder, state);
+    }
+}
+
 //==============================================================================
 // MlrVSTAudioProcessor Implementation
 //==============================================================================
@@ -893,25 +978,63 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
     loadPersistentDefaultPaths();
     loadPersistentControlPages();
     setSwingDivisionSelection(swingDivisionSelection.load(std::memory_order_acquire));
+
+    for (auto& held : arcKeyHeld)
+        held = 0;
+    for (auto& ring : arcRingCache)
+        ring.fill(-1);
+    arcControlMode = ArcControlMode::SelectedStrip;
+    lastGridLedUpdateTimeMs = 0;
     
     // Setup monome callbacks
     monomeConnection.onKeyPress = [this](int x, int y, int state)
     {
         handleMonomeKeyPress(x, y, state);
     };
+    monomeConnection.onArcDelta = [this](int encoder, int delta)
+    {
+        handleMonomeArcDelta(encoder, delta);
+    };
+    monomeConnection.onArcKey = [this](int encoder, int state)
+    {
+        handleMonomeArcKey(encoder, state);
+    };
     
     monomeConnection.onDeviceConnected = [this]()
     {
-        // Force full LED resend after any reconnect to avoid stale cache mismatch.
-        for (int y = 0; y < 8; ++y)
-            for (int x = 0; x < 16; ++x)
-                ledCache[x][y] = -1;
+        if (isTimerRunning())
+            startTimer(monomeConnection.supportsArc() ? kArcRefreshMs : kGridRefreshMs);
+
+        if (monomeConnection.supportsGrid())
+        {
+            // Force full LED resend after any reconnect to avoid stale cache mismatch.
+            for (int y = 0; y < 8; ++y)
+                for (int x = 0; x < 16; ++x)
+                    ledCache[x][y] = -1;
+        }
+
+        for (auto& held : arcKeyHeld)
+            held = 0;
+        for (auto& ring : arcRingCache)
+            ring.fill(-1);
+        arcControlMode = ArcControlMode::SelectedStrip;
+        arcSelectedModStep = 0;
+        lastGridLedUpdateTimeMs = 0;
 
         // Defer LED update slightly to ensure everything is ready
         juce::MessageManager::callAsync([this]()
         {
-            updateMonomeLEDs();
+            if (monomeConnection.supportsGrid())
+                updateMonomeLEDs();
+            if (monomeConnection.supportsArc())
+                updateMonomeArcRings();
         });
+    };
+
+    monomeConnection.onDeviceDisconnected = [this]()
+    {
+        if (isTimerRunning())
+            startTimer(kGridRefreshMs);
     };
     
     // Don't connect yet - wait for prepareToPlay
@@ -1135,6 +1258,7 @@ void MlrVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate;
     audioEngine->prepareToPlay(sampleRate, samplesPerBlock);
+    lastGridLedUpdateTimeMs = 0;
 
     // Now safe to connect to monome
     if (!monomeConnection.isConnected())
@@ -1145,17 +1269,26 @@ void MlrVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     {
         if (monomeConnection.isConnected())
         {
-            monomeConnection.setAllLEDs(0);
-            // Initialize LED cache
-            for (int y = 0; y < 8; ++y)
-                for (int x = 0; x < 16; ++x)
-                    ledCache[x][y] = -1;
+            if (monomeConnection.supportsGrid())
+            {
+                monomeConnection.setAllLEDs(0);
+                // Initialize LED cache
+                for (int y = 0; y < 8; ++y)
+                    for (int x = 0; x < 16; ++x)
+                        ledCache[x][y] = -1;
+            }
+            if (monomeConnection.supportsArc())
+            {
+                for (auto& ring : arcRingCache)
+                    ring.fill(-1);
+                updateMonomeArcRings();
+            }
         }
     });
 
     // Start LED update timer at 10fps (monome recommended refresh rate)
     if (!isTimerRunning())
-        startTimer(100);  // 10fps - prevents flickering
+        startTimer(kGridRefreshMs);
 }
 
 void MlrVSTAudioProcessor::releaseResources()
@@ -3585,7 +3718,15 @@ void MlrVSTAudioProcessor::timerCallback()
     // Update monome LEDs regularly for smooth playhead
     if (monomeConnection.isConnected() && audioEngine)
     {
-        updateMonomeLEDs();
+        const auto nowMs = juce::Time::currentTimeMillis();
+        if (monomeConnection.supportsGrid()
+            && (lastGridLedUpdateTimeMs == 0 || (nowMs - lastGridLedUpdateTimeMs) >= kGridRefreshMs))
+        {
+            updateMonomeLEDs();
+            lastGridLedUpdateTimeMs = nowMs;
+        }
+        if (monomeConnection.supportsArc())
+            updateMonomeArcRings();
     }
 }
 
@@ -4011,7 +4152,7 @@ void MlrVSTAudioProcessor::savePreset(int presetIndex)
         return;
 
     if (!isTimerRunning())
-        startTimer(100);
+        startTimer(kGridRefreshMs);
 
     PresetSaveRequest request;
     request.presetIndex = presetIndex;

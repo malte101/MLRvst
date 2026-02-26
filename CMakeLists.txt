@@ -72,6 +72,7 @@ target_sources(mlrVST
         Source/PresetStore.cpp
         Source/PresetStore.h
         Source/MonomeController.cpp
+        Source/ArcController.cpp
         Source/MonomeFilterActions.cpp
         Source/MonomeFilterActions.h
         Source/MonomeGroupAssignActions.cpp

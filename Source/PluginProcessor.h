@@ -57,6 +57,13 @@ public:
     void setLEDLevelRow(int xOffset, int y, const std::array<int, 8>& levels);
     void setLEDLevelColumn(int x, int yOffset, const std::array<int, 8>& levels);
     void setLEDLevelMap(int xOffset, int yOffset, const std::array<int, 64>& levels);
+    void setArcRingMap(int encoder, const std::array<int, 64>& levels);
+    void setArcRingLevel(int encoder, int ledIndex, int level);
+    void setArcRingRange(int encoder, int start, int end, int level);
+
+    bool supportsGrid() const;
+    bool supportsArc() const;
+    int getArcEncoderCount() const;
     
     // System commands
     void setRotation(int degrees); // 0, 90, 180, 270
@@ -86,6 +93,8 @@ public:
     // Callbacks
     std::function<void(int x, int y, int state)> onKeyPress;
     std::function<void(int sensor, int x, int y, int z)> onTilt;
+    std::function<void(int encoder, int delta)> onArcDelta;
+    std::function<void(int encoder, int state)> onArcKey;
     std::function<void()> onDeviceConnected;
     std::function<void()> onDeviceDisconnected;
     std::function<void(const std::vector<DeviceInfo>&)> onDeviceListUpdated;
@@ -96,6 +105,7 @@ private:
     void handleGridMessage(const juce::OSCMessage& message);
     void handleSystemMessage(const juce::OSCMessage& message);
     void handleTiltMessage(const juce::OSCMessage& message);
+    void handleArcMessage(const juce::OSCMessage& message);
     
     void timerCallback() override;
     void attemptReconnection();
@@ -300,6 +310,12 @@ private:
         Decay,
         Release
     };
+
+    enum class ArcControlMode
+    {
+        SelectedStrip,
+        Modulation
+    };
     
     std::unique_ptr<ModernAudioEngine> audioEngine;
     MonomeConnection monomeConnection;
@@ -389,6 +405,13 @@ private:
     std::array<std::array<uint32_t, BrowserFavoriteSlots>, MaxStrips> browserFavoritePadPressStartMs{};
     std::array<uint32_t, BrowserFavoriteSlots> browserFavoriteSaveBurstUntilMs{};
     std::array<uint32_t, BrowserFavoriteSlots> browserFavoriteMissingBurstUntilMs{};
+    std::array<int, 4> arcKeyHeld{};
+    std::array<std::array<int, 64>, 4> arcRingCache{};
+    ArcControlMode arcControlMode = ArcControlMode::SelectedStrip;
+    int arcSelectedModStep = 0;
+    juce::int64 lastGridLedUpdateTimeMs = 0;
+    static constexpr int kGridRefreshMs = 100;
+    static constexpr int kArcRefreshMs = 33;
     static constexpr uint32_t browserFavoriteHoldSaveMs = 3000;
     static constexpr uint32_t browserFavoriteSaveBurstDurationMs = 320;
     static constexpr uint32_t browserFavoriteMissingBurstDurationMs = 260;
@@ -398,9 +421,14 @@ private:
     
     // LED update
     void updateMonomeLEDs();
+    void updateMonomeArcRings();
     void timerCallback() override;
     
     void handleMonomeKeyPress(int x, int y, int state);
+    bool isArcModulationMode() const;
+    void setArcControlMode(ArcControlMode mode);
+    void handleMonomeArcDelta(int encoder, int delta);
+    void handleMonomeArcKey(int encoder, int state);
     void setMomentaryScratchHold(bool shouldEnable);
     void setMomentaryStutterHold(bool shouldEnable);
     
