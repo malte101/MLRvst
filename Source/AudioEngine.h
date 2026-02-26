@@ -106,6 +106,7 @@ struct QuantisedTrigger
     int column = 0;
     bool clearPendingOnFire = true;
     bool isMomentaryStutter = false;
+    bool isSequencerRetrigger = false;
 };
 
 class QuantizationClock
@@ -368,13 +369,13 @@ public:
     // Step sequencer state (PUBLIC for GUI access)
     static constexpr int MaxStepSubdivisions = 16;
     int currentStep = 0;                        // Current absolute step index (0-63)
-    std::array<bool, 64> stepPattern = {};      // Up to 4 bars (16 steps per bar)
+    std::array<bool, 64> stepPattern = {};      // Up to 64 total steps
     std::array<int, 64> stepSubdivisions = {};  // Per-step retrigger count (1..MaxStepSubdivisions)
     std::array<float, 64> stepSubdivisionStartVelocity = {};  // 0..1 gain for first substep hit
     std::array<float, 64> stepSubdivisionRepeatVelocity = {}; // 0..1 gain target for repeated substeps
     std::array<float, 64> stepProbability = {}; // 0..1 trigger chance per step
-    std::atomic<int> stepPatternBars{1};        // 1..4 bars
-    std::atomic<int> stepViewPage{0};           // Visible 16-step page (0..bars-1)
+    std::atomic<int> stepPatternLengthSteps{16}; // 1..64 absolute pattern length
+    std::atomic<int> stepViewPage{0};            // Visible 16-step page (0..ceil(steps/16)-1)
     std::atomic<float> stepEnvelopeAttackMs{0.0f};
     std::atomic<float> stepEnvelopeDecayMs{4000.0f};
     std::atomic<float> stepEnvelopeReleaseMs{110.0f};
@@ -449,9 +450,12 @@ public:
     
     // Step sequencer control
     void startStepSequencer();  // Start step sequencer playback (auto-runs with clock)
+    void retriggerStepVoice();  // Retrigger currently active step voice without editing gates
+    void setStepPatternLengthSteps(int steps);
+    int getStepPatternLengthSteps() const { return juce::jlimit(1, 64, stepPatternLengthSteps.load(std::memory_order_acquire)); }
     void setStepPatternBars(int bars);
-    int getStepPatternBars() const { return stepPatternBars.load(std::memory_order_acquire); }
-    int getStepTotalSteps() const { return getStepPatternBars() * 16; }
+    int getStepPatternBars() const { return juce::jmax(1, (getStepPatternLengthSteps() + 15) / 16); }
+    int getStepTotalSteps() const { return getStepPatternLengthSteps(); }
     int getStepPage() const { return stepViewPage.load(std::memory_order_acquire); }
     void setStepPage(int page);
     std::array<bool, 16> getVisibleStepPattern() const;
@@ -1093,6 +1097,7 @@ public:
     static constexpr int MaxColumns = 16;
     static constexpr int MaxGroups = 4;
     static constexpr int MaxPatterns = 4;
+    static constexpr int NumModSequencers = 3;
     static constexpr int ModSteps = 16;
     static constexpr int MaxModBars = 8;
     static constexpr int ModTotalSteps = ModSteps * MaxModBars;
@@ -1200,6 +1205,8 @@ public:
     PatternRecorder* getPattern(int index);
 
     // Per-strip modulation sequencers.
+    void setModSequencerSlot(int stripIndex, int slot);
+    int getModSequencerSlot(int stripIndex) const;
     ModSequencerState getModSequencerState(int stripIndex) const;
     static bool modTargetSupportsBipolar(ModTarget target);
     void setModTarget(int stripIndex, ModTarget target);
@@ -1306,10 +1313,18 @@ private:
         std::atomic<int> lastGlobalStep{0};
     };
 
+    int sanitizeModSequencerSlot(int slot) const;
+    int getActiveModSequencerSlot(int stripIndex) const;
+    ModSequencer& getActiveModSequencer(int stripIndex);
+    const ModSequencer& getActiveModSequencer(int stripIndex) const;
+    ModSequencer& getModSequencer(int stripIndex, int slot);
+    const ModSequencer& getModSequencer(int stripIndex, int slot) const;
+
     std::array<std::unique_ptr<EnhancedAudioStrip>, MaxStrips> strips;
     std::array<std::unique_ptr<StripGroup>, MaxGroups> groups;
     std::array<std::unique_ptr<PatternRecorder>, 4> patterns;
-    std::array<ModSequencer, MaxStrips> modSequencers;
+    std::array<std::array<ModSequencer, NumModSequencers>, MaxStrips> modSequencers;
+    std::array<std::atomic<int>, MaxStrips> activeModSequencerSlots{};
     std::atomic<int> momentaryStutterActive{0};
     std::atomic<double> momentaryStutterDivisionBeats{0.5}; // quarter-note units
     std::atomic<double> momentaryStutterStartPpq{0.0};

@@ -6279,6 +6279,23 @@ void EnhancedAudioStrip::startStepSequencer()
     DBG("Step sequencer started for strip " << stripIndex);
 }
 
+void EnhancedAudioStrip::retriggerStepVoice()
+{
+    juce::ScopedLock lock(bufferLock);
+
+    if (playMode != PlayMode::Step || !playing)
+        return;
+
+    const int totalSteps = juce::jmax(1, getStepTotalSteps());
+    const int stepIndex = juce::jlimit(0, totalSteps - 1, currentStep);
+    if (!stepPattern[static_cast<size_t>(stepIndex)])
+        return;
+    if (!stepSubdivisionGateOpen)
+        return;
+
+    stepSampler.triggerNote(getStepSubdivisionStartVelocityAtIndex(stepIndex));
+}
+
 void EnhancedAudioStrip::setLoop(int startColumn, int endColumn)
 {
     loopStart = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, startColumn);
@@ -7278,6 +7295,46 @@ float EnhancedAudioStrip::getPanGain(int channel) const
 // ModernAudioEngine Implementation
 //==============================================================================
 
+int ModernAudioEngine::sanitizeModSequencerSlot(int slot) const
+{
+    return juce::jlimit(0, NumModSequencers - 1, slot);
+}
+
+int ModernAudioEngine::getActiveModSequencerSlot(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return 0;
+
+    return sanitizeModSequencerSlot(
+        activeModSequencerSlots[static_cast<size_t>(stripIndex)].load(std::memory_order_acquire));
+}
+
+ModernAudioEngine::ModSequencer& ModernAudioEngine::getActiveModSequencer(int stripIndex)
+{
+    const int safeStrip = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    return modSequencers[static_cast<size_t>(safeStrip)][static_cast<size_t>(getActiveModSequencerSlot(safeStrip))];
+}
+
+const ModernAudioEngine::ModSequencer& ModernAudioEngine::getActiveModSequencer(int stripIndex) const
+{
+    const int safeStrip = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    return modSequencers[static_cast<size_t>(safeStrip)][static_cast<size_t>(getActiveModSequencerSlot(safeStrip))];
+}
+
+ModernAudioEngine::ModSequencer& ModernAudioEngine::getModSequencer(int stripIndex, int slot)
+{
+    const int safeStrip = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    const int safeSlot = sanitizeModSequencerSlot(slot);
+    return modSequencers[static_cast<size_t>(safeStrip)][static_cast<size_t>(safeSlot)];
+}
+
+const ModernAudioEngine::ModSequencer& ModernAudioEngine::getModSequencer(int stripIndex, int slot) const
+{
+    const int safeStrip = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    const int safeSlot = sanitizeModSequencerSlot(slot);
+    return modSequencers[static_cast<size_t>(safeStrip)][static_cast<size_t>(safeSlot)];
+}
+
 ModernAudioEngine::ModernAudioEngine()
 {
     // Initialize strips
@@ -7308,30 +7365,34 @@ ModernAudioEngine::ModernAudioEngine()
     
     liveRecorder = std::make_unique<LiveRecorder>();
 
-    for (auto& seq : modSequencers)
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
     {
-        seq.target.store(static_cast<int>(ModTarget::None), std::memory_order_release);
-        seq.bipolar.store(0, std::memory_order_release);
-        seq.curveMode.store(0, std::memory_order_release);
-        seq.depth.store(1.0f, std::memory_order_release);
-        seq.offset.store(0, std::memory_order_release);
-        seq.lengthBars.store(1, std::memory_order_release);
-        seq.editPage.store(0, std::memory_order_release);
-        seq.smoothingMs.store(0.0f, std::memory_order_release);
-        seq.curveBend.store(0.0f, std::memory_order_release);
-        seq.curveShape.store(static_cast<int>(ModCurveShape::Linear), std::memory_order_release);
-        seq.pitchScaleQuantize.store(0, std::memory_order_release);
-        seq.pitchScale.store(static_cast<int>(PitchScale::Chromatic), std::memory_order_release);
-        seq.smoothedRaw = 0.0f;
-        seq.grainDezipperedRaw = 0.0f;
-        seq.pitchDezipperedRaw = 0.0f;
-        seq.lastGlobalStep.store(0, std::memory_order_release);
-        for (size_t stepIndex = 0; stepIndex < seq.steps.size(); ++stepIndex)
+        activeModSequencerSlots[static_cast<size_t>(stripIndex)].store(0, std::memory_order_release);
+        for (auto& seq : modSequencers[static_cast<size_t>(stripIndex)])
         {
-            seq.steps[stepIndex].store(0.0f, std::memory_order_release);
-            seq.stepSubdivisions[stepIndex].store(1, std::memory_order_release);
-            seq.stepEndValues[stepIndex].store(0.0f, std::memory_order_release);
-            seq.stepCurveShapes[stepIndex].store(static_cast<int>(ModCurveShape::Linear), std::memory_order_release);
+            seq.target.store(static_cast<int>(ModTarget::None), std::memory_order_release);
+            seq.bipolar.store(0, std::memory_order_release);
+            seq.curveMode.store(0, std::memory_order_release);
+            seq.depth.store(1.0f, std::memory_order_release);
+            seq.offset.store(0, std::memory_order_release);
+            seq.lengthBars.store(1, std::memory_order_release);
+            seq.editPage.store(0, std::memory_order_release);
+            seq.smoothingMs.store(0.0f, std::memory_order_release);
+            seq.curveBend.store(0.0f, std::memory_order_release);
+            seq.curveShape.store(static_cast<int>(ModCurveShape::Linear), std::memory_order_release);
+            seq.pitchScaleQuantize.store(0, std::memory_order_release);
+            seq.pitchScale.store(static_cast<int>(PitchScale::Chromatic), std::memory_order_release);
+            seq.smoothedRaw = 0.0f;
+            seq.grainDezipperedRaw = 0.0f;
+            seq.pitchDezipperedRaw = 0.0f;
+            seq.lastGlobalStep.store(0, std::memory_order_release);
+            for (size_t stepIndex = 0; stepIndex < seq.steps.size(); ++stepIndex)
+            {
+                seq.steps[stepIndex].store(0.0f, std::memory_order_release);
+                seq.stepSubdivisions[stepIndex].store(1, std::memory_order_release);
+                seq.stepEndValues[stepIndex].store(0.0f, std::memory_order_release);
+                seq.stepCurveShapes[stepIndex].store(static_cast<int>(ModCurveShape::Linear), std::memory_order_release);
+            }
         }
     }
 
@@ -7447,7 +7508,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             auto* strip = strips[i].get();
             const bool stripIsStepMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
             auto* stepSampler = stripIsStepMode ? strip->getStepSampler() : nullptr;
-            auto& seq = modSequencers[i];
+            const int seqSlot = getActiveModSequencerSlot(static_cast<int>(i));
+            auto& seq = modSequencers[i][static_cast<size_t>(seqSlot)];
             const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
             const bool stripPlaying = strip->isPlaying();
             const bool applyParamMod = modulationPpqReady
@@ -7880,7 +7942,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             if (strip == nullptr || !strip->isPlaying())
                 continue;
 
-            const auto& seq = modSequencers[static_cast<size_t>(stripIdx)];
+            const int seqSlot = getActiveModSequencerSlot(stripIdx);
+            const auto& seq = modSequencers[static_cast<size_t>(stripIdx)][static_cast<size_t>(seqSlot)];
             const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
             if (target != ModTarget::Retrigger)
                 continue;
@@ -7920,6 +7983,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     t.stripIndex = stripIdx;
                     t.column = strip->getCurrentColumn();
                     t.clearPendingOnFire = false;
+                    t.isSequencerRetrigger = true;
                     eventsInBlock.push_back(t);
                     lastOffsetSamples = offsetSamples;
                 }
@@ -8013,6 +8077,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                             t.column = stutterColumn;
                             t.clearPendingOnFire = false;
                             t.isMomentaryStutter = true;
+                            t.isSequencerRetrigger = true;
                             eventsInBlock.push_back(t);
                             lastOffsetSamples = offsetSamples;
                         }
@@ -8082,19 +8147,30 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
 
             if (auto* strip = getStrip(event.stripIndex))
             {
-                enforceGroupExclusivity(event.stripIndex, false);
+                const bool stepRetriggerEvent = event.isSequencerRetrigger
+                    && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step;
 
-                auto triggerPosInfo = makeSegmentPositionInfo(eventOffset);
-                if (hasPpq)
+                if (!stepRetriggerEvent)
+                    enforceGroupExclusivity(event.stripIndex, false);
+
+                if (stepRetriggerEvent)
                 {
-                    // Use the scheduled grid PPQ so column jumps are deterministic.
-                    triggerPosInfo.setPpqPosition(event.targetPPQ);
+                    strip->retriggerStepVoice();
                 }
+                else
+                {
+                    auto triggerPosInfo = makeSegmentPositionInfo(eventOffset);
+                    if (hasPpq)
+                    {
+                        // Use the scheduled grid PPQ so column jumps are deterministic.
+                        triggerPosInfo.setPpqPosition(event.targetPPQ);
+                    }
 
-                const int64_t triggerSample = blockStart + eventOffset;
-                strip->triggerAtSample(event.column, tempoNow, triggerSample, triggerPosInfo, event.isMomentaryStutter);
-                if (event.clearPendingOnFire)
-                    quantizeClock.clearPendingTriggersForStrip(event.stripIndex);
+                    const int64_t triggerSample = blockStart + eventOffset;
+                    strip->triggerAtSample(event.column, tempoNow, triggerSample, triggerPosInfo, event.isMomentaryStutter);
+                    if (event.clearPendingOnFire)
+                        quantizeClock.clearPendingTriggersForStrip(event.stripIndex);
+                }
             }
 
             ++eventIndex;
@@ -8651,6 +8727,28 @@ bool ModernAudioEngine::modTargetSupportsBipolar(ModTarget target)
     return false;
 }
 
+void ModernAudioEngine::setModSequencerSlot(int stripIndex, int slot)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    const int safeSlot = sanitizeModSequencerSlot(slot);
+    activeModSequencerSlots[static_cast<size_t>(stripIndex)].store(safeSlot, std::memory_order_release);
+
+    auto& seq = getActiveModSequencer(stripIndex);
+    const int maxPage = juce::jmax(0, getModLengthBars(stripIndex) - 1);
+    const int clampedPage = juce::jlimit(0, maxPage, seq.editPage.load(std::memory_order_acquire));
+    seq.editPage.store(clampedPage, std::memory_order_release);
+}
+
+int ModernAudioEngine::getModSequencerSlot(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return 0;
+
+    return getActiveModSequencerSlot(stripIndex);
+}
+
 ModernAudioEngine::ModSequencerState ModernAudioEngine::getModSequencerState(int stripIndex) const
 {
     ModSequencerState state{};
@@ -8660,7 +8758,7 @@ ModernAudioEngine::ModSequencerState ModernAudioEngine::getModSequencerState(int
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return state;
 
-    const auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const auto& seq = getActiveModSequencer(stripIndex);
     state.target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
     state.bipolar = modTargetSupportsBipolar(state.target) && (seq.bipolar.load(std::memory_order_acquire) != 0);
     state.curveMode = (seq.curveMode.load(std::memory_order_acquire) != 0);
@@ -8702,7 +8800,7 @@ void ModernAudioEngine::setModTarget(int stripIndex, ModTarget target)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    auto& seq = getActiveModSequencer(stripIndex);
     seq.target.store(static_cast<int>(target), std::memory_order_release);
     seq.bipolar.store(modTargetAutoDefaultBipolar(target) ? 1 : 0, std::memory_order_release);
 
@@ -8716,14 +8814,14 @@ ModernAudioEngine::ModTarget ModernAudioEngine::getModTarget(int stripIndex) con
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return ModTarget::None;
-    return static_cast<ModTarget>(modSequencers[static_cast<size_t>(stripIndex)].target.load(std::memory_order_acquire));
+    return static_cast<ModTarget>(getActiveModSequencer(stripIndex).target.load(std::memory_order_acquire));
 }
 
 void ModernAudioEngine::setModBipolar(int stripIndex, bool bipolar)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    auto& seq = getActiveModSequencer(stripIndex);
     const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
     seq.bipolar.store((bipolar && modTargetSupportsBipolar(target)) ? 1 : 0, std::memory_order_release);
     for (auto& step : seq.steps)
@@ -8737,56 +8835,56 @@ bool ModernAudioEngine::isModBipolar(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return false;
-    return modSequencers[static_cast<size_t>(stripIndex)].bipolar.load(std::memory_order_acquire) != 0;
+    return getActiveModSequencer(stripIndex).bipolar.load(std::memory_order_acquire) != 0;
 }
 
 void ModernAudioEngine::setModDepth(int stripIndex, float depth)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    modSequencers[static_cast<size_t>(stripIndex)].depth.store(juce::jlimit(0.0f, 1.0f, depth), std::memory_order_release);
+    getActiveModSequencer(stripIndex).depth.store(juce::jlimit(0.0f, 1.0f, depth), std::memory_order_release);
 }
 
 float ModernAudioEngine::getModDepth(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 1.0f;
-    return modSequencers[static_cast<size_t>(stripIndex)].depth.load(std::memory_order_acquire);
+    return getActiveModSequencer(stripIndex).depth.load(std::memory_order_acquire);
 }
 
 void ModernAudioEngine::setModCurveMode(int stripIndex, bool curveMode)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    modSequencers[static_cast<size_t>(stripIndex)].curveMode.store(curveMode ? 1 : 0, std::memory_order_release);
+    getActiveModSequencer(stripIndex).curveMode.store(curveMode ? 1 : 0, std::memory_order_release);
 }
 
 bool ModernAudioEngine::isModCurveMode(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return true;
-    return modSequencers[static_cast<size_t>(stripIndex)].curveMode.load(std::memory_order_acquire) != 0;
+    return getActiveModSequencer(stripIndex).curveMode.load(std::memory_order_acquire) != 0;
 }
 
 void ModernAudioEngine::setModOffset(int stripIndex, int offset)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    modSequencers[static_cast<size_t>(stripIndex)].offset.store(juce::jlimit(-(ModTotalSteps - 1), ModTotalSteps - 1, offset), std::memory_order_release);
+    getActiveModSequencer(stripIndex).offset.store(juce::jlimit(-(ModTotalSteps - 1), ModTotalSteps - 1, offset), std::memory_order_release);
 }
 
 int ModernAudioEngine::getModOffset(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 0;
-    return modSequencers[static_cast<size_t>(stripIndex)].offset.load(std::memory_order_acquire);
+    return getActiveModSequencer(stripIndex).offset.load(std::memory_order_acquire);
 }
 
 void ModernAudioEngine::setModStepValue(int stripIndex, int step, float value01)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips || step < 0 || step >= ModSteps)
         return;
-    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    auto& seq = getActiveModSequencer(stripIndex);
     const int page = juce::jlimit(0, MaxModBars - 1, seq.editPage.load(std::memory_order_acquire));
     const int idx = (page * ModSteps) + step;
     const float clampedValue = juce::jlimit(0.0f, 1.0f, value01);
@@ -8804,7 +8902,7 @@ void ModernAudioEngine::setModStepValueAbsolute(int stripIndex, int absoluteStep
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
         return;
-    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    auto& seq = getActiveModSequencer(stripIndex);
     const float clampedValue = juce::jlimit(0.0f, 1.0f, value01);
     const int activeCurveShape = juce::jlimit(
         0,
@@ -8820,7 +8918,7 @@ float ModernAudioEngine::getModStepValue(int stripIndex, int step) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips || step < 0 || step >= ModSteps)
         return 0.0f;
-    const auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const auto& seq = getActiveModSequencer(stripIndex);
     const int page = juce::jlimit(0, MaxModBars - 1, seq.editPage.load(std::memory_order_acquire));
     const int idx = (page * ModSteps) + step;
     return seq.steps[static_cast<size_t>(idx)].load(std::memory_order_acquire);
@@ -8830,7 +8928,7 @@ float ModernAudioEngine::getModStepValueAbsolute(int stripIndex, int absoluteSte
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
         return 0.0f;
-    return modSequencers[static_cast<size_t>(stripIndex)].steps[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire);
+    return getActiveModSequencer(stripIndex).steps[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire);
 }
 
 void ModernAudioEngine::setModStepShape(int stripIndex, int step, int subdivisions, float endValue01)
@@ -8838,7 +8936,7 @@ void ModernAudioEngine::setModStepShape(int stripIndex, int step, int subdivisio
     if (stripIndex < 0 || stripIndex >= MaxStrips || step < 0 || step >= ModSteps)
         return;
 
-    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    auto& seq = getActiveModSequencer(stripIndex);
     const int page = juce::jlimit(0, MaxModBars - 1, seq.editPage.load(std::memory_order_acquire));
     const int absoluteStep = (page * ModSteps) + step;
     setModStepShapeAbsolute(stripIndex, absoluteStep, subdivisions, endValue01);
@@ -8849,7 +8947,7 @@ void ModernAudioEngine::setModStepShapeAbsolute(int stripIndex, int absoluteStep
     if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
         return;
 
-    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    auto& seq = getActiveModSequencer(stripIndex);
     const int clampedSubdivisions = juce::jlimit(1, ModMaxStepSubdivisions, subdivisions);
     const float startValue = juce::jlimit(
         0.0f, 1.0f, seq.steps[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
@@ -8869,7 +8967,7 @@ int ModernAudioEngine::getModStepSubdivisionAbsolute(int stripIndex, int absolut
     return juce::jlimit(
         1,
         ModMaxStepSubdivisions,
-        modSequencers[static_cast<size_t>(stripIndex)].stepSubdivisions[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+        getActiveModSequencer(stripIndex).stepSubdivisions[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
 }
 
 float ModernAudioEngine::getModStepEndValueAbsolute(int stripIndex, int absoluteStep) const
@@ -8877,7 +8975,7 @@ float ModernAudioEngine::getModStepEndValueAbsolute(int stripIndex, int absolute
     if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
         return 0.0f;
 
-    const auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const auto& seq = getActiveModSequencer(stripIndex);
     const int subdivisions = juce::jlimit(
         1,
         ModMaxStepSubdivisions,
@@ -8896,7 +8994,7 @@ void ModernAudioEngine::setModStepCurveShape(int stripIndex, int step, ModCurveS
     if (stripIndex < 0 || stripIndex >= MaxStrips || step < 0 || step >= ModSteps)
         return;
 
-    const auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const auto& seq = getActiveModSequencer(stripIndex);
     const int page = juce::jlimit(0, MaxModBars - 1, seq.editPage.load(std::memory_order_acquire));
     const int absoluteStep = (page * ModSteps) + step;
     setModStepCurveShapeAbsolute(stripIndex, absoluteStep, shape);
@@ -8907,7 +9005,7 @@ void ModernAudioEngine::setModStepCurveShapeAbsolute(int stripIndex, int absolut
     if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
         return;
 
-    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    auto& seq = getActiveModSequencer(stripIndex);
     const int clampedShape = juce::jlimit(
         0,
         static_cast<int>(ModCurveShape::Square),
@@ -8920,7 +9018,7 @@ ModernAudioEngine::ModCurveShape ModernAudioEngine::getModStepCurveShapeAbsolute
     if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
         return ModCurveShape::Linear;
 
-    const auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const auto& seq = getActiveModSequencer(stripIndex);
     return static_cast<ModCurveShape>(juce::jlimit(
         0,
         static_cast<int>(ModCurveShape::Square),
@@ -8931,7 +9029,7 @@ void ModernAudioEngine::toggleModStep(int stripIndex, int step)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips || step < 0 || step >= ModSteps)
         return;
-    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    auto& seq = getActiveModSequencer(stripIndex);
     const int page = juce::jlimit(0, MaxModBars - 1, seq.editPage.load(std::memory_order_acquire));
     const int idx = (page * ModSteps) + step;
     auto& cell = seq.steps[static_cast<size_t>(idx)];
@@ -8951,7 +9049,7 @@ void ModernAudioEngine::clearModSteps(int stripIndex)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    auto& seq = getActiveModSequencer(stripIndex);
     const int activeCurveShape = juce::jlimit(
         0,
         static_cast<int>(ModCurveShape::Square),
@@ -8981,7 +9079,7 @@ int ModernAudioEngine::getModCurrentGlobalStep(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 0;
-    const auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const auto& seq = getActiveModSequencer(stripIndex);
     const int lengthBars = juce::jlimit(1, MaxModBars, seq.lengthBars.load(std::memory_order_acquire));
     const int totalSteps = juce::jmax(ModSteps, ModSteps * lengthBars);
     return juce::jlimit(0, totalSteps - 1, seq.lastGlobalStep.load(std::memory_order_acquire));
@@ -8991,7 +9089,7 @@ void ModernAudioEngine::setModLengthBars(int stripIndex, int bars)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    auto& seq = getActiveModSequencer(stripIndex);
     int clampedBars = 1;
     if (bars >= 8)
         clampedBars = 8;
@@ -9009,14 +9107,14 @@ int ModernAudioEngine::getModLengthBars(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 1;
-    return juce::jlimit(1, MaxModBars, modSequencers[static_cast<size_t>(stripIndex)].lengthBars.load(std::memory_order_acquire));
+    return juce::jlimit(1, MaxModBars, getActiveModSequencer(stripIndex).lengthBars.load(std::memory_order_acquire));
 }
 
 void ModernAudioEngine::setModEditPage(int stripIndex, int page)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    auto& seq = getActiveModSequencer(stripIndex);
     const int maxPage = juce::jmax(0, getModLengthBars(stripIndex) - 1);
     seq.editPage.store(juce::jlimit(0, maxPage, page), std::memory_order_release);
 }
@@ -9025,7 +9123,7 @@ int ModernAudioEngine::getModEditPage(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 0;
-    const auto& seq = modSequencers[static_cast<size_t>(stripIndex)];
+    const auto& seq = getActiveModSequencer(stripIndex);
     const int maxPage = juce::jmax(0, getModLengthBars(stripIndex) - 1);
     return juce::jlimit(0, maxPage, seq.editPage.load(std::memory_order_acquire));
 }
@@ -9034,35 +9132,35 @@ void ModernAudioEngine::setModSmoothingMs(int stripIndex, float ms)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    modSequencers[static_cast<size_t>(stripIndex)].smoothingMs.store(juce::jlimit(0.0f, 250.0f, ms), std::memory_order_release);
+    getActiveModSequencer(stripIndex).smoothingMs.store(juce::jlimit(0.0f, 250.0f, ms), std::memory_order_release);
 }
 
 float ModernAudioEngine::getModSmoothingMs(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 0.0f;
-    return juce::jlimit(0.0f, 250.0f, modSequencers[static_cast<size_t>(stripIndex)].smoothingMs.load(std::memory_order_acquire));
+    return juce::jlimit(0.0f, 250.0f, getActiveModSequencer(stripIndex).smoothingMs.load(std::memory_order_acquire));
 }
 
 void ModernAudioEngine::setModCurveBend(int stripIndex, float bend)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    modSequencers[static_cast<size_t>(stripIndex)].curveBend.store(juce::jlimit(-1.0f, 1.0f, bend), std::memory_order_release);
+    getActiveModSequencer(stripIndex).curveBend.store(juce::jlimit(-1.0f, 1.0f, bend), std::memory_order_release);
 }
 
 float ModernAudioEngine::getModCurveBend(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 0.0f;
-    return juce::jlimit(-1.0f, 1.0f, modSequencers[static_cast<size_t>(stripIndex)].curveBend.load(std::memory_order_acquire));
+    return juce::jlimit(-1.0f, 1.0f, getActiveModSequencer(stripIndex).curveBend.load(std::memory_order_acquire));
 }
 
 void ModernAudioEngine::setModCurveShape(int stripIndex, ModCurveShape shape)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    modSequencers[static_cast<size_t>(stripIndex)].curveShape.store(
+    getActiveModSequencer(stripIndex).curveShape.store(
         juce::jlimit(0, static_cast<int>(ModCurveShape::Square), static_cast<int>(shape)),
         std::memory_order_release);
 }
@@ -9073,28 +9171,28 @@ ModernAudioEngine::ModCurveShape ModernAudioEngine::getModCurveShape(int stripIn
         return ModCurveShape::Linear;
     return static_cast<ModCurveShape>(juce::jlimit(
         0, static_cast<int>(ModCurveShape::Square),
-        modSequencers[static_cast<size_t>(stripIndex)].curveShape.load(std::memory_order_acquire)));
+        getActiveModSequencer(stripIndex).curveShape.load(std::memory_order_acquire)));
 }
 
 void ModernAudioEngine::setModPitchScaleQuantize(int stripIndex, bool enabled)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    modSequencers[static_cast<size_t>(stripIndex)].pitchScaleQuantize.store(enabled ? 1 : 0, std::memory_order_release);
+    getActiveModSequencer(stripIndex).pitchScaleQuantize.store(enabled ? 1 : 0, std::memory_order_release);
 }
 
 bool ModernAudioEngine::isModPitchScaleQuantize(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return false;
-    return modSequencers[static_cast<size_t>(stripIndex)].pitchScaleQuantize.load(std::memory_order_acquire) != 0;
+    return getActiveModSequencer(stripIndex).pitchScaleQuantize.load(std::memory_order_acquire) != 0;
 }
 
 void ModernAudioEngine::setModPitchScale(int stripIndex, PitchScale scale)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    modSequencers[static_cast<size_t>(stripIndex)].pitchScale.store(
+    getActiveModSequencer(stripIndex).pitchScale.store(
         juce::jlimit(0, static_cast<int>(PitchScale::PentatonicMinor), static_cast<int>(scale)),
         std::memory_order_release);
 }
@@ -9104,7 +9202,7 @@ ModernAudioEngine::PitchScale ModernAudioEngine::getModPitchScale(int stripIndex
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return PitchScale::Chromatic;
     const int idx = juce::jlimit(0, static_cast<int>(PitchScale::PentatonicMinor),
-                                 modSequencers[static_cast<size_t>(stripIndex)].pitchScale.load(std::memory_order_acquire));
+                                 getActiveModSequencer(stripIndex).pitchScale.load(std::memory_order_acquire));
     return static_cast<PitchScale>(idx);
 }
 
@@ -9240,12 +9338,12 @@ void ModernAudioEngine::clearPattern(int patternIndex)
         patterns[static_cast<size_t>(patternIndex)]->clear();
 }
 
-void EnhancedAudioStrip::setStepPatternBars(int bars)
+void EnhancedAudioStrip::setStepPatternLengthSteps(int steps)
 {
-    const int clampedBars = juce::jlimit(1, 4, bars);
-    stepPatternBars.store(clampedBars, std::memory_order_release);
+    const int clampedSteps = juce::jlimit(1, 64, steps);
+    stepPatternLengthSteps.store(clampedSteps, std::memory_order_release);
 
-    const int totalSteps = clampedBars * 16;
+    const int totalSteps = clampedSteps;
     for (int i = totalSteps; i < static_cast<int>(stepPattern.size()); ++i)
     {
         stepPattern[static_cast<size_t>(i)] = false;
@@ -9258,9 +9356,15 @@ void EnhancedAudioStrip::setStepPatternBars(int bars)
     if (currentStep >= totalSteps)
         currentStep = 0;
 
-    const int maxPage = juce::jmax(0, clampedBars - 1);
+    const int maxPage = juce::jmax(0, (clampedSteps - 1) / 16);
     if (stepViewPage.load(std::memory_order_acquire) > maxPage)
         stepViewPage.store(maxPage, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::setStepPatternBars(int bars)
+{
+    const int clampedBars = juce::jlimit(1, 4, bars);
+    setStepPatternLengthSteps(clampedBars * 16);
 }
 
 void EnhancedAudioStrip::setStepPage(int page)

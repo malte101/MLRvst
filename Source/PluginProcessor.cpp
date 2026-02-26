@@ -3976,20 +3976,25 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
         }
 
         audioEngine->assignStripToGroup(i, -1);
-        audioEngine->setModTarget(i, ModernAudioEngine::ModTarget::None);
-        audioEngine->setModBipolar(i, false);
-        audioEngine->setModCurveMode(i, false);
-        audioEngine->setModDepth(i, 1.0f);
-        audioEngine->setModOffset(i, 0);
-        audioEngine->setModLengthBars(i, 1);
-        audioEngine->setModEditPage(i, 0);
-        audioEngine->setModSmoothingMs(i, 0.0f);
-        audioEngine->setModCurveBend(i, 0.0f);
-        audioEngine->setModCurveShape(i, ModernAudioEngine::ModCurveShape::Linear);
-        audioEngine->setModPitchScaleQuantize(i, false);
-        audioEngine->setModPitchScale(i, ModernAudioEngine::PitchScale::Chromatic);
-        for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
-            audioEngine->setModStepValueAbsolute(i, s, 0.0f);
+        for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+        {
+            audioEngine->setModSequencerSlot(i, slot);
+            audioEngine->setModTarget(i, ModernAudioEngine::ModTarget::None);
+            audioEngine->setModBipolar(i, false);
+            audioEngine->setModCurveMode(i, false);
+            audioEngine->setModDepth(i, 1.0f);
+            audioEngine->setModOffset(i, 0);
+            audioEngine->setModLengthBars(i, 1);
+            audioEngine->setModEditPage(i, 0);
+            audioEngine->setModSmoothingMs(i, 0.0f);
+            audioEngine->setModCurveBend(i, 0.0f);
+            audioEngine->setModCurveShape(i, ModernAudioEngine::ModCurveShape::Linear);
+            audioEngine->setModPitchScaleQuantize(i, false);
+            audioEngine->setModPitchScale(i, ModernAudioEngine::PitchScale::Chromatic);
+            for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
+                audioEngine->setModStepValueAbsolute(i, s, 0.0f);
+        }
+        audioEngine->setModSequencerSlot(i, 0);
 
         if (auto* param = parameters.getParameter("stripVolume" + juce::String(i)))
             param->setValueNotifyingHost(param->getDefaultValue());

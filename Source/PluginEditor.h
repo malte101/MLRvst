@@ -12,6 +12,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <array>
+#include <functional>
 #include "PluginProcessor.h"
 #include "StepSequencerDisplay.h"
 
@@ -358,6 +359,73 @@ public:
     private:
         juce::Colour knobColor{juce::Colour(0xff6f93c8)};
     };
+
+    class DraggableNumberBox : public juce::Label
+    {
+    public:
+        void setRange(int minimum, int maximum)
+        {
+            minValue = juce::jmin(minimum, maximum);
+            maxValue = juce::jmax(minimum, maximum);
+            setValue(currentValue, juce::dontSendNotification);
+        }
+
+        void setValue(int value, juce::NotificationType notify)
+        {
+            const int clamped = juce::jlimit(minValue, maxValue, value);
+            currentValue = clamped;
+            setText(juce::String(clamped), juce::dontSendNotification);
+            if (notify != juce::dontSendNotification && onValueChange != nullptr)
+                onValueChange(clamped);
+        }
+
+        int getValue() const { return currentValue; }
+        bool isInteracting() const { return dragActive || isBeingEdited(); }
+        std::function<void(int)> onValueChange;
+
+        void mouseDown(const juce::MouseEvent& e) override
+        {
+            juce::Label::mouseDown(e);
+            if (!e.mods.isLeftButtonDown() || isBeingEdited())
+                return;
+            dragActive = true;
+            dragStartPos = e.getPosition();
+            dragStartValue = currentValue;
+        }
+
+        void mouseDrag(const juce::MouseEvent& e) override
+        {
+            if (!dragActive || isBeingEdited())
+            {
+                juce::Label::mouseDrag(e);
+                return;
+            }
+
+            const int dragDelta = dragStartPos.y - e.getPosition().y;
+            const int pixelsPerStep = e.mods.isShiftDown() ? 8 : 3;
+            const int valueDelta = dragDelta / juce::jmax(1, pixelsPerStep);
+            setValue(dragStartValue + valueDelta, juce::sendNotification);
+        }
+
+        void mouseUp(const juce::MouseEvent& e) override
+        {
+            dragActive = false;
+            juce::Label::mouseUp(e);
+        }
+
+        void textWasEdited() override
+        {
+            setValue(getText().trim().getIntValue(), juce::sendNotification);
+        }
+
+    private:
+        int minValue = 1;
+        int maxValue = 64;
+        int currentValue = 16;
+        bool dragActive = false;
+        juce::Point<int> dragStartPos;
+        int dragStartValue = 16;
+    };
     
 private:
     int stripIndex;
@@ -383,6 +451,7 @@ private:
     juce::Slider speedSlider;       // Compact rotary
     juce::Slider scratchSlider;     // Compact rotary - scratch amount
     juce::ComboBox patternLengthBox; // Step mode pattern length (16..64)
+    DraggableNumberBox stepLengthReadoutBox; // Step mode draggable numeric length (1..64)
     juce::Slider stepAttackSlider;  // Step mode attack (ms)
     juce::Slider stepDecaySlider;   // Step mode decay (ms)
     juce::Slider stepReleaseSlider; // Step mode release (ms)
@@ -443,6 +512,7 @@ private:
     juce::Slider modCurveBendSlider;
     juce::Label modLengthLabel;
     juce::ComboBox modLengthBox;
+    std::array<juce::TextButton, ModernAudioEngine::NumModSequencers> modSequencerTabs;
     juce::ToggleButton modPitchQuantToggle;
     juce::ComboBox modPitchScaleBox;
     juce::Label modShapeLabel;
@@ -481,6 +551,7 @@ private:
     void hideAllGrainControls();
     void updateGrainOverlayVisibility();
     void updateGrainTabButtons();
+    void updateModSequencerTabButtons();
 
     enum class ModTransformMode
     {

@@ -67,7 +67,7 @@ public:
     void setStepPattern(const std::array<bool, 64>& pattern, int steps)
     {
         stepPattern = pattern;
-        totalSteps = juce::jlimit(16, 64, steps);
+        totalSteps = juce::jlimit(1, 64, steps);
         pruneSelectionToVisibleSteps();
         repaint();
     }

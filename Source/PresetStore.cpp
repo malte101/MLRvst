@@ -221,20 +221,25 @@ void resetStripToDefaultState(int stripIndex,
     strip.setGrainTempoSyncEnabled(true);
 
     audioEngine.assignStripToGroup(stripIndex, -1);
-    audioEngine.setModTarget(stripIndex, ModernAudioEngine::ModTarget::None);
-    audioEngine.setModBipolar(stripIndex, false);
-    audioEngine.setModCurveMode(stripIndex, false);
-    audioEngine.setModDepth(stripIndex, 1.0f);
-    audioEngine.setModOffset(stripIndex, 0);
-    audioEngine.setModLengthBars(stripIndex, 1);
-    audioEngine.setModEditPage(stripIndex, 0);
-    audioEngine.setModSmoothingMs(stripIndex, 0.0f);
-    audioEngine.setModCurveBend(stripIndex, 0.0f);
-    audioEngine.setModCurveShape(stripIndex, ModernAudioEngine::ModCurveShape::Linear);
-    audioEngine.setModPitchScaleQuantize(stripIndex, false);
-    audioEngine.setModPitchScale(stripIndex, ModernAudioEngine::PitchScale::Chromatic);
-    for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
-        audioEngine.setModStepValueAbsolute(stripIndex, s, 0.0f);
+    for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+    {
+        audioEngine.setModSequencerSlot(stripIndex, slot);
+        audioEngine.setModTarget(stripIndex, ModernAudioEngine::ModTarget::None);
+        audioEngine.setModBipolar(stripIndex, false);
+        audioEngine.setModCurveMode(stripIndex, false);
+        audioEngine.setModDepth(stripIndex, 1.0f);
+        audioEngine.setModOffset(stripIndex, 0);
+        audioEngine.setModLengthBars(stripIndex, 1);
+        audioEngine.setModEditPage(stripIndex, 0);
+        audioEngine.setModSmoothingMs(stripIndex, 0.0f);
+        audioEngine.setModCurveBend(stripIndex, 0.0f);
+        audioEngine.setModCurveShape(stripIndex, ModernAudioEngine::ModCurveShape::Linear);
+        audioEngine.setModPitchScaleQuantize(stripIndex, false);
+        audioEngine.setModPitchScale(stripIndex, ModernAudioEngine::PitchScale::Chromatic);
+        for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
+            audioEngine.setModStepValueAbsolute(stripIndex, s, 0.0f);
+    }
+    audioEngine.setModSequencerSlot(stripIndex, 0);
 
     resetStripParametersToDefaults(parameters, stripIndex);
 }
@@ -610,6 +615,7 @@ bool savePreset(int presetIndex,
         stripXml->setAttribute("gateSpeed", strip->getGateSpeed());
         stripXml->setAttribute("gateEnvelope", strip->getGateEnvelope());
         stripXml->setAttribute("gateShapeCurve", strip->getGateShape());
+        stripXml->setAttribute("stepPatternSteps", strip->getStepPatternLengthSteps());
         stripXml->setAttribute("stepPatternBars", strip->getStepPatternBars());
         stripXml->setAttribute("stepViewPage", strip->getStepPage());
         stripXml->setAttribute("stepCurrent", strip->currentStep);
@@ -641,39 +647,54 @@ bool savePreset(int presetIndex,
         stripXml->setAttribute("grainArpMode", strip->getGrainArpMode());
         stripXml->setAttribute("grainTempoSync", strip->isGrainTempoSyncEnabled());
 
-        const auto mod = audioEngine->getModSequencerState(i);
-        std::array<float, ModernAudioEngine::ModTotalSteps> modSteps{};
-        std::array<int, ModernAudioEngine::ModTotalSteps> modStepSubdivisions{};
-        std::array<float, ModernAudioEngine::ModTotalSteps> modStepEndValues{};
-        std::array<int, ModernAudioEngine::ModTotalSteps> modStepCurveShapes{};
-        for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
+        const int originalModSlot = audioEngine->getModSequencerSlot(i);
+        stripXml->setAttribute("modActiveSequencer", originalModSlot);
+        for (int modSlot = 0; modSlot < ModernAudioEngine::NumModSequencers; ++modSlot)
         {
-            modSteps[static_cast<size_t>(s)] = audioEngine->getModStepValueAbsolute(i, s);
-            modStepSubdivisions[static_cast<size_t>(s)] = juce::jlimit(
-                1, ModernAudioEngine::ModMaxStepSubdivisions, audioEngine->getModStepSubdivisionAbsolute(i, s));
-            modStepEndValues[static_cast<size_t>(s)] = juce::jlimit(
-                0.0f, 1.0f, audioEngine->getModStepEndValueAbsolute(i, s));
-            modStepCurveShapes[static_cast<size_t>(s)] = juce::jlimit(
-                0,
-                static_cast<int>(ModernAudioEngine::ModCurveShape::Square),
-                static_cast<int>(audioEngine->getModStepCurveShapeAbsolute(i, s)));
+            audioEngine->setModSequencerSlot(i, modSlot);
+            const auto mod = audioEngine->getModSequencerState(i);
+            std::array<float, ModernAudioEngine::ModTotalSteps> modSteps{};
+            std::array<int, ModernAudioEngine::ModTotalSteps> modStepSubdivisions{};
+            std::array<float, ModernAudioEngine::ModTotalSteps> modStepEndValues{};
+            std::array<int, ModernAudioEngine::ModTotalSteps> modStepCurveShapes{};
+            for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
+            {
+                modSteps[static_cast<size_t>(s)] = audioEngine->getModStepValueAbsolute(i, s);
+                modStepSubdivisions[static_cast<size_t>(s)] = juce::jlimit(
+                    1, ModernAudioEngine::ModMaxStepSubdivisions, audioEngine->getModStepSubdivisionAbsolute(i, s));
+                modStepEndValues[static_cast<size_t>(s)] = juce::jlimit(
+                    0.0f, 1.0f, audioEngine->getModStepEndValueAbsolute(i, s));
+                modStepCurveShapes[static_cast<size_t>(s)] = juce::jlimit(
+                    0,
+                    static_cast<int>(ModernAudioEngine::ModCurveShape::Square),
+                    static_cast<int>(audioEngine->getModStepCurveShapeAbsolute(i, s)));
+            }
+
+            auto slotKey = [modSlot](const juce::String& suffix)
+            {
+                if (modSlot == 0)
+                    return "mod" + suffix;
+                return "mod" + juce::String(modSlot + 1) + suffix;
+            };
+
+            stripXml->setAttribute(slotKey("Target"), static_cast<int>(mod.target));
+            stripXml->setAttribute(slotKey("Bipolar"), mod.bipolar);
+            stripXml->setAttribute(slotKey("CurveMode"), mod.curveMode);
+            stripXml->setAttribute(slotKey("Depth"), mod.depth);
+            stripXml->setAttribute(slotKey("Offset"), mod.offset);
+            stripXml->setAttribute(slotKey("LengthBars"), mod.lengthBars);
+            stripXml->setAttribute(slotKey("EditPage"), mod.editPage);
+            stripXml->setAttribute(slotKey("SmoothMs"), mod.smoothingMs);
+            stripXml->setAttribute(slotKey("CurveBend"), mod.curveBend);
+            stripXml->setAttribute(slotKey("CurveShape"), mod.curveShape);
+            stripXml->setAttribute(slotKey("PitchScaleQuantize"), mod.pitchScaleQuantize);
+            stripXml->setAttribute(slotKey("PitchScale"), mod.pitchScale);
+            stripXml->setAttribute(slotKey("Steps"), encodeModSteps(modSteps));
+            stripXml->setAttribute(slotKey("StepSubdivisions"), encodeIntArrayCsv(modStepSubdivisions));
+            stripXml->setAttribute(slotKey("StepEndValues"), encodeFloatArrayCsv(modStepEndValues));
+            stripXml->setAttribute(slotKey("StepCurveShapes"), encodeIntArrayCsv(modStepCurveShapes));
         }
-        stripXml->setAttribute("modTarget", static_cast<int>(mod.target));
-        stripXml->setAttribute("modBipolar", mod.bipolar);
-        stripXml->setAttribute("modCurveMode", mod.curveMode);
-        stripXml->setAttribute("modDepth", mod.depth);
-        stripXml->setAttribute("modOffset", mod.offset);
-        stripXml->setAttribute("modLengthBars", mod.lengthBars);
-        stripXml->setAttribute("modEditPage", mod.editPage);
-        stripXml->setAttribute("modSmoothMs", mod.smoothingMs);
-        stripXml->setAttribute("modCurveBend", mod.curveBend);
-        stripXml->setAttribute("modCurveShape", mod.curveShape);
-        stripXml->setAttribute("modPitchScaleQuantize", mod.pitchScaleQuantize);
-        stripXml->setAttribute("modPitchScale", mod.pitchScale);
-        stripXml->setAttribute("modSteps", encodeModSteps(modSteps));
-        stripXml->setAttribute("modStepSubdivisions", encodeIntArrayCsv(modStepSubdivisions));
-        stripXml->setAttribute("modStepEndValues", encodeFloatArrayCsv(modStepEndValues));
-        stripXml->setAttribute("modStepCurveShapes", encodeIntArrayCsv(modStepCurveShapes));
+        audioEngine->setModSequencerSlot(i, originalModSlot);
     }
 
     auto* groupsXml = preset.createNewChildElement("Groups");
@@ -979,7 +1000,11 @@ bool loadPreset(int presetIndex,
             strip->setGateShape(mappedShape);
         }
 
-        strip->setStepPatternBars(clampedInt(stripXml->getIntAttribute("stepPatternBars", 1), 1, 4, 1));
+        const int stepPatternSteps = clampedInt(
+            stripXml->getIntAttribute("stepPatternSteps",
+                                      clampedInt(stripXml->getIntAttribute("stepPatternBars", 1), 1, 4, 1) * 16),
+            1, 64, 16);
+        strip->setStepPatternLengthSteps(stepPatternSteps);
         strip->setStepPage(clampedInt(stripXml->getIntAttribute("stepViewPage", 0), 0, 3, 0));
         strip->currentStep = juce::jmax(0, stripXml->getIntAttribute("stepCurrent", 0));
         decodeStepPatternBits(stripXml->getStringAttribute("stepPatternBits"), strip->stepPattern);
@@ -993,6 +1018,7 @@ bool loadPreset(int presetIndex,
         decodeStepSubdivisionRepeatVelocity(
             stripXml->getStringAttribute("stepProbability"),
             strip->stepProbability);
+        strip->setStepPatternLengthSteps(stepPatternSteps);
         strip->setStepEnvelopeAttackMs(clampedFloat(stripXml->getDoubleAttribute("stepAttackMs", 0.0), 0.0f, 0.0f, 400.0f));
         strip->setStepEnvelopeDecayMs(clampedFloat(stripXml->getDoubleAttribute("stepDecayMs", 4000.0), 4000.0f, 1.0f, 4000.0f));
         strip->setStepEnvelopeReleaseMs(clampedFloat(stripXml->getDoubleAttribute("stepReleaseMs", 110.0), 110.0f, 1.0f, 4000.0f));
@@ -1013,62 +1039,86 @@ bool loadPreset(int presetIndex,
         strip->setGrainArpMode(clampedInt(stripXml->getIntAttribute("grainArpMode", 0), 0, 5, 0));
         strip->setGrainTempoSyncEnabled(stripXml->getBoolAttribute("grainTempoSync", true));
 
-        audioEngine->setModTarget(stripIndex,
-            static_cast<ModernAudioEngine::ModTarget>(clampedInt(stripXml->getIntAttribute("modTarget", 0), 0, 18, 0)));
-        audioEngine->setModBipolar(stripIndex, stripXml->getBoolAttribute("modBipolar", false));
-        audioEngine->setModCurveMode(stripIndex, stripXml->getBoolAttribute("modCurveMode", false));
-        audioEngine->setModDepth(stripIndex, clampedFloat(stripXml->getDoubleAttribute("modDepth", 1.0), 1.0f, 0.0f, 1.0f));
-        audioEngine->setModOffset(stripIndex, clampedInt(stripXml->getIntAttribute("modOffset", 0), -127, 127, 0));
-        audioEngine->setModLengthBars(stripIndex, clampedInt(stripXml->getIntAttribute("modLengthBars", 1), 1, 8, 1));
-        audioEngine->setModEditPage(stripIndex, clampedInt(stripXml->getIntAttribute("modEditPage", 0), 0, 7, 0));
-        audioEngine->setModSmoothingMs(stripIndex, clampedFloat(stripXml->getDoubleAttribute("modSmoothMs", 0.0), 0.0f, 0.0f, 250.0f));
-        audioEngine->setModCurveBend(stripIndex, clampedFloat(stripXml->getDoubleAttribute("modCurveBend", 0.0), 0.0f, -1.0f, 1.0f));
-        const int modCurveShapeIndex = clampedInt(stripXml->getIntAttribute("modCurveShape", 0), 0, 4, 0);
-        audioEngine->setModCurveShape(stripIndex, static_cast<ModernAudioEngine::ModCurveShape>(modCurveShapeIndex));
-        audioEngine->setModPitchScaleQuantize(stripIndex, stripXml->getBoolAttribute("modPitchScaleQuantize", false));
-        audioEngine->setModPitchScale(stripIndex, static_cast<ModernAudioEngine::PitchScale>(
-            clampedInt(stripXml->getIntAttribute("modPitchScale", 0), 0, 4, 0)));
-        std::array<float, ModernAudioEngine::ModTotalSteps> modSteps{};
-        decodeModSteps(stripXml->getStringAttribute("modSteps"), modSteps);
-        std::array<int, ModernAudioEngine::ModTotalSteps> modStepSubdivisions{};
-        modStepSubdivisions.fill(1);
-        std::array<float, ModernAudioEngine::ModTotalSteps> modStepEndValues = modSteps;
-        std::array<int, ModernAudioEngine::ModTotalSteps> modStepCurveShapes{};
-        modStepCurveShapes.fill(modCurveShapeIndex);
-        const auto modSubdivText = stripXml->getStringAttribute("modStepSubdivisions");
-        const auto modEndText = stripXml->getStringAttribute("modStepEndValues");
-        const auto modCurvePerStepText = stripXml->getStringAttribute("modStepCurveShapes");
-        const bool hasModShapeData = modSubdivText.isNotEmpty() || modEndText.isNotEmpty();
-        const bool hasModCurvePerStepData = modCurvePerStepText.isNotEmpty();
-        if (hasModShapeData)
+        const int requestedActiveModSlot = clampedInt(
+            stripXml->getIntAttribute("modActiveSequencer", 0),
+            0,
+            ModernAudioEngine::NumModSequencers - 1,
+            0);
+
+        for (int modSlot = 0; modSlot < ModernAudioEngine::NumModSequencers; ++modSlot)
         {
-            if (modSubdivText.isNotEmpty())
-                decodeIntArrayCsv(modSubdivText, modStepSubdivisions);
-            if (modEndText.isNotEmpty())
-                decodeFloatArrayCsv(modEndText, modStepEndValues);
-        }
-        if (hasModCurvePerStepData)
-            decodeIntArrayCsv(modCurvePerStepText, modStepCurveShapes);
-        for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
-        {
-            const float startValue = juce::jlimit(0.0f, 1.0f, modSteps[static_cast<size_t>(s)]);
-            audioEngine->setModStepValueAbsolute(stripIndex, s, startValue);
+            audioEngine->setModSequencerSlot(stripIndex, modSlot);
+            auto slotKey = [modSlot](const juce::String& suffix)
+            {
+                if (modSlot == 0)
+                    return "mod" + suffix;
+                return "mod" + juce::String(modSlot + 1) + suffix;
+            };
+
+            const auto targetKey = slotKey("Target");
+            const auto stepsKey = slotKey("Steps");
+            if (modSlot > 0 && !stripXml->hasAttribute(targetKey) && stripXml->getStringAttribute(stepsKey).isEmpty())
+                continue;
+
+            audioEngine->setModTarget(stripIndex,
+                static_cast<ModernAudioEngine::ModTarget>(clampedInt(stripXml->getIntAttribute(targetKey, 0), 0, 18, 0)));
+            audioEngine->setModBipolar(stripIndex, stripXml->getBoolAttribute(slotKey("Bipolar"), false));
+            audioEngine->setModCurveMode(stripIndex, stripXml->getBoolAttribute(slotKey("CurveMode"), false));
+            audioEngine->setModDepth(stripIndex, clampedFloat(stripXml->getDoubleAttribute(slotKey("Depth"), 1.0), 1.0f, 0.0f, 1.0f));
+            audioEngine->setModOffset(stripIndex, clampedInt(stripXml->getIntAttribute(slotKey("Offset"), 0), -127, 127, 0));
+            audioEngine->setModLengthBars(stripIndex, clampedInt(stripXml->getIntAttribute(slotKey("LengthBars"), 1), 1, 8, 1));
+            audioEngine->setModEditPage(stripIndex, clampedInt(stripXml->getIntAttribute(slotKey("EditPage"), 0), 0, 7, 0));
+            audioEngine->setModSmoothingMs(stripIndex, clampedFloat(stripXml->getDoubleAttribute(slotKey("SmoothMs"), 0.0), 0.0f, 0.0f, 250.0f));
+            audioEngine->setModCurveBend(stripIndex, clampedFloat(stripXml->getDoubleAttribute(slotKey("CurveBend"), 0.0), 0.0f, -1.0f, 1.0f));
+            const int modCurveShapeIndex = clampedInt(stripXml->getIntAttribute(slotKey("CurveShape"), 0), 0, 4, 0);
+            audioEngine->setModCurveShape(stripIndex, static_cast<ModernAudioEngine::ModCurveShape>(modCurveShapeIndex));
+            audioEngine->setModPitchScaleQuantize(stripIndex, stripXml->getBoolAttribute(slotKey("PitchScaleQuantize"), false));
+            audioEngine->setModPitchScale(stripIndex, static_cast<ModernAudioEngine::PitchScale>(
+                clampedInt(stripXml->getIntAttribute(slotKey("PitchScale"), 0), 0, 4, 0)));
+            std::array<float, ModernAudioEngine::ModTotalSteps> modSteps{};
+            decodeModSteps(stripXml->getStringAttribute(stepsKey), modSteps);
+            std::array<int, ModernAudioEngine::ModTotalSteps> modStepSubdivisions{};
+            modStepSubdivisions.fill(1);
+            std::array<float, ModernAudioEngine::ModTotalSteps> modStepEndValues = modSteps;
+            std::array<int, ModernAudioEngine::ModTotalSteps> modStepCurveShapes{};
+            modStepCurveShapes.fill(modCurveShapeIndex);
+            const auto modSubdivText = stripXml->getStringAttribute(slotKey("StepSubdivisions"));
+            const auto modEndText = stripXml->getStringAttribute(slotKey("StepEndValues"));
+            const auto modCurvePerStepText = stripXml->getStringAttribute(slotKey("StepCurveShapes"));
+            const bool hasModShapeData = modSubdivText.isNotEmpty() || modEndText.isNotEmpty();
+            const bool hasModCurvePerStepData = modCurvePerStepText.isNotEmpty();
             if (hasModShapeData)
             {
-                const int subdivisions = juce::jlimit(
-                    1, ModernAudioEngine::ModMaxStepSubdivisions, modStepSubdivisions[static_cast<size_t>(s)]);
-                const float endValue = juce::jlimit(0.0f, 1.0f, modStepEndValues[static_cast<size_t>(s)]);
-                audioEngine->setModStepShapeAbsolute(stripIndex, s, subdivisions, endValue);
+                if (modSubdivText.isNotEmpty())
+                    decodeIntArrayCsv(modSubdivText, modStepSubdivisions);
+                if (modEndText.isNotEmpty())
+                    decodeFloatArrayCsv(modEndText, modStepEndValues);
             }
-            const int stepCurveShapeIndex = juce::jlimit(
-                0,
-                static_cast<int>(ModernAudioEngine::ModCurveShape::Square),
-                modStepCurveShapes[static_cast<size_t>(s)]);
-            audioEngine->setModStepCurveShapeAbsolute(
-                stripIndex,
-                s,
-                static_cast<ModernAudioEngine::ModCurveShape>(stepCurveShapeIndex));
+            if (hasModCurvePerStepData)
+                decodeIntArrayCsv(modCurvePerStepText, modStepCurveShapes);
+            for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
+            {
+                const float startValue = juce::jlimit(0.0f, 1.0f, modSteps[static_cast<size_t>(s)]);
+                audioEngine->setModStepValueAbsolute(stripIndex, s, startValue);
+                if (hasModShapeData)
+                {
+                    const int subdivisions = juce::jlimit(
+                        1, ModernAudioEngine::ModMaxStepSubdivisions, modStepSubdivisions[static_cast<size_t>(s)]);
+                    const float endValue = juce::jlimit(0.0f, 1.0f, modStepEndValues[static_cast<size_t>(s)]);
+                    audioEngine->setModStepShapeAbsolute(stripIndex, s, subdivisions, endValue);
+                }
+                const int stepCurveShapeIndex = juce::jlimit(
+                    0,
+                    static_cast<int>(ModernAudioEngine::ModCurveShape::Square),
+                    modStepCurveShapes[static_cast<size_t>(s)]);
+                audioEngine->setModStepCurveShapeAbsolute(
+                    stripIndex,
+                    s,
+                    static_cast<ModernAudioEngine::ModCurveShape>(stepCurveShapeIndex));
+            }
         }
+
+        audioEngine->setModSequencerSlot(stripIndex, requestedActiveModSlot);
 
         if (auto* volParam = parameters.getParameter("stripVolume" + juce::String(stripIndex)))
             volParam->setValueNotifyingHost(static_cast<float>(stripXml->getDoubleAttribute("volume", 1.0)));

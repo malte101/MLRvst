@@ -184,8 +184,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
 
     if (modulationMode)
     {
-        const int activePage = audioEngine->getModCurrentPage(targetStrip);
-        audioEngine->setModEditPage(targetStrip, activePage);
+        const int activePage = audioEngine->getModEditPage(targetStrip);
         arcSelectedModStep = juce::jlimit(0, ModernAudioEngine::ModSteps - 1, arcSelectedModStep);
         const int absoluteStep = (activePage * ModernAudioEngine::ModSteps) + arcSelectedModStep;
 
@@ -388,12 +387,16 @@ void MlrVSTAudioProcessor::updateMonomeArcRings()
     int overlayStep = -1;
     if (modulationMode)
     {
-        const int activePage = audioEngine->getModCurrentPage(targetStrip);
-        audioEngine->setModEditPage(targetStrip, activePage);
+        const int activePage = audioEngine->getModEditPage(targetStrip);
         arcSelectedModStep = juce::jlimit(0, ModernAudioEngine::ModSteps - 1, arcSelectedModStep);
         const int absoluteStep = (activePage * ModernAudioEngine::ModSteps) + arcSelectedModStep;
-        const int activeStep = juce::jlimit(0, ModernAudioEngine::ModSteps - 1, audioEngine->getModCurrentStep(targetStrip));
-        overlayStep = activeStep;
+        const int activeGlobalStep = audioEngine->getModCurrentGlobalStep(targetStrip);
+        const int playbackPage = juce::jlimit(
+            0,
+            ModernAudioEngine::MaxModBars - 1,
+            activeGlobalStep / ModernAudioEngine::ModSteps);
+        if (playbackPage == activePage)
+            overlayStep = juce::jlimit(0, ModernAudioEngine::ModSteps - 1, activeGlobalStep % ModernAudioEngine::ModSteps);
 
         const auto seq = audioEngine->getModSequencerState(targetStrip);
         const float stepValue = juce::jlimit(0.0f, 1.0f, audioEngine->getModStepValueAbsolute(targetStrip, absoluteStep));
