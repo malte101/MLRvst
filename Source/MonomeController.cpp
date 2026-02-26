@@ -780,11 +780,13 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     {
                         setStepEnabled(absoluteStep, true);
                         const int maxSubs = juce::jmax(2, EnhancedAudioStrip::MaxStepSubdivisions);
+                        // Map row value directly to the visible subdivision scale.
+                        // (Old mapping had a +2 bias that made low values feel offset.)
                         const int subdivisions = juce::jlimit(
                             2,
                             maxSubs,
-                            2 + static_cast<int>(std::round(rowValue
-                                * static_cast<float>(juce::jmax(0, maxSubs - 2)))));
+                            1 + static_cast<int>(std::round(rowValue
+                                * static_cast<float>(juce::jmax(1, maxSubs - 1)))));
                         targetStrip->setStepSubdivisionAtIndex(absoluteStep, subdivisions);
                         break;
                     }

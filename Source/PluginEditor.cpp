@@ -930,7 +930,7 @@ void StripControl::setupComponents()
             {
                 const int totalSteps = strip->getStepTotalSteps();
                 if (stepIndex >= 0 && stepIndex < totalSteps)
-                    strip->stepPattern[static_cast<size_t>(stepIndex)] = enabled;
+                    strip->setStepEnabledAtIndex(stepIndex, enabled, true);
             }
         }
     };

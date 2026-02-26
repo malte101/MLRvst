@@ -459,6 +459,7 @@ public:
     int getVisibleStepOffset() const;
     void toggleStepAtVisibleColumn(int column);
     void toggleStepAtIndex(int absoluteStep);
+    void setStepEnabledAtIndex(int absoluteStep, bool enabled, bool resetShapeOnEnable = true);
     int getStepSubdivisionAtIndex(int absoluteStep) const;
     void setStepSubdivisionAtIndex(int absoluteStep, int subdivisions);
     float getStepSubdivisionStartVelocityAtIndex(int absoluteStep) const;
@@ -986,6 +987,7 @@ private:
     bool grainThreeButtonSnapshotActive = false;
     
 private:
+    void resetStepShapeAtIndex(int absoluteStep);
     double lastStepTime = 0.0;        // Last step trigger time (in beats)
     bool stepSequencerActive = false; // Is step sequencer running?
     bool stepSamplePlaying = false;   // Is a step-triggered sample currently playing?
