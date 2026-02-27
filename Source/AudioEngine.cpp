@@ -3969,20 +3969,17 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         if (!(playMode == PlayMode::Loop || playMode == PlayMode::Gate))
             return mappedPositionInLoop;
         const bool hasSwingTraversal = std::isfinite(swingMappedPositionInLoop);
-        const bool traversalAtUnity = (std::abs(playheadTraversalRatio - 1.0) <= 1.0e-6);
-        if (traversalAtUnity)
-        {
-            if (!hasSwingTraversal)
-                return mappedPositionInLoop;
-
-            const double loopLenSafe = juce::jmax(1.0, loopLength);
-            double swungWrapped = std::fmod(swingMappedPositionInLoop, loopLenSafe);
-            if (swungWrapped < 0.0)
-                swungWrapped += loopLenSafe;
-            return swungWrapped;
-        }
+        if (std::abs(playheadTraversalRatio - 1.0) <= 1.0e-6 && !hasSwingTraversal)
+            return mappedPositionInLoop;
 
         int traversalSlices = juce::jmax(1, loopCols);
+        if (hasSwingTraversal && std::abs(playheadTraversalRatio - 1.0) <= 1.0e-6)
+        {
+            // Keep swing traversal resolution independent from beatsPerLoop so
+            // bar-length changes cannot remap the traversal grid itself.
+            constexpr int kSwingTraversalSlices = 64;
+            traversalSlices = juce::jmax(traversalSlices, kSwingTraversalSlices);
+        }
         const double loopLenSafe = juce::jmax(1.0, loopLength);
         const double sliceLength = loopLenSafe / static_cast<double>(traversalSlices);
         if (!(sliceLength > 1.0e-9))
