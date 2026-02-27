@@ -195,6 +195,7 @@ public:
     void captureRecentAudioToStrip(int stripIndex);
     void clearRecentAudioBuffer();
     void requestBarLengthChange(int stripIndex, int bars);
+    bool canChangeBarLengthNow(int stripIndex) const;
     void setPendingBarLengthApply(int stripIndex, bool pending);
     void triggerStrip(int stripIndex, int column);
     void stopStrip(int stripIndex);
@@ -214,6 +215,16 @@ public:
     bool isBrowserFavoriteMissingBurstActive(int slot, uint32_t nowMs) const;
     void beginBrowserFavoritePadHold(int stripIndex, int slot);
     void endBrowserFavoritePadHold(int stripIndex, int slot);
+
+    enum class PitchControlMode
+    {
+        PitchShift = 0,
+        Resample = 1
+    };
+    PitchControlMode getPitchControlMode() const;
+    bool isPitchControlResampleMode() const { return getPitchControlMode() == PitchControlMode::Resample; }
+    void applyPitchControlToStrip(EnhancedAudioStrip& strip, float semitones);
+    float getPitchSemitonesForDisplay(const EnhancedAudioStrip& strip) const;
     
     // Control mode (for GUI to check if level/pan/etc controls are active)
     enum class ControlMode
@@ -347,6 +358,8 @@ private:
 
     // Cached parameter pointers to avoid string lookups in processBlock
     std::atomic<float>* masterVolumeParam = nullptr;
+    std::atomic<float>* limiterThresholdParam = nullptr;
+    std::atomic<float>* limiterEnabledParam = nullptr;
     std::atomic<float>* quantizeParam = nullptr;
     std::atomic<float>* innerLoopLengthParam = nullptr;
     std::atomic<float>* grainQualityParam = nullptr;
@@ -355,6 +368,7 @@ private:
     std::atomic<float>* crossfadeLengthParam = nullptr;
     std::atomic<float>* triggerFadeInParam = nullptr;
     std::atomic<float>* outputRoutingParam = nullptr;
+    std::atomic<float>* pitchControlModeParam = nullptr;
     std::array<std::atomic<float>*, MaxStrips> stripVolumeParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPanParams{};
     std::array<std::atomic<float>*, MaxStrips> stripSpeedParams{};
@@ -374,6 +388,7 @@ private:
     mutable juce::CriticalSection controlPageOrderLock;
     ControlPageOrder controlPageOrder {
         ControlMode::Speed,
+        ControlMode::Pitch,
         ControlMode::Pan,
         ControlMode::Volume,
         ControlMode::GrainSize,
@@ -382,7 +397,6 @@ private:
         ControlMode::FileBrowser,
         ControlMode::GroupAssign,
         ControlMode::Filter,
-        ControlMode::Pitch,
         ControlMode::Modulation,
         ControlMode::Preset,
         ControlMode::StepEdit

@@ -3528,6 +3528,10 @@ void EnhancedAudioStrip::clearSample()
     lastStepTime = -1.0;
     stepSamplePlaying = false;
     currentStep = 0;
+    stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+    stepTraversalTick = std::numeric_limits<int64_t>::min();
+    stepSubdivisionTriggerIndex = 0;
+    stepSubdivisionGateOpen = true;
     resetGrainState();
     resetPitchShifter();
     resetScratchComboState();
@@ -3585,8 +3589,10 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     {
         playing = true;
         stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+        stepTraversalTick = std::numeric_limits<int64_t>::min();
         stepSubdivisionTriggerIndex = 0;
         stepSubdivisionGateOpen = true;
+        stepTraversalRatioAtLastTick = -1.0;
 
         // Hard re-sync to host PPQ phase on every transport start.
         // We set lastStepTime to one step behind so the first active block
@@ -3594,9 +3600,12 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         if (positionInfo.getPpqPosition().hasValue())
         {
             const double hostPpq = *positionInfo.getPpqPosition();
-            const double sixteenthPos = std::floor(hostPpq * 4.0);
-            lastStepTime = sixteenthPos - 1.0;
-            currentStep = static_cast<int>(sixteenthPos) % 16;
+            const double stepTraversalRatio = juce::jmax(
+                0.125,
+                static_cast<double>(playheadSpeedRatio.load(std::memory_order_acquire)));
+            const double stepPosition = std::floor(hostPpq * 4.0 * stepTraversalRatio);
+            lastStepTime = stepPosition - 1.0;
+            currentStep = static_cast<int>(stepPosition) % 16;
             if (currentStep < 0)
                 currentStep += 16;
         }
@@ -3613,8 +3622,10 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         stepSampler.allNotesOff();
         lastStepTime = -1.0;
         stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+        stepTraversalTick = std::numeric_limits<int64_t>::min();
         stepSubdivisionTriggerIndex = 0;
         stepSubdivisionGateOpen = true;
+        stepTraversalRatioAtLastTick = -1.0;
     }
     
     // Auto-stop audio strips when transport stops
@@ -3692,6 +3703,9 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     }
 
     double beatsForLoop = 4.0;
+    const double playheadTraversalRatio = juce::jmax(
+        0.125,
+        static_cast<double>(playheadSpeedRatio.load(std::memory_order_acquire)));
 
     auto mapLoopPositionForMode = [&](double rawPositionInLoop) -> double
     {
@@ -3948,7 +3962,55 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             wrapped += loopLength;
         return wrapped;
     };
-    
+
+    auto applyPlayheadTraversalToLoopPosition = [&](double mappedPositionInLoop,
+                                                    double swingMappedPositionInLoop = std::numeric_limits<double>::quiet_NaN()) -> double
+    {
+        if (!(playMode == PlayMode::Loop || playMode == PlayMode::Gate))
+            return mappedPositionInLoop;
+        const bool hasSwingTraversal = std::isfinite(swingMappedPositionInLoop);
+        const bool traversalAtUnity = (std::abs(playheadTraversalRatio - 1.0) <= 1.0e-6);
+        if (traversalAtUnity)
+        {
+            if (!hasSwingTraversal)
+                return mappedPositionInLoop;
+
+            const double loopLenSafe = juce::jmax(1.0, loopLength);
+            double swungWrapped = std::fmod(swingMappedPositionInLoop, loopLenSafe);
+            if (swungWrapped < 0.0)
+                swungWrapped += loopLenSafe;
+            return swungWrapped;
+        }
+
+        int traversalSlices = juce::jmax(1, loopCols);
+        const double loopLenSafe = juce::jmax(1.0, loopLength);
+        const double sliceLength = loopLenSafe / static_cast<double>(traversalSlices);
+        if (!(sliceLength > 1.0e-9))
+            return mappedPositionInLoop;
+
+        double wrapped = std::fmod(mappedPositionInLoop, loopLenSafe);
+        if (wrapped < 0.0)
+            wrapped += loopLenSafe;
+
+        const double slicePos = wrapped / sliceLength;
+        const double unswungBaseSlice = std::floor(slicePos);
+        double baseSliceForTraversal = unswungBaseSlice;
+        if (hasSwingTraversal)
+        {
+            double swingWrapped = std::fmod(swingMappedPositionInLoop, loopLenSafe);
+            if (swingWrapped < 0.0)
+                swingWrapped += loopLenSafe;
+            baseSliceForTraversal = std::floor(swingWrapped / sliceLength);
+        }
+        const double intraSlice = slicePos - unswungBaseSlice;
+        double traversedSlice = std::floor(baseSliceForTraversal * playheadTraversalRatio);
+        traversedSlice = std::fmod(traversedSlice, static_cast<double>(traversalSlices));
+        if (traversedSlice < 0.0)
+            traversedSlice += static_cast<double>(traversalSlices);
+
+        return (traversedSlice + intraSlice) * sliceLength;
+    };
+
     // AUTO-WARP TO GLOBAL TEMPO:
     // CRITICAL: Always use the FULL sample's beat count for tempo calculation
     // Inner loops should NOT change the playback speed, just the looping section
@@ -4007,6 +4069,17 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             locked -= loopLenSafe;
         return locked;
     };
+
+    auto mapPlaybackPositionInLoop = [&](double rawPositionInLoop,
+                                         double swingRawPositionInLoop = std::numeric_limits<double>::quiet_NaN()) -> double
+    {
+        const double directed = mapLoopPositionForMode(rawPositionInLoop);
+        const double swingDirected = std::isfinite(swingRawPositionInLoop)
+            ? mapLoopPositionForMode(swingRawPositionInLoop)
+            : std::numeric_limits<double>::quiet_NaN();
+        const double traversed = applyPlayheadTraversalToLoopPosition(directed, swingDirected);
+        return lockPositionToTriggerSlice(traversed);
+    };
     
     // STEP SEQUENCER MODE - handle entirely separately (before main loop)
     if (playMode == PlayMode::Step)
@@ -4014,24 +4087,33 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         stepSampler.setAmpAttackMs(stepEnvelopeAttackMs.load(std::memory_order_acquire));
         stepSampler.setAmpDecayMs(stepEnvelopeDecayMs.load(std::memory_order_acquire));
         stepSampler.setAmpReleaseMs(stepEnvelopeReleaseMs.load(std::memory_order_acquire));
+        const double stepTraversalRatio = juce::jmax(
+            0.125,
+            static_cast<double>(playheadSpeedRatio.load(std::memory_order_acquire)));
+        if (stepTraversalRatioAtLastTick <= 0.0
+            || std::abs(stepTraversalRatio - stepTraversalRatioAtLastTick) > 1.0e-6)
+        {
+            // Prevent burst retriggers when speed ratio changes while transport is running.
+            stepTraversalTick = std::numeric_limits<int64_t>::min();
+            stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+            stepSubdivisionTriggerIndex = 0;
+            stepSubdivisionGateOpen = false;
+            stepTraversalRatioAtLastTick = stepTraversalRatio;
+        }
+        const double stepEventsPerPpq = juce::jmax(1.0e-6, 4.0 * stepTraversalRatio);
+        const double stepLengthPpq = 1.0 / stepEventsPerPpq;
 
         // DON'T copy strip parameters to StepSampler here!
         // StepSampler parameters are controlled directly by monome buttons
         // (volume, pan, speed are set in PluginProcessor button handlers)
 
-        auto triggerStepForSixteenth = [&](int64_t sixteenthIndex, double ppqForLog)
+        auto triggerStepForSequenceTick = [&](int64_t sequenceTick, double ppqForLog)
         {
             juce::ignoreUnused(ppqForLog);
-
-            // Ignore duplicate callbacks for the same sixteenth. This keeps
-            // subdivision counts stable even when host position jitters.
-            if (sixteenthIndex == stepSubdivisionSixteenth)
-                return;
-
-            lastStepTime = static_cast<double>(sixteenthIndex);
+            lastStepTime = static_cast<double>(sequenceTick);
 
             const int totalSteps = juce::jmax(1, getStepTotalSteps());
-            const int baseStep = static_cast<int>(((sixteenthIndex % totalSteps) + totalSteps) % totalSteps);
+            const int baseStep = static_cast<int>(((sequenceTick % totalSteps) + totalSteps) % totalSteps);
             int nextStep = baseStep;
 
             switch (directionMode)
@@ -4047,7 +4129,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 case DirectionMode::PingPong:
                 {
                     const int pingPongLen = juce::jmax(1, totalSteps * 2);
-                    const int cycle = static_cast<int>(((sixteenthIndex % pingPongLen) + pingPongLen) % pingPongLen);
+                    const int cycle = static_cast<int>(((sequenceTick % pingPongLen) + pingPongLen) % pingPongLen);
                     nextStep = (cycle < totalSteps) ? cycle : ((pingPongLen - 1) - cycle);
                     break;
                 }
@@ -4088,7 +4170,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
 
                 case DirectionMode::RandomSlice:
                 {
-                    const int64_t beatGroup = sixteenthIndex / 4;
+                    const int64_t beatGroup = sequenceTick / 4;
                     if (beatGroup != stepRandomSliceBeatGroup)
                     {
                         stepRandomSliceBeatGroup = beatGroup;
@@ -4099,7 +4181,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     }
 
                     static constexpr int motif[4] = {0, 2, 1, 3};
-                    const int motifStep = motif[static_cast<size_t>(sixteenthIndex & 0x3)];
+                    const int motifStep = motif[static_cast<size_t>(sequenceTick & 0x3)];
                     nextStep = (stepRandomSliceBase + (stepRandomSliceDirection * motifStep) + totalSteps) % totalSteps;
                     break;
                 }
@@ -4109,7 +4191,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             if (totalSteps > 16)
                 setStepPage(currentStep / 16);
 
-            stepSubdivisionSixteenth = sixteenthIndex;
+            stepSubdivisionSixteenth = sequenceTick;
             stepSubdivisionTriggerIndex = 0;
             stepSubdivisionGateOpen = false;
 
@@ -4142,15 +4224,34 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             {
                 const double ppqAtProcessedRaw = ppqStartRaw + (static_cast<double>(processed) / samplesPerBeatLocal);
                 const double ppqAtProcessed = applySwingToPpq(ppqAtProcessedRaw);
-                const int64_t sixteenthNow = static_cast<int64_t>(std::floor(ppqAtProcessed * 4.0));
-                const int64_t lastSixteenth = static_cast<int64_t>(lastStepTime);
+                const double sequencePosNow = ppqAtProcessed * stepEventsPerPpq;
+                const int64_t sequenceTickNow = static_cast<int64_t>(std::floor(sequencePosNow));
 
-                if (sixteenthNow != lastSixteenth)
-                    triggerStepForSixteenth(sixteenthNow, ppqAtProcessed);
+                if (stepTraversalTick == std::numeric_limits<int64_t>::min())
+                    stepTraversalTick = sequenceTickNow - 1;
 
-                double nextBoundaryPpq = (static_cast<double>(sixteenthNow) + 1.0) / 4.0;
+                if (sequenceTickNow < stepTraversalTick)
+                {
+                    // Host moved backwards; re-arm step tracking from current PPQ.
+                    stepTraversalTick = sequenceTickNow - 1;
+                    stepSubdivisionTriggerIndex = 0;
+                    stepSubdivisionGateOpen = false;
+                }
+
+                constexpr int64_t kMaxTickCatchup = 128;
+                if ((sequenceTickNow - stepTraversalTick) > kMaxTickCatchup)
+                    stepTraversalTick = sequenceTickNow - 1;
+
+                while (stepTraversalTick < sequenceTickNow)
+                {
+                    ++stepTraversalTick;
+                    triggerStepForSequenceTick(stepTraversalTick, ppqAtProcessed);
+                }
+
+                const double sequenceTickFloor = std::floor(sequencePosNow);
+                double nextBoundaryPpq = (sequenceTickFloor + 1.0) / stepEventsPerPpq;
                 if (stepSubdivisionGateOpen
-                    && sixteenthNow == stepSubdivisionSixteenth)
+                    && stepTraversalTick == stepSubdivisionSixteenth)
                 {
                     const int subdivisions = getStepSubdivisionAtIndex(currentStep);
                     if (subdivisions > 1)
@@ -4158,10 +4259,10 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                         const int nextSubIndex = stepSubdivisionTriggerIndex + 1;
                         if (nextSubIndex < subdivisions)
                         {
-                            const double sixteenthStartPpq = static_cast<double>(sixteenthNow) / 4.0;
-                            const double subStepLengthPpq = 0.25 / static_cast<double>(subdivisions);
+                            const double stepStartPpq = static_cast<double>(stepTraversalTick) / stepEventsPerPpq;
+                            const double subStepLengthPpq = stepLengthPpq / static_cast<double>(subdivisions);
                             const double candidateBoundaryPpq
-                                = sixteenthStartPpq + (static_cast<double>(nextSubIndex) * subStepLengthPpq);
+                                = stepStartPpq + (static_cast<double>(nextSubIndex) * subStepLengthPpq);
                             if (candidateBoundaryPpq < nextBoundaryPpq - 1.0e-12)
                                 nextBoundaryPpq = candidateBoundaryPpq;
                         }
@@ -4182,24 +4283,26 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
 
                 if (processed < numSamples
                     && stepSubdivisionGateOpen
-                    && sixteenthNow == stepSubdivisionSixteenth)
+                    && stepTraversalTick == stepSubdivisionSixteenth)
                 {
                     const double ppqAfterProcessedRaw = ppqStartRaw
                         + (static_cast<double>(processed) / samplesPerBeatLocal);
                     const double ppqAfterProcessed = applySwingToPpq(ppqAfterProcessedRaw);
+                    const double sequencePosAfter = ppqAfterProcessed * stepEventsPerPpq;
+                    const int64_t sequenceTickAfter = static_cast<int64_t>(std::floor(sequencePosAfter));
 
                     const int subdivisions = getStepSubdivisionAtIndex(currentStep);
-                    if (subdivisions > 1)
+                    if (subdivisions > 1 && sequenceTickAfter == stepTraversalTick)
                     {
-                        const double sixteenthStartPpq = static_cast<double>(sixteenthNow) / 4.0;
-                        const double sixteenthPhase = juce::jlimit(
+                        const double stepStartPpq = static_cast<double>(stepTraversalTick) / stepEventsPerPpq;
+                        const double stepPhase = juce::jlimit(
                             0.0,
                             0.999999,
-                            (ppqAfterProcessed - sixteenthStartPpq) / 0.25);
+                            (ppqAfterProcessed - stepStartPpq) / stepLengthPpq);
                         const int expectedSubTriggers = juce::jlimit(
                             0,
                             juce::jmax(0, subdivisions - 1),
-                            static_cast<int>(std::floor((sixteenthPhase * static_cast<double>(subdivisions))
+                            static_cast<int>(std::floor((stepPhase * static_cast<double>(subdivisions))
                                                         + 1.0e-9)));
 
                         const float startVelocity = getStepSubdivisionStartVelocityAtIndex(currentStep);
@@ -4245,6 +4348,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         : 1.0;
     const bool speedBypassPpq = !stutterTimingActive && (std::abs(speedForSync - 1.0) > 1.0e-3);
     const bool bypassPpqSync = scratchBypassPpq || speedBypassPpq;
+    const bool swingTraversalEnabled = (playMode == PlayMode::Loop || playMode == PlayMode::Gate)
+        && (swingAmount.load(std::memory_order_acquire) > 1.0e-4f);
 
     if (speedPpqBypassActive != speedBypassPpq)
     {
@@ -4266,22 +4371,25 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         // Returning speed to unity hard-snaps to PPQ timeline.
         if (!speedBypassPpq && positionInfo.getPpqPosition().hasValue() && tempo > 0.0)
         {
-            const double currentPpq = applySwingToPpq(*positionInfo.getPpqPosition());
+            const double currentPpq = *positionInfo.getPpqPosition();
+            const double swungPpq = swingTraversalEnabled ? applySwingToPpq(currentPpq) : currentPpq;
             if (ppqTimelineAnchored)
             {
                 const double timelineBeats = currentPpq + ppqTimelineOffsetBeats;
                 const double timelinePosition = (timelineBeats / beatsForLoop) * sampleLength;
-                playbackPosition = loopStartSamples + lockPositionToTriggerSlice(
-                    mapLoopPositionForMode(timelinePosition));
+                const double swungTimelineBeats = swungPpq + ppqTimelineOffsetBeats;
+                const double swungTimelinePosition = (swungTimelineBeats / beatsForLoop) * sampleLength;
+                playbackPosition = loopStartSamples + mapPlaybackPositionInLoop(timelinePosition, swungTimelinePosition);
             }
             else if (triggerPpqPosition >= 0.0)
             {
                 const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
                 const double ppqElapsed = currentPpq - triggerPpqPosition;
+                const double swungPpqElapsed = swungPpq - triggerPpqPosition;
                 const double triggerOffset = triggerOffsetRatioLocal * loopLength;
                 const double rawPos = triggerOffset + (ppqElapsed * samplesPerBeat * autoWarpSpeed);
-                playbackPosition = loopStartSamples + lockPositionToTriggerSlice(
-                    mapLoopPositionForMode(rawPos));
+                const double swingRawPos = triggerOffset + (swungPpqElapsed * samplesPerBeat * autoWarpSpeed);
+                playbackPosition = loopStartSamples + mapPlaybackPositionInLoop(rawPos, swingRawPos);
             }
         }
         speedPpqBypassActive = speedBypassPpq;
@@ -4293,7 +4401,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     if (positionInfo.getPpqPosition().hasValue() && !bypassPpqSync && playing
         && (triggerPpqPosition >= 0.0 || useTimelineAnchorForPlayback))
     {
-        double currentPpq = applySwingToPpq(*positionInfo.getPpqPosition());
+        double currentPpq = *positionInfo.getPpqPosition();
+        const double swungPpq = swingTraversalEnabled ? applySwingToPpq(currentPpq) : currentPpq;
         double positionInLoop = 0.0;
         double columnOffsetSamples = 0.0;
         double samplesElapsed = 0.0;
@@ -4304,7 +4413,9 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             // Use unwrapped phase so Ping-Pong can produce outbound+return.
             const double timelineBeats = currentPpq + ppqTimelineOffsetBeats;
             const double timelinePosition = (timelineBeats / beatsForLoop) * sampleLength;
-            positionInLoop = lockPositionToTriggerSlice(mapLoopPositionForMode(timelinePosition));
+            const double swungTimelineBeats = swungPpq + ppqTimelineOffsetBeats;
+            const double swungTimelinePosition = (swungTimelineBeats / beatsForLoop) * sampleLength;
+            positionInLoop = mapPlaybackPositionInLoop(timelinePosition, swungTimelinePosition);
             playbackPosition = loopStartSamples + positionInLoop;
         }
         else
@@ -4321,7 +4432,10 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             samplesElapsed = ppqElapsed * samplesPerBeat * autoWarpSpeed * stutterPpqRateScale;
             columnOffsetSamples = triggerOffsetRatioLocal * loopLength;
             const double totalPosition = columnOffsetSamples + samplesElapsed;
-            positionInLoop = lockPositionToTriggerSlice(mapLoopPositionForMode(totalPosition));
+            const double swungPpqElapsed = swungPpq - triggerPpqPosition;
+            const double swungSamplesElapsed = swungPpqElapsed * samplesPerBeat * autoWarpSpeed * stutterPpqRateScale;
+            const double swungTotalPosition = columnOffsetSamples + swungSamplesElapsed;
+            positionInLoop = mapPlaybackPositionInLoop(totalPosition, swungTotalPosition);
             playbackPosition = loopStartSamples + positionInLoop;
         }
         
@@ -4330,12 +4444,14 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     {
         // ABSOLUTE PPQ MODE (for stop/restart with no trigger)
         // Position locked to timeline PPQ - no column offset
-        double currentPpq = applySwingToPpq(*positionInfo.getPpqPosition());
+        double currentPpq = *positionInfo.getPpqPosition();
+        const double swungPpq = swingTraversalEnabled ? applySwingToPpq(currentPpq) : currentPpq;
         double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
         double timelineSamples = currentPpq * samplesPerBeat * autoWarpSpeed;
+        double swungTimelineSamples = swungPpq * samplesPerBeat * autoWarpSpeed;
         
         // Use timeline position directly - no column offset!
-        double positionInLoop = lockPositionToTriggerSlice(mapLoopPositionForMode(timelineSamples));
+        double positionInLoop = mapPlaybackPositionInLoop(timelineSamples, swungTimelineSamples);
         playbackPosition = loopStartSamples + positionInLoop;
     }
     else if (playing)
@@ -4347,19 +4463,17 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         
         // Start from trigger column offset
         double triggerOffset = triggerOffsetRatioLocal * loopLength;
-        double swungElapsedSamples = static_cast<double>(samplesElapsed);
-        const float swing = swingAmount.load(std::memory_order_acquire);
-        if (swing > 1.0e-6f && tempo > 1.0e-6)
+        double totalPosition = triggerOffset + (static_cast<double>(samplesElapsed) * playbackSpeed.load());
+        double swingTotalPosition = std::numeric_limits<double>::quiet_NaN();
+        if (swingTraversalEnabled && tempo > 0.0)
         {
             const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
-            const double beatElapsed = swungElapsedSamples / juce::jmax(1.0, samplesPerBeat);
+            const double beatElapsed = static_cast<double>(samplesElapsed) / juce::jmax(1.0, samplesPerBeat);
             const double swungBeatElapsed = applySwingToPpq(beatElapsed);
-            swungElapsedSamples = swungBeatElapsed * samplesPerBeat;
+            swingTotalPosition = triggerOffset + (swungBeatElapsed * samplesPerBeat * playbackSpeed.load());
         }
 
-        double totalPosition = triggerOffset + (swungElapsedSamples * playbackSpeed.load());
-        
-        double positionInLoop = lockPositionToTriggerSlice(mapLoopPositionForMode(totalPosition));
+        double positionInLoop = mapPlaybackPositionInLoop(totalPosition, swingTotalPosition);
         
         playbackPosition = loopStartSamples + positionInLoop;
     }
@@ -4728,16 +4842,16 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             
             if (ppqSyncActiveForCalc)
             {
-                // PPQ sync: derive sample positions from swung timeline phase.
-                // Compute PPQ at this sample index so swing can audibly affect playback,
-                // not just marker display.
+                // PPQ sync: derive sample positions from timeline phase.
                 const auto ppqOpt = positionInfo.getPpqPosition();
                 const double basePpq = ppqOpt.hasValue() ? *ppqOpt : 0.0;
                 const double samplesPerBeatLocal = secondsPerBeat * currentSampleRate;
                 const double ppqPerSample = (samplesPerBeatLocal > 0.0) ? (1.0 / samplesPerBeatLocal) : 0.0;
                 const double ppqAtSampleRaw = basePpq + (static_cast<double>(i) * ppqPerSample);
-                const double currentPpq = applySwingToPpq(ppqAtSampleRaw);
+                const double currentPpq = ppqAtSampleRaw;
+                const double swungPpq = swingTraversalEnabled ? applySwingToPpq(ppqAtSampleRaw) : currentPpq;
                 double rawBase = 0.0;
+                double swingRawBase = std::numeric_limits<double>::quiet_NaN();
                 if (useTimelineAnchorForCalc)
                 {
                     const double timelineBeats = currentPpq + ppqTimelineOffsetBeats;
@@ -4745,6 +4859,11 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     // Keep PPQ-derived phase, but let playback rate scale that phase in loop mode
                     // so speed modulation/control affects both audio and marker motion.
                     rawBase = ((timelineBeats * timelineRate) / beatsForLoop) * sampleLength;
+                    if (swingTraversalEnabled)
+                    {
+                        const double swungTimelineBeats = swungPpq + ppqTimelineOffsetBeats;
+                        swingRawBase = ((swungTimelineBeats * timelineRate) / beatsForLoop) * sampleLength;
+                    }
                 }
                 else if (triggerPpqPosition >= 0.0)
                 {
@@ -4755,6 +4874,11 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                         ? juce::jmax(0.0, std::abs(static_cast<double>(currentSpeed)))
                         : 1.0;
                     rawBase = columnOffsetSamples + (ppqElapsed * samplesPerBeat * autoWarpSpeed * sampleRateScale);
+                    if (swingTraversalEnabled)
+                    {
+                        const double swungPpqElapsed = swungPpq - triggerPpqPosition;
+                        swingRawBase = columnOffsetSamples + (swungPpqElapsed * samplesPerBeat * autoWarpSpeed * sampleRateScale);
+                    }
                 }
                 else
                 {
@@ -4762,9 +4886,16 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     int64_t samplesElapsed = currentGlobalSample - triggerSample;
                     double triggerOffset = triggerOffsetRatioLocal * loopLength;
                     rawBase = triggerOffset + (samplesElapsed * effectiveSpeed);
+                    if (swingTraversalEnabled && tempo > 0.0)
+                    {
+                        const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
+                        const double beatElapsed = static_cast<double>(samplesElapsed) / juce::jmax(1.0, samplesPerBeat);
+                        const double swungBeatElapsed = applySwingToPpq(beatElapsed);
+                        swingRawBase = triggerOffset + (swungBeatElapsed * samplesPerBeat * effectiveSpeed);
+                    }
                 }
 
-                positionInLoop = lockPositionToTriggerSlice(mapLoopPositionForMode(rawBase));
+                positionInLoop = mapPlaybackPositionInLoop(rawBase, swingRawBase);
                 }
                 else
                 {
@@ -4773,8 +4904,16 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 int64_t samplesElapsed = currentGlobalSample - triggerSample;
                 
                 double triggerOffset = triggerOffsetRatioLocal * loopLength;
-                    positionInLoop = lockPositionToTriggerSlice(
-                        mapLoopPositionForMode(triggerOffset + (samplesElapsed * effectiveSpeed)));
+                    double rawBase = triggerOffset + (samplesElapsed * effectiveSpeed);
+                    double swingRawBase = std::numeric_limits<double>::quiet_NaN();
+                    if (swingTraversalEnabled && tempo > 0.0)
+                    {
+                        const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
+                        const double beatElapsed = static_cast<double>(samplesElapsed) / juce::jmax(1.0, samplesPerBeat);
+                        const double swungBeatElapsed = applySwingToPpq(beatElapsed);
+                        swingRawBase = triggerOffset + (swungBeatElapsed * samplesPerBeat * effectiveSpeed);
+                    }
+                    positionInLoop = mapPlaybackPositionInLoop(rawBase, swingRawBase);
                 }
                 
             }
@@ -6272,6 +6411,7 @@ void EnhancedAudioStrip::startStepSequencer()
     stepRandomWalkPos = 0;
     stepRandomSliceBeatGroup = -1;
     stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+    stepTraversalTick = std::numeric_limits<int64_t>::min();
     stepSubdivisionTriggerIndex = 0;
     stepSubdivisionGateOpen = true;
     randomSliceNextTriggerBeat = -1.0;
@@ -6331,6 +6471,7 @@ void EnhancedAudioStrip::setBeatsPerLoopAtPpq(float beats, double hostPpqNow)
     double oldBeatInLoop = std::fmod(hostPpqNow + ppqTimelineOffsetBeats, previousBeats);
     if (oldBeatInLoop < 0.0)
         oldBeatInLoop += previousBeats;
+
     const double normalizedPhase = oldBeatInLoop / previousBeats;
     const double beatInLoopNew = normalizedPhase * nextBeats;
 
@@ -7418,6 +7559,23 @@ void ModernAudioEngine::prepareToPlay(double sampleRate, int maxBlockSize)
     liveRecorder->prepareToPlay(sampleRate, maxBlockSize);
     setCrossfadeLengthMs(crossfadeLengthMs.load(std::memory_order_acquire));
     setTriggerFadeInMs(triggerFadeInMs.load(std::memory_order_acquire));
+
+    juce::dsp::ProcessSpec limiterSpec;
+    limiterSpec.sampleRate = juce::jmax(1.0, sampleRate);
+    limiterSpec.maximumBlockSize = static_cast<juce::uint32>(juce::jmax(1, maxBlockSize));
+    limiterSpec.numChannels = 1;
+    const float thresholdDb = limiterThresholdDb.load(std::memory_order_acquire);
+    for (size_t i = 0; i < outputLimiterL.size(); ++i)
+    {
+        outputLimiterL[i].prepare(limiterSpec);
+        outputLimiterR[i].prepare(limiterSpec);
+        outputLimiterL[i].setThreshold(thresholdDb);
+        outputLimiterR[i].setThreshold(thresholdDb);
+        outputLimiterL[i].setRelease(80.0f);
+        outputLimiterR[i].setRelease(80.0f);
+        outputLimiterL[i].reset();
+        outputLimiterR[i].reset();
+    }
 }
 
 void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer, 
@@ -8233,6 +8391,34 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
         if (inputCopy.getNumChannels() == 1 && numChannels == 2)
             buffer.addFrom(1, 0, inputCopy, 0, 0, numSamples, inputMonitorVol);
     }
+
+    if (limiterEnabled.load(std::memory_order_acquire) != 0)
+    {
+        const float limiterThresholdDbLocal = limiterThresholdDb.load(std::memory_order_acquire);
+        for (size_t b = 0; b < buffersToPostProcessCount; ++b)
+        {
+            auto* target = buffersToPostProcess[b];
+            const int targetChannels = target->getNumChannels();
+            const int targetSamples = target->getNumSamples();
+            if (targetSamples <= 0 || targetChannels <= 0)
+                continue;
+
+            outputLimiterL[b].setThreshold(limiterThresholdDbLocal);
+            outputLimiterR[b].setThreshold(limiterThresholdDbLocal);
+
+            for (int ch = 0; ch < targetChannels; ++ch)
+            {
+                auto* write = target->getWritePointer(ch);
+                float* channelData[1] { write };
+                juce::dsp::AudioBlock<float> monoBlock(channelData, 1, static_cast<size_t>(targetSamples));
+                juce::dsp::ProcessContextReplacing<float> context(monoBlock);
+                if (ch == 0)
+                    outputLimiterL[b].process(context);
+                else
+                    outputLimiterR[b].process(context);
+            }
+        }
+    }
     
     // Only advance clocks when host is playing
     // This keeps everything locked to host timeline
@@ -8498,6 +8684,30 @@ void ModernAudioEngine::triggerStripWithQuantization(int stripIndex, int column,
 void ModernAudioEngine::setMasterVolume(float vol)
 {
     masterVolume = juce::jlimit(0.0f, 1.0f, vol);
+}
+
+void ModernAudioEngine::setLimiterEnabled(bool enabled)
+{
+    const bool wasEnabled = limiterEnabled.exchange(enabled ? 1 : 0, std::memory_order_acq_rel) != 0;
+    if (wasEnabled == enabled)
+        return;
+
+    for (size_t i = 0; i < outputLimiterL.size(); ++i)
+    {
+        outputLimiterL[i].reset();
+        outputLimiterR[i].reset();
+    }
+}
+
+void ModernAudioEngine::setLimiterThresholdDb(float thresholdDb)
+{
+    const float clamped = juce::jlimit(-24.0f, 0.0f, thresholdDb);
+    limiterThresholdDb.store(clamped, std::memory_order_release);
+    for (size_t i = 0; i < outputLimiterL.size(); ++i)
+    {
+        outputLimiterL[i].setThreshold(clamped);
+        outputLimiterR[i].setThreshold(clamped);
+    }
 }
 
 void ModernAudioEngine::setPitchSmoothingTime(float seconds)

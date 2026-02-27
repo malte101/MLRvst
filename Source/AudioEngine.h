@@ -499,6 +499,11 @@ public:
     float getVolume() const { return volume.load(); }
     void setPan(float panValue); // -1.0 (left) to 1.0 (right)
     float getPan() const { return pan.load(); }
+    void setPlayheadSpeedRatio(float ratio)
+    {
+        playheadSpeedRatio.store(juce::jlimit(0.125f, 4.0f, ratio), std::memory_order_release);
+    }
+    float getPlayheadSpeedRatio() const { return playheadSpeedRatio.load(std::memory_order_acquire); }
     void setPlaybackSpeed(float speed);
     void setPlaybackSpeedImmediate(float speed);
     void setMomentaryStutterTimingActive(bool active)
@@ -636,7 +641,10 @@ public:
             lastStepTime = -1.0;
             currentStep = 0;
             stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+            stepTraversalTick = std::numeric_limits<int64_t>::min();
             stepSubdivisionTriggerIndex = 0;
+            stepSubdivisionGateOpen = true;
+            stepTraversalRatioAtLastTick = -1.0;
 
             // If the strip already has loop sample content but step sampler
             // is empty, bootstrap step mode from that content.
@@ -686,7 +694,10 @@ public:
             lastStepTime = -1.0;
             stepSamplePlaying = false;
             stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+            stepTraversalTick = std::numeric_limits<int64_t>::min();
             stepSubdivisionTriggerIndex = 0;
+            stepSubdivisionGateOpen = true;
+            stepTraversalRatioAtLastTick = -1.0;
             scrubActive = false;
             tapeStopActive = false;
             scratchGestureActive = false;
@@ -793,6 +804,7 @@ private:
     juce::LagrangeInterpolator interpolators[2]; // For stereo
     
     std::atomic<double> playbackPosition{0.0};
+    std::atomic<float> playheadSpeedRatio{1.0f}; // Playmarker traversal multiplier (quantized musical ratios)
     std::atomic<double> playbackSpeed{1.0};
     std::atomic<float> displaySpeedAtomic{1.0f};
     std::atomic<bool> playing{false};
@@ -1002,8 +1014,10 @@ private:
     int stepRandomSliceBase = 0;
     int stepRandomSliceDirection = 1;
     int64_t stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+    int64_t stepTraversalTick = std::numeric_limits<int64_t>::min();
     int stepSubdivisionTriggerIndex = 0;
     bool stepSubdivisionGateOpen = true;
+    double stepTraversalRatioAtLastTick = -1.0;
     
 public:
     
@@ -1264,6 +1278,10 @@ public:
     // Master controls
     void setMasterVolume(float vol);
     float getMasterVolume() const { return masterVolume; }
+    void setLimiterEnabled(bool enabled);
+    bool isLimiterEnabled() const { return limiterEnabled.load(std::memory_order_acquire) != 0; }
+    void setLimiterThresholdDb(float thresholdDb);
+    float getLimiterThresholdDb() const { return limiterThresholdDb.load(std::memory_order_acquire); }
     
     void setPitchSmoothingTime(float seconds);  // 0 = no smoothing, 1.0 = 1 second for scratching
     float getPitchSmoothingTime() const { return pitchSmoothingTime; }
@@ -1336,6 +1354,10 @@ private:
     QuantizationClock quantizeClock;
     
     std::atomic<float> masterVolume{1.0f};
+    std::atomic<int> limiterEnabled{0};
+    std::atomic<float> limiterThresholdDb{0.0f}; // 0 dB = transparent until over 0 dBFS
+    std::array<juce::dsp::Limiter<float>, MaxStrips + 1> outputLimiterL{};
+    std::array<juce::dsp::Limiter<float>, MaxStrips + 1> outputLimiterR{};
     std::atomic<float> pitchSmoothingTime{0.05f};  // Default 50ms, range 0-1.0 seconds
     std::atomic<float> inputMonitorVolume{0.0f};  // Default off, range 0-1.0
     std::atomic<float> inputLevelL{0.0f};  // Input meter level left (0-1)

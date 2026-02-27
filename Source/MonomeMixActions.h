@@ -12,6 +12,7 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
                        int mode);
 
 void renderRow(const EnhancedAudioStrip& strip,
+               const MlrVSTAudioProcessor& processor,
                int y,
                int newLedState[16][8],
                int mode);

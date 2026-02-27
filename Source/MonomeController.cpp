@@ -655,28 +655,10 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 const int selectedStripIndex = juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip);
                 if (auto* strip = audioEngine->getStrip(selectedStripIndex))
                 {
-                    float currentSemitones = strip->getPitchShift();
-                    if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
-                    {
-                        if (auto* stepSampler = strip->getStepSampler())
-                            currentSemitones = static_cast<float>(stepSampler->getPitchOffset());
-                    }
-
+                    const float currentSemitones = getPitchSemitonesForDisplay(*strip);
                     const float delta = (x == 13) ? -1.0f : 1.0f;
                     const float nextSemitones = juce::jlimit(-24.0f, 24.0f, currentSemitones + delta);
-
-                    if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
-                    {
-                        if (auto* stepSampler = strip->getStepSampler())
-                        {
-                            const float ratio = std::pow(2.0f, nextSemitones / 12.0f);
-                            stepSampler->setSpeed(ratio);
-                        }
-                    }
-                    else
-                    {
-                        strip->setPitchShift(nextSemitones);
-                    }
+                    applyPitchControlToStrip(*strip, nextSemitones);
 
                     if (auto* param = parameters.getParameter("stripPitch" + juce::String(selectedStripIndex)))
                     {
@@ -763,18 +745,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 if (stepEditTool == StepEditTool::Release)
                 {
                     const float pitchSemitones = juce::jmap(columnNorm, -24.0f, 24.0f);
-                    if (targetStrip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
-                    {
-                        if (auto* stepSampler = targetStrip->getStepSampler())
-                        {
-                            const float ratio = std::pow(2.0f, pitchSemitones / 12.0f);
-                            stepSampler->setSpeed(ratio);
-                        }
-                    }
-                    else
-                    {
-                        targetStrip->setPitchShift(pitchSemitones);
-                    }
+                    applyPitchControlToStrip(*targetStrip, pitchSemitones);
 
                     if (auto* param = parameters.getParameter("stripPitch" + juce::String(selectedStripIndex)))
                     {
@@ -1629,12 +1600,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                     normalized = juce::jlimit(0.0f, 1.0f, (selectedStrip->getStepEnvelopeDecayMs() - 1.0f) / 3999.0f);
                 else
                 {
-                    float pitchSemitones = selectedStrip->getPitchShift();
-                    if (selectedStrip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
-                    {
-                        if (auto* stepSampler = selectedStrip->getStepSampler())
-                            pitchSemitones = static_cast<float>(stepSampler->getPitchOffset());
-                    }
+                    const float pitchSemitones = getPitchSemitonesForDisplay(*selectedStrip);
                     normalized = juce::jlimit(0.0f, 1.0f, (pitchSemitones + 24.0f) / 48.0f);
                 }
 
@@ -1750,27 +1716,27 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         // Different displays per mode - ONLY when control button is HELD
         if (controlModeActive && currentControlMode == ControlMode::Speed)
         {
-            MonomeMixActions::renderRow(*strip, y, newLedState, static_cast<int>(currentControlMode));
+            MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
         }
         else if (controlModeActive && currentControlMode == ControlMode::Pitch)
         {
-            MonomeMixActions::renderRow(*strip, y, newLedState, static_cast<int>(currentControlMode));
+            MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
         }
         else if (controlModeActive && currentControlMode == ControlMode::Pan)
         {
-            MonomeMixActions::renderRow(*strip, y, newLedState, static_cast<int>(currentControlMode));
+            MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
         }
         else if (controlModeActive && currentControlMode == ControlMode::Volume)
         {
-            MonomeMixActions::renderRow(*strip, y, newLedState, static_cast<int>(currentControlMode));
+            MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
         }
         else if (controlModeActive && currentControlMode == ControlMode::Swing)
         {
-            MonomeMixActions::renderRow(*strip, y, newLedState, static_cast<int>(currentControlMode));
+            MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
         }
         else if (controlModeActive && currentControlMode == ControlMode::Gate)
         {
-            MonomeMixActions::renderRow(*strip, y, newLedState, static_cast<int>(currentControlMode));
+            MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
         }
         else if (controlModeActive && currentControlMode == ControlMode::GrainSize)
         {

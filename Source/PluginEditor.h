@@ -448,8 +448,8 @@ private:
     // Compact controls on the right
     juce::Slider volumeSlider;      // Compact rotary
     juce::Slider panSlider;         // Compact rotary
-    juce::Slider speedSlider;       // Compact rotary
-    juce::Slider scratchSlider;     // Compact rotary - scratch amount
+    juce::Slider speedSlider;       // Compact rotary - pitch
+    juce::Slider scratchSlider;     // Compact rotary - playhead speed
     juce::ComboBox patternLengthBox; // Step mode pattern length (16..64)
     DraggableNumberBox stepLengthReadoutBox; // Step mode draggable numeric length (1..64)
     juce::Slider stepAttackSlider;  // Step mode attack (ms)
@@ -535,6 +535,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> volumeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> panAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> speedAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> scratchAttachment;
     
     void setupComponents();
     void loadSample();
@@ -691,8 +692,10 @@ private:
     MlrVSTAudioProcessor& processor;
     
     juce::Label titleLabel;
+    juce::Label versionLabel;
     juce::Slider masterVolumeSlider;
     juce::Label masterVolumeLabel;
+    juce::ToggleButton limiterToggle;
     juce::ComboBox quantizeSelector;
     juce::Label quantizeLabel;
     juce::ComboBox innerLoopLengthBox;
@@ -703,6 +706,8 @@ private:
     juce::Label swingDivisionLabel;
     juce::ComboBox outputRoutingBox;
     juce::Label outputRoutingLabel;
+    juce::ComboBox pitchControlModeBox;
+    juce::Label pitchControlModeLabel;
     
     // Input monitoring controls
     juce::Slider inputMonitorSlider;
@@ -720,6 +725,7 @@ private:
     juce::ToggleButton tooltipsToggle;
     
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterVolumeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> limiterEnabledAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> quantizeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> innerLoopLengthAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> grainQualityAttachment;
@@ -727,6 +733,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> crossfadeLengthAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> triggerFadeInAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> outputRoutingAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> pitchControlModeAttachment;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GlobalControlPanel)
 };

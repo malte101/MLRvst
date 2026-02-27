@@ -9,6 +9,7 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "PlayheadSpeedQuantizer.h"
 #include "PresetStore.h"
 #include <cmath>
 #include <limits>
@@ -1044,6 +1045,8 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
 void MlrVSTAudioProcessor::cacheParameterPointers()
 {
     masterVolumeParam = parameters.getRawParameterValue("masterVolume");
+    limiterThresholdParam = parameters.getRawParameterValue("limiterThreshold");
+    limiterEnabledParam = parameters.getRawParameterValue("limiterEnabled");
     quantizeParam = parameters.getRawParameterValue("quantize");
     innerLoopLengthParam = parameters.getRawParameterValue("innerLoopLength");
     grainQualityParam = parameters.getRawParameterValue("quality");
@@ -1052,6 +1055,7 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
     crossfadeLengthParam = parameters.getRawParameterValue("crossfadeLength");
     triggerFadeInParam = parameters.getRawParameterValue("triggerFadeIn");
     outputRoutingParam = parameters.getRawParameterValue("outputRouting");
+    pitchControlModeParam = parameters.getRawParameterValue("pitchControlMode");
 
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -1089,6 +1093,58 @@ juce::String MlrVSTAudioProcessor::getControlModeName(ControlMode mode)
         case ControlMode::Normal:
         default: return "Normal";
     }
+}
+
+MlrVSTAudioProcessor::PitchControlMode MlrVSTAudioProcessor::getPitchControlMode() const
+{
+    const float rawChoice = (pitchControlModeParam != nullptr)
+        ? pitchControlModeParam->load(std::memory_order_acquire)
+        : 0.0f;
+    const int modeIndex = juce::jlimit(0, 1, static_cast<int>(std::round(rawChoice)));
+    return (modeIndex == 1) ? PitchControlMode::Resample : PitchControlMode::PitchShift;
+}
+
+void MlrVSTAudioProcessor::applyPitchControlToStrip(EnhancedAudioStrip& strip, float semitones)
+{
+    const float clampedSemitones = juce::jlimit(-24.0f, 24.0f, semitones);
+    const float ratio = juce::jlimit(0.125f, 4.0f, std::pow(2.0f, clampedSemitones / 12.0f));
+    const bool stripIsStepMode = (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+
+    if (stripIsStepMode)
+    {
+        strip.setPitchShift(clampedSemitones);
+        if (auto* stepSampler = strip.getStepSampler())
+            stepSampler->setSpeed(ratio);
+        return;
+    }
+
+    if (getPitchControlMode() == PitchControlMode::Resample)
+    {
+        strip.setPitchShift(0.0f);
+        strip.setPlaybackSpeed(ratio);
+        return;
+    }
+
+    strip.setPlaybackSpeed(1.0f);
+    strip.setPitchShift(clampedSemitones);
+}
+
+float MlrVSTAudioProcessor::getPitchSemitonesForDisplay(const EnhancedAudioStrip& strip) const
+{
+    if (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+    {
+        if (const auto* stepSampler = strip.getStepSampler())
+            return static_cast<float>(stepSampler->getPitchOffset());
+    }
+
+    if (getPitchControlMode() == PitchControlMode::Resample)
+    {
+        const float ratio = juce::jmax(0.125f, strip.getPlaybackSpeed());
+        const float semitones = 12.0f * std::log2(ratio);
+        return juce::jlimit(-24.0f, 24.0f, semitones);
+    }
+
+    return strip.getPitchShift();
 }
 
 MlrVSTAudioProcessor::ControlPageOrder MlrVSTAudioProcessor::getControlPageOrder() const
@@ -1174,6 +1230,17 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         "Master Volume",
         juce::NormalisableRange<float>(0.0f, 1.0f),
         1.0f));
+
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        "limiterThreshold",
+        "Limiter Threshold (dB)",
+        juce::NormalisableRange<float>(-24.0f, 0.0f, 0.1f),
+        0.0f));
+
+    layout.add(std::make_unique<juce::AudioParameterBool>(
+        "limiterEnabled",
+        "Limiter Enabled",
+        false));
     
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "quantize",
@@ -1223,6 +1290,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         "Output Routing",
         juce::StringArray{"Stereo Mix", "Separate Strip Outs"},
         0));
+
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "pitchControlMode",
+        "Pitch Control Mode",
+        juce::StringArray{"Pitch Shift", "Resample"},
+        0));
     
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -1240,8 +1313,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         
         layout.add(std::make_unique<juce::AudioParameterFloat>(
             "stripSpeed" + juce::String(i),
-            "Strip " + juce::String(i + 1) + " Speed",
-            juce::NormalisableRange<float>(0.0f, 4.0f, 0.01f, 0.5f),  // Includes full stop for grain mode
+            "Strip " + juce::String(i + 1) + " Playhead Speed",
+            juce::NormalisableRange<float>(0.0f, 4.0f, 0.01f, 0.5f),
             1.0f));
 
         layout.add(std::make_unique<juce::AudioParameterFloat>(
@@ -1367,6 +1440,12 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     // Update engine parameters
     if (masterVolumeParam)
         audioEngine->setMasterVolume(*masterVolumeParam);
+
+    if (limiterThresholdParam)
+        audioEngine->setLimiterThresholdDb(limiterThresholdParam->load(std::memory_order_acquire));
+
+    if (limiterEnabledParam)
+        audioEngine->setLimiterEnabled(limiterEnabledParam->load(std::memory_order_acquire) > 0.5f);
     
     if (quantizeParam)
     {
@@ -1421,11 +1500,15 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
             
             auto* speedParam = stripSpeedParams[static_cast<size_t>(i)];
             if (speedParam)
-                strip->setPlaybackSpeed(*speedParam);
+            {
+                const float speedRatio = PlayheadSpeedQuantizer::quantizeRatio(
+                    juce::jlimit(0.0f, 4.0f, speedParam->load(std::memory_order_acquire)));
+                strip->setPlayheadSpeedRatio(speedRatio);
+            }
 
             auto* pitchParam = stripPitchParams[static_cast<size_t>(i)];
             if (pitchParam)
-                strip->setPitchShift(*pitchParam);
+                applyPitchControlToStrip(*strip, pitchParam->load(std::memory_order_acquire));
         }
     }
 
@@ -1587,6 +1670,33 @@ void MlrVSTAudioProcessor::setPendingBarLengthApply(int stripIndex, bool pending
     pendingBarLengthApply[static_cast<size_t>(stripIndex)] = pending;
 }
 
+bool MlrVSTAudioProcessor::canChangeBarLengthNow(int stripIndex) const
+{
+    if (!audioEngine || stripIndex < 0 || stripIndex >= MaxStrips)
+        return false;
+
+    auto* strip = audioEngine->getStrip(stripIndex);
+    if (!strip)
+        return false;
+
+    if (!strip->hasAudio() || !strip->isPlaying())
+        return true;
+
+    if (!strip->isPpqTimelineAnchored())
+        return false;
+
+    if (auto* playHead = getPlayHead())
+    {
+        if (auto position = playHead->getPosition())
+        {
+            if (position->getPpqPosition().hasValue())
+                return std::isfinite(*position->getPpqPosition());
+        }
+    }
+
+    return false;
+}
+
 void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
 {
     if (!audioEngine || stripIndex < 0 || stripIndex >= MaxStrips)
@@ -1597,12 +1707,11 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
         return;
 
     const auto selection = decodeBarSelection(bars);
-    // UI should reflect requested bars immediately; beat-domain remap can still be quantized.
-    strip->setRecordingBars(selection.recordingBars);
     setPendingBarLengthApply(stripIndex, false);
 
     if (!strip->hasAudio())
     {
+        strip->setRecordingBars(selection.recordingBars);
         strip->setBeatsPerLoop(selection.beatsPerLoop);
         const juce::ScopedLock lock(pendingBarChangeLock);
         pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
@@ -1611,6 +1720,7 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
 
     if (!strip->isPlaying())
     {
+        strip->setRecordingBars(selection.recordingBars);
         strip->setBeatsPerLoop(selection.beatsPerLoop);
         const juce::ScopedLock lock(pendingBarChangeLock);
         pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
@@ -1618,23 +1728,26 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
     }
 
     const int quantizeDivision = getQuantizeDivision();
-    // Bar changes must always be PPQ-grid scheduled; no immediate fallback path.
+    // Bar changes are always PPQ-grid scheduled when host PPQ is valid.
     const bool useQuantize = (quantizeDivision >= 1);
 
-    double currentPpq = audioEngine->getTimelineBeat();
+    bool hasHostPpq = false;
+    double currentPpq = std::numeric_limits<double>::quiet_NaN();
     if (auto* playHead = getPlayHead())
     {
         if (auto position = playHead->getPosition())
         {
             if (position->getPpqPosition().hasValue())
+            {
+                hasHostPpq = true;
                 currentPpq = *position->getPpqPosition();
+            }
         }
     }
 
-    // Strict PPQ safety:
-    // if PPQ/anchor is not valid at request time, keep request pending and
-    // resolve target grid later when timing becomes valid.
-    juce::ignoreUnused(currentPpq);
+    const bool syncReadyNow = hasHostPpq
+        && std::isfinite(currentPpq)
+        && strip->isPpqTimelineAnchored();
 
     const juce::ScopedLock lock(pendingBarChangeLock);
     auto& pending = pendingBarChanges[static_cast<size_t>(stripIndex)];
@@ -1645,8 +1758,14 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
     pending.quantizeDivision = quantizeDivision;
     pending.targetPpq = std::numeric_limits<double>::quiet_NaN();
 
-    // PPQ target is intentionally resolved on the audio thread in
-    // applyPendingBarChanges() to avoid GUI/OSC vs audio clock skew.
+    // If PPQ/anchor is not currently valid, keep request pending and resolve the
+    // target grid on the first PPQ-valid anchored audio block.
+    if (!syncReadyNow)
+        return;
+
+    if (!pending.quantized)
+        return;
+    // Resolve quantized target on the audio thread to avoid GUI/playhead clock skew.
 }
 
 int MlrVSTAudioProcessor::getQuantizeDivision() const
@@ -1881,9 +2000,10 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
     if (!audioEngine)
         return;
 
-    double currentPpq = audioEngine->getTimelineBeat();
-    if (posInfo.getPpqPosition().hasValue())
-        currentPpq = *posInfo.getPpqPosition();
+    if (!posInfo.getPpqPosition().hasValue())
+        return;
+
+    const double currentPpq = *posInfo.getPpqPosition();
 
     std::array<PendingBarChange, MaxStrips> readyChanges{};
     {
@@ -1894,9 +2014,13 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
             if (!pending.active)
                 continue;
 
+            auto* strip = audioEngine->getStrip(i);
+            const bool stripApplyReady = (strip != nullptr) && strip->hasAudio() && strip->isPlaying();
+            const bool anchorReady = stripApplyReady && strip->isPpqTimelineAnchored();
+
             if (pending.quantized && !std::isfinite(pending.targetPpq))
             {
-                if (!std::isfinite(currentPpq))
+                if (!std::isfinite(currentPpq) || !anchorReady)
                     continue;
 
                 const int division = juce::jmax(1, pending.quantizeDivision);
@@ -1907,9 +2031,6 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
                 pending.targetPpq = std::round(targetPpq / quantBeats) * quantBeats;
                 continue;
             }
-
-            auto* strip = audioEngine->getStrip(i);
-            const bool stripApplyReady = (strip != nullptr) && strip->hasAudio() && strip->isPlaying();
 
             bool canApplyNow = false;
             if (!pending.quantized)
@@ -1925,8 +2046,8 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
 
                 if (targetReached && !hasAnchor)
                 {
-                    // Strict PPQ safety: if anchor is not valid on target grid,
-                    // roll to the next grid instead of applying off-sync.
+                    // Keep the request alive and roll to the next grid if this
+                    // strip is not anchor-safe on the current grid.
                     const int division = juce::jmax(1, pending.quantizeDivision);
                     const double quantBeats = 4.0 / static_cast<double>(division);
                     double nextTarget = std::ceil(currentPpq / quantBeats) * quantBeats;
@@ -1969,8 +2090,7 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
         strip->setBeatsPerLoopAtPpq(change.beatsPerLoop, applyPpq);
         if (std::isfinite(applyPpq) && currentTempo > 0.0)
         {
-            // Use the same hard PPQ restore path as preset load to keep
-            // timing deterministic after bar-domain remap.
+            // Match the preset-restore path so bar remaps re-anchor deterministically.
             strip->restorePresetPpqState(true,
                                          true,
                                          strip->getPpqTimelineOffsetBeats(),
@@ -1979,6 +2099,9 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
                                          applyPpq,
                                          currentGlobalSample);
         }
+        // After target-grid remap, force a hard lock to the *current* host PPQ
+        // so trigger/fallback references are consistent within this audio block.
+        strip->realignToPpqAnchor(currentPpq, currentGlobalSample);
     }
 }
 
@@ -2123,10 +2246,7 @@ void MlrVSTAudioProcessor::captureMomentaryStutterMacroBaseline()
 
         saved.valid = true;
         saved.pan = strip->getPan();
-        if (auto* speedParam = stripSpeedParams[idx])
-            saved.playbackSpeed = speedParam->load(std::memory_order_acquire);
-        else
-            saved.playbackSpeed = strip->getPlaybackSpeed();
+        saved.playbackSpeed = strip->getPlaybackSpeed();
         saved.pitchShift = strip->getPitchShift();
         saved.filterEnabled = strip->isFilterEnabled();
         saved.filterFrequency = strip->getFilterFrequency();
@@ -2894,11 +3014,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
             juce::MathConstants<double>::twoPi * wrapUnitPhase(phase + (0.13 * static_cast<double>(i)))));
 
         const float savedSpeed = juce::jlimit(0.0f, 4.0f, saved.playbackSpeed);
-        const float speedBaseline = twoButton
-            ? ((stripSpeedParams[idx] != nullptr)
-                ? juce::jlimit(0.0f, 4.0f, stripSpeedParams[idx]->load(std::memory_order_acquire))
-                : savedSpeed)
-            : savedSpeed;
+        const float speedBaseline = savedSpeed;
         const float stutterSpeedFloor = applySpeedMacro
             ? (ultraFastDivision ? 0.72f : (veryFastDivision ? 0.56f : 0.30f))
             : speedBaseline;

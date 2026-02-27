@@ -1,5 +1,6 @@
 #include "PresetStore.h"
 #include "AudioEngine.h"
+#include "PlayheadSpeedQuantizer.h"
 #include <cmath>
 #include <limits>
 
@@ -23,6 +24,8 @@ constexpr int kMaxStoredSamplePathChars = 4096;
 struct GlobalParameterSnapshot
 {
     float masterVolume = 1.0f;
+    float limiterThresholdDb = 0.0f;
+    float limiterEnabled = 0.0f;
     float quantizeChoice = 5.0f;
     float innerLoopLengthChoice = 0.0f;
     float grainQuality = 2.0f;
@@ -31,6 +34,7 @@ struct GlobalParameterSnapshot
     float crossfadeMs = 10.0f;
     float triggerFadeInMs = 12.0f;
     float outputRouting = 0.0f;
+    float pitchControlMode = 0.0f;
 };
 
 bool isPresetFileSizeValid(const juce::File& file, int64_t maxBytes)
@@ -104,6 +108,10 @@ GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeSta
     GlobalParameterSnapshot snapshot;
     if (auto* p = parameters.getRawParameterValue("masterVolume"))
         snapshot.masterVolume = *p;
+    if (auto* p = parameters.getRawParameterValue("limiterThreshold"))
+        snapshot.limiterThresholdDb = *p;
+    if (auto* p = parameters.getRawParameterValue("limiterEnabled"))
+        snapshot.limiterEnabled = *p;
     if (auto* p = parameters.getRawParameterValue("quantize"))
         snapshot.quantizeChoice = *p;
     if (auto* p = parameters.getRawParameterValue("innerLoopLength"))
@@ -120,6 +128,8 @@ GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeSta
         snapshot.triggerFadeInMs = *p;
     if (auto* p = parameters.getRawParameterValue("outputRouting"))
         snapshot.outputRouting = *p;
+    if (auto* p = parameters.getRawParameterValue("pitchControlMode"))
+        snapshot.pitchControlMode = *p;
     return snapshot;
 }
 
@@ -127,6 +137,10 @@ void restoreGlobalParameters(juce::AudioProcessorValueTreeState& parameters, con
 {
     if (auto* param = parameters.getParameter("masterVolume"))
         param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, snapshot.masterVolume));
+    if (auto* param = parameters.getParameter("limiterThreshold"))
+        param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, (snapshot.limiterThresholdDb + 24.0f) / 24.0f));
+    if (auto* param = parameters.getParameter("limiterEnabled"))
+        param->setValueNotifyingHost(snapshot.limiterEnabled > 0.5f ? 1.0f : 0.0f);
     if (auto* param = parameters.getParameter("quantize"))
         param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, snapshot.quantizeChoice / 9.0f));
     if (auto* param = parameters.getParameter("innerLoopLength"))
@@ -148,6 +162,8 @@ void restoreGlobalParameters(juce::AudioProcessorValueTreeState& parameters, con
         else
             param->setValueNotifyingHost(snapshot.outputRouting > 0.5f ? 1.0f : 0.0f);
     }
+    if (auto* param = parameters.getParameter("pitchControlMode"))
+        param->setValueNotifyingHost(snapshot.pitchControlMode > 0.5f ? 1.0f : 0.0f);
 }
 
 void setParameterToDefault(juce::AudioProcessorValueTreeState& parameters, const juce::String& parameterId)
@@ -581,7 +597,8 @@ bool savePreset(int presetIndex,
 
         stripXml->setAttribute("volume", strip->getVolume());
         stripXml->setAttribute("pan", strip->getPan());
-        stripXml->setAttribute("speed", strip->getPlaybackSpeed());
+        const float savedSpeedRatio = PlayheadSpeedQuantizer::quantizeRatio(strip->getPlayheadSpeedRatio());
+        stripXml->setAttribute("speed", savedSpeedRatio);
         stripXml->setAttribute("loopStart", strip->getLoopStart());
         stripXml->setAttribute("loopEnd", strip->getLoopEnd());
         stripXml->setAttribute("playMode", static_cast<int>(strip->getPlayMode()));
@@ -902,7 +919,23 @@ bool loadPreset(int presetIndex,
 
         strip->setVolume(clampedFloat(stripXml->getDoubleAttribute("volume", 1.0), 1.0f, 0.0f, 1.0f));
         strip->setPan(clampedFloat(stripXml->getDoubleAttribute("pan", 0.0), 0.0f, -1.0f, 1.0f));
-        strip->setPlaybackSpeed(clampedFloat(stripXml->getDoubleAttribute("speed", 1.0), 1.0f, 0.0f, 4.0f));
+        strip->setPlaybackSpeed(1.0f);
+        float speedRatio = 1.0f;
+        if (stripXml->hasAttribute("speed"))
+        {
+            speedRatio = PlayheadSpeedQuantizer::quantizeRatio(
+                static_cast<float>(stripXml->getDoubleAttribute("speed", 1.0)));
+        }
+        else if (stripXml->hasAttribute("beatsPerLoop"))
+        {
+            const int speedBars = clampedInt(stripXml->getIntAttribute("recordingBars", strip->getRecordingBars()),
+                                             1, 8, 1);
+            speedRatio = PlayheadSpeedQuantizer::quantizeRatio(
+                PlayheadSpeedQuantizer::ratioFromBeatsPerLoop(
+                    static_cast<float>(stripXml->getDoubleAttribute("beatsPerLoop", 4.0)),
+                    speedBars));
+        }
+        strip->setPlayheadSpeedRatio(speedRatio);
         const int safeLoopStart = clampedInt(stripXml->getIntAttribute("loopStart", 0), 0, 15, 0);
         const int safeLoopEnd = clampedInt(stripXml->getIntAttribute("loopEnd", 16), 1, 16, 16);
         strip->setLoop(safeLoopStart, safeLoopEnd);
@@ -1131,7 +1164,7 @@ bool loadPreset(int presetIndex,
 
         if (auto* speedParam = parameters.getParameter("stripSpeed" + juce::String(stripIndex)))
         {
-            float speedValue = static_cast<float>(stripXml->getDoubleAttribute("speed", 1.0));
+            const float speedValue = PlayheadSpeedQuantizer::quantizeRatio(strip->getPlayheadSpeedRatio());
             if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(speedParam))
             {
                 speedParam->setValueNotifyingHost(

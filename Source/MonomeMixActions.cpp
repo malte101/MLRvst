@@ -1,6 +1,7 @@
 #include "MonomeMixActions.h"
 #include "PluginProcessor.h"
 #include "AudioEngine.h"
+#include "PlayheadSpeedQuantizer.h"
 #include <array>
 #include <cmath>
 
@@ -16,28 +17,9 @@ constexpr int grainSizeMode = static_cast<int>(MlrVSTAudioProcessor::ControlMode
 constexpr int swingMode = static_cast<int>(MlrVSTAudioProcessor::ControlMode::Swing);
 constexpr int gateMode = static_cast<int>(MlrVSTAudioProcessor::ControlMode::Gate);
 
-const std::array<float, 16> rhythmicSpeeds = {
-    0.125f,  // 1/8
-    0.1666667f, // 1/6
-    0.25f,   // 1/4
-    0.3333333f, // 1/3
-    0.5f,    // 1/2
-    0.6666667f, // 2/3
-    0.75f,   // 3/4
-    0.875f,  // 7/8
-    1.0f,    // 1/1
-    1.125f,  // 9/8
-    1.25f,   // 5/4
-    1.3333333f, // 4/3
-    1.5f,    // 3/2
-    1.6666667f, // 5/3
-    1.75f,   // 7/4
-    2.0f     // 2/1
-};
-
 const std::array<int, 16> musicalPitchSemitones = {
-    -12, -10, -9, -7, -5, -4, -2, -1,
-      0,   1,  2,  4,  5,  7,  9, 12
+    -24, -21, -18, -15, -12, -9, -6, -3,
+      0,   3,   6,   9,  12, 15, 18, 24
 };
 
 float grainSizeFromColumn(int x)
@@ -66,20 +48,7 @@ int findNearestColumn(float value, float minValue, float maxValue)
 
 int findNearestSpeedColumn(float speed)
 {
-    int best = 0;
-    float bestDiff = std::abs(speed - rhythmicSpeeds[0]);
-
-    for (int i = 1; i < 16; ++i)
-    {
-        const float diff = std::abs(speed - rhythmicSpeeds[static_cast<size_t>(i)]);
-        if (diff < bestDiff)
-        {
-            bestDiff = diff;
-            best = i;
-        }
-    }
-
-    return best;
+    return PlayheadSpeedQuantizer::nearestSpeedIndex(speed);
 }
 
 int findNearestPitchColumn(int semitones)
@@ -127,43 +96,16 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
 {
     if (mode == speedMode)
     {
-        if (strip.playMode == EnhancedAudioStrip::PlayMode::Step)
-        {
-            const int semitones = musicalPitchSemitones[static_cast<size_t>(juce::jlimit(0, 15, x))];
-            if (auto* stepSampler = strip.getStepSampler())
-            {
-                const float ratio = std::pow(2.0f, static_cast<float>(semitones) / 12.0f);
-                stepSampler->setSpeed(ratio);
-            }
+        const float speedRatio = PlayheadSpeedQuantizer::ratioFromColumn(juce::jlimit(0, 15, x));
+        strip.setPlayheadSpeedRatio(speedRatio);
 
-            if (auto* param = processor.parameters.getParameter("stripPitch" + juce::String(stripIndex)))
-                param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(semitones)));
-
-            return;
-        }
-
-        // Match Strip +/- behavior: speed is controlled by beats-per-loop,
-        // where 4 beats == normal speed, lower beats == faster, higher == slower.
-        const float speedRatio = rhythmicSpeeds[static_cast<size_t>(juce::jlimit(0, 15, x))];
-        const float targetBeatsPerLoop = 4.0f / speedRatio;
-        strip.setBeatsPerLoop(targetBeatsPerLoop);
+        if (auto* param = processor.parameters.getParameter("stripSpeed" + juce::String(stripIndex)))
+            param->setValueNotifyingHost(param->convertTo0to1(speedRatio));
     }
     else if (mode == pitchMode)
     {
         const int semitones = musicalPitchSemitones[static_cast<size_t>(juce::jlimit(0, 15, x))];
-
-        if (strip.playMode == EnhancedAudioStrip::PlayMode::Step)
-        {
-            if (auto* stepSampler = strip.getStepSampler())
-            {
-                const float ratio = std::pow(2.0f, static_cast<float>(semitones) / 12.0f);
-                stepSampler->setSpeed(ratio);
-            }
-        }
-        else
-        {
-            strip.setPitchShift(static_cast<float>(semitones));
-        }
+        processor.applyPitchControlToStrip(strip, static_cast<float>(semitones));
 
         if (auto* param = processor.parameters.getParameter("stripPitch" + juce::String(stripIndex)))
             param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(semitones)));
@@ -213,36 +155,19 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
     }
 }
 
-void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][8], int mode)
+void renderRow(const EnhancedAudioStrip& strip,
+               const MlrVSTAudioProcessor& processor,
+               int y,
+               int newLedState[16][8],
+               int mode)
 {
     const bool isStepMode = (strip.playMode == EnhancedAudioStrip::PlayMode::Step);
     auto* stepSampler = isStepMode ? const_cast<EnhancedAudioStrip&>(strip).getStepSampler() : nullptr;
 
     if (mode == speedMode)
     {
-        if (isStepMode && stepSampler)
-        {
-            const int semitones = stepSampler->getPitchOffset();
-            const int activeCol = findNearestPitchColumn(semitones);
-
-            for (int x = 0; x < 16; ++x)
-            {
-                newLedState[x][y] = 4;
-                if (x == 8)
-                    newLedState[x][y] = 6;
-                if (x == activeCol)
-                    newLedState[x][y] = 15;
-            }
-
-            return;
-        }
-
-        float beats = strip.getBeatsPerLoop();
-        if (beats < 0.0f)
-            beats = 4.0f; // Auto mode defaults to musical normal speed
-
-        const float speed = 4.0f / beats;
-
+        const float speed = PlayheadSpeedQuantizer::quantizeRatio(
+            strip.getPlayheadSpeedRatio());
         const int activeCol = findNearestSpeedColumn(speed);
 
         for (int x = 0; x < 16; ++x)
@@ -256,11 +181,7 @@ void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][8], i
     }
     else if (mode == pitchMode)
     {
-        int semitones = 0;
-        if (isStepMode && stepSampler)
-            semitones = stepSampler->getPitchOffset();
-        else
-            semitones = static_cast<int>(std::round(strip.getPitchShift()));
+        const int semitones = static_cast<int>(std::round(processor.getPitchSemitonesForDisplay(strip)));
 
         const int activeCol = findNearestPitchColumn(semitones);
 

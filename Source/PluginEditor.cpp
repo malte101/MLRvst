@@ -9,6 +9,7 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "PlayheadSpeedQuantizer.h"
 #include <cmath>
 #include <juce_audio_formats/juce_audio_formats.h>
 
@@ -90,6 +91,16 @@ juce::String getGrainArpModeName(int mode)
         default: break;
     }
     return "Octave";
+}
+
+juce::String getPlayheadSpeedLabel(float ratio)
+{
+    return juce::String(PlayheadSpeedQuantizer::labelForRatio(ratio));
+}
+
+float getPlayheadSpeedRatioForStrip(const EnhancedAudioStrip& strip)
+{
+    return PlayheadSpeedQuantizer::quantizeRatio(strip.getPlayheadSpeedRatio());
 }
 
 juce::String getMonomePageDisplayName(MlrVSTAudioProcessor::ControlMode mode)
@@ -1092,62 +1103,47 @@ void StripControl::setupComponents()
     speedSlider.setLookAndFeel(&knobLookAndFeel);
     speedSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
     speedSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-    speedSlider.setRange(0.0, 4.0, 0.01);
-    speedSlider.setValue(1.0);
-    enableAltClickReset(speedSlider, 1.0);
-    speedSlider.setSkewFactorFromMidPoint(1.0);
+    speedSlider.setRange(-24.0, 24.0, 0.01);
+    speedSlider.setValue(0.0);
+    enableAltClickReset(speedSlider, 0.0);
     speedSlider.setPopupDisplayEnabled(true, false, this);
+    speedSlider.setTextValueSuffix(" st");
+    speedSlider.setTooltip("Pitch offset in semitones.");
     addAndMakeVisible(speedSlider);
     
     speedAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-        processor.parameters, "stripSpeed" + juce::String(stripIndex), speedSlider);
+        processor.parameters, "stripPitch" + juce::String(stripIndex), speedSlider);
     
-    // Scratch slider - small, compact
+    // Playhead speed (slice traversal) - quantized musical divisions
     scratchSlider.setLookAndFeel(&knobLookAndFeel);
     scratchSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
     scratchSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-    scratchSlider.setRange(0.0, 100.0, 1.0);
-    scratchSlider.setValue(0.0);
-    enableAltClickReset(scratchSlider, 0.0);
-    scratchSlider.textFromValueFunction = [this](double value)
+    scratchSlider.setRange(0.0, 4.0, 0.001);
+    scratchSlider.setValue(1.0);
+    enableAltClickReset(scratchSlider, 1.0);
+    scratchSlider.textFromValueFunction = [](double value)
     {
-        const double clamped = juce::jlimit(0.0, 100.0, value);
-        if (clamped <= 0.0001)
-            return juce::String("0.00 s");
-        double seconds = 0.0;
-        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex);
-            strip != nullptr && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
-        {
-            const double t = clamped / 100.0;
-            seconds = juce::jlimit(0.015, 3.0, std::pow(t, 1.7) * 3.0);
-        }
-        else
-        {
-            double beats = 0.25;
-            if (clamped <= 10.0)
-            {
-                const double t = clamped / 10.0;
-                beats = 0.02 + (std::pow(t, 1.6) * 0.08);
-            }
-            else
-            {
-                const double t = (clamped - 10.0) / 90.0;
-                beats = 0.10 + (std::pow(t, 1.8) * 7.90);
-            }
-
-            double tempo = 120.0;
-            if (auto* engine = processor.getAudioEngine())
-                tempo = juce::jmax(1.0, engine->getCurrentTempo());
-            seconds = beats * (60.0 / tempo);
-        }
-        return juce::String(seconds, 2) + " s";
+        return getPlayheadSpeedLabel(PlayheadSpeedQuantizer::quantizeRatio(static_cast<float>(value)));
     };
     scratchSlider.setPopupDisplayEnabled(true, false, this);
-    scratchSlider.onValueChange = [this]() {
+    scratchSlider.setTooltip("Playhead speed (slice traversal only).");
+    scratchSlider.onValueChange = [this]()
+    {
+        const float quantizedRatio = PlayheadSpeedQuantizer::quantizeRatio(static_cast<float>(scratchSlider.getValue()));
+        if (std::abs(quantizedRatio - static_cast<float>(scratchSlider.getValue())) > 1.0e-4f)
+        {
+            scratchSlider.setValue(quantizedRatio, juce::sendNotificationSync);
+            return;
+        }
+
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-            strip->setScratchAmount(static_cast<float>(scratchSlider.getValue()));
+        {
+            strip->setPlayheadSpeedRatio(quantizedRatio);
+        }
     };
     addAndMakeVisible(scratchSlider);
+    scratchAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "stripSpeed" + juce::String(stripIndex), scratchSlider);
 
     auto setupGrainKnob = [this](juce::Slider& slider, juce::Label& label, const char* text,
                                  double min, double max, double step)
@@ -1508,13 +1504,13 @@ void StripControl::setupComponents()
     panLabel.setColour(juce::Label::textColourId, stripColor.brighter(0.3f));
     addAndMakeVisible(panLabel);
     
-    speedLabel.setText("SPEED", juce::dontSendNotification);
+    speedLabel.setText("PITCH", juce::dontSendNotification);
     speedLabel.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
     speedLabel.setJustificationType(juce::Justification::centred);
     speedLabel.setColour(juce::Label::textColourId, stripColor.brighter(0.3f));
     addAndMakeVisible(speedLabel);
     
-    scratchLabel.setText("SCR", juce::dontSendNotification);
+    scratchLabel.setText("SPEED", juce::dontSendNotification);
     scratchLabel.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
     scratchLabel.setJustificationType(juce::Justification::centred);
     scratchLabel.setColour(juce::Label::textColourId, stripColor.brighter(0.3f));
@@ -1771,10 +1767,10 @@ void StripControl::updateGrainOverlayVisibility()
     volumeLabel.setVisible(!isGrainMode);
     panLabel.setVisible(!isGrainMode);
 
-    speedSlider.setVisible(!showingStepDisplay);
-    scratchSlider.setVisible(!showingStepDisplay);
-    speedLabel.setVisible(!showingStepDisplay);
-    scratchLabel.setVisible(!showingStepDisplay);
+    speedSlider.setVisible(!showingStepDisplay && !isGrainMode);
+    scratchSlider.setVisible(!showingStepDisplay && !isGrainMode);
+    speedLabel.setVisible(!showingStepDisplay && !isGrainMode);
+    scratchLabel.setVisible(!showingStepDisplay && !isGrainMode);
     patternLengthBox.setVisible(isStepMode && !isGrainMode);
     stepLengthReadoutBox.setVisible(isStepMode && !isGrainMode);
     stepAttackSlider.setVisible(isStepMode && !isGrainMode);
@@ -2726,7 +2722,7 @@ void StripControl::resized()
     {
         grainSizeSlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
         grainDensitySlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
-        speedSlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
+        knobsRow.removeFromLeft(mainKnobWidth);
     }
     else if (isStepMode)
     {
@@ -2765,7 +2761,7 @@ void StripControl::resized()
         sizeLabelArea.removeFromLeft(2);
         grainSizeDivLabel.setBounds(sizeLabelArea.removeFromLeft(syncModeW));
         grainDensityLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
-        speedLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
+        labelsRow.removeFromLeft(mainKnobWidth);
     }
     else if (isStepMode)
     {
@@ -3092,8 +3088,8 @@ void StripControl::updateFromEngine()
         }
     }
     
-    // Sync scratch slider from engine
-    scratchSlider.setValue(strip->getScratchAmount(), juce::dontSendNotification);
+    if (!scratchSlider.isMouseButtonDown())
+        scratchSlider.setValue(getPlayheadSpeedRatioForStrip(*strip), juce::dontSendNotification);
     const int stepLength = strip->getStepPatternLengthSteps();
     if ((stepLength % 16) == 0)
         patternLengthBox.setSelectedId(juce::jlimit(1, 4, stepLength / 16), juce::dontSendNotification);
@@ -3136,6 +3132,7 @@ void StripControl::updateFromEngine()
             }
         }
         recordBarsBox.setSelectedId(selectedId, juce::dontSendNotification);
+        recordBarsBox.setEnabled(processor.canChangeBarLengthNow(stripIndex));
     }
     const bool recordArmed = !strip->hasAudio();
     const bool blinkOn = processor.getAudioEngine()->shouldBlinkRecordLED();
@@ -3151,10 +3148,8 @@ void StripControl::updateFromEngine()
         volumeSlider.setValue(strip->getVolume(), juce::dontSendNotification);
     if (!modulates(ModernAudioEngine::ModTarget::Pan))
         panSlider.setValue(strip->getPan(), juce::dontSendNotification);
-    const bool showDisplaySpeed = strip->isScratchActive()
-        || (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain && strip->getGrainHeldCount() > 0);
-    if (!modulates(ModernAudioEngine::ModTarget::Speed))
-        speedSlider.setValue(showDisplaySpeed ? strip->getDisplaySpeed() : strip->getPlaybackSpeed(), juce::dontSendNotification);
+    if (!modulates(ModernAudioEngine::ModTarget::Pitch))
+        speedSlider.setValue(processor.getPitchSemitonesForDisplay(*strip), juce::dontSendNotification);
     
     // Sync play mode dropdown with strip state
     int modeId = static_cast<int>(strip->getPlayMode()) + 1;
@@ -3324,8 +3319,8 @@ void StripControl::updateFromEngine()
                     case ModernAudioEngine::ModTarget::None: return nullptr;
                     case ModernAudioEngine::ModTarget::Volume: return &volumeSlider;
                     case ModernAudioEngine::ModTarget::Pan: return &panSlider;
-                    case ModernAudioEngine::ModTarget::Pitch: return nullptr;
-                    case ModernAudioEngine::ModTarget::Speed: return &speedSlider;
+                    case ModernAudioEngine::ModTarget::Pitch: return &speedSlider;
+                    case ModernAudioEngine::ModTarget::Speed: return nullptr;
                     case ModernAudioEngine::ModTarget::Cutoff: return nullptr;
                     case ModernAudioEngine::ModTarget::Resonance: return nullptr;
                     case ModernAudioEngine::ModTarget::GrainSize: return &grainSizeSlider;
@@ -4265,6 +4260,13 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     titleLabel.setColour(juce::Label::textColourId, kTextPrimary);
     addAndMakeVisible(titleLabel);
     titleLabel.setTooltip("Master timing, quality, monitoring, and UI help settings.");
+
+    versionLabel.setText("v" + juce::String(JucePlugin_VersionString), juce::dontSendNotification);
+    versionLabel.setJustificationType(juce::Justification::centredRight);
+    versionLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
+    versionLabel.setColour(juce::Label::textColourId, kTextMuted);
+    versionLabel.setTooltip("Plugin version.");
+    addAndMakeVisible(versionLabel);
     
     // Master volume
     masterVolumeLabel.setText("Master", juce::dontSendNotification);
@@ -4281,6 +4283,14 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     
     masterVolumeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
         processor.parameters, "masterVolume", masterVolumeSlider);
+
+    limiterToggle.setButtonText("Limiter");
+    limiterToggle.setClickingTogglesState(true);
+    limiterToggle.setTooltip("Enable JUCE limiter on plugin outputs.");
+    addAndMakeVisible(limiterToggle);
+    styleUiButton(limiterToggle);
+    limiterEnabledAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+        processor.parameters, "limiterEnabled", limiterToggle);
     
     // Quantize
     quantizeLabel.setText("Quantize", juce::dontSendNotification);
@@ -4349,6 +4359,19 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     outputRoutingBox.setTooltip("Route strip audio to separate DAW outputs (requires multi-output plugin instance).");
     outputRoutingAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
         processor.parameters, "outputRouting", outputRoutingBox);
+
+    pitchControlModeLabel.setText("Pitch Mode", juce::dontSendNotification);
+    pitchControlModeLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(pitchControlModeLabel);
+
+    pitchControlModeBox.addItem("Pitch Shift", 1);
+    pitchControlModeBox.addItem("Resample", 2);
+    pitchControlModeBox.setSelectedId(1, juce::dontSendNotification);
+    addAndMakeVisible(pitchControlModeBox);
+    styleUiCombo(pitchControlModeBox);
+    pitchControlModeBox.setTooltip("Global strip pitch behavior: time-preserving shift or playback-rate resample.");
+    pitchControlModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "pitchControlMode", pitchControlModeBox);
     
     // Grain quality (global for all strips in Grain mode)
     qualityLabel.setText("Grain Q", juce::dontSendNotification);
@@ -4982,6 +5005,8 @@ void GlobalControlPanel::resized()
     titleRow.removeFromRight(6);
     momentaryToggle.setBounds(titleRow.removeFromRight(92));
     titleRow.removeFromRight(6);
+    versionLabel.setBounds(titleRow.removeFromRight(62));
+    titleRow.removeFromRight(6);
     titleLabel.setBounds(titleRow);
     
     bounds.removeFromTop(4);  // Less gap (was 8)
@@ -4990,17 +5015,21 @@ void GlobalControlPanel::resized()
     
     // COMPACT LAYOUT: Reduce individual column widths
     // Calculate based on actual needs rather than equal division
-    const int sliderWidth = 50;      // Vertical sliders
-    const int meterWidth = 30;       // L/R meters
-    const int knobWidth = 112;       // Larger rotary fade controls
-    const int dropdownWidth = 92;    // Dropdowns
-    const int spacing = 8;           // Between controls
+    const int sliderWidth = 48;      // Vertical sliders
+    const int meterWidth = 28;       // L/R meters
+    const int knobWidth = 100;       // Rotary fade controls
+    const int dropdownWidth = 84;    // Dropdowns
+    const int spacing = 6;           // Between controls
     
     // Master volume
     auto masterArea = controlsArea.removeFromLeft(sliderWidth);
     masterVolumeLabel.setBounds(masterArea.removeFromTop(16));  // Smaller label (was 20)
     masterArea.removeFromTop(2);  // Less gap (was 4)
     masterVolumeSlider.setBounds(masterArea);
+    controlsArea.removeFromLeft(spacing);
+
+    auto limiterArea = controlsArea.removeFromLeft(84);
+    limiterToggle.setBounds(limiterArea.removeFromTop(24));
     controlsArea.removeFromLeft(spacing);
     
     // Input monitor slider
@@ -5061,7 +5090,13 @@ void GlobalControlPanel::resized()
     swingDivisionBox.setBounds(swingArea.removeFromTop(28));
     controlsArea.removeFromLeft(spacing);
 
-    auto outputRoutingArea = controlsArea.removeFromLeft(132);
+    auto pitchModeArea = controlsArea.removeFromLeft(dropdownWidth);
+    pitchControlModeLabel.setBounds(pitchModeArea.removeFromTop(16));
+    pitchModeArea.removeFromTop(2);
+    pitchControlModeBox.setBounds(pitchModeArea.removeFromTop(28));
+    controlsArea.removeFromLeft(spacing);
+
+    auto outputRoutingArea = controlsArea.removeFromLeft(120);
     outputRoutingLabel.setBounds(outputRoutingArea.removeFromTop(16));
     outputRoutingArea.removeFromTop(2);
     outputRoutingBox.setBounds(outputRoutingArea.removeFromTop(28));
