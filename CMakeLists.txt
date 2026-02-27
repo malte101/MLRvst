@@ -24,8 +24,23 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/JUCE/CMakeLists.txt")
         "  git clone https://github.com/juce-framework/JUCE.git\n")
 endif()
 
+# JUCE 8 does not support MinGW on Windows targets.
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(FATAL_ERROR
+        "MinGW is not supported by JUCE 8 for this project.\n"
+        "Use Visual Studio (MSVC) or clang-cl with the Windows SDK.")
+endif()
+
 # Add JUCE
 add_subdirectory(JUCE)
+
+# Plugin formats by platform
+set(MLRVST_PLUGIN_FORMATS VST3)
+set(MLRVST_AU_MAIN_TYPE_ARGS)
+if(APPLE)
+    list(APPEND MLRVST_PLUGIN_FORMATS AU)
+    list(APPEND MLRVST_AU_MAIN_TYPE_ARGS AU_MAIN_TYPE kAudioUnitType_MusicEffect)
+endif()
 
 # Plugin configuration
 juce_add_plugin(mlrVST
@@ -40,12 +55,12 @@ juce_add_plugin(mlrVST
     PLUGIN_MANUFACTURER_CODE Mlrx
     PLUGIN_CODE Mlrv
     
-    FORMATS VST3 AU
+    FORMATS ${MLRVST_PLUGIN_FORMATS}
     
     PRODUCT_NAME "mlrVST"
     
     VST3_CATEGORIES Fx Sampler
-    AU_MAIN_TYPE kAudioUnitType_MusicEffect
+    ${MLRVST_AU_MAIN_TYPE_ARGS}
     
     # Bundle identifiers for macOS
     BUNDLE_ID "com.mlrVST.plugin"
@@ -224,7 +239,9 @@ message(STATUS "  Huovilainen model: ${MLRVST_ENABLE_HUOVILAINEN}")
 message(STATUS "")
 message(STATUS "Plugin Formats:")
 message(STATUS "  ✓ VST3")
-message(STATUS "  ✓ AU (Audio Unit)")
+if(APPLE)
+    message(STATUS "  ✓ AU (Audio Unit)")
+endif()
 message(STATUS "")
 if(APPLE)
     message(STATUS "macOS build outputs:")

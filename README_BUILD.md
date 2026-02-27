@@ -32,6 +32,11 @@ make package-release
 
 Release artifacts are written to `release/`.
 
+## Windows Build Note
+
+- JUCE 8 does not support MinGW for this project.
+- Build Windows binaries with MSVC (`Visual Studio 2022`, `-A x64`) or run the GitHub Actions Windows workflow.
+
 ## macOS Signing + Notarization
 
 ```bash

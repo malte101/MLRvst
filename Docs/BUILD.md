@@ -70,11 +70,7 @@ sudo dnf install -y \
 - **Visual Studio 2019 or later** with C++ Desktop Development
 - **CMake** (download from cmake.org)
 - **Git for Windows**
-
-Or use **MSYS2/MinGW**:
-```bash
-pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake make
-```
+- **PowerShell 5+** (for packaging helper scripts)
 
 ## Getting JUCE
 
@@ -179,13 +175,13 @@ After `make install`:
 ### Visual Studio (Recommended)
 
 ```cmd
-REM Open "Developer Command Prompt for VS 2019"
+REM Open "Developer Command Prompt for VS 2022"
 cd <repo-root>
 mkdir Build
 cd Build
 
 REM Configure
-cmake .. -G "Visual Studio 16 2019" -A x64
+cmake .. -G "Visual Studio 17 2022" -A x64
 
 REM Build
 cmake --build . --config Release
@@ -194,13 +190,19 @@ REM Install (run as Administrator)
 cmake --install .
 ```
 
-### MinGW/MSYS2
+### Release Packaging (Windows)
 
-```bash
-mkdir Build && cd Build
-cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j8
+```powershell
+cd <repo-root>
+.\scripts\package_release_windows.ps1 -BuildDir build -Config Release -OutDir release\windows
 ```
+
+This writes a distributable VST3 zip to `release/windows/`.
+
+### Important
+
+- MinGW/MSYS2 is not supported for this project with JUCE 8.
+- Use MSVC (Visual Studio generator) for Windows builds.
 
 ### Installation Locations
 
@@ -306,7 +308,7 @@ sudo apt-get install build-essential
 
 **Windows**:
 - Install Visual Studio with C++ Desktop Development
-- Or install MinGW/MSYS2
+- Use the Visual Studio generator (`-G "Visual Studio 17 2022" -A x64`)
 
 ### Missing Dependencies (Linux)
 

@@ -1,5 +1,5 @@
 # mlrVST Modern Edition - Makefile
-# Supports macOS, Linux, and Windows (with MinGW/MSYS2)
+# Supports macOS, Linux, and Windows (MSVC toolchain on Windows)
 
 # Detect OS
 UNAME_S := $(shell uname -s)
