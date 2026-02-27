@@ -6157,10 +6157,18 @@ MlrVSTAudioProcessorEditor::MlrVSTAudioProcessorEditor(MlrVSTAudioProcessor& p)
     // Enable keyboard input for spacebar transport control
     setWantsKeyboardFocus(true);
     
-    // Set window size FIRST
-    setSize(windowWidth, windowHeight);
+    // Set window size FIRST. Clamp initial height to the current display so hosts
+    // that do not expose plugin resizing (e.g. Logic for some formats) still show
+    // the full UI without clipping the bottom.
+    int initialHeight = windowHeight;
+    if (const auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
+    {
+        const int safeVisibleHeight = juce::jmax(620, display->userArea.getHeight() - 80);
+        initialHeight = juce::jmin(windowHeight, safeVisibleHeight);
+    }
+    setSize(windowWidth, initialHeight);
     setResizable(true, true);
-    setResizeLimits(1000, 900, 1920, 1400);  // Larger minimum for tempo controls
+    setResizeLimits(1000, 620, 1920, 1400);
     
     // Create all UI components
     createUIComponents();
@@ -6214,10 +6222,11 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
         {
             auto bounds = getLocalBounds();
             const int gap = 1;
-            int stripHeight = (bounds.getHeight() - (gap * (strips.size() - 1))) / strips.size();
-            stripHeight = juce::jmax(122, stripHeight);  // Larger controls while keeping strip 6 visible
+            const int stripCount = juce::jmax(1, strips.size());
+            const int totalGap = gap * juce::jmax(0, stripCount - 1);
+            const int stripHeight = juce::jmax(1, (bounds.getHeight() - totalGap) / stripCount);
             
-            for (int i = 0; i < strips.size(); ++i)
+            for (int i = 0; i < stripCount; ++i)
             {
                 int y = i * (stripHeight + gap);
                 strips[i]->setBounds(0, y, bounds.getWidth(), stripHeight);
@@ -6236,10 +6245,11 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
         {
             auto bounds = getLocalBounds();
             const int gap = 1;
-            int stripHeight = (bounds.getHeight() - (gap * (strips.size() - 1))) / strips.size();
-            stripHeight = juce::jmax(122, stripHeight);  // Match strip height policy for FX tab
+            const int stripCount = juce::jmax(1, strips.size());
+            const int totalGap = gap * juce::jmax(0, stripCount - 1);
+            const int stripHeight = juce::jmax(1, (bounds.getHeight() - totalGap) / stripCount);
             
-            for (int i = 0; i < strips.size(); ++i)
+            for (int i = 0; i < stripCount; ++i)
             {
                 int y = i * (stripHeight + gap);
                 strips[i]->setBounds(0, y, bounds.getWidth(), stripHeight);
