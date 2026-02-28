@@ -524,6 +524,16 @@ public:
     float getDisplaySpeed() const { return displaySpeedAtomic.load(std::memory_order_acquire); }
     void setPitchShift(float semitones);
     float getPitchShift() const { return pitchShiftSemitones.load(); }
+    void setResamplePitchEnabled(bool enabled) { resamplePitchEnabled.store(enabled ? 1 : 0, std::memory_order_release); }
+    bool isResamplePitchEnabled() const { return resamplePitchEnabled.load(std::memory_order_acquire) != 0; }
+    void setResamplePitchRatio(float ratio)
+    {
+        resamplePitchRatio.store(juce::jlimit(0.125f, 8.0f, ratio), std::memory_order_release);
+    }
+    float getResamplePitchRatio() const
+    {
+        return juce::jlimit(0.125f, 8.0f, resamplePitchRatio.load(std::memory_order_acquire));
+    }
     void setSoundTouchEnabled(bool enabled);
     bool isSoundTouchEnabled() const { return soundTouchEnabled.load(std::memory_order_acquire) != 0; }
     void setScratchAmount(float amount) { scratchAmount = juce::jlimit(0.0f, 100.0f, amount); }
@@ -532,6 +542,8 @@ public:
     bool isReversed() const { return reverse; }
     void setTransientSliceMode(bool enabled);
     bool isTransientSliceMode() const { return transientSliceMode.load(std::memory_order_acquire); }
+    void setLoopSliceLength(float amount) { loopSliceLength.store(juce::jlimit(0.02f, 1.0f, amount), std::memory_order_release); }
+    float getLoopSliceLength() const { return loopSliceLength.load(std::memory_order_acquire); }
     std::array<int, 16> getSliceStartSamples(bool transientMode) const;
     std::array<int, 16> getCachedTransientSliceSamples() const;
     std::array<float, 128> getCachedRmsMap() const;
@@ -825,6 +837,9 @@ private:
     bool soundTouchSwingCacheUsesTransientAnchors = false;
     std::uint64_t soundTouchSwingCacheAnchorHash = 0;
 #endif
+    std::array<double, 16> neutralResampleSegmentSourceStarts{};
+    std::uint64_t neutralResampleAnchorHash = 0;
+    bool neutralResampleAnchorsValid = false;
     juce::LagrangeInterpolator interpolators[2]; // For stereo
     
     std::atomic<double> playbackPosition{0.0};
@@ -833,11 +848,14 @@ private:
     std::atomic<float> displaySpeedAtomic{1.0f};
     std::atomic<bool> playing{false};
     std::atomic<bool> pendingTrigger{false};
+    std::atomic<int> resamplePitchEnabled{0};
+    std::atomic<float> resamplePitchRatio{1.0f};
     std::atomic<int> soundTouchEnabled{1};
     std::atomic<float> scratchAmount{0.0f};  // Per-strip scratch: 0-100%
     std::atomic<float> loopCrossfadeLengthMs{10.0f};
     std::atomic<float> triggerFadeInMs{12.0f};
     std::atomic<bool> transientSliceMode{false};
+    std::atomic<float> loopSliceLength{1.0f};
     GrainParams grainParams;
     GrainGestureState grainGesture;
     static constexpr int kMaxGrainVoices = 32;

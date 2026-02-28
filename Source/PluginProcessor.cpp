@@ -1064,6 +1064,7 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
         stripPanParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripPan" + juce::String(i));
         stripSpeedParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripSpeed" + juce::String(i));
         stripPitchParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripPitch" + juce::String(i));
+        stripSliceLengthParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripSliceLength" + juce::String(i));
     }
 }
 
@@ -1117,6 +1118,8 @@ void MlrVSTAudioProcessor::applyPitchControlToStrip(EnhancedAudioStrip& strip, f
         // the resulting playback-speed range to +/-3 octaves (0.125x..8x).
         const float stepSpeedSemitones = clampedSemitones * 1.5f;
         const float stepRatio = juce::jlimit(0.125f, 8.0f, std::pow(2.0f, stepSpeedSemitones / 12.0f));
+        strip.setResamplePitchEnabled(false);
+        strip.setResamplePitchRatio(1.0f);
         strip.setPitchShift(clampedSemitones);
         if (auto* stepSampler = strip.getStepSampler())
             stepSampler->setSpeed(stepRatio);
@@ -1125,11 +1128,16 @@ void MlrVSTAudioProcessor::applyPitchControlToStrip(EnhancedAudioStrip& strip, f
 
     if (getPitchControlMode() == PitchControlMode::Resample)
     {
+        strip.setResamplePitchEnabled(true);
+        strip.setResamplePitchRatio(ratio);
         strip.setPitchShift(0.0f);
-        strip.setPlaybackSpeed(ratio);
+        // Keep traversal/playmarker speed independent from resample pitch ratio.
+        strip.setPlaybackSpeed(1.0f);
         return;
     }
 
+    strip.setResamplePitchEnabled(false);
+    strip.setResamplePitchRatio(1.0f);
     strip.setPlaybackSpeed(1.0f);
     strip.setPitchShift(clampedSemitones);
 }
@@ -1144,7 +1152,9 @@ float MlrVSTAudioProcessor::getPitchSemitonesForDisplay(const EnhancedAudioStrip
 
     if (getPitchControlMode() == PitchControlMode::Resample)
     {
-        const float ratio = juce::jmax(0.125f, strip.getPlaybackSpeed());
+        const float ratio = strip.isResamplePitchEnabled()
+            ? strip.getResamplePitchRatio()
+            : 1.0f;
         const float semitones = 12.0f * std::log2(ratio);
         return juce::jlimit(-24.0f, 24.0f, semitones);
     }
@@ -1333,6 +1343,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
             "Strip " + juce::String(i + 1) + " Pitch",
             juce::NormalisableRange<float>(-24.0f, 24.0f, 0.01f),
             0.0f));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripSliceLength" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Slice Length",
+            juce::NormalisableRange<float>(0.02f, 1.0f, 0.001f, 0.5f),
+            1.0f));
     }
     
     return layout;
@@ -1531,6 +1547,10 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
             auto* pitchParam = stripPitchParams[static_cast<size_t>(i)];
             if (pitchParam)
                 applyPitchControlToStrip(*strip, pitchParam->load(std::memory_order_acquire));
+
+            auto* sliceLengthParam = stripSliceLengthParams[static_cast<size_t>(i)];
+            if (sliceLengthParam)
+                strip->setLoopSliceLength(sliceLengthParam->load(std::memory_order_acquire));
         }
     }
 
@@ -4073,6 +4093,9 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
             strip->setBeatsPerLoop(-1.0f);
             strip->setScratchAmount(0.0f);
             strip->setTransientSliceMode(false);
+            strip->setLoopSliceLength(1.0f);
+            strip->setResamplePitchEnabled(false);
+            strip->setResamplePitchRatio(1.0f);
             strip->setPitchShift(0.0f);
             strip->setRecordingBars(1);
             strip->setFilterFrequency(20000.0f);
@@ -4141,6 +4164,8 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
         if (auto* param = parameters.getParameter("stripSpeed" + juce::String(i)))
             param->setValueNotifyingHost(param->getDefaultValue());
         if (auto* param = parameters.getParameter("stripPitch" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripSliceLength" + juce::String(i)))
             param->setValueNotifyingHost(param->getDefaultValue());
     }
 

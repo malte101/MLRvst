@@ -4466,6 +4466,124 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         playbackSourceSampleLength = static_cast<double>(soundTouchSwingCacheBuffer.getNumSamples());
     }
 #endif
+
+    const float loopSliceLengthValue = juce::jlimit(0.02f, 1.0f, loopSliceLength.load(std::memory_order_acquire));
+    const bool loopSliceEnvelopeActive = (playMode == PlayMode::Loop)
+        && !isScratching
+        && (loopSliceLengthValue < 0.9995f)
+        && loopLength > 1.0
+        && loopCols > 0;
+    const int loopSegmentCount = juce::jmax(1, loopCols);
+    const double loopSegmentLength = juce::jmax(1.0, loopLength) / static_cast<double>(loopSegmentCount);
+    const double playbackSourceLoopLength = soundTouchSwingActive
+        ? juce::jmax(1.0, playbackSourceSampleLength)
+        : juce::jmax(1.0, loopLength);
+    const double playbackSourceSegmentLength = playbackSourceLoopLength / static_cast<double>(loopSegmentCount);
+    const bool resamplePitchModeActive = (resamplePitchEnabled.load(std::memory_order_acquire) != 0)
+        && (playMode != PlayMode::Step)
+        && (playMode != PlayMode::Grain);
+    const bool resampleUsesPerSegmentWarp = resamplePitchModeActive
+        && (playMode == PlayMode::Loop || playMode == PlayMode::Gate);
+    const bool useTransientAnchors = transientSliceMode.load(std::memory_order_acquire);
+
+    auto wrapPlaybackSourcePosition = [&](double sourcePosition) -> double
+    {
+        const double sourceLoopLenSafe = juce::jmax(1.0, playbackSourceLoopLength);
+        double wrapped = std::fmod(sourcePosition - playbackSourceLoopStartSamples, sourceLoopLenSafe);
+        if (wrapped < 0.0)
+            wrapped += sourceLoopLenSafe;
+        return playbackSourceLoopStartSamples + wrapped;
+    };
+
+    std::array<double, ModernAudioEngine::MaxColumns> computedLoopSegmentSourceStarts{};
+    std::uint64_t loopSegmentAnchorHash = 1469598103934665603ULL;
+    loopSegmentAnchorHash = hashMix64(loopSegmentAnchorHash, static_cast<std::uint64_t>(useTransientAnchors ? 1 : 0));
+    loopSegmentAnchorHash = hashMix64(loopSegmentAnchorHash, static_cast<std::uint64_t>(soundTouchSwingActive ? 1 : 0));
+    loopSegmentAnchorHash = hashMix64(loopSegmentAnchorHash, static_cast<std::uint64_t>(loopStart + 1));
+    loopSegmentAnchorHash = hashMix64(loopSegmentAnchorHash, static_cast<std::uint64_t>(loopSegmentCount + 1));
+
+    if (loopSliceEnvelopeActive || resampleUsesPerSegmentWarp)
+    {
+        for (int segment = 0; segment < loopSegmentCount; ++segment)
+        {
+            const int globalColumn = juce::jlimit(
+                0, ModernAudioEngine::MaxColumns - 1, loopStart + segment);
+            const double anchorAbsolute = useTransientAnchors
+                ? getTriggerTargetPositionForColumn(globalColumn, loopStartSamples, loopLength)
+                : (loopStartSamples + (static_cast<double>(segment) * loopSegmentLength));
+            double anchorInLoop = std::fmod(anchorAbsolute - loopStartSamples, loopLength);
+            if (anchorInLoop < 0.0)
+                anchorInLoop += loopLength;
+            const double anchorNorm = anchorInLoop / juce::jmax(1.0, loopLength);
+            const double anchorSourcePos = playbackSourceLoopStartSamples + (anchorNorm * playbackSourceLoopLength);
+            computedLoopSegmentSourceStarts[static_cast<size_t>(segment)] = anchorSourcePos;
+
+            const std::uint64_t anchorQuantized = static_cast<std::uint64_t>(
+                std::max<int64_t>(0LL, static_cast<int64_t>(std::llround(anchorSourcePos * 1000.0))));
+            loopSegmentAnchorHash = hashMix64(loopSegmentAnchorHash, anchorQuantized + 1ULL);
+        }
+    }
+
+    const double resampleReadRatio = resamplePitchModeActive
+        ? static_cast<double>(juce::jlimit(0.125f, 8.0f, resamplePitchRatio.load(std::memory_order_acquire)))
+        : 1.0;
+    const bool resampleRatioNeutral = std::abs(resampleReadRatio - 1.0) <= 1.0e-6;
+    if (resampleUsesPerSegmentWarp)
+    {
+        const bool canReuseNeutralAnchors = neutralResampleAnchorsValid
+            && (neutralResampleAnchorHash == loopSegmentAnchorHash);
+        if (resampleRatioNeutral || !canReuseNeutralAnchors)
+        {
+            neutralResampleSegmentSourceStarts = computedLoopSegmentSourceStarts;
+            neutralResampleAnchorHash = loopSegmentAnchorHash;
+            neutralResampleAnchorsValid = true;
+        }
+    }
+
+    const auto& loopSegmentSourceStarts = (resampleUsesPerSegmentWarp
+                                           && neutralResampleAnchorsValid
+                                           && !resampleRatioNeutral)
+        ? neutralResampleSegmentSourceStarts
+        : computedLoopSegmentSourceStarts;
+
+    auto mapResampleReadPosition = [&](double sourcePosition,
+                                       double loopPhasePosition = std::numeric_limits<double>::quiet_NaN()) -> double
+    {
+        if (!resamplePitchModeActive || resampleRatioNeutral)
+            return sourcePosition;
+
+        const double sourceLoopLenSafe = juce::jmax(1.0, playbackSourceLoopLength);
+        const double sourceLoopStart = playbackSourceLoopStartSamples;
+        const double sourceLoopEnd = sourceLoopStart + sourceLoopLenSafe - 1.0;
+        const double loopLengthSafeForResample = juce::jmax(1.0, loopLength);
+
+        if (playMode == PlayMode::OneShot)
+        {
+            const double warped = sourceLoopStart + ((sourcePosition - sourceLoopStart) * resampleReadRatio);
+            return juce::jlimit(sourceLoopStart, sourceLoopEnd, warped);
+        }
+
+        if (resampleUsesPerSegmentWarp && std::isfinite(loopPhasePosition))
+        {
+            double wrappedLoopPhase = std::fmod(loopPhasePosition, loopLengthSafeForResample);
+            if (wrappedLoopPhase < 0.0)
+                wrappedLoopPhase += loopLengthSafeForResample;
+
+            const double segmentPos = wrappedLoopPhase / juce::jmax(1.0e-9, loopSegmentLength);
+            const double segmentFloor = std::floor(segmentPos);
+            const int segmentIndex = juce::jlimit(0, loopSegmentCount - 1, static_cast<int>(segmentFloor));
+            const double segmentPhase = juce::jlimit(0.0, 0.999999, segmentPos - segmentFloor);
+            const double warpedSegmentPhase = juce::jlimit(0.0, 0.999999, segmentPhase * resampleReadRatio);
+
+            const double sourceSegmentStart = loopSegmentSourceStarts[static_cast<size_t>(segmentIndex)];
+            return wrapPlaybackSourcePosition(sourceSegmentStart + (warpedSegmentPhase * playbackSourceSegmentLength));
+        }
+
+        double warpedRel = std::fmod((sourcePosition - sourceLoopStart) * resampleReadRatio, sourceLoopLenSafe);
+        if (warpedRel < 0.0)
+            warpedRel += sourceLoopLenSafe;
+        return sourceLoopStart + warpedRel;
+    };
     
     // Calculate how long this loop SHOULD take at current tempo (in samples)
     double secondsPerBeat = 60.0 / tempo;
@@ -4517,6 +4635,28 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             : std::numeric_limits<double>::quiet_NaN();
         const double traversed = applyPlayheadTraversalToLoopPosition(directed, swingDirected);
         return lockPositionToTriggerSlice(traversed);
+    };
+
+    auto resolveLoopSegmentState = [&](double loopPhasePosition,
+                                       int& segmentIndexOut,
+                                       double& segmentPhaseOut) -> bool
+    {
+        segmentIndexOut = -1;
+        segmentPhaseOut = 0.0;
+
+        if (loopSegmentCount <= 0 || loopLength <= 1.0e-9)
+            return false;
+
+        const double loopLenSafe = juce::jmax(1.0, loopLength);
+        double wrapped = std::fmod(loopPhasePosition, loopLenSafe);
+        if (wrapped < 0.0)
+            wrapped += loopLenSafe;
+
+        const double segmentPos = wrapped / juce::jmax(1.0e-9, loopSegmentLength);
+        const double segmentFloor = std::floor(segmentPos);
+        segmentIndexOut = juce::jlimit(0, loopSegmentCount - 1, static_cast<int>(segmentFloor));
+        segmentPhaseOut = juce::jlimit(0.0, 0.999999, segmentPos - segmentFloor);
+        return true;
     };
     
     // STEP SEQUENCER MODE - handle entirely separately (before main loop)
@@ -5227,6 +5367,9 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         // Position calculation (skip for step mode - already calculated above)
         double positionInLoop = 0.0;
         double samplePosition = 0.0;
+        float loopSegmentEnvelopeGain = 1.0f;
+        int activeLoopSegmentIndex = -1;
+        double activeLoopSegmentPhase = 0.0;
         
         if (playMode == PlayMode::Step)
         {
@@ -5370,6 +5513,53 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             }
             const double timelineSamplePosition = loopStartSamples + positionInLoop;
             samplePosition = playbackSourceLoopStartSamples + positionInLoop;
+
+            const bool hasLoopSegmentState = resolveLoopSegmentState(
+                positionInLoop, activeLoopSegmentIndex, activeLoopSegmentPhase);
+            if (hasLoopSegmentState && playMode == PlayMode::Loop)
+            {
+                if (loopSliceEnvelopeActive)
+                {
+                    const double sourceSegmentStart =
+                        loopSegmentSourceStarts[static_cast<size_t>(activeLoopSegmentIndex)];
+                    samplePosition = wrapPlaybackSourcePosition(
+                        sourceSegmentStart + (activeLoopSegmentPhase * playbackSourceSegmentLength));
+                }
+
+                const bool resampleSliceSafetyActive = resampleUsesPerSegmentWarp && !resampleRatioNeutral;
+                if (loopSliceEnvelopeActive || resampleSliceSafetyActive)
+                {
+                    double gatePhase = loopSliceEnvelopeActive
+                        ? juce::jlimit(0.02, 1.0, static_cast<double>(loopSliceLengthValue))
+                        : 1.0;
+                    if (resampleSliceSafetyActive && resampleReadRatio > 1.0)
+                    {
+                        const double autoGate = juce::jlimit(0.02, 1.0, 1.0 / resampleReadRatio);
+                        gatePhase = juce::jmin(gatePhase, autoGate);
+                    }
+
+                    if (activeLoopSegmentPhase >= gatePhase || gatePhase <= 1.0e-5)
+                    {
+                        loopSegmentEnvelopeGain = 0.0f;
+                    }
+                    else
+                    {
+                        const double fadeSamples = resampleSliceSafetyActive ? 64.0 : 48.0;
+                        const double fadePhase = juce::jlimit(
+                            1.0e-6, gatePhase * 0.5, fadeSamples / juce::jmax(1.0, playbackSourceSegmentLength));
+                        double env = 1.0;
+                        if (activeLoopSegmentPhase < fadePhase)
+                            env = activeLoopSegmentPhase / fadePhase;
+                        const double releaseStart = gatePhase - fadePhase;
+                        if (activeLoopSegmentPhase > releaseStart)
+                            env = juce::jmin(env, (gatePhase - activeLoopSegmentPhase) / fadePhase);
+                        env = juce::jlimit(0.0, 1.0, env);
+                        env = env * env * (3.0 - (2.0 * env)); // smoothstep
+                        loopSegmentEnvelopeGain = static_cast<float>(env);
+                    }
+                }
+            }
+
             double displayTimelineSamplePosition = timelineSamplePosition;
             if (soundTouchSwingActive && beatsForLoop > 0.0)
             {
@@ -5426,12 +5616,14 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         // Blend BEFORE loop start (pre-roll) into end of loop
         float innerLoopBlend = 0.0f;  // Amount to blend pre-roll sample (0-1)
         double prerollSamplePosition = samplePosition;
+        double prerollPositionInLoop = positionInLoop;
         
         const double crossfadeLengthMsLocal = static_cast<double>(loopCrossfadeLengthMs.load(std::memory_order_acquire));
         const double crossfadeSamples = (crossfadeLengthMsLocal * 0.001) * currentSampleRate;
         
         // Only apply crossfade if we have an actual inner loop (not full 16 columns)
-        if (!soundTouchSwingActive
+        if (!loopSliceEnvelopeActive
+            && !soundTouchSwingActive
             && loopCols < ModernAudioEngine::MaxColumns
             && crossfadeSamples > 0
             && crossfadeSamples < loopLength)
@@ -5453,10 +5645,43 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 // We're at the end of the loop, need audio from before the start
                 double offsetIntoFade = positionInLoop - fadeStart;
                 prerollSamplePosition = playbackSourceLoopStartSamples - crossfadeSamples + offsetIntoFade;
+                prerollPositionInLoop = positionInLoop - loopLength;
                 
                 // Handle wrapping if pre-roll goes before sample start
                 if (prerollSamplePosition < 0)
                     prerollSamplePosition += playbackSourceSampleLength;
+            }
+        }
+
+        double readSamplePosition = mapResampleReadPosition(samplePosition, positionInLoop);
+        double readPrerollSamplePosition = mapResampleReadPosition(prerollSamplePosition, prerollPositionInLoop);
+        double overlapReadSamplePosition = readSamplePosition;
+        float overlapCurrentGain = 1.0f;
+        float overlapPreviousGain = 0.0f;
+        if (resampleUsesPerSegmentWarp
+            && playMode == PlayMode::Loop
+            && activeLoopSegmentIndex >= 0
+            && resampleReadRatio < 0.9999)
+        {
+            const double overlapPhaseSpan = juce::jlimit(
+                0.0, 1.0, (1.0 / juce::jmax(1.0e-6, resampleReadRatio)) - 1.0);
+            if (overlapPhaseSpan > 1.0e-5 && activeLoopSegmentPhase < overlapPhaseSpan)
+            {
+                const int previousSegmentIndex =
+                    (activeLoopSegmentIndex + loopSegmentCount - 1) % loopSegmentCount;
+                const double prevSourceSegmentStart =
+                    loopSegmentSourceStarts[static_cast<size_t>(previousSegmentIndex)];
+                const double prevPhase = juce::jlimit(
+                    0.0, 0.999999, (1.0 + activeLoopSegmentPhase) * resampleReadRatio);
+                overlapReadSamplePosition = wrapPlaybackSourcePosition(
+                    prevSourceSegmentStart + (prevPhase * playbackSourceSegmentLength));
+
+                const float blendNorm = juce::jlimit(
+                    0.0f,
+                    1.0f,
+                    static_cast<float>(activeLoopSegmentPhase / juce::jmax(1.0e-9, overlapPhaseSpan)));
+                overlapCurrentGain = std::sin(juce::MathConstants<float>::halfPi * blendNorm);
+                overlapPreviousGain = std::cos(juce::MathConstants<float>::halfPi * blendNorm);
             }
         }
         
@@ -5502,15 +5727,22 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         else if (playbackNumChannels == 1)
         {
             // Mono source: read once, apply to both with pan
-            float monoSample = resampler.getSample(*playbackSourceBuffer, 0, samplePosition, playbackSpeed);
+            float monoSample = resampler.getSample(*playbackSourceBuffer, 0, readSamplePosition, playbackSpeed);
             
             // Apply inner loop crossfade if active
             if (innerLoopBlend > 0.0f)
             {
-                float prerollSample = resampler.getSample(*playbackSourceBuffer, 0, prerollSamplePosition, playbackSpeed);
+                float prerollSample = resampler.getSample(*playbackSourceBuffer, 0, readPrerollSamplePosition, playbackSpeed);
                 const float fadeOutTerm = juce::jlimit(0.0f, 1.0f, 1.0f - (innerLoopBlend * innerLoopBlend));
                 float fadeOut = std::sqrt(fadeOutTerm);  // Complementary
                 monoSample = (monoSample * fadeOut) + (prerollSample * innerLoopBlend);
+            }
+
+            if (overlapPreviousGain > 1.0e-5f)
+            {
+                const float overlapSample = resampler.getSample(
+                    *playbackSourceBuffer, 0, overlapReadSamplePosition, playbackSpeed);
+                monoSample = (monoSample * overlapCurrentGain) + (overlapSample * overlapPreviousGain);
             }
             
             leftSample = monoSample * leftGain;
@@ -5519,19 +5751,29 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         else if (playbackNumChannels == 2)
         {
             // Stereo source: preserve stereo and apply constant-power balance.
-            float leftSource = resampler.getSample(*playbackSourceBuffer, 0, samplePosition, playbackSpeed);
-            float rightSource = resampler.getSample(*playbackSourceBuffer, 1, samplePosition, playbackSpeed);
+            float leftSource = resampler.getSample(*playbackSourceBuffer, 0, readSamplePosition, playbackSpeed);
+            float rightSource = resampler.getSample(*playbackSourceBuffer, 1, readSamplePosition, playbackSpeed);
             
             // Apply inner loop crossfade if active
             if (innerLoopBlend > 0.0f)
             {
-                float leftPreroll = resampler.getSample(*playbackSourceBuffer, 0, prerollSamplePosition, playbackSpeed);
-                float rightPreroll = resampler.getSample(*playbackSourceBuffer, 1, prerollSamplePosition, playbackSpeed);
+                float leftPreroll = resampler.getSample(*playbackSourceBuffer, 0, readPrerollSamplePosition, playbackSpeed);
+                float rightPreroll = resampler.getSample(*playbackSourceBuffer, 1, readPrerollSamplePosition, playbackSpeed);
                 const float fadeOutTerm = juce::jlimit(0.0f, 1.0f, 1.0f - (innerLoopBlend * innerLoopBlend));
                 float fadeOut = std::sqrt(fadeOutTerm);  // Complementary
                 
                 leftSource = (leftSource * fadeOut) + (leftPreroll * innerLoopBlend);
                 rightSource = (rightSource * fadeOut) + (rightPreroll * innerLoopBlend);
+            }
+
+            if (overlapPreviousGain > 1.0e-5f)
+            {
+                const float leftOverlap = resampler.getSample(
+                    *playbackSourceBuffer, 0, overlapReadSamplePosition, playbackSpeed);
+                const float rightOverlap = resampler.getSample(
+                    *playbackSourceBuffer, 1, overlapReadSamplePosition, playbackSpeed);
+                leftSource = (leftSource * overlapCurrentGain) + (leftOverlap * overlapPreviousGain);
+                rightSource = (rightSource * overlapCurrentGain) + (rightOverlap * overlapPreviousGain);
             }
             
             leftSample = leftSource * leftGain;
@@ -5548,17 +5790,19 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             float oldLeft = 0.0f;
             float oldRight = 0.0f;
             const double oldPos = retriggerBlendOldPosition;
+            const double oldReadPos = mapResampleReadPosition(
+                oldPos, oldPos - playbackSourceLoopStartSamples);
 
             if (numChannels == 1)
             {
-                const float monoOld = resampler.getSample(sampleBuffer, 0, oldPos, playbackSpeed);
+                const float monoOld = resampler.getSample(sampleBuffer, 0, oldReadPos, playbackSpeed);
                 oldLeft = monoOld * leftGain;
                 oldRight = monoOld * rightGain;
             }
             else if (numChannels == 2)
             {
-                oldLeft = resampler.getSample(sampleBuffer, 0, oldPos, playbackSpeed) * leftGain;
-                oldRight = resampler.getSample(sampleBuffer, 1, oldPos, playbackSpeed) * rightGain;
+                oldLeft = resampler.getSample(sampleBuffer, 0, oldReadPos, playbackSpeed) * leftGain;
+                oldRight = resampler.getSample(sampleBuffer, 1, oldReadPos, playbackSpeed) * rightGain;
             }
 
             const float progress = 1.0f - (static_cast<float>(retriggerBlendSamplesRemaining)
@@ -5583,6 +5827,12 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 retriggerBlendSamplesRemaining = 0;
                 retriggerBlendTotalSamples = 0;
             }
+        }
+
+        if (playMode == PlayMode::Loop && loopSegmentEnvelopeGain < 0.99999f)
+        {
+            leftSample *= loopSegmentEnvelopeGain;
+            rightSample *= loopSegmentEnvelopeGain;
         }
 
         // Apply volume and crossfade
