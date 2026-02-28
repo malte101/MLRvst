@@ -1935,15 +1935,52 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             }
             else if (!isGroupMuted && strip->isPlaying())
             {
-                // NORMAL PLAYBACK MODE - show playhead
-                int currentCol = strip->getCurrentColumn();
-                int loopStart = strip->getLoopStart();
-                int loopEnd = strip->getLoopEnd();
-                
+                // NORMAL PLAYBACK MODE - show playhead with fractional interpolation.
+                const int loopStart = juce::jlimit(0, 15, strip->getLoopStart());
+                const int loopEnd = juce::jlimit(loopStart + 1, 16, strip->getLoopEnd());
                 for (int x = loopStart; x < loopEnd && x < 16; ++x)
                     newLedState[x][y] = 2;
-                
-                if (currentCol >= 0 && currentCol < 16)
+
+                const int loopCols = juce::jmax(1, loopEnd - loopStart);
+                const int currentCol = strip->getCurrentColumn();
+                bool drewInterpolatedPlayhead = false;
+
+                const auto* audioBuffer = strip->getAudioBuffer();
+                const int sampleCount = (audioBuffer != nullptr) ? audioBuffer->getNumSamples() : 0;
+                const double playbackPos = strip->getPlaybackPosition();
+                if (sampleCount > 0 && std::isfinite(playbackPos))
+                {
+                    double normalized = playbackPos / static_cast<double>(sampleCount);
+                    normalized = std::fmod(normalized, 1.0);
+                    if (normalized < 0.0)
+                        normalized += 1.0;
+
+                    double loopPosCols = (normalized * static_cast<double>(MaxColumns))
+                        - static_cast<double>(loopStart);
+                    loopPosCols = std::fmod(loopPosCols, static_cast<double>(loopCols));
+                    if (loopPosCols < 0.0)
+                        loopPosCols += static_cast<double>(loopCols);
+
+                    const int baseOffset = juce::jlimit(
+                        0, loopCols - 1, static_cast<int>(std::floor(loopPosCols)));
+                    const double frac = juce::jlimit(
+                        0.0, 1.0, loopPosCols - static_cast<double>(baseOffset));
+                    const int baseCol = loopStart + baseOffset;
+                    const int nextCol = loopStart + ((baseOffset + 1) % loopCols);
+                    const int baseLevel = juce::jlimit(
+                        2, 15, static_cast<int>(std::lround(15.0 - (frac * 7.0))));
+                    const int nextLevel = juce::jlimit(
+                        2, 15, static_cast<int>(std::lround(8.0 + (frac * 7.0))));
+
+                    if (baseCol >= 0 && baseCol < 16)
+                        newLedState[baseCol][y] = juce::jmax(newLedState[baseCol][y], baseLevel);
+                    if (nextCol >= 0 && nextCol < 16)
+                        newLedState[nextCol][y] = juce::jmax(newLedState[nextCol][y], nextLevel);
+
+                    drewInterpolatedPlayhead = true;
+                }
+
+                if (!drewInterpolatedPlayhead && currentCol >= 0 && currentCol < 16)
                     newLedState[currentCol][y] = 15;
             }
         }
@@ -1973,8 +2010,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
 
             if (selectedStrip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
             {
-                if (auto* stepSampler = selectedStrip->getStepSampler())
-                    pitchSemitones = stepSampler->getPitchOffset();
+                pitchSemitones = static_cast<int>(std::round(getPitchSemitonesForDisplay(*selectedStrip)));
             }
         }
 

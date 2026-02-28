@@ -23,12 +23,18 @@
 #include <juce_dsp/juce_dsp.h>
 #include <atomic>
 #include <array>
+#include <cstdint>
 #include <limits>
 #include <set>
 #include <random>
+#include <vector>
 
 #include "StepSampler.h"
 #include "LadderFilterBase.h"
+
+#ifndef MLRVST_ENABLE_SOUNDTOUCH
+#define MLRVST_ENABLE_SOUNDTOUCH 0
+#endif
 
 //==============================================================================
 /**
@@ -351,7 +357,10 @@ public:
         Quarter = 0,   // 1/4
         Eighth,        // 1/8
         Sixteenth,     // 1/16
-        Triplet        // 1/8T
+        Triplet,       // 1/8T (3 subdivisions per beat)
+        Half,          // 1/2
+        ThirtySecond,  // 1/32
+        SixteenthTriplet // 1/16T (6 subdivisions per beat)
     };
     
     // Public member variables (must be declared before inline methods that use them)
@@ -515,6 +524,8 @@ public:
     float getDisplaySpeed() const { return displaySpeedAtomic.load(std::memory_order_acquire); }
     void setPitchShift(float semitones);
     float getPitchShift() const { return pitchShiftSemitones.load(); }
+    void setSoundTouchEnabled(bool enabled);
+    bool isSoundTouchEnabled() const { return soundTouchEnabled.load(std::memory_order_acquire) != 0; }
     void setScratchAmount(float amount) { scratchAmount = juce::jlimit(0.0f, 100.0f, amount); }
     float getScratchAmount() const { return scratchAmount.load(); }
     void setReverse(bool shouldReverse);
@@ -801,6 +812,19 @@ private:
     };
 
     juce::AudioBuffer<float> sampleBuffer;
+#if MLRVST_ENABLE_SOUNDTOUCH
+    juce::AudioBuffer<float> soundTouchSwingCacheBuffer;
+    bool soundTouchSwingCacheValid = false;
+    double soundTouchSwingCacheLoopStart = -1.0;
+    double soundTouchSwingCacheLoopLength = -1.0;
+    double soundTouchSwingCacheBeatsForLoop = -1.0;
+    float soundTouchSwingCacheAmount = -1.0f;
+    int soundTouchSwingCacheDivision = -1;
+    int soundTouchSwingCacheLoopCols = -1;
+    int soundTouchSwingCacheSourceSamples = -1;
+    bool soundTouchSwingCacheUsesTransientAnchors = false;
+    std::uint64_t soundTouchSwingCacheAnchorHash = 0;
+#endif
     juce::LagrangeInterpolator interpolators[2]; // For stereo
     
     std::atomic<double> playbackPosition{0.0};
@@ -809,6 +833,7 @@ private:
     std::atomic<float> displaySpeedAtomic{1.0f};
     std::atomic<bool> playing{false};
     std::atomic<bool> pendingTrigger{false};
+    std::atomic<int> soundTouchEnabled{1};
     std::atomic<float> scratchAmount{0.0f};  // Per-strip scratch: 0-100%
     std::atomic<float> loopCrossfadeLengthMs{10.0f};
     std::atomic<float> triggerFadeInMs{12.0f};
@@ -1061,6 +1086,12 @@ public:
     float getPanGain(int channel) const; // 0=left, 1=right
     void rebuildTransientSliceMap();
     void rebuildSampleAnalysisCacheLocked();
+#if MLRVST_ENABLE_SOUNDTOUCH
+    bool shouldUseSoundTouchSwingCache(double loopLength, double beatsForLoop, int loopCols,
+                                       bool isScratching, double playheadTraversalRatio) const;
+    bool rebuildSoundTouchSwingCache(double loopStartSamples, double loopLength, double beatsForLoop, int loopCols);
+    void invalidateSoundTouchSwingCache();
+#endif
     double getTriggerTargetPositionForColumn(int column, double loopStartSamples, double loopLengthSamples) const;
     double snapToNearestZeroCrossing(double targetPos, int radiusSamples) const;
     double getWrappedSamplePosition(double samplePos, double loopStartSamples, double loopLengthSamples) const;
@@ -1086,7 +1117,7 @@ public:
     void reverseScratchToTimeline(int64_t currentGlobalSample);
     void resetPitchShifter();
     float readPitchDelaySample(int channel, double delaySamples) const;
-    void processPitchShift(float& left, float& right);
+    void processPitchShift(float& left, float& right, float semitones);
     int64_t makeFeasibleScratchDuration(double startPosSamples,
                                         double endPosSamples,
                                         int64_t requestedDurationSamples,
@@ -1294,6 +1325,8 @@ public:
     float getTriggerFadeInMs() const { return triggerFadeInMs.load(std::memory_order_acquire); }
     void setGlobalSwingDivision(EnhancedAudioStrip::SwingDivision division);
     EnhancedAudioStrip::SwingDivision getGlobalSwingDivision() const;
+    void setGlobalSoundTouchEnabled(bool enabled);
+    bool isGlobalSoundTouchEnabled() const { return soundTouchEnabled.load(std::memory_order_acquire) != 0; }
     
     // Input metering
     float getInputLevelL() const { return inputLevelL.load(); }
@@ -1328,6 +1361,7 @@ private:
         float smoothedRaw = 0.0f;
         float grainDezipperedRaw = 0.0f;
         float pitchDezipperedRaw = 0.0f;
+        float speedDezipperedTarget = -1.0f;
         std::atomic<int> lastGlobalStep{0};
     };
 
@@ -1364,6 +1398,7 @@ private:
     std::atomic<float> inputLevelR{0.0f};  // Input meter level right (0-1)
     std::atomic<float> crossfadeLengthMs{10.0f}; // Inner-loop and capture-loop crossfade (ms)
     std::atomic<float> triggerFadeInMs{12.0f}; // Trigger fade-in de-click time (ms)
+    std::atomic<int> soundTouchEnabled{1};
     
     std::atomic<double> currentTempo{120.0};
     std::atomic<int> currentTimeSigNumerator{4};

@@ -1056,6 +1056,7 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
     triggerFadeInParam = parameters.getRawParameterValue("triggerFadeIn");
     outputRoutingParam = parameters.getRawParameterValue("outputRouting");
     pitchControlModeParam = parameters.getRawParameterValue("pitchControlMode");
+    soundTouchEnabledParam = parameters.getRawParameterValue("soundTouchEnabled");
 
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -1112,9 +1113,13 @@ void MlrVSTAudioProcessor::applyPitchControlToStrip(EnhancedAudioStrip& strip, f
 
     if (stripIsStepMode)
     {
+        // Step mode: keep control-domain semitone range unchanged, but expand
+        // the resulting playback-speed range to +/-3 octaves (0.125x..8x).
+        const float stepSpeedSemitones = clampedSemitones * 1.5f;
+        const float stepRatio = juce::jlimit(0.125f, 8.0f, std::pow(2.0f, stepSpeedSemitones / 12.0f));
         strip.setPitchShift(clampedSemitones);
         if (auto* stepSampler = strip.getStepSampler())
-            stepSampler->setSpeed(ratio);
+            stepSampler->setSpeed(stepRatio);
         return;
     }
 
@@ -1134,7 +1139,7 @@ float MlrVSTAudioProcessor::getPitchSemitonesForDisplay(const EnhancedAudioStrip
     if (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
     {
         if (const auto* stepSampler = strip.getStepSampler())
-            return static_cast<float>(stepSampler->getPitchOffset());
+            return juce::jlimit(-24.0f, 24.0f, static_cast<float>(stepSampler->getPitchOffset()) / 1.5f);
     }
 
     if (getPitchControlMode() == PitchControlMode::Resample)
@@ -1198,7 +1203,8 @@ void MlrVSTAudioProcessor::setControlPageMomentary(bool shouldBeMomentary)
 
 void MlrVSTAudioProcessor::setSwingDivisionSelection(int mode)
 {
-    const int clamped = juce::jlimit(0, 3, mode);
+    const int maxDivision = static_cast<int>(EnhancedAudioStrip::SwingDivision::SixteenthTriplet);
+    const int clamped = juce::jlimit(0, maxDivision, mode);
     swingDivisionSelection.store(clamped, std::memory_order_release);
     if (audioEngine)
         audioEngine->setGlobalSwingDivision(static_cast<EnhancedAudioStrip::SwingDivision>(clamped));
@@ -1296,6 +1302,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         "Pitch Control Mode",
         juce::StringArray{"Pitch Shift", "Resample"},
         0));
+
+    layout.add(std::make_unique<juce::AudioParameterBool>(
+        "soundTouchEnabled",
+        "SoundTouch Enabled",
+        true));
     
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -1332,6 +1343,7 @@ void MlrVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate;
     audioEngine->prepareToPlay(sampleRate, samplesPerBlock);
+    lastAppliedSoundTouchEnabled = -1;
     lastGridLedUpdateTimeMs = 0;
 
     // Now safe to connect to monome
@@ -1477,6 +1489,16 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
 
     if (triggerFadeInParam)
         audioEngine->setTriggerFadeInMs(*triggerFadeInParam);
+
+    if (soundTouchEnabledParam)
+    {
+        const int enabledInt = (soundTouchEnabledParam->load(std::memory_order_acquire) > 0.5f) ? 1 : 0;
+        if (enabledInt != lastAppliedSoundTouchEnabled)
+        {
+            audioEngine->setGlobalSoundTouchEnabled(enabledInt != 0);
+            lastAppliedSoundTouchEnabled = enabledInt;
+        }
+    }
 
     // Apply any pending loop enter/exit actions that were quantized to timeline.
     applyPendingLoopChanges(posInfo);

@@ -274,13 +274,14 @@ public:
     void setSpeed(float speed)
     {
         // Speed control via pitch shifting
-        // 0.5 = down octave, 1.0 = normal, 2.0 = up octave
+        // Step mode extended range: 0.125 = down 3 octaves, 1.0 = normal, 8.0 = up 3 octaves.
         // Convert to semitone offset: 12 semitones per octave
         if (speed > 0.0f)
         {
-            double semitones = 12.0 * std::log2(speed);
+            const double clampedSpeed = juce::jlimit(0.125, 8.0, static_cast<double>(speed));
+            double semitones = 12.0 * std::log2(clampedSpeed);
             pitchOffset = static_cast<int>(std::round(semitones));
-            pitchOffset = juce::jlimit(-24, 24, pitchOffset);  // ±2 octaves
+            pitchOffset = juce::jlimit(-36, 36, pitchOffset);  // ±3 octaves
         }
     }
 

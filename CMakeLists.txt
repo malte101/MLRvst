@@ -11,6 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Licensing-sensitive optional model:
 # OFF by default so release binaries do not accidentally include Huovilainen code.
 option(MLRVST_ENABLE_HUOVILAINEN "Enable Huovilainen Moog model (LGPL-derived upstream)" OFF)
+option(MLRVST_ENABLE_SOUNDTOUCH "Enable SoundTouch-based swing time-stretch path" ON)
 
 # Export compile commands for IDE support
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -113,6 +114,28 @@ if(MLRVST_ENABLE_HUOVILAINEN)
     target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_HUOVILAINEN=1)
 else()
     target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_HUOVILAINEN=0)
+endif()
+
+set(MLRVST_SOUNDTOUCH_ENABLED FALSE)
+if(MLRVST_ENABLE_SOUNDTOUCH)
+    find_path(MLRVST_SOUNDTOUCH_INCLUDE_DIR
+        NAMES soundtouch/SoundTouch.h
+        PATHS /opt/homebrew/include /usr/local/include)
+    find_library(MLRVST_SOUNDTOUCH_LIBRARY
+        NAMES SoundTouch soundtouch
+        PATHS /opt/homebrew/lib /usr/local/lib)
+
+    if(MLRVST_SOUNDTOUCH_INCLUDE_DIR AND MLRVST_SOUNDTOUCH_LIBRARY)
+        target_include_directories(mlrVST SYSTEM PRIVATE "${MLRVST_SOUNDTOUCH_INCLUDE_DIR}")
+        target_link_libraries(mlrVST PRIVATE "${MLRVST_SOUNDTOUCH_LIBRARY}")
+        target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_SOUNDTOUCH=1)
+        set(MLRVST_SOUNDTOUCH_ENABLED TRUE)
+    else()
+        message(WARNING "SoundTouch requested but not found; building with legacy swing path.")
+        target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_SOUNDTOUCH=0)
+    endif()
+else()
+    target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_SOUNDTOUCH=0)
 endif()
 
 # Link libraries
@@ -236,6 +259,7 @@ message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ Standard: C++${CMAKE_CXX_STANDARD}")
 message(STATUS "  System: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "  Huovilainen model: ${MLRVST_ENABLE_HUOVILAINEN}")
+message(STATUS "  SoundTouch swing path: ${MLRVST_SOUNDTOUCH_ENABLED}")
 message(STATUS "")
 message(STATUS "Plugin Formats:")
 message(STATUS "  ✓ VST3")

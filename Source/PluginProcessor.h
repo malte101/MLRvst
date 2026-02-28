@@ -369,6 +369,7 @@ private:
     std::atomic<float>* triggerFadeInParam = nullptr;
     std::atomic<float>* outputRoutingParam = nullptr;
     std::atomic<float>* pitchControlModeParam = nullptr;
+    std::atomic<float>* soundTouchEnabledParam = nullptr;
     std::array<std::atomic<float>*, MaxStrips> stripVolumeParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPanParams{};
     std::array<std::atomic<float>*, MaxStrips> stripSpeedParams{};
@@ -412,7 +413,8 @@ private:
     std::array<uint32_t, MaxColumns> stepEditVelocityGestureLastActivityMs{};
     static constexpr uint32_t stepEditVelocityGestureLatchMs = 180;
     std::atomic<bool> controlPageMomentary{true};
-    std::atomic<int> swingDivisionSelection{1}; // 0=1/4,1=1/8,2=1/16,3=Triplet
+    std::atomic<int> swingDivisionSelection{1}; // 0=1/4,1=1/8,2=1/16,3=1/8T,4=1/2,5=1/32,6=1/16T
+    int lastAppliedSoundTouchEnabled = -1; // -1 = force initial sync on first process block
     
     // LED state cache to prevent flickering
     int ledCache[16][8] = {{0}};

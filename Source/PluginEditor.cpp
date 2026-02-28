@@ -4339,13 +4339,17 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     swingDivisionBox.addItem("1/4", 1);
     swingDivisionBox.addItem("1/8", 2);
     swingDivisionBox.addItem("1/16", 3);
-    swingDivisionBox.addItem("Triplet", 4);
+    swingDivisionBox.addItem("1/8T", 4);
+    swingDivisionBox.addItem("1/2", 5);
+    swingDivisionBox.addItem("1/32", 6);
+    swingDivisionBox.addItem("1/16T", 7);
     swingDivisionBox.onChange = [this]()
     {
         processor.setSwingDivisionSelection(swingDivisionBox.getSelectedId() - 1);
     };
     addAndMakeVisible(swingDivisionBox);
     styleUiCombo(swingDivisionBox);
+    swingDivisionBox.setTooltip("Swing subdivision grid. 1/8T is triplet swing (3 subdivisions per beat), 1/16T is 6 subdivisions per beat.");
 
     outputRoutingLabel.setText("Outputs", juce::dontSendNotification);
     outputRoutingLabel.setJustificationType(juce::Justification::centred);
@@ -4369,7 +4373,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     pitchControlModeBox.setSelectedId(1, juce::dontSendNotification);
     addAndMakeVisible(pitchControlModeBox);
     styleUiCombo(pitchControlModeBox);
-    pitchControlModeBox.setTooltip("Global strip pitch behavior: time-preserving shift or playback-rate resample.");
+    pitchControlModeBox.setTooltip("Global strip pitch behavior: legacy pitch shift or playback-rate resample.");
     pitchControlModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
         processor.parameters, "pitchControlMode", pitchControlModeBox);
     
@@ -4465,6 +4469,14 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     momentaryToggle.setTooltip("Monome page buttons are hold-to-temporary when enabled.");
     addAndMakeVisible(momentaryToggle);
     styleUiButton(momentaryToggle);
+
+    soundTouchToggle.setButtonText("SoundTouch");
+    soundTouchToggle.setClickingTogglesState(true);
+    soundTouchToggle.setTooltip("Enable SoundTouch swing warp in Loop/Gate playback.");
+    addAndMakeVisible(soundTouchToggle);
+    styleUiButton(soundTouchToggle);
+    soundTouchEnabledAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+        processor.parameters, "soundTouchEnabled", soundTouchToggle);
     
     crossfadeLengthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
         processor.parameters, "crossfadeLength", crossfadeLengthSlider);
@@ -5002,6 +5014,8 @@ void GlobalControlPanel::resized()
     
     auto titleRow = bounds.removeFromTop(20);  // Smaller title (was 24)
     tooltipsToggle.setBounds(titleRow.removeFromRight(86));
+    titleRow.removeFromRight(6);
+    soundTouchToggle.setBounds(titleRow.removeFromRight(102));
     titleRow.removeFromRight(6);
     momentaryToggle.setBounds(titleRow.removeFromRight(92));
     titleRow.removeFromRight(6);
