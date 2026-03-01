@@ -56,7 +56,7 @@ help:
 	@echo "  make vst3          - Build VST3 only"
 	@echo "  make au            - Build Audio Unit only (macOS)"
 	@echo "  make standalone    - Build standalone app only"
-	@echo "  make install       - Install plugins to system"
+	@echo "  make install       - Install plugins to system (macOS uses /Library)"
 	@echo "  make package-release - Build + package release zips with notices (macOS)"
 	@echo "  make sign-notarize - Sign + notarize VST3/AU (macOS)"
 	@echo "  make clean         - Clean build directory"
@@ -134,16 +134,20 @@ standalone:
 install: build
 	@echo "$(BLUE)Installing plugins...$(NO_COLOR)"
 ifeq ($(DETECTED_OS),Darwin)
-	@echo "$(GREEN)Installing to macOS plugin directories...$(NO_COLOR)"
+	@echo "$(GREEN)Installing to macOS system plugin directories...$(NO_COLOR)"
 	@if [ -d "$(BUILD_DIR)/$(PROJECT_NAME)_artefacts/$(CONFIG)/VST3" ]; then \
-		mkdir -p ~/Library/Audio/Plug-Ins/VST3; \
-		cp -r $(BUILD_DIR)/$(PROJECT_NAME)_artefacts/$(CONFIG)/VST3/*.vst3 ~/Library/Audio/Plug-Ins/VST3/; \
-		echo "$(GREEN)✓ VST3 installed$(NO_COLOR)"; \
+		sudo mkdir -p /Library/Audio/Plug-Ins/VST3; \
+		for bundle in $(BUILD_DIR)/$(PROJECT_NAME)_artefacts/$(CONFIG)/VST3/*.vst3; do \
+			sudo ditto "$$bundle" "/Library/Audio/Plug-Ins/VST3/$$(basename "$$bundle")"; \
+		done; \
+		echo "$(GREEN)✓ VST3 installed to /Library/Audio/Plug-Ins/VST3$(NO_COLOR)"; \
 	fi
 	@if [ -d "$(BUILD_DIR)/$(PROJECT_NAME)_artefacts/$(CONFIG)/AU" ]; then \
-		mkdir -p ~/Library/Audio/Plug-Ins/Components; \
-		cp -r $(BUILD_DIR)/$(PROJECT_NAME)_artefacts/$(CONFIG)/AU/*.component ~/Library/Audio/Plug-Ins/Components/; \
-		echo "$(GREEN)✓ AU installed$(NO_COLOR)"; \
+		sudo mkdir -p /Library/Audio/Plug-Ins/Components; \
+		for bundle in $(BUILD_DIR)/$(PROJECT_NAME)_artefacts/$(CONFIG)/AU/*.component; do \
+			sudo ditto "$$bundle" "/Library/Audio/Plug-Ins/Components/$$(basename "$$bundle")"; \
+		done; \
+		echo "$(GREEN)✓ AU installed to /Library/Audio/Plug-Ins/Components$(NO_COLOR)"; \
 	fi
 else ifeq ($(DETECTED_OS),Linux)
 	@echo "$(GREEN)Installing to Linux plugin directories...$(NO_COLOR)"
@@ -214,4 +218,6 @@ show-artifacts:
 		done; \
 	fi
 	@echo ""
-	@echo "$(YELLOW)Run 'make install' to install plugins to system directories$(NO_COLOR)"
+	@if [ "$(MAKECMDGOALS)" != "install" ]; then \
+		echo "$(YELLOW)Run 'make install' to install plugins to system directories$(NO_COLOR)"; \
+	fi
