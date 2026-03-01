@@ -530,9 +530,12 @@ bool decodeWavBase64ToStrip(const juce::String& base64Data, EnhancedAudioStrip& 
 
 juce::File getPresetDirectory()
 {
-    auto dir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+    auto dir = juce::File::getSpecialLocation(juce::File::userHomeDirectory)
+        .getChildFile("Library")
+        .getChildFile("Audio")
+        .getChildFile("Presets")
         .getChildFile("mlrVST")
-        .getChildFile("Presets");
+        .getChildFile("mlrVST");
     if (!dir.exists())
         dir.createDirectory();
     return dir;

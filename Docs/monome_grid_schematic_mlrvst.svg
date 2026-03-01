@@ -132,20 +132,50 @@
   <text x="90" y="402" class="label">y6</text>
   <text x="90" y="434" class="label">y7</text>
 
-  <!-- Main overview text block -->
-  <text x="680" y="210" class="body">Row y0 (Groups/Patterns/Scratch/Stutter):</text>
-  <text x="700" y="234" class="body">x0..x3 = Group mute/unmute.</text>
-  <text x="700" y="256" class="body">x4..x7 = Pattern record/play (auto-quantized length on stop).</text>
-  <text x="700" y="278" class="body">x8 = Momentary scratch hold.</text>
-  <text x="700" y="300" class="body">x9..x15 = Momentary stutter rates: 1/2, 1/4, 1/8, 1/16, 1/32, 1/64, 1/128.</text>
+  <!-- Main overview callouts (one per function) -->
+  <rect x="680" y="200" width="520" height="28" rx="6" class="callout"/>
+  <text x="694" y="219" class="body">x0..x3 Group mute/unmute</text>
+  <line x1="680" y1="214" x2="170" y2="206" class="arrow" marker-end="url(#arrow)"/>
 
-  <text x="680" y="334" class="body">Rows y1..y6 (Strip rows):</text>
-  <text x="700" y="358" class="body">x0..x15 = Slice/step triggers. Hold first then press second = inner loop.</text>
-  <text x="700" y="380" class="body">If second &lt; first, inner loop plays reverse. Exit returns to normal playback.</text>
+  <rect x="680" y="232" width="520" height="28" rx="6" class="callout"/>
+  <text x="694" y="251" class="body">x4..x7 Pattern record/play/stop</text>
+  <line x1="680" y1="246" x2="298" y2="206" class="arrow" marker-end="url(#arrow)"/>
 
-  <text x="680" y="414" class="body">Row y7 (Control row):</text>
-  <text x="700" y="438" class="body">x0..x12 = Control page buttons (Speed, Pitch, Pan, Volume, Grain, Filter, Swing, Gate, Browser, Group, Mod, Preset, Step).</text>
-  <text x="700" y="460" class="body">x13/x14 = Step Edit pitch -/+ semitone (only in Step Edit). x15 = Quantize toggle.</text>
+  <rect x="680" y="264" width="520" height="28" rx="6" class="callout"/>
+  <text x="694" y="283" class="body">x8 Momentary scratch hold</text>
+  <line x1="680" y1="278" x2="402" y2="206" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="680" y="296" width="520" height="28" rx="6" class="callout"/>
+  <text x="694" y="315" class="body">x9..x15 Momentary stutter rates (1/2 → 1/128)</text>
+  <line x1="680" y1="310" x2="520" y2="206" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="680" y="332" width="520" height="28" rx="6" class="callout"/>
+  <text x="694" y="351" class="body">y1..y6 Strip triggers (slice/step)</text>
+  <line x1="680" y1="346" x2="170" y2="270" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="680" y="364" width="520" height="28" rx="6" class="callout"/>
+  <text x="694" y="383" class="body">Hold first then press second = inner loop</text>
+  <line x1="680" y1="378" x2="330" y2="302" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="680" y="396" width="520" height="28" rx="6" class="callout"/>
+  <text x="694" y="415" class="body">Second &lt; first = inner loop reverse</text>
+  <line x1="680" y1="410" x2="330" y2="334" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="680" y="432" width="520" height="28" rx="6" class="callout"/>
+  <text x="694" y="451" class="body">y7 x0..x12 Control pages (Speed→Step)</text>
+  <line x1="680" y1="446" x2="200" y2="430" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="680" y="464" width="520" height="28" rx="6" class="callout"/>
+  <text x="694" y="483" class="body">y7 x13 Step Edit pitch -1 semitone</text>
+  <line x1="680" y1="478" x2="545" y2="430" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="680" y="496" width="520" height="28" rx="6" class="callout"/>
+  <text x="694" y="515" class="body">y7 x14 Step Edit pitch +1 semitone</text>
+  <line x1="680" y1="510" x2="577" y2="430" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="680" y="528" width="520" height="28" rx="6" class="callout"/>
+  <text x="694" y="547" class="body">y7 x15 Quantize toggle</text>
+  <line x1="680" y1="542" x2="610" y2="430" class="arrow" marker-end="url(#arrow)"/>
 
   <!-- Mode color legend -->
   <rect x="680" y="490" width="1120" height="58" rx="8" class="callout"/>
@@ -163,7 +193,7 @@
   <rect x="1650" y="504" width="14" height="14" class="modePreset"/><text x="1670" y="516" class="tiny">Preset</text>
   <rect x="1750" y="504" width="14" height="14" class="modeStep"/><text x="1770" y="516" class="tiny">Step</text>
 
-  <text x="90" y="570" class="body">Notes: Control pages are reorderable. Step Edit tools live on y0 and use full grid for step editing.</text>
+  <text x="90" y="590" class="body">Notes: Control pages are reorderable. Step Edit tools live on y0 and use full grid for step editing.</text>
 
   <!-- Special pages section header -->
   <text x="90" y="790" class="section">B) Special Pages (Full 16x8 Grids)</text>
@@ -218,24 +248,58 @@
     <line x1="110" y1="1130" x2="590" y2="1130"/>
   </g>
 
-  <!-- Step Edit callouts -->
-  <rect x="650" y="900" width="470" height="72" rx="8" class="callout"/>
-  <text x="670" y="924" class="body">y0 tools: x0 Velocity, x1 Divide, x2 RampUp, x3 RampDown, x4 Probability,</text>
-  <text x="670" y="946" class="body">x5 Attack, x6 Decay, x7 Release (Pitch tool).</text>
-  <line x1="650" y1="905" x2="230" y2="905" class="arrow" marker-end="url(#arrow)"/>
+  <!-- Step Edit callouts (one per function) -->
+  <rect x="620" y="900" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="918" class="body">x0 Velocity tool</text>
+  <line x1="620" y1="913" x2="125" y2="905" class="arrow" marker-end="url(#arrow)"/>
 
-  <rect x="650" y="980" width="470" height="58" rx="8" class="callout"/>
-  <text x="670" y="1004" class="body">y0 strip select: x8..x13 (banked by 6). x14/x15 = bank -/+.</text>
-  <line x1="650" y1="965" x2="440" y2="905" class="arrow" marker-end="url(#arrow)"/>
-  <line x1="650" y1="975" x2="560" y2="905" class="arrow" marker-end="url(#arrow)"/>
+  <rect x="620" y="928" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="946" class="body">x1 Divide tool</text>
+  <line x1="620" y1="941" x2="155" y2="905" class="arrow" marker-end="url(#arrow)"/>
 
-  <rect x="650" y="1048" width="470" height="58" rx="8" class="callout"/>
-  <text x="670" y="1072" class="body">y1..y6: steps for selected strip. x0..x15 = step index.</text>
-  <line x1="650" y1="1035" x2="350" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+  <rect x="620" y="956" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="974" class="body">x2 Ramp+ tool</text>
+  <line x1="620" y1="969" x2="185" y2="905" class="arrow" marker-end="url(#arrow)"/>
 
-  <rect x="650" y="1114" width="470" height="58" rx="8" class="callout"/>
-  <text x="670" y="1138" class="body">y7 control row: page buttons; x13/x14 pitch -/+ semitone; x15 quantize.</text>
-  <line x1="650" y1="1110" x2="350" y2="1115" class="arrow" marker-end="url(#arrow)"/>
+  <rect x="620" y="984" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1002" class="body">x3 Ramp- tool</text>
+  <line x1="620" y1="997" x2="215" y2="905" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1012" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1030" class="body">x4 Probability tool</text>
+  <line x1="620" y1="1025" x2="245" y2="905" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1040" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1058" class="body">x5 Attack tool</text>
+  <line x1="620" y1="1053" x2="275" y2="905" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1068" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1086" class="body">x6 Decay tool</text>
+  <line x1="620" y1="1081" x2="305" y2="905" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1096" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1114" class="body">x7 Pitch tool</text>
+  <line x1="620" y1="1109" x2="335" y2="905" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1124" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1142" class="body">x8..x13 Select strip for step edit</text>
+  <line x1="620" y1="1137" x2="470" y2="905" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1152" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1170" class="body">x14 Strip bank -</text>
+  <line x1="620" y1="1165" x2="545" y2="905" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1180" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1198" class="body">x15 Strip bank +</text>
+  <line x1="620" y1="1193" x2="575" y2="905" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1208" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1226" class="body">y1..y6 Step grid (x0..x15 = step index)</text>
+  <line x1="620" y1="1221" x2="350" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1236" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1254" class="body">Velocity tool: bottom row disables step</text>
+  <line x1="620" y1="1249" x2="350" y2="1075" class="arrow" marker-end="url(#arrow)"/>
 
   <!-- Group page card -->
   <rect x="1220" y="820" width="1120" height="520" rx="12" class="cardStrong"/>
@@ -286,17 +350,62 @@
     <line x1="1270" y1="1130" x2="1750" y2="1130"/>
   </g>
 
-  <rect x="1810" y="900" width="470" height="58" rx="8" class="callout"/>
-  <text x="1830" y="924" class="body">Per strip row: x0 = No group. x1..x4 = Assign to group 1..4.</text>
-  <line x1="1810" y1="905" x2="1345" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+  <!-- Group page callouts (one per function) -->
+  <rect x="1780" y="900" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="918" class="body">x0 Ungroup</text>
+  <line x1="1780" y1="913" x2="1285" y2="1010" class="arrow" marker-end="url(#arrow)"/>
 
-  <rect x="1810" y="968" width="470" height="58" rx="8" class="callout"/>
-  <text x="1830" y="992" class="body">x6..x11 = Direction: Normal, Reverse, PingPong, Random, RandomWalk, RandomSlice.</text>
-  <line x1="1810" y1="970" x2="1540" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+  <rect x="1780" y="928" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="946" class="body">x1 Group 1</text>
+  <line x1="1780" y1="941" x2="1315" y2="1010" class="arrow" marker-end="url(#arrow)"/>
 
-  <rect x="1810" y="1036" width="470" height="58" rx="8" class="callout"/>
-  <text x="1830" y="1060" class="body">x13..x15 = Play mode: Loop, Step, Grain. (x5/x12 are visual spacers.)</text>
-  <line x1="1810" y1="1035" x2="1705" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+  <rect x="1780" y="956" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="974" class="body">x2 Group 2</text>
+  <line x1="1780" y1="969" x2="1345" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="1780" y="984" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="1002" class="body">x3 Group 3</text>
+  <line x1="1780" y1="997" x2="1375" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="1780" y="1012" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="1030" class="body">x4 Group 4</text>
+  <line x1="1780" y1="1025" x2="1405" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="1780" y="1040" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="1058" class="body">x6 Direction: Normal</text>
+  <line x1="1780" y1="1053" x2="1465" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="1780" y="1068" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="1086" class="body">x7 Direction: Reverse</text>
+  <line x1="1780" y1="1081" x2="1495" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="900" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="918" class="body">x8 Direction: PingPong</text>
+  <line x1="2060" y1="913" x2="1525" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="928" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="946" class="body">x9 Direction: Random</text>
+  <line x1="2060" y1="941" x2="1555" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="956" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="974" class="body">x10 Direction: Rnd Walk</text>
+  <line x1="2060" y1="969" x2="1585" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="984" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="1002" class="body">x11 Direction: Rnd Slice</text>
+  <line x1="2060" y1="997" x2="1615" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="1012" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="1030" class="body">x13 Play mode: Loop</text>
+  <line x1="2060" y1="1025" x2="1675" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="1040" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="1058" class="body">x14 Play mode: Step</text>
+  <line x1="2060" y1="1053" x2="1705" y2="1010" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="1068" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="1086" class="body">x15 Play mode: Grain</text>
+  <line x1="2060" y1="1081" x2="1735" y2="1010" class="arrow" marker-end="url(#arrow)"/>
 
   <!-- Mod page card -->
   <rect x="60" y="1380" width="1120" height="520" rx="12" class="cardStrong"/>
@@ -347,14 +456,30 @@
     <line x1="110" y1="1690" x2="590" y2="1690"/>
   </g>
 
-  <rect x="650" y="1460" width="470" height="58" rx="8" class="callout"/>
-  <text x="670" y="1484" class="body">y0: x11/x12 = page -/+; x13..x15 = mod slot select (A/B/C).</text>
-  <line x1="650" y1="1465" x2="470" y2="1465" class="arrow" marker-end="url(#arrow)"/>
-  <line x1="650" y1="1475" x2="545" y2="1465" class="arrow" marker-end="url(#arrow)"/>
+  <!-- Modulation callouts (one per function) -->
+  <rect x="620" y="1460" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1478" class="body">x11 Mod page -</text>
+  <line x1="620" y1="1473" x2="455" y2="1465" class="arrow" marker-end="url(#arrow)"/>
 
-  <rect x="650" y="1528" width="470" height="58" rx="8" class="callout"/>
-  <text x="670" y="1552" class="body">y1..y6: x = step index; y = value. Bipolar mode maps center row to 0.</text>
-  <line x1="650" y1="1535" x2="350" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+  <rect x="620" y="1488" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1506" class="body">x12 Mod page +</text>
+  <line x1="620" y1="1501" x2="485" y2="1465" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1516" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1534" class="body">x13 Mod slot A</text>
+  <line x1="620" y1="1529" x2="515" y2="1465" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1544" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1562" class="body">x14 Mod slot B</text>
+  <line x1="620" y1="1557" x2="545" y2="1465" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1572" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1590" class="body">x15 Mod slot C</text>
+  <line x1="620" y1="1585" x2="575" y2="1465" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="1600" width="520" height="26" rx="6" class="callout"/>
+  <text x="634" y="1618" class="body">y1..y6 Mod values (center row = 0 in bipolar)</text>
+  <line x1="620" y1="1613" x2="350" y2="1570" class="arrow" marker-end="url(#arrow)"/>
 
   <!-- Browser page card -->
   <rect x="1220" y="1380" width="1120" height="520" rx="12" class="cardStrong"/>
@@ -406,15 +531,58 @@
     <line x1="1270" y1="1690" x2="1750" y2="1690"/>
   </g>
 
-  <rect x="1810" y="1460" width="470" height="58" rx="8" class="callout"/>
-  <text x="1830" y="1484" class="body">Per strip row: x0 Prev, x1 Next. x3..x8 = Favorites (hold to store).</text>
-  <line x1="1810" y1="1465" x2="1300" y2="1570" class="arrow" marker-end="url(#arrow)"/>
-  <line x1="1810" y1="1475" x2="1450" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+  <!-- Browser callouts (one per function) -->
+  <rect x="1780" y="1460" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="1478" class="body">x0 Prev sample</text>
+  <line x1="1780" y1="1473" x2="1285" y2="1570" class="arrow" marker-end="url(#arrow)"/>
 
-  <rect x="1810" y="1528" width="470" height="58" rx="8" class="callout"/>
-  <text x="1830" y="1552" class="body">x11..x14 = Bars (1,2,4,8). x15 = Capture recent audio.</text>
-  <line x1="1810" y1="1535" x2="1660" y2="1570" class="arrow" marker-end="url(#arrow)"/>
-  <line x1="1810" y1="1545" x2="1735" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+  <rect x="1780" y="1488" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="1506" class="body">x1 Next sample</text>
+  <line x1="1780" y1="1501" x2="1315" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="1780" y="1516" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="1534" class="body">x3 Favorite 1</text>
+  <line x1="1780" y1="1529" x2="1375" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="1780" y="1544" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="1562" class="body">x4 Favorite 2</text>
+  <line x1="1780" y1="1557" x2="1405" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="1780" y="1572" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="1590" class="body">x5 Favorite 3</text>
+  <line x1="1780" y1="1585" x2="1435" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="1780" y="1600" width="250" height="26" rx="6" class="callout"/>
+  <text x="1794" y="1618" class="body">x6 Favorite 4</text>
+  <line x1="1780" y1="1613" x2="1465" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="1460" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="1478" class="body">x7 Favorite 5</text>
+  <line x1="2060" y1="1473" x2="1495" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="1488" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="1506" class="body">x8 Favorite 6</text>
+  <line x1="2060" y1="1501" x2="1525" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="1516" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="1534" class="body">x11 Record 1 bar</text>
+  <line x1="2060" y1="1529" x2="1615" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="1544" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="1562" class="body">x12 Record 2 bars</text>
+  <line x1="2060" y1="1557" x2="1645" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="1572" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="1590" class="body">x13 Record 4 bars</text>
+  <line x1="2060" y1="1585" x2="1675" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="1600" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="1618" class="body">x14 Record 8 bars</text>
+  <line x1="2060" y1="1613" x2="1705" y2="1570" class="arrow" marker-end="url(#arrow)"/>
+
+  <rect x="2060" y="1628" width="250" height="26" rx="6" class="callout"/>
+  <text x="2074" y="1646" class="body">x15 Capture recent input</text>
+  <line x1="2060" y1="1641" x2="1735" y2="1570" class="arrow" marker-end="url(#arrow)"/>
 
   <!-- Footer -->
   <text x="60" y="2140" class="muted">Based on current code: MonomeController, MonomeGroupAssignActions, MonomeFileBrowserActions.</text>

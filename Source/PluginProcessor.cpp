@@ -98,17 +98,6 @@ juce::File getGlobalSettingsFile()
     return presetsRoot.getChildFile("GlobalSettings.xml");
 }
 
-juce::File getGlobalSettingsFileFallback()
-{
-    auto presetsRoot = juce::File::getSpecialLocation(juce::File::userHomeDirectory)
-        .getChildFile("Library")
-        .getChildFile("Audio")
-        .getChildFile("Presets")
-        .getChildFile("Subsonance")
-        .getChildFile("mlrVST");
-    return presetsRoot.getChildFile("GlobalSettings.xml");
-}
-
 juce::File getLegacyGlobalSettingsFile()
 {
     return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
@@ -138,13 +127,6 @@ std::unique_ptr<juce::XmlElement> loadGlobalSettingsXml()
             return xml;
     }
 
-    auto fallbackFile = getGlobalSettingsFileFallback();
-    if (fallbackFile.existsAsFile())
-    {
-        if (auto xml = juce::XmlDocument::parse(fallbackFile))
-            return xml;
-    }
-
     auto legacySettingsFile = getLegacyGlobalSettingsFile();
     if (legacySettingsFile.existsAsFile())
     {
@@ -167,18 +149,11 @@ void saveGlobalSettingsXml(const juce::XmlElement& xml)
         settingsDir.createDirectory();
     xml.writeTo(settingsFile);
 
-    auto fallbackFile = getGlobalSettingsFileFallback();
-    auto fallbackDir = fallbackFile.getParentDirectory();
-    if (!fallbackDir.exists())
-        fallbackDir.createDirectory();
-    if (fallbackFile != settingsFile)
-        xml.writeTo(fallbackFile);
-
     auto legacyFile = getLegacyGlobalSettingsFile();
     auto legacyDir = legacyFile.getParentDirectory();
     if (!legacyDir.exists())
         legacyDir.createDirectory();
-    if (legacyFile != settingsFile && legacyFile != fallbackFile)
+    if (legacyFile != settingsFile)
         xml.writeTo(legacyFile);
 
     juce::PropertiesFile legacyProps(getLegacySettingsOptions());
@@ -198,9 +173,7 @@ void appendGlobalSettingsDiagnostic(const juce::String& tag, const juce::XmlElem
     stream.setPosition(diagFile.getSize());
     stream << "=== " << tag << " @ " << juce::Time::getCurrentTime().toString(true, true) << " ===\n";
     stream << "Path: " << getGlobalSettingsFile().getFullPathName() << "\n";
-    stream << "Fallback: " << getGlobalSettingsFileFallback().getFullPathName() << "\n";
     stream << "Exists: " << (getGlobalSettingsFile().existsAsFile() ? "yes" : "no") << "\n";
-    stream << "Fallback exists: " << (getGlobalSettingsFileFallback().existsAsFile() ? "yes" : "no") << "\n";
     if (xml != nullptr)
         stream << "XML: " << xml->toString() << "\n";
     stream << "\n";
