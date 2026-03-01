@@ -46,7 +46,7 @@ void handleButtonRelease(MlrVSTAudioProcessor& processor, EnhancedAudioStrip& st
         processor.endBrowserFavoritePadHold(stripIndex, x - kFavoriteFirstButton);
 }
 
-void renderRow(const MlrVSTAudioProcessor& processor, const ModernAudioEngine& engine, const EnhancedAudioStrip& strip, int stripIndex, int y, int newLedState[16][8])
+void renderRow(const MlrVSTAudioProcessor& processor, const ModernAudioEngine& engine, const EnhancedAudioStrip& strip, int stripIndex, int y, int newLedState[16][16])
 {
     // File browser controls (always visible)
     newLedState[kPrevButton][y] = 8;  // Prev

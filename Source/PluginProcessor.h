@@ -148,7 +148,8 @@ private:
  * MlrVSTAudioProcessor - Main plugin processor
  */
 class MlrVSTAudioProcessor : public juce::AudioProcessor,
-                             public juce::Timer
+                             public juce::Timer,
+                             public juce::AudioProcessorValueTreeState::Listener
 {
 public:
     MlrVSTAudioProcessor();
@@ -161,6 +162,7 @@ public:
     bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
 
     void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+    void parameterChanged(const juce::String& parameterID, float newValue) override;
 
     //==============================================================================
     juce::AudioProcessorEditor* createEditor() override;
@@ -180,6 +182,9 @@ public:
     void setCurrentProgram(int index) override;
     const juce::String getProgramName(int index) override;
     void changeProgramName(int index, const juce::String& newName) override;
+
+    void markPersistentGlobalUserChange();
+    void queuePersistentGlobalControlsSave();
 
     //==============================================================================
     void getStateInformation(juce::MemoryBlock& destData) override;
@@ -280,6 +285,10 @@ public:
         }
     }
     int getStepEditSelectedStrip() const { return juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip); }
+    int getMonomeGridWidth() const;
+    int getMonomeGridHeight() const;
+    int getMonomeControlRow() const;
+    int getMonomeActiveStripCount() const;
     
     // Preset management
     void savePreset(int presetIndex);
@@ -299,6 +308,8 @@ public:
     
     static constexpr int MaxStrips = ModernAudioEngine::MaxStrips;
     static constexpr int MaxColumns = 16;
+    static constexpr int MaxGridWidth = 16;
+    static constexpr int MaxGridHeight = 16;
 
 private:
     //==============================================================================
@@ -374,6 +385,7 @@ private:
     std::array<std::atomic<float>*, MaxStrips> stripPanParams{};
     std::array<std::atomic<float>*, MaxStrips> stripSpeedParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPitchParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripSliceLengthParams{};
     juce::CriticalSection pendingLoopChangeLock;
     std::array<PendingLoopChange, MaxStrips> pendingLoopChanges{};
     juce::CriticalSection pendingBarChangeLock;
@@ -384,7 +396,6 @@ private:
     ControlMode currentControlMode = ControlMode::Normal;
     bool controlModeActive = false;  // True when control button is held
     FilterSubPage filterSubPage = FilterSubPage::Frequency;  // Current filter sub-page
-    bool quantizeEnabled = true;
     std::atomic<int> lastMonomePressedStripRow{0};
     mutable juce::CriticalSection controlPageOrderLock;
     ControlPageOrder controlPageOrder {
@@ -404,6 +415,7 @@ private:
     };
     StepEditTool stepEditTool = StepEditTool::Gate;
     int stepEditSelectedStrip = 0;
+    int stepEditStripBank = 0;
     std::array<bool, MaxColumns> stepEditVelocityGestureActive{};
     std::array<int, MaxColumns> stepEditVelocityGestureStrip{};
     std::array<int, MaxColumns> stepEditVelocityGestureStep{};
@@ -417,13 +429,23 @@ private:
     int lastAppliedSoundTouchEnabled = -1; // -1 = force initial sync on first process block
     
     // LED state cache to prevent flickering
-    int ledCache[16][8] = {{0}};
+    int ledCache[MaxGridWidth][MaxGridHeight] = {{0}};
     
     // Last loaded folder for file browsing
     juce::File lastSampleFolder;
     std::array<juce::File, MaxStrips> defaultLoopDirectories;
     std::array<juce::File, MaxStrips> defaultStepDirectories;
     std::array<juce::File, BrowserFavoriteSlots> browserFavoriteDirectories;
+    std::atomic<int> persistentGlobalControlsDirty{0};
+    std::atomic<int> suppressPersistentGlobalControlsSave{0};
+    std::atomic<int> persistentGlobalControlsSaveQueued{0};
+    juce::int64 lastPersistentGlobalControlsSaveMs = 0;
+    bool persistentGlobalControlsApplied = false;
+    std::atomic<int> pendingPersistentGlobalControlsRestore{0};
+    juce::int64 pendingPersistentGlobalControlsRestoreMs = 0;
+    int pendingPersistentGlobalControlsRestoreRemaining = 0;
+    std::atomic<int> persistentGlobalControlsReady{0};
+    std::atomic<int> persistentGlobalUserTouched{0};
     std::array<std::array<bool, BrowserFavoriteSlots>, MaxStrips> browserFavoritePadHeld{};
     std::array<std::array<bool, BrowserFavoriteSlots>, MaxStrips> browserFavoritePadHoldSaveTriggered{};
     std::array<std::array<uint32_t, BrowserFavoriteSlots>, MaxStrips> browserFavoritePadPressStartMs{};
@@ -441,7 +463,7 @@ private:
     static constexpr uint32_t browserFavoriteMissingBurstDurationMs = 260;
     
     // Current file per strip for proper next/prev browsing
-    juce::File currentStripFiles[8];
+    std::array<juce::File, MaxStrips> currentStripFiles;
     
     // LED update
     void updateMonomeLEDs();
@@ -467,10 +489,12 @@ private:
     void appendDefaultPathsToState(juce::ValueTree& state) const;
     void loadControlPagesFromState(const juce::ValueTree& state);
     void appendControlPagesToState(juce::ValueTree& state) const;
+    void stripPersistentGlobalControlsFromState(juce::ValueTree& state) const;
     void loadPersistentDefaultPaths();
     void savePersistentDefaultPaths() const;
     void loadPersistentControlPages();
     void savePersistentControlPages() const;
+    void loadPersistentGlobalControls();
     int getQuantizeDivision() const;
     float getInnerLoopLengthFactor() const;
     void queueLoopChange(int stripIndex, bool clearLoop, int startColumn, int endColumn, bool reverseDirection, int markerColumn = -1);
@@ -509,21 +533,28 @@ private:
 
     // Row 0, cols 9..15: PPQ stutter-hold with fixed divisions.
     bool momentaryStutterHoldActive = false;
-    double momentaryStutterDivisionBeats = 1.0; // 1.0=1/4 ... 0.0625=1/64
+    double momentaryStutterDivisionBeats = 1.0; // one-button map spans 2.0 (1/2) ... 0.03125 (1/128)
     int momentaryStutterActiveDivisionButton = -1;
     std::atomic<uint8_t> momentaryStutterButtonMask{0};
     std::array<bool, MaxStrips> momentaryStutterStripArmed{};
     struct MomentaryStutterSavedStripState
     {
         bool valid = false;
+        bool stepMode = false;
         float pan = 0.0f;
         float playbackSpeed = 1.0f;
+        float pitchSemitones = 0.0f;
         float pitchShift = 0.0f;
+        float loopSliceLength = 1.0f;
         bool filterEnabled = false;
         float filterFrequency = 20000.0f;
         float filterResonance = 0.707f;
         float filterMorph = 0.0f;
         EnhancedAudioStrip::FilterAlgorithm filterAlgorithm = EnhancedAudioStrip::FilterAlgorithm::Tpt12;
+        bool stepFilterEnabled = false;
+        float stepFilterFrequency = 1000.0f;
+        float stepFilterResonance = 0.7f;
+        FilterType stepFilterType = FilterType::LowPass;
     };
     std::array<MomentaryStutterSavedStripState, MaxStrips> momentaryStutterSavedState{};
     bool momentaryStutterMacroBaselineCaptured = false;
@@ -536,6 +567,7 @@ private:
     std::atomic<int> pendingStutterStartActive{0};
     std::atomic<double> pendingStutterStartPpq{-1.0};
     std::atomic<double> pendingStutterStartDivisionBeats{1.0};
+    std::atomic<int> pendingStutterStartQuantizeDivision{8};
     std::atomic<int64_t> pendingStutterStartSampleTarget{-1};
     std::atomic<int> pendingStutterReleaseActive{0};
     std::atomic<double> pendingStutterReleasePpq{-1.0};
@@ -562,4 +594,5 @@ private:
     std::atomic<int> presetSaveJobsInFlight{0};
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MlrVSTAudioProcessor)
+    JUCE_DECLARE_WEAK_REFERENCEABLE(MlrVSTAudioProcessor)
 };

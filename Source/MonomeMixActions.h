@@ -14,7 +14,7 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
 void renderRow(const EnhancedAudioStrip& strip,
                const MlrVSTAudioProcessor& processor,
                int y,
-               int newLedState[16][8],
+               int newLedState[16][16],
                int mode);
 
 void handleGrainPageButtonPress(EnhancedAudioStrip& targetStrip,
@@ -24,5 +24,5 @@ void handleGrainPageButtonPress(EnhancedAudioStrip& targetStrip,
 void renderGrainPageRow(const EnhancedAudioStrip& targetStrip,
                         int controlRow,
                         int y,
-                        int newLedState[16][8]);
+                        int newLedState[16][16]);
 } // namespace MonomeMixActions

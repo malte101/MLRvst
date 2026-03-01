@@ -55,7 +55,7 @@ bool handleButtonPress(ModernAudioEngine& audioEngine, int stripIndex, int x)
     return false;
 }
 
-void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][8])
+void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][16])
 {
     int currentGroup = strip.getGroup();
 

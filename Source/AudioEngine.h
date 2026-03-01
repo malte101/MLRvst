@@ -442,7 +442,8 @@ public:
     void trigger(int column, double tempo, bool quantized = false);
     void triggerAtSample(int column, double tempo, int64_t globalSample, 
                         const juce::AudioPlayHead::PositionInfo& positionInfo,
-                        bool stutterRetrigger = false);  // Sample-accurate trigger with PPQ sync
+                        bool stutterRetrigger = false,
+                        double stutterOffsetRatioOverride = -1.0);  // Sample-accurate trigger with PPQ sync
     void stop(bool immediate = false);
     void syncToGlobalPhase(double globalPhase, double tempo);  // NEW: Sync playback to global clock
     void calculatePositionFromGlobalSample(int64_t globalSample, double tempo);  // Calculate from global clock
@@ -519,6 +520,15 @@ public:
     {
         momentaryStutterTimingActive.store(active ? 1 : 0, std::memory_order_release);
     }
+    void setMomentaryStutterDivisionBeats(double beats)
+    {
+        momentaryStutterDivisionForFadeBeats.store(
+            juce::jlimit(0.03125, 4.0, beats), std::memory_order_release);
+    }
+    void setMomentaryStutterRetriggerFadeMs(float fadeMs)
+    {
+        momentaryStutterRetriggerFadeMs.store(juce::jlimit(0.1f, 3.0f, fadeMs), std::memory_order_release);
+    }
     void setPitchSmoothingTime(float seconds);  // Update speed smoothing ramp time (0-1 seconds)
     float getPlaybackSpeed() const { return static_cast<float>(playbackSpeed.load()); }
     float getDisplaySpeed() const { return displaySpeedAtomic.load(std::memory_order_acquire); }
@@ -563,6 +573,11 @@ public:
     bool isButtonHeld() const { return buttonHeld; }
     int getHeldButton() const { return heldButton; }
     int getHeldButtonCount() const { return static_cast<int>(heldButtons.size()); }
+    bool isButtonHeld(int column) const
+    {
+        const int clamped = juce::jlimit(0, 15, column);
+        return heldButtons.count(clamped) > 0;
+    }
     bool isScratchActive() const { return scrubActive || tapeStopActive || scratchGestureActive; }
     bool isGrainFreezeActive() const;
     int getGrainAnchorColumn() const;
@@ -648,6 +663,9 @@ public:
     { 
         PlayMode oldMode = playMode;
         playMode = mode;
+        playheadTraversalRatioAtLastCalc = -1.0;
+        playheadTraversalPhaseOffsetSlices = 0.0;
+        playheadTraversalSliceCountAtLastCalc = -1;
 
         // Switching INTO step mode while transport is already running must
         // immediately arm step playback; waiting for a new transport edge
@@ -668,6 +686,7 @@ public:
             stepSubdivisionTriggerIndex = 0;
             stepSubdivisionGateOpen = true;
             stepTraversalRatioAtLastTick = -1.0;
+            stepTraversalPhaseOffsetTicks = 0.0;
 
             // If the strip already has loop sample content but step sampler
             // is empty, bootstrap step mode from that content.
@@ -721,6 +740,7 @@ public:
             stepSubdivisionTriggerIndex = 0;
             stepSubdivisionGateOpen = true;
             stepTraversalRatioAtLastTick = -1.0;
+            stepTraversalPhaseOffsetTicks = 0.0;
             scrubActive = false;
             tapeStopActive = false;
             scratchGestureActive = false;
@@ -759,6 +779,8 @@ public:
     
     // LED feedback
     int getCurrentColumn() const;
+    int getStutterEntryColumn() const;
+    double getStutterEntryOffsetRatio() const;
     std::array<bool, 16> getLEDStates() const;
     
     // Resampler access
@@ -845,6 +867,9 @@ private:
     std::atomic<double> playbackPosition{0.0};
     std::atomic<float> playheadSpeedRatio{1.0f}; // Playmarker traversal multiplier (quantized musical ratios)
     std::atomic<double> playbackSpeed{1.0};
+    double playheadTraversalRatioAtLastCalc = -1.0;
+    double playheadTraversalPhaseOffsetSlices = 0.0;
+    int playheadTraversalSliceCountAtLastCalc = -1;
     std::atomic<float> displaySpeedAtomic{1.0f};
     std::atomic<bool> playing{false};
     std::atomic<bool> pendingTrigger{false};
@@ -920,6 +945,8 @@ private:
     double lastObservedTempo = 120.0;
     bool speedPpqBypassActive = false;
     std::atomic<int> momentaryStutterTimingActive{0};
+    std::atomic<double> momentaryStutterDivisionForFadeBeats{0.5};
+    std::atomic<float> momentaryStutterRetriggerFadeMs{0.7f};
     double stopLoopPosition = 0.0;    // Position in loop when stopped (for visual sync)
     bool lastHostPlayingState = true; // Track host transport state changes (start true to detect first stop)
     bool wasPlayingBeforeStop = false; // Track if strip was playing when host stopped (for auto-resume)
@@ -1061,6 +1088,7 @@ private:
     int stepSubdivisionTriggerIndex = 0;
     bool stepSubdivisionGateOpen = true;
     double stepTraversalRatioAtLastTick = -1.0;
+    double stepTraversalPhaseOffsetTicks = 0.0;
     
 public:
     
@@ -1156,7 +1184,7 @@ public:
 class ModernAudioEngine
 {
 public:
-    static constexpr int MaxStrips = 6;
+    static constexpr int MaxStrips = 14;
     static constexpr int MaxColumns = 16;
     static constexpr int MaxGroups = 4;
     static constexpr int MaxPatterns = 4;
@@ -1253,7 +1281,8 @@ public:
     void setMomentaryStutterActive(bool enabled);
     void setMomentaryStutterDivision(double beats);
     void setMomentaryStutterStartPpq(double ppq);
-    void setMomentaryStutterStrip(int stripIndex, int column, bool enabled);
+    void setMomentaryStutterRetriggerFadeMs(float fadeMs);
+    void setMomentaryStutterStrip(int stripIndex, int column, double offsetRatio, bool enabled);
     void clearMomentaryStutterStrips();
     void clearPendingQuantizedTriggersForStrip(int stripIndex);
     
@@ -1400,6 +1429,7 @@ private:
     std::atomic<double> momentaryStutterStartPpq{0.0};
     std::array<std::atomic<int>, MaxStrips> momentaryStutterStripEnabled{};
     std::array<std::atomic<int>, MaxStrips> momentaryStutterColumns{};
+    std::array<std::atomic<double>, MaxStrips> momentaryStutterOffsetRatios{};
     std::array<std::atomic<double>, MaxStrips> momentaryStutterNextPpq{};
     std::unique_ptr<LiveRecorder> liveRecorder;
     

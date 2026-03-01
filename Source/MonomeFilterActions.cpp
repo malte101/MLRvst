@@ -79,7 +79,7 @@ void handleButtonPress(EnhancedAudioStrip& strip, int x, int subPage)
     }
 }
 
-void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][8], int subPage)
+void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][16], int subPage)
 {
     const bool isStepMode = (strip.playMode == EnhancedAudioStrip::PlayMode::Step);
     auto* stepSampler = isStepMode ? const_cast<EnhancedAudioStrip&>(strip).getStepSampler() : nullptr;
@@ -149,4 +149,3 @@ void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][8], i
     }
 }
 } // namespace MonomeFilterActions
-

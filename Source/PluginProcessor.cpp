@@ -85,11 +85,154 @@ bool controlModeFromKey(const juce::String& key, MlrVSTAudioProcessor::ControlMo
     return false;
 }
 
+constexpr const char* kGlobalSettingsKey = "GlobalSettingsXml";
+
 juce::File getGlobalSettingsFile()
+{
+    auto presetsRoot = juce::File::getSpecialLocation(juce::File::userHomeDirectory)
+        .getChildFile("Library")
+        .getChildFile("Audio")
+        .getChildFile("Presets")
+        .getChildFile("mlrVST")
+        .getChildFile("mlrVST");
+    return presetsRoot.getChildFile("GlobalSettings.xml");
+}
+
+juce::File getGlobalSettingsFileFallback()
+{
+    auto presetsRoot = juce::File::getSpecialLocation(juce::File::userHomeDirectory)
+        .getChildFile("Library")
+        .getChildFile("Audio")
+        .getChildFile("Presets")
+        .getChildFile("Subsonance")
+        .getChildFile("mlrVST");
+    return presetsRoot.getChildFile("GlobalSettings.xml");
+}
+
+juce::File getLegacyGlobalSettingsFile()
 {
     return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
         .getChildFile("mlrVST")
         .getChildFile("GlobalSettings.xml");
+}
+
+juce::PropertiesFile::Options getLegacySettingsOptions()
+{
+    juce::PropertiesFile::Options options;
+    options.applicationName = "mlrVST";
+    options.filenameSuffix = "settings";
+    options.folderName = "";
+    options.osxLibrarySubFolder = "Application Support";
+    options.commonToAllUsers = false;
+    options.ignoreCaseOfKeyNames = false;
+    options.storageFormat = juce::PropertiesFile::storeAsXML;
+    return options;
+}
+
+std::unique_ptr<juce::XmlElement> loadGlobalSettingsXml()
+{
+    auto settingsFile = getGlobalSettingsFile();
+    if (settingsFile.existsAsFile())
+    {
+        if (auto xml = juce::XmlDocument::parse(settingsFile))
+            return xml;
+    }
+
+    auto fallbackFile = getGlobalSettingsFileFallback();
+    if (fallbackFile.existsAsFile())
+    {
+        if (auto xml = juce::XmlDocument::parse(fallbackFile))
+            return xml;
+    }
+
+    auto legacySettingsFile = getLegacyGlobalSettingsFile();
+    if (legacySettingsFile.existsAsFile())
+    {
+        if (auto xml = juce::XmlDocument::parse(legacySettingsFile))
+            return xml;
+    }
+
+    juce::PropertiesFile legacyProps(getLegacySettingsOptions());
+    if (legacyProps.isValidFile())
+        return legacyProps.getXmlValue(kGlobalSettingsKey);
+
+    return nullptr;
+}
+
+void saveGlobalSettingsXml(const juce::XmlElement& xml)
+{
+    auto settingsFile = getGlobalSettingsFile();
+    auto settingsDir = settingsFile.getParentDirectory();
+    if (!settingsDir.exists())
+        settingsDir.createDirectory();
+    xml.writeTo(settingsFile);
+
+    auto fallbackFile = getGlobalSettingsFileFallback();
+    auto fallbackDir = fallbackFile.getParentDirectory();
+    if (!fallbackDir.exists())
+        fallbackDir.createDirectory();
+    if (fallbackFile != settingsFile)
+        xml.writeTo(fallbackFile);
+
+    auto legacyFile = getLegacyGlobalSettingsFile();
+    auto legacyDir = legacyFile.getParentDirectory();
+    if (!legacyDir.exists())
+        legacyDir.createDirectory();
+    if (legacyFile != settingsFile && legacyFile != fallbackFile)
+        xml.writeTo(legacyFile);
+
+    juce::PropertiesFile legacyProps(getLegacySettingsOptions());
+    if (legacyProps.isValidFile())
+    {
+        legacyProps.setValue(kGlobalSettingsKey, &xml);
+        legacyProps.saveIfNeeded();
+    }
+}
+
+void appendGlobalSettingsDiagnostic(const juce::String& tag, const juce::XmlElement* xml)
+{
+    auto diagFile = getGlobalSettingsFile().getParentDirectory().getChildFile("GlobalSettings_diag.txt");
+    juce::FileOutputStream stream(diagFile, 1024);
+    if (!stream.openedOk())
+        return;
+    stream.setPosition(diagFile.getSize());
+    stream << "=== " << tag << " @ " << juce::Time::getCurrentTime().toString(true, true) << " ===\n";
+    stream << "Path: " << getGlobalSettingsFile().getFullPathName() << "\n";
+    stream << "Fallback: " << getGlobalSettingsFileFallback().getFullPathName() << "\n";
+    stream << "Exists: " << (getGlobalSettingsFile().existsAsFile() ? "yes" : "no") << "\n";
+    stream << "Fallback exists: " << (getGlobalSettingsFileFallback().existsAsFile() ? "yes" : "no") << "\n";
+    if (xml != nullptr)
+        stream << "XML: " << xml->toString() << "\n";
+    stream << "\n";
+    stream.flush();
+}
+
+constexpr juce::int64 kPersistentGlobalControlsSaveDebounceMs = 350;
+
+constexpr std::array<const char*, 13> kPersistentGlobalControlParameterIds {
+    "masterVolume",
+    "limiterThreshold",
+    "limiterEnabled",
+    "quantize",
+    "innerLoopLength",
+    "quality",
+    "pitchSmoothing",
+    "inputMonitor",
+    "crossfadeLength",
+    "triggerFadeIn",
+    "outputRouting",
+    "pitchControlMode",
+    "soundTouchEnabled"
+};
+
+bool isPersistentGlobalControlParameterId(const juce::String& parameterID)
+{
+    for (const auto* id : kPersistentGlobalControlParameterIds)
+    {
+        if (parameterID == id)
+            return true;
+    }
+    return false;
 }
 
 constexpr int kStutterButtonFirstColumn = 9;
@@ -136,13 +279,13 @@ int lowestStutterBit(uint8_t mask)
 double stutterDivisionBeatsFromBit(int bit)
 {
     static constexpr std::array<double, kStutterButtonCount> kDivisionBeats{
-        1.0,            // bit 0 (col 9)  -> 1/4
-        2.0 / 3.0,      // bit 1 (col 10) -> 1/4T
+        2.0,            // bit 0 (col 9)  -> 1/2
+        1.0,            // bit 1 (col 10) -> 1/4
         0.5,            // bit 2 (col 11) -> 1/8
-        1.0 / 3.0,      // bit 3 (col 12) -> 1/8T
-        0.25,           // bit 4 (col 13) -> 1/16
-        0.125,          // bit 5 (col 14) -> 1/32
-        1.0 / 12.0      // bit 6 (col 15) -> 1/32T
+        0.25,           // bit 3 (col 12) -> 1/16
+        0.125,          // bit 4 (col 13) -> 1/32
+        0.0625,         // bit 5 (col 14) -> 1/64
+        0.03125         // bit 6 (col 15) -> 1/128
     };
     const int idx = juce::jlimit(0, kStutterButtonCount - 1, bit);
     return kDivisionBeats[static_cast<size_t>(idx)];
@@ -156,9 +299,10 @@ double stutterDivisionBeatsFromBitForMacro(int bit, bool preferStraight)
 
     switch (juce::jlimit(0, kStutterButtonCount - 1, bit))
     {
-        case 1: return 0.5;   // 1/8 instead of 1/4T
-        case 3: return 0.25;  // 1/16 instead of 1/8T
-        case 6: return 0.125; // 1/32 instead of 1/32T
+        // Keep macro path mostly in the core straight-musical range.
+        case 0: return 1.0;   // clamp 1/2 to 1/4 for multi-button macro motion
+        case 5: return 0.125; // clamp 1/64 to 1/32
+        case 6: return 0.125; // clamp 1/128 to 1/32
         default: return base;
     }
 }
@@ -978,6 +1122,13 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
     cacheParameterPointers();
     loadPersistentDefaultPaths();
     loadPersistentControlPages();
+    loadPersistentGlobalControls();
+    persistentGlobalControlsReady.store(1, std::memory_order_release);
+    pendingPersistentGlobalControlsRestore.store(1, std::memory_order_release);
+    pendingPersistentGlobalControlsRestoreMs = juce::Time::currentTimeMillis() + 250;
+    pendingPersistentGlobalControlsRestoreRemaining = 5;
+    for (const auto* id : kPersistentGlobalControlParameterIds)
+        parameters.addParameterListener(id, this);
     setSwingDivisionSelection(swingDivisionSelection.load(std::memory_order_acquire));
     resetStepEditVelocityGestures();
 
@@ -1010,8 +1161,8 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
         if (monomeConnection.supportsGrid())
         {
             // Force full LED resend after any reconnect to avoid stale cache mismatch.
-            for (int y = 0; y < 8; ++y)
-                for (int x = 0; x < 16; ++x)
+            for (int y = 0; y < MaxGridHeight; ++y)
+                for (int x = 0; x < MaxGridWidth; ++x)
                     ledCache[x][y] = -1;
         }
 
@@ -1068,8 +1219,44 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
     }
 }
 
+void MlrVSTAudioProcessor::parameterChanged(const juce::String& parameterID, float /*newValue*/)
+{
+    if (!isPersistentGlobalControlParameterId(parameterID))
+        return;
+    persistentGlobalUserTouched.store(1, std::memory_order_release);
+    queuePersistentGlobalControlsSave();
+}
+
+void MlrVSTAudioProcessor::markPersistentGlobalUserChange()
+{
+    persistentGlobalUserTouched.store(1, std::memory_order_release);
+    persistentGlobalControlsReady.store(1, std::memory_order_release);
+    queuePersistentGlobalControlsSave();
+}
+
+void MlrVSTAudioProcessor::queuePersistentGlobalControlsSave()
+{
+    if (suppressPersistentGlobalControlsSave.load(std::memory_order_acquire) != 0)
+        return;
+    if (pendingPersistentGlobalControlsRestore.load(std::memory_order_acquire) != 0)
+    {
+        if (persistentGlobalUserTouched.load(std::memory_order_acquire) == 0)
+            return;
+        pendingPersistentGlobalControlsRestore.store(0, std::memory_order_release);
+        pendingPersistentGlobalControlsRestoreRemaining = 0;
+    }
+    if (persistentGlobalControlsReady.load(std::memory_order_acquire) == 0)
+        return;
+
+    persistentGlobalControlsDirty.store(1, std::memory_order_release);
+}
+
 MlrVSTAudioProcessor::~MlrVSTAudioProcessor()
 {
+    for (const auto* id : kPersistentGlobalControlParameterIds)
+        parameters.removeParameterListener(id, this);
+    if (persistentGlobalControlsDirty.load(std::memory_order_acquire) != 0)
+        savePersistentControlPages();
     presetSaveThreadPool.removeAllJobs(true, 4000);
     stopTimer();
     monomeConnection.disconnect();
@@ -1095,6 +1282,37 @@ juce::String MlrVSTAudioProcessor::getControlModeName(ControlMode mode)
         case ControlMode::Normal:
         default: return "Normal";
     }
+}
+
+int MlrVSTAudioProcessor::getMonomeGridWidth() const
+{
+    if (!monomeConnection.supportsGrid())
+        return MaxGridWidth;
+
+    const auto device = monomeConnection.getCurrentDevice();
+    const int reportedWidth = (device.sizeX > 0) ? device.sizeX : MaxGridWidth;
+    return juce::jlimit(1, MaxGridWidth, reportedWidth);
+}
+
+int MlrVSTAudioProcessor::getMonomeGridHeight() const
+{
+    if (!monomeConnection.supportsGrid())
+        return 8;
+
+    const auto device = monomeConnection.getCurrentDevice();
+    const int reportedHeight = (device.sizeY > 0) ? device.sizeY : 8;
+    return juce::jlimit(2, MaxGridHeight, reportedHeight);
+}
+
+int MlrVSTAudioProcessor::getMonomeControlRow() const
+{
+    return juce::jmax(1, getMonomeGridHeight() - 1);
+}
+
+int MlrVSTAudioProcessor::getMonomeActiveStripCount() const
+{
+    const int stripRows = juce::jmax(0, getMonomeControlRow() - 1);
+    return juce::jlimit(0, MaxStrips, stripRows);
 }
 
 MlrVSTAudioProcessor::PitchControlMode MlrVSTAudioProcessor::getPitchControlMode() const
@@ -1240,83 +1458,99 @@ void MlrVSTAudioProcessor::setControlModeFromGui(ControlMode mode, bool shouldBe
 juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::createParameterLayout()
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
+    const auto globalFloatAttrs = juce::AudioParameterFloatAttributes().withAutomatable(false);
+    const auto globalChoiceAttrs = juce::AudioParameterChoiceAttributes().withAutomatable(false);
+    const auto globalBoolAttrs = juce::AudioParameterBoolAttributes().withAutomatable(false);
     
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         "masterVolume",
         "Master Volume",
         juce::NormalisableRange<float>(0.0f, 1.0f),
-        1.0f));
+        1.0f,
+        globalFloatAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         "limiterThreshold",
         "Limiter Threshold (dB)",
         juce::NormalisableRange<float>(-24.0f, 0.0f, 0.1f),
-        0.0f));
+        0.0f,
+        globalFloatAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterBool>(
         "limiterEnabled",
         "Limiter Enabled",
-        false));
+        false,
+        globalBoolAttrs));
     
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "quantize",
         "Quantize",
         juce::StringArray{"1", "1/2", "1/2T", "1/4", "1/4T", 
                           "1/8", "1/8T", "1/16", "1/16T", "1/32"},
-        5));  // Default to 1/8
+        5,
+        globalChoiceAttrs));  // Default to 1/8
 
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "innerLoopLength",
         "Inner Loop Length",
         juce::StringArray{"1", "1/2", "1/4", "1/8", "1/16"},
-        0));
+        0,
+        globalChoiceAttrs));
     
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "quality",
         "Grain Quality",
         juce::StringArray{"Linear", "Cubic", "Sinc", "Sinc HQ"},
-        1));
+        1,
+        globalChoiceAttrs));
     
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         "pitchSmoothing",
         "Pitch Smoothing",
         juce::NormalisableRange<float>(0.0f, 1.0f, 0.01f),
-        0.05f));  // Default 50ms
+        0.05f,
+        globalFloatAttrs));  // Default 50ms
     
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         "inputMonitor",
         "Input Monitor",
         juce::NormalisableRange<float>(0.0f, 1.0f),
-        1.0f));  // Default ON (1.0) for immediate monitoring
+        1.0f,
+        globalFloatAttrs));  // Default ON (1.0) for immediate monitoring
 
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         "crossfadeLength",
         "Crossfade Length (ms)",
         juce::NormalisableRange<float>(1.0f, 50.0f, 0.1f),
-        10.0f));
+        10.0f,
+        globalFloatAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         "triggerFadeIn",
         "Trigger Fade In (ms)",
         juce::NormalisableRange<float>(0.1f, 120.0f, 0.1f),
-        12.0f));
+        12.0f,
+        globalFloatAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "outputRouting",
         "Output Routing",
         juce::StringArray{"Stereo Mix", "Separate Strip Outs"},
-        0));
+        0,
+        globalChoiceAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "pitchControlMode",
         "Pitch Control Mode",
         juce::StringArray{"Pitch Shift", "Resample"},
-        0));
+        0,
+        globalChoiceAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterBool>(
         "soundTouchEnabled",
         "SoundTouch Enabled",
-        true));
+        true,
+        globalBoolAttrs));
     
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -1375,8 +1609,8 @@ void MlrVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
             {
                 monomeConnection.setAllLEDs(0);
                 // Initialize LED cache
-                for (int y = 0; y < 8; ++y)
-                    for (int x = 0; x < 16; ++x)
+                for (int y = 0; y < MaxGridHeight; ++y)
+                    for (int x = 0; x < MaxGridWidth; ++x)
                         ledCache[x][y] = -1;
             }
             if (monomeConnection.supportsArc())
@@ -1391,6 +1625,18 @@ void MlrVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     // Start LED update timer at 10fps (monome recommended refresh rate)
     if (!isTimerRunning())
         startTimer(kGridRefreshMs);
+
+    if (!persistentGlobalControlsApplied)
+    {
+        suppressPersistentGlobalControlsSave.store(1, std::memory_order_release);
+        loadPersistentGlobalControls();
+        suppressPersistentGlobalControlsSave.store(0, std::memory_order_release);
+        persistentGlobalControlsApplied = true;
+    }
+
+    pendingPersistentGlobalControlsRestore.store(1, std::memory_order_release);
+    pendingPersistentGlobalControlsRestoreMs = juce::Time::currentTimeMillis() + 250;
+    pendingPersistentGlobalControlsRestoreRemaining = 5;
 }
 
 void MlrVSTAudioProcessor::releaseResources()
@@ -1622,6 +1868,7 @@ void MlrVSTAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
     try
     {
         auto state = parameters.copyState();
+        stripPersistentGlobalControlsFromState(state);
         appendDefaultPathsToState(state);
         appendControlPagesToState(state);
         
@@ -1649,11 +1896,28 @@ void MlrVSTAudioProcessor::setStateInformation(const void* data, int sizeInBytes
     if (xmlState != nullptr)
         if (xmlState->hasTagName(parameters.state.getType()))
         {
+            suppressPersistentGlobalControlsSave.store(1, std::memory_order_release);
             auto state = juce::ValueTree::fromXml(*xmlState);
+            stripPersistentGlobalControlsFromState(state);
             parameters.replaceState(state);
             loadDefaultPathsFromState(state);
             loadControlPagesFromState(state);
+            loadPersistentGlobalControls();
+            persistentGlobalControlsApplied = true;
+            pendingPersistentGlobalControlsRestore.store(1, std::memory_order_release);
+            pendingPersistentGlobalControlsRestoreMs = juce::Time::currentTimeMillis() + 250;
+            pendingPersistentGlobalControlsRestoreRemaining = 5;
+            suppressPersistentGlobalControlsSave.store(0, std::memory_order_release);
+            persistentGlobalControlsReady.store(1, std::memory_order_release);
         }
+}
+
+void MlrVSTAudioProcessor::stripPersistentGlobalControlsFromState(juce::ValueTree& state) const
+{
+    if (!state.isValid())
+        return;
+    for (const auto* id : kPersistentGlobalControlParameterIds)
+        state.removeProperty(id, nullptr);
 }
 
 //==============================================================================
@@ -1668,7 +1932,7 @@ bool MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& f
 
         const bool loaded = audioEngine->loadSampleToStrip(stripIndex, file);
         if (loaded)
-            currentStripFiles[stripIndex] = file;
+            currentStripFiles[static_cast<size_t>(stripIndex)] = file;
 
         return loaded;
     }
@@ -1688,7 +1952,7 @@ void MlrVSTAudioProcessor::captureRecentAudioToStrip(int stripIndex)
 
         // Captured audio comes from the live input ring buffer, not a source file.
         // Clear stale path so preset save can embed the audio data.
-        currentStripFiles[stripIndex] = juce::File();
+        currentStripFiles[static_cast<size_t>(stripIndex)] = juce::File();
 
         // Recording stop auto-trigger must still respect group choke behavior.
         audioEngine->triggerStripWithQuantization(stripIndex, 0, false);
@@ -1838,7 +2102,7 @@ void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int s
 
     const int quantizeDivision = getQuantizeDivision();
     // PPQ safety: clearing an active inner loop must always be grid-scheduled.
-    const bool useQuantize = clearLoop || (quantizeEnabled && quantizeDivision > 1);
+    const bool useQuantize = clearLoop || (quantizeDivision > 1);
 
     if (!useQuantize)
     {
@@ -1852,6 +2116,7 @@ void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int s
         {
             strip->clearLoop();
             strip->setReverse(false);
+            strip->setDirectionMode(EnhancedAudioStrip::DirectionMode::Normal);
             if (markerColumn >= 0)
             {
                 strip->setPlaybackMarkerColumn(markerColumn, audioEngine->getGlobalSampleCount());
@@ -1861,7 +2126,9 @@ void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int s
         else
         {
             strip->setLoop(startColumn, endColumn);
-            strip->setReverse(reverseDirection);
+            strip->setDirectionMode(reverseDirection
+                ? EnhancedAudioStrip::DirectionMode::Reverse
+                : EnhancedAudioStrip::DirectionMode::Normal);
         }
 
         if (!markerApplied && strip->isPlaying() && strip->hasAudio())
@@ -1987,6 +2254,7 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
         {
             strip->clearLoop();
             strip->setReverse(false);
+            strip->setDirectionMode(EnhancedAudioStrip::DirectionMode::Normal);
             if (change.markerColumn >= 0 && std::isfinite(currentPpq) && currentTempo > 0.0)
             {
                 juce::AudioPlayHead::PositionInfo retriggerPosInfo;
@@ -2006,7 +2274,9 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
         else
         {
             strip->setLoop(change.startColumn, change.endColumn);
-            strip->setReverse(change.reverse);
+            strip->setDirectionMode(change.reverse
+                ? EnhancedAudioStrip::DirectionMode::Reverse
+                : EnhancedAudioStrip::DirectionMode::Normal);
         }
 
         if (change.quantized && !triggeredAtColumn)
@@ -2031,7 +2301,7 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
         {
             const int targetColumn = juce::jlimit(0, MaxColumns - 1, change.postClearTriggerColumn);
             const int quantizeDivision = getQuantizeDivision();
-            const bool useQuantize = quantizeEnabled && quantizeDivision > 1;
+            const bool useQuantize = quantizeDivision > 1;
             audioEngine->triggerStripWithQuantization(i, targetColumn, useQuantize);
         }
     }
@@ -2158,6 +2428,9 @@ void MlrVSTAudioProcessor::applyPendingStutterStart(const juce::AudioPlayHead::P
 
     double targetPpq = pendingStutterStartPpq.load(std::memory_order_acquire);
     const int64_t currentSample = audioEngine->getGlobalSampleCount();
+    const int startQuantizeDivision = juce::jmax(1,
+        pendingStutterStartQuantizeDivision.load(std::memory_order_acquire));
+    const double startQuantizeBeats = 4.0 / static_cast<double>(startQuantizeDivision);
 
     // Match inner-loop quantized scheduling:
     // resolve target grid on audio thread to avoid GUI/playhead clock skew.
@@ -2166,12 +2439,10 @@ void MlrVSTAudioProcessor::applyPendingStutterStart(const juce::AudioPlayHead::P
         if (!(std::isfinite(currentPpq) && currentPpq >= 0.0))
             return;
 
-        const double division = juce::jlimit(
-            0.03125, 4.0, pendingStutterStartDivisionBeats.load(std::memory_order_acquire));
-        targetPpq = std::ceil(currentPpq / division) * division;
+        targetPpq = std::ceil(currentPpq / startQuantizeBeats) * startQuantizeBeats;
         if (targetPpq <= (currentPpq + 1.0e-6))
-            targetPpq += division;
-        targetPpq = std::round(targetPpq / division) * division;
+            targetPpq += startQuantizeBeats;
+        targetPpq = std::round(targetPpq / startQuantizeBeats) * startQuantizeBeats;
         pendingStutterStartPpq.store(targetPpq, std::memory_order_release);
         pendingStutterStartSampleTarget.store(-1, std::memory_order_release);
         return;
@@ -2190,10 +2461,14 @@ void MlrVSTAudioProcessor::applyPendingStutterStart(const juce::AudioPlayHead::P
     for (int i = 0; i < MaxStrips; ++i)
     {
         auto* strip = audioEngine->getStrip(i);
-        if (!strip || !strip->hasAudio() || !strip->isPlaying())
+        const bool stepMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+        const auto* stepSampler = stepMode && strip ? strip->getStepSampler() : nullptr;
+        const bool hasPlayableContent = strip
+            && (strip->hasAudio() || (stepSampler && stepSampler->getHasAudio()));
+        if (!strip || !hasPlayableContent || !strip->isPlaying())
             continue;
         hasAnyPlayingStrip = true;
-        if (!strip->isPpqTimelineAnchored())
+        if (!stepMode && !strip->isPpqTimelineAnchored())
         {
             anchorsReady = false;
             break;
@@ -2201,17 +2476,15 @@ void MlrVSTAudioProcessor::applyPendingStutterStart(const juce::AudioPlayHead::P
     }
 
     // Mirror inner-loop quantized-apply safety: if anchor isn't valid on this grid,
-    // roll to the next stutter grid instead of entering off-sync.
+    // roll to the next global quantize boundary instead of entering off-sync.
     if (hasAnyPlayingStrip && !anchorsReady
         && std::isfinite(currentPpq)
         && std::isfinite(targetPpq))
     {
-        const double division = juce::jlimit(
-            0.03125, 4.0, pendingStutterStartDivisionBeats.load(std::memory_order_acquire));
-        double nextTarget = std::ceil(currentPpq / division) * division;
+        double nextTarget = std::ceil(currentPpq / startQuantizeBeats) * startQuantizeBeats;
         if (nextTarget <= (currentPpq + 1.0e-6))
-            nextTarget += division;
-        nextTarget = std::round(nextTarget / division) * division;
+            nextTarget += startQuantizeBeats;
+        nextTarget = std::round(nextTarget / startQuantizeBeats) * startQuantizeBeats;
         pendingStutterStartPpq.store(nextTarget, std::memory_order_release);
         pendingStutterStartSampleTarget.store(-1, std::memory_order_release);
         return;
@@ -2283,18 +2556,32 @@ void MlrVSTAudioProcessor::captureMomentaryStutterMacroBaseline()
         saved = MomentaryStutterSavedStripState{};
 
         auto* strip = audioEngine->getStrip(i);
-        if (!strip || !momentaryStutterStripArmed[idx] || !strip->hasAudio() || !strip->isPlaying())
+        const bool stepMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+        const auto* stepSampler = stepMode && strip ? strip->getStepSampler() : nullptr;
+        const bool hasPlayableContent = strip
+            && (strip->hasAudio() || (stepSampler && stepSampler->getHasAudio()));
+        if (!strip || !momentaryStutterStripArmed[idx] || !hasPlayableContent || !strip->isPlaying())
             continue;
 
         saved.valid = true;
-        saved.pan = strip->getPan();
+        saved.stepMode = stepMode;
+        saved.pan = (stepSampler != nullptr) ? stepSampler->getPan() : strip->getPan();
         saved.playbackSpeed = strip->getPlaybackSpeed();
+        saved.pitchSemitones = getPitchSemitonesForDisplay(*strip);
         saved.pitchShift = strip->getPitchShift();
+        saved.loopSliceLength = strip->getLoopSliceLength();
         saved.filterEnabled = strip->isFilterEnabled();
         saved.filterFrequency = strip->getFilterFrequency();
         saved.filterResonance = strip->getFilterResonance();
         saved.filterMorph = strip->getFilterMorph();
         saved.filterAlgorithm = strip->getFilterAlgorithm();
+        if (stepSampler != nullptr)
+        {
+            saved.stepFilterEnabled = stepSampler->isFilterEnabled();
+            saved.stepFilterFrequency = stepSampler->getFilterFrequency();
+            saved.stepFilterResonance = stepSampler->getFilterResonance();
+            saved.stepFilterType = stepSampler->getFilterType();
+        }
     }
 
     momentaryStutterMacroBaselineCaptured = true;
@@ -2335,21 +2622,79 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         + (highestBit * 11)
         + (lowestBit * 5);
     const int variant = seed % 8;
-    const bool singleButton = (bitCount <= 1);
-    const bool multiButton = (bitCount > 1);
+    const bool singleButton = (bitCount == 1);
+    const bool multiButton = (bitCount >= 2);
     const bool twoButton = (bitCount == 2);
-    const bool allowPitchSpeedMacro = (bitCount > 2);
-    const bool allowPitchMacro = (bitCount > 2);
-    const bool applySpeedMacro = (bitCount > 1);
+    const bool allowPitchSpeedMacro = (bitCount >= 3);
+    const bool allowPitchMacro = (bitCount >= 3);
+    const bool applySpeedMacro = (bitCount >= 2);
     const bool threeButton = (bitCount == 3);
     const bool hardStepMode = (variant >= 4);
+    auto restoreSavedState = [this](EnhancedAudioStrip& strip, const MomentaryStutterSavedStripState& saved)
+    {
+        strip.setPan(saved.pan);
+        strip.setPlaybackSpeedImmediate(saved.playbackSpeed);
+        strip.setLoopSliceLength(saved.loopSliceLength);
+
+        if (saved.stepMode)
+        {
+            applyPitchControlToStrip(strip, saved.pitchSemitones);
+            if (auto* stepSampler = strip.getStepSampler())
+            {
+                stepSampler->setPan(saved.pan);
+                stepSampler->setFilterEnabled(saved.stepFilterEnabled);
+                stepSampler->setFilterFrequency(saved.stepFilterFrequency);
+                stepSampler->setFilterResonance(saved.stepFilterResonance);
+                stepSampler->setFilterType(saved.stepFilterType);
+            }
+        }
+        else
+        {
+            strip.setPitchShift(saved.pitchShift);
+        }
+
+        strip.setFilterAlgorithm(saved.filterAlgorithm);
+        strip.setFilterFrequency(saved.filterFrequency);
+        strip.setFilterResonance(saved.filterResonance);
+        strip.setFilterMorph(saved.filterMorph);
+        strip.setFilterEnabled(saved.filterEnabled);
+    };
+
+    if (singleButton)
+    {
+        audioEngine->setMomentaryStutterDivision(
+            juce::jlimit(0.03125, 4.0, stutterDivisionBeatsFromBit(highestBit)));
+        audioEngine->setMomentaryStutterRetriggerFadeMs(0.7f);
+
+        for (int i = 0; i < MaxStrips; ++i)
+        {
+            const auto idx = static_cast<size_t>(i);
+            const auto& saved = momentaryStutterSavedState[idx];
+            if (!saved.valid || !momentaryStutterStripArmed[idx])
+                continue;
+
+            auto* strip = audioEngine->getStrip(i);
+            const bool stepMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+            const auto* stepSampler = stepMode && strip ? strip->getStepSampler() : nullptr;
+            const bool hasPlayableContent = strip
+                && (strip->hasAudio() || (stepSampler && stepSampler->getHasAudio()));
+            if (!strip || !hasPlayableContent || !strip->isPlaying())
+                continue;
+
+            restoreSavedState(*strip, saved);
+        }
+
+        momentaryStutterLastComboMask = comboMask;
+        momentaryStutterTwoButtonStepBaseValid = false;
+        momentaryStutterTwoButtonStepBase = 0;
+        return;
+    }
 
     int lengthBars = 1 + ((seed / 13) % 4);
-    if (threeButton)
-    {
-        // Keep 3-button scenes longer and include explicit 2-bar phrases.
-        lengthBars = (((seed / 31) + highestBit + lowestBit) & 0x1) == 0 ? 2 : 4;
-    }
+    if (twoButton)
+        lengthBars = 1 + (((seed / 31) + highestBit + lowestBit) & 0x3);
+    else if (bitCount >= 4)
+        lengthBars = juce::jlimit(2, 4, 2 + (((seed / 17) + highestBit) & 0x1));
     const double cycleBeats = 4.0 * static_cast<double>(lengthBars);
     if (cycleBeats <= 0.0 || !std::isfinite(cycleBeats))
         return;
@@ -2363,11 +2708,9 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
     int stepsPerBar = 8;
     if (multiButton)
     {
-        const int rhythmClass = ((seed / 7) + highestBit + lowestBit) % 3;
+        const int rhythmClass = ((seed / 7) + highestBit + lowestBit) % 4;
         if (rhythmClass == 1)
-            stepsPerBar = 10;
-        else if (rhythmClass == 2)
-            stepsPerBar = 7;
+            stepsPerBar = 16;
     }
     const int totalSteps = juce::jmax(8, stepsPerBar * lengthBars);
     const int stepIndex = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(phase * static_cast<double>(totalSteps))));
@@ -2581,23 +2924,21 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
     if (twoButton)
     {
         // Two-finger mode:
-        // - use fixed PPQ-safe retrigger divisions,
-        // - include both slow linear ramps and dramatic fast exponential ramps,
-        // - always starts from the current speed baseline at step 0.
+        // - dedicated speed/pitch up/down gestures,
+        // - dynamic retrigger-rate movement over a 1..4 bar phrase,
+        // - always starts from the current strip speed baseline.
         const int twoButtonMode = ((seed / 7) + (highestBit * 3) + lowestBit) & 0x7;
         twoButtonDirectionUp = ((twoButtonMode & 0x1) == 0);
-        twoButtonUseFilter = (twoButtonMode <= 3); // Keep higher-intensity modes filter-free.
+        twoButtonUseFilter = false;
         const float phaseNorm = juce::jlimit(0.0f, 1.0f, static_cast<float>(phase));
 
-        // Keep some slower linear ramps and add aggressive/faster variants.
-        if (twoButtonMode <= 1)
-            dynamicStutterDivisionBeats = 0.5;   // 1/8 (slower)
-        else if (twoButtonMode <= 3)
-            dynamicStutterDivisionBeats = 0.25;  // 1/16 (fast)
-        else if (twoButtonMode <= 5)
-            dynamicStutterDivisionBeats = 0.125; // 1/32 (dramatic)
-        else
-            dynamicStutterDivisionBeats = 0.0625; // 1/64 (extreme)
+        const double slowDivision = (twoButtonMode <= 1) ? 0.5 : 0.25;
+        const double fastDivision = 0.125;
+        const float phraseProgress = twoButtonDirectionUp ? phaseNorm : (1.0f - phaseNorm);
+        const float gestureDrive = juce::jlimit(0.0f, 1.0f,
+            phraseProgress * (0.45f + (0.55f * heldRamp)));
+        const float shapedDrive = std::pow(gestureDrive, (twoButtonMode >= 4) ? 0.66f : 1.15f);
+        dynamicStutterDivisionBeats = juce::jmap(static_cast<double>(shapedDrive), slowDivision, fastDivision);
 
         const double elapsedBeats = juce::jmax(0.0, ppqNow - momentaryStutterMacroStartPpq);
         const double stepPos = elapsedBeats / juce::jmax(0.03125, dynamicStutterDivisionBeats);
@@ -2609,14 +2950,12 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         }
         twoButtonStepAbs = juce::jmax(0, globalTwoButtonStep - momentaryStutterTwoButtonStepBase);
         const int semitoneStride = (twoButtonMode >= 4) ? 2 : 1;
-        // Slow ramps can span up to 3 octaves; fast ramps are capped to 1 octave.
-        const int twoButtonMaxSemitones = (twoButtonMode <= 1) ? 36 : 12;
+        const int twoButtonMaxSemitones = (twoButtonMode <= 1) ? 36 : 24;
         int pacedStepAbs = twoButtonStepAbs;
         if (twoButtonMode >= 2)
         {
-            // Dynamic pacing: faster stutter divisions ramp pitch more slowly per trigger.
             const float paceScale = juce::jlimit(0.125f, 1.0f,
-                static_cast<float>(dynamicStutterDivisionBeats / 0.5));
+                static_cast<float>(dynamicStutterDivisionBeats / slowDivision));
             const float pacedContinuous = static_cast<float>(twoButtonStepAbs) * paceScale;
             pacedStepAbs = juce::jmax(0, static_cast<int>(std::floor(pacedContinuous + 1.0e-4f)));
         }
@@ -2625,7 +2964,6 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         int semitoneStep = linearSemitoneStep;
         if (twoButtonMode >= 2)
         {
-            // Fast modes use exponential semitone rise/fall so ramps feel more dramatic.
             const float expoK = (twoButtonMode >= 6) ? 0.74f
                 : (twoButtonMode >= 4 ? 0.58f
                                       : (twoButtonMode >= 2 ? 0.36f : 0.30f));
@@ -2638,28 +2976,13 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         }
         twoButtonSemitoneStep = static_cast<float>(twoButtonDirectionUp ? semitoneStep : -semitoneStep);
 
-        const float panDepthStep = juce::jlimit(0.0f, 1.0f, static_cast<float>(semitoneStep) / 16.0f);
+        const float panDepthStep = juce::jlimit(0.0f, 1.0f,
+            0.28f + (static_cast<float>(semitoneStep) / 18.0f));
         panDepthShape = panDepthStep;
-        // Quantized semitone-step speed ratio (1 or 2 semitones per retrigger depending on mode).
         twoButtonSemitoneSpeedRatio = std::pow(2.0f, twoButtonSemitoneStep / 12.0f);
-
-        if (twoButtonUseFilter)
-        {
-            // Two-finger filter curves always start OPEN at stutter start.
-            // mode 0: LP closes over phrase; mode 1: HP rises from open over phrase.
-            const float curve = std::pow(phaseNorm, 1.35f);
-            targetResonance = juce::jlimit(0.2f, 1.3f, 0.72f + (0.28f * curve));
-            if (twoButtonMode == 0)
-            {
-                targetMorph = 0.0f; // low-pass
-                cutoffNorm = juce::jlimit(0.0f, 1.0f, 1.0f - (0.72f * curve)); // open at start
-            }
-            else
-            {
-                targetMorph = 1.0f; // high-pass
-                cutoffNorm = juce::jlimit(0.0f, 1.0f, 0.04f + (0.64f * curve)); // open at start
-            }
-        }
+        cutoffNorm = 1.0f;
+        targetMorph = 0.0f;
+        targetResonance = 0.72f;
     }
     else
     {
@@ -2677,10 +3000,10 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         const float rampPingPong = juce::jlimit(0.0f, 1.0f, static_cast<float>(1.0 - std::abs((phase * 2.0) - 1.0)));
         const float heldDrive = juce::jlimit(0.20f, 1.0f, 0.35f + (0.65f * heldRamp));
 
-        const double baseDivision = juce::jlimit(0.0625, 1.0, dynamicStutterDivisionBeats);
-        const double minFastDivision = allowPitchSpeedMacro ? 0.0625 : 0.125;
+        const double baseDivision = juce::jlimit(0.125, 1.0, dynamicStutterDivisionBeats);
+        const double minFastDivision = 0.125;
         const double fastDivision = juce::jlimit(minFastDivision, 1.0, baseDivision * (threeButton ? 0.30 : 0.42));
-        const double slowDivision = juce::jlimit(0.0625, 2.0, baseDivision * (threeButton ? 2.25 : 1.85));
+        const double slowDivision = juce::jlimit(0.125, 2.0, baseDivision * (threeButton ? 2.25 : 1.85));
 
         const int rampMode = ((seed / 17) + bitCount + highestBit + lowestBit) % 4;
         switch (rampMode)
@@ -2782,7 +3105,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
                 panDepthShape = juce::jlimit(0.0f, 1.0f, juce::jmap(expRise, 0.02f, 1.0f));
                 dynamicStutterDivisionBeats = juce::jmap(static_cast<double>(expRise),
                     juce::jmin(2.0, dynamicStutterDivisionBeats * longPatternSlow),
-                    juce::jmax(0.0625, dynamicStutterDivisionBeats * longPatternFast));
+                    juce::jmax(0.125, dynamicStutterDivisionBeats * longPatternFast));
                 break;
             }
             case 1: // Exponential faller
@@ -2794,7 +3117,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
                 targetResonance = juce::jlimit(0.2f, 2.4f, 0.68f + (0.64f * expFall));
                 panDepthShape = juce::jlimit(0.0f, 1.0f, juce::jmap(expFall, 0.05f, 1.0f));
                 dynamicStutterDivisionBeats = juce::jmap(static_cast<double>(expFall),
-                    juce::jmax(0.0625, dynamicStutterDivisionBeats * longPatternFast),
+                    juce::jmax(0.125, dynamicStutterDivisionBeats * longPatternFast),
                     juce::jmin(2.0, dynamicStutterDivisionBeats * longPatternSlow));
                 break;
             }
@@ -2808,7 +3131,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
                 panDepthShape = juce::jlimit(0.0f, 1.0f, juce::jmap(arc, 0.05f, 1.0f));
                 dynamicStutterDivisionBeats = juce::jmap(static_cast<double>(arc),
                     juce::jmin(2.0, dynamicStutterDivisionBeats * (longPatternSlow - 0.20)),
-                    juce::jmax(0.0625, dynamicStutterDivisionBeats * (longPatternFast + 0.05)));
+                    juce::jmax(0.125, dynamicStutterDivisionBeats * (longPatternFast + 0.05)));
                 break;
             }
             case 3:
@@ -2823,7 +3146,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
                 panDepthShape = juce::jlimit(0.0f, 1.0f, juce::jmap(invArc, 0.05f, 1.0f));
                 dynamicStutterDivisionBeats = juce::jmap(static_cast<double>(invArc),
                     juce::jmin(2.0, dynamicStutterDivisionBeats * (longPatternSlow - 0.10)),
-                    juce::jmax(0.0625, dynamicStutterDivisionBeats * (longPatternFast + 0.08)));
+                    juce::jmax(0.125, dynamicStutterDivisionBeats * (longPatternFast + 0.08)));
                 break;
             }
         }
@@ -2836,7 +3159,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
     // 2-button combos should stay expressive but avoid ultra-harsh ringing/noise at high stutter rates.
     if (!allowPitchSpeedMacro)
     {
-        const double minDivision = twoButton ? 0.0625 : 0.125;
+        const double minDivision = 0.125;
         dynamicStutterDivisionBeats = juce::jlimit(minDivision, 4.0, dynamicStutterDivisionBeats);
         targetResonance = juce::jlimit(0.2f, 1.4f, targetResonance);
     }
@@ -2845,7 +3168,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
     // align at the same time; keep them in a musical envelope.
     if (allowPitchSpeedMacro && hasTopStutterBit)
     {
-        dynamicStutterDivisionBeats = juce::jlimit(0.0833333333, 4.0, dynamicStutterDivisionBeats);
+        dynamicStutterDivisionBeats = juce::jlimit(0.125, 4.0, dynamicStutterDivisionBeats);
         speedMult = juce::jlimit(0.60f, 2.0f, speedMult);
         pitchPattern = juce::jlimit(-8.0f, 8.0f, pitchPattern);
         targetResonance = juce::jlimit(0.2f, 2.4f, targetResonance);
@@ -2868,7 +3191,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
 
     if (combo12And13And15)
     {
-        dynamicStutterDivisionBeats = juce::jlimit(0.0833333333, 4.0, dynamicStutterDivisionBeats);
+        dynamicStutterDivisionBeats = juce::jlimit(0.125, 4.0, dynamicStutterDivisionBeats);
         speedMult = juce::jlimit(0.70f, 1.60f, speedMult);
         pitchPattern = juce::jlimit(-6.0f, 6.0f, pitchPattern);
         targetResonance = juce::jlimit(0.2f, 1.8f, targetResonance);
@@ -2876,9 +3199,9 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
 
     if (multiButton)
     {
-        static constexpr std::array<double, 5> kTwoButtonGrid { 1.0, 0.5, 0.25, 0.125, 0.0625 };
-        static constexpr std::array<double, 5> kThreeButtonGrid { 1.0, 0.5, 0.25, 0.125, 0.0625 };
-        static constexpr std::array<double, 4> kDenseButtonGrid { 0.5, 0.25, 0.125, 0.0625 };
+        static constexpr std::array<double, 4> kTwoButtonGrid { 1.0, 0.5, 0.25, 0.125 };
+        static constexpr std::array<double, 4> kThreeButtonGrid { 1.0, 0.5, 0.25, 0.125 };
+        static constexpr std::array<double, 3> kDenseButtonGrid { 0.5, 0.25, 0.125 };
 
         if (bitCount == 2)
             dynamicStutterDivisionBeats = snapDivisionToGrid(dynamicStutterDivisionBeats, kTwoButtonGrid);
@@ -2890,6 +3213,13 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
 
     const bool veryFastDivision = dynamicStutterDivisionBeats <= 0.1250001;
     const bool ultraFastDivision = dynamicStutterDivisionBeats <= 0.0835001;
+    float retriggerFadeMs = 0.7f;
+    if (bitCount == 2)
+        retriggerFadeMs = veryFastDivision ? 1.30f : 1.00f;
+    else if (bitCount >= 3)
+        retriggerFadeMs = ultraFastDivision ? 2.00f : (veryFastDivision ? 1.70f : 1.35f);
+    audioEngine->setMomentaryStutterRetriggerFadeMs(retriggerFadeMs);
+
     if (multiButton && veryFastDivision)
     {
         const float speedFloor = ultraFastDivision ? 0.72f : 0.60f;
@@ -3029,12 +3359,36 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         || (multiButton && veryFastDivision))
         filterAlgorithm = EnhancedAudioStrip::FilterAlgorithm::Tpt12;
     const float targetCutoff = cutoffFromNormalized(cutoffNorm);
-    audioEngine->setMomentaryStutterDivision(juce::jlimit(0.03125, 4.0, dynamicStutterDivisionBeats));
-    const double speedStepDivisionBeats = juce::jmax(0.03125, dynamicStutterDivisionBeats);
+    const bool allowSliceLengthGesture = (twoButton || threeButton);
+    const bool comboUsesSliceGesture = allowSliceLengthGesture
+        && ((twoButton && (((seed + highestBit + lowestBit) & 0x1) == 0 || highestBit >= 4))
+            || (threeButton && ((((seed >> 1) + highestBit) & 0x1) == 0 || highestBit >= 3)));
+    const float phraseProgress = twoButton
+        ? juce::jlimit(0.0f, 1.0f, twoButtonDirectionUp ? static_cast<float>(phase)
+                                                         : (1.0f - static_cast<float>(phase)))
+        : juce::jlimit(0.0f, 1.0f, static_cast<float>(phase));
+    const float stutterDensityNorm = juce::jlimit(0.0f, 1.0f, static_cast<float>(
+        (0.5 - juce::jlimit(0.125, 0.5, dynamicStutterDivisionBeats))
+        / (0.5 - 0.125)));
+    const float sliceGestureStrength = comboUsesSliceGesture
+        ? juce::jlimit(0.0f, 1.0f,
+            (0.50f * phraseProgress) + (0.30f * stutterDensityNorm) + (0.20f * heldRamp))
+        : 0.0f;
+    const float minSliceLengthForGesture = twoButton ? 0.06f : 0.03f;
+    audioEngine->setMomentaryStutterDivision(juce::jlimit(0.125, 4.0, dynamicStutterDivisionBeats));
+    const double speedStepDivisionBeats = juce::jmax(0.125, dynamicStutterDivisionBeats);
     const double speedStepPos = (ppqNow - momentaryStutterMacroStartPpq) / speedStepDivisionBeats;
     const int speedStepAbs = juce::jmax(0, static_cast<int>(std::floor(std::isfinite(speedStepPos) ? speedStepPos : 0.0)));
     const bool stutterStartStep = (speedStepAbs == 0);
     const bool firstSpeedStep = applySpeedMacro && (speedStepAbs == 0);
+    const auto stepFilterTypeFromMorph = [](float morph)
+    {
+        if (morph < 0.34f)
+            return FilterType::LowPass;
+        if (morph > 0.66f)
+            return FilterType::HighPass;
+        return FilterType::BandPass;
+    };
 
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -3044,7 +3398,11 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
             continue;
 
         auto* strip = audioEngine->getStrip(i);
-        if (!strip || !strip->hasAudio() || !strip->isPlaying())
+        const bool stepMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+        auto* stepSampler = (stepMode && strip) ? strip->getStepSampler() : nullptr;
+        const bool hasPlayableContent = strip
+            && (strip->hasAudio() || (stepSampler && stepSampler->getHasAudio()));
+        if (!strip || !hasPlayableContent || !strip->isPlaying())
             continue;
 
         const float stripOffset = static_cast<float>(i - (MaxStrips / 2));
@@ -3073,29 +3431,67 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
                 (speedBaseline * shapedSpeedMult) + stripSpeedSpread);
         const bool holdBaselineSpeed = twoButton ? (twoButtonStepAbs == 0) : firstSpeedStep;
         const float targetSpeed = holdBaselineSpeed ? speedBaseline : modulatedTargetSpeed;
-        if (applySpeedMacro)
-            strip->setPlaybackSpeedImmediate(targetSpeed);
+        if (!stepMode)
+        {
+            if (applySpeedMacro)
+                strip->setPlaybackSpeedImmediate(targetSpeed);
+            else
+                strip->setPlaybackSpeed(speedBaseline);
+        }
         else
-            strip->setPlaybackSpeed(speedBaseline);
-        strip->setPan(juce::jlimit(-1.0f, 1.0f, saved.pan + (panOffsetBase * stripPanScale)));
-        float targetPitch = saved.pitchShift;
+        {
+            // Step mode uses step-sampler pitch speed; keep strip traversal speed stable.
+            strip->setPlaybackSpeed(saved.playbackSpeed);
+        }
+
+        const float targetPan = juce::jlimit(-1.0f, 1.0f, saved.pan + (panOffsetBase * stripPanScale));
+        strip->setPan(targetPan);
+        if (stepSampler != nullptr)
+            stepSampler->setPan(targetPan);
+
+        float targetPitch = saved.stepMode ? saved.pitchSemitones : saved.pitchShift;
         if (twoButton && applySpeedMacro)
         {
-            // Guarantee full 3-octave contour even when speed reaches hard limits:
-            // carry residual semitone motion into pitch shift.
-            const float ratioBase = juce::jmax(0.03125f, speedBaseline);
-            const float ratioActual = juce::jmax(0.03125f, targetSpeed / ratioBase);
-            const float actualSemitoneFromSpeed = 12.0f * std::log2(ratioActual);
-            const float residualSemitone = twoButtonSemitoneStep - actualSemitoneFromSpeed;
-            targetPitch = juce::jlimit(-24.0f, 24.0f, saved.pitchShift + residualSemitone);
+            if (stepMode)
+            {
+                targetPitch = juce::jlimit(-24.0f, 24.0f, saved.pitchSemitones + twoButtonSemitoneStep);
+            }
+            else
+            {
+                // Guarantee full contour even when speed reaches hard limits:
+                // carry residual semitone motion into pitch shift.
+                const float ratioBase = juce::jmax(0.03125f, speedBaseline);
+                const float ratioActual = juce::jmax(0.03125f, targetSpeed / ratioBase);
+                const float actualSemitoneFromSpeed = 12.0f * std::log2(ratioActual);
+                const float residualSemitone = twoButtonSemitoneStep - actualSemitoneFromSpeed;
+                targetPitch = juce::jlimit(-24.0f, 24.0f, saved.pitchShift + residualSemitone);
+            }
         }
         else if (allowPitchMacro)
         {
-            targetPitch = juce::jlimit(-12.0f, 12.0f, saved.pitchShift + pitchOffsetBase + stripPitchSpread);
+            const float pitchBase = stepMode ? saved.pitchSemitones : saved.pitchShift;
+            targetPitch = juce::jlimit(-12.0f, 12.0f, pitchBase + pitchOffsetBase + stripPitchSpread);
         }
-        strip->setPitchShift(targetPitch);
 
-        if (singleButton || (twoButton && !twoButtonUseFilter))
+        if (stepMode)
+            applyPitchControlToStrip(*strip, targetPitch);
+        else
+            strip->setPitchShift(targetPitch);
+
+        if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Loop)
+        {
+            float targetSliceLength = saved.loopSliceLength;
+            if (comboUsesSliceGesture)
+            {
+                const float shortened = saved.loopSliceLength
+                    - ((saved.loopSliceLength - minSliceLengthForGesture) * sliceGestureStrength);
+                targetSliceLength = juce::jlimit(minSliceLengthForGesture, 1.0f, shortened);
+            }
+            strip->setLoopSliceLength(targetSliceLength);
+        }
+
+        const bool useMacroFilter = !(singleButton || (twoButton && !twoButtonUseFilter));
+        if (!useMacroFilter)
         {
             // Clean stutter variants: no filter color.
             strip->setFilterAlgorithm(saved.filterAlgorithm);
@@ -3103,6 +3499,13 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
             strip->setFilterResonance(saved.filterResonance);
             strip->setFilterMorph(saved.filterMorph);
             strip->setFilterEnabled(saved.filterEnabled);
+            if (stepSampler != nullptr)
+            {
+                stepSampler->setFilterEnabled(saved.stepFilterEnabled);
+                stepSampler->setFilterFrequency(saved.stepFilterFrequency);
+                stepSampler->setFilterResonance(saved.stepFilterResonance);
+                stepSampler->setFilterType(saved.stepFilterType);
+            }
         }
         else
         {
@@ -3110,17 +3513,31 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
             strip->setFilterAlgorithm(filterAlgorithm);
             if (stutterStartStep)
             {
-                // Start every stutter with filter fully open and minimum resonance,
-                // then apply macro movement from subsequent stutter steps.
+                // Start every stutter with filter fully open and minimum resonance.
                 strip->setFilterMorph(0.0f);
                 strip->setFilterFrequency(20000.0f);
                 strip->setFilterResonance(0.1f);
+                if (stepSampler != nullptr)
+                {
+                    stepSampler->setFilterEnabled(true);
+                    stepSampler->setFilterType(FilterType::LowPass);
+                    stepSampler->setFilterFrequency(20000.0f);
+                    stepSampler->setFilterResonance(0.1f);
+                }
             }
             else
             {
+                const float morphWithOffset = juce::jlimit(0.0f, 1.0f, targetMorph + stripMorphOffset);
                 strip->setFilterFrequency(targetCutoff);
                 strip->setFilterResonance(targetResonance);
-                strip->setFilterMorph(juce::jlimit(0.0f, 1.0f, targetMorph + stripMorphOffset));
+                strip->setFilterMorph(morphWithOffset);
+                if (stepSampler != nullptr)
+                {
+                    stepSampler->setFilterEnabled(true);
+                    stepSampler->setFilterType(stepFilterTypeFromMorph(morphWithOffset));
+                    stepSampler->setFilterFrequency(targetCutoff);
+                    stepSampler->setFilterResonance(juce::jlimit(0.1f, 10.0f, targetResonance));
+                }
             }
         }
     }
@@ -3144,7 +3561,23 @@ void MlrVSTAudioProcessor::restoreMomentaryStutterMacroBaseline()
         {
             strip->setPan(saved.pan);
             strip->setPlaybackSpeedImmediate(saved.playbackSpeed);
-            strip->setPitchShift(saved.pitchShift);
+            strip->setLoopSliceLength(saved.loopSliceLength);
+            if (saved.stepMode)
+            {
+                applyPitchControlToStrip(*strip, saved.pitchSemitones);
+                if (auto* stepSampler = strip->getStepSampler())
+                {
+                    stepSampler->setPan(saved.pan);
+                    stepSampler->setFilterEnabled(saved.stepFilterEnabled);
+                    stepSampler->setFilterFrequency(saved.stepFilterFrequency);
+                    stepSampler->setFilterResonance(saved.stepFilterResonance);
+                    stepSampler->setFilterType(saved.stepFilterType);
+                }
+            }
+            else
+            {
+                strip->setPitchShift(saved.pitchShift);
+            }
             strip->setFilterAlgorithm(saved.filterAlgorithm);
             strip->setFilterFrequency(saved.filterFrequency);
             strip->setFilterResonance(saved.filterResonance);
@@ -3207,7 +3640,7 @@ juce::File MlrVSTAudioProcessor::getCurrentBrowserDirectoryForStrip(int stripInd
     if (isValidDir(fallbackDir))
         return fallbackDir;
 
-    const auto currentFile = currentStripFiles[stripIndex];
+    const auto currentFile = currentStripFiles[static_cast<size_t>(stripIndex)];
     auto currentDir = currentFile.getParentDirectory();
     if (isValidDir(currentDir))
         return currentDir;
@@ -3220,7 +3653,7 @@ juce::File MlrVSTAudioProcessor::getCurrentBrowserDirectoryForStrip(int stripInd
         if (isValidDir(defaultLoopDirectories[static_cast<size_t>(i)]))
             return defaultLoopDirectories[static_cast<size_t>(i)];
 
-        const auto otherCurrentDir = currentStripFiles[i].getParentDirectory();
+        const auto otherCurrentDir = currentStripFiles[static_cast<size_t>(i)].getParentDirectory();
         if (isValidDir(otherCurrentDir))
             return otherCurrentDir;
     }
@@ -3605,16 +4038,18 @@ void MlrVSTAudioProcessor::savePersistentDefaultPaths() const
 
 void MlrVSTAudioProcessor::loadPersistentControlPages()
 {
-    auto settingsFile = getGlobalSettingsFile();
-    if (!settingsFile.existsAsFile())
+    const auto previousSuppress = suppressPersistentGlobalControlsSave.load(std::memory_order_acquire);
+    suppressPersistentGlobalControlsSave.store(1, std::memory_order_release);
+    auto xml = loadGlobalSettingsXml();
+    if (xml == nullptr)
     {
+        suppressPersistentGlobalControlsSave.store(previousSuppress, std::memory_order_release);
         savePersistentControlPages();
         return;
     }
-
-    auto xml = juce::XmlDocument::parse(settingsFile);
-    if (xml == nullptr || xml->getTagName() != "GlobalSettings")
+    if (xml->getTagName() != "GlobalSettings")
     {
+        suppressPersistentGlobalControlsSave.store(previousSuppress, std::memory_order_release);
         savePersistentControlPages();
         return;
     }
@@ -3631,15 +4066,87 @@ void MlrVSTAudioProcessor::loadPersistentControlPages()
     state.addChild(controlPages, -1, nullptr);
 
     loadControlPagesFromState(state);
+    suppressPersistentGlobalControlsSave.store(previousSuppress, std::memory_order_release);
+    appendGlobalSettingsDiagnostic("load-control-pages", xml.get());
+}
+
+void MlrVSTAudioProcessor::loadPersistentGlobalControls()
+{
+    auto xml = loadGlobalSettingsXml();
+    if (xml == nullptr || xml->getTagName() != "GlobalSettings")
+    {
+        persistentGlobalControlsReady.store(1, std::memory_order_release);
+        return;
+    }
+
+    auto restoreFloatParam = [this, &xml](const char* attrName, const char* paramId, double minValue, double maxValue) -> bool
+    {
+        if (!xml->hasAttribute(attrName))
+            return false;
+        auto* param = parameters.getParameter(paramId);
+        if (param == nullptr)
+            return false;
+        const auto restored = static_cast<float>(
+            juce::jlimit(minValue, maxValue, xml->getDoubleAttribute(attrName)));
+        param->setValueNotifyingHost(param->convertTo0to1(restored));
+        return true;
+    };
+
+    auto restoreChoiceParam = [this, &xml](const char* attrName, const char* paramId, int minValue, int maxValue) -> bool
+    {
+        if (!xml->hasAttribute(attrName))
+            return false;
+        auto* param = parameters.getParameter(paramId);
+        if (param == nullptr)
+            return false;
+        const auto restored = static_cast<float>(
+            juce::jlimit(minValue, maxValue, xml->getIntAttribute(attrName)));
+        param->setValueNotifyingHost(param->convertTo0to1(restored));
+        return true;
+    };
+
+    auto restoreBoolParam = [this, &xml](const char* attrName, const char* paramId) -> bool
+    {
+        if (!xml->hasAttribute(attrName))
+            return false;
+        auto* param = parameters.getParameter(paramId);
+        if (param == nullptr)
+            return false;
+        param->setValueNotifyingHost(param->convertTo0to1(xml->getBoolAttribute(attrName) ? 1.0f : 0.0f));
+        return true;
+    };
+
+    suppressPersistentGlobalControlsSave.store(1, std::memory_order_release);
+    bool anyRestored = false;
+    anyRestored = restoreFloatParam("masterVolume", "masterVolume", 0.0, 1.0) || anyRestored;
+    anyRestored = restoreFloatParam("limiterThreshold", "limiterThreshold", -24.0, 0.0) || anyRestored;
+    anyRestored = restoreBoolParam("limiterEnabled", "limiterEnabled") || anyRestored;
+    anyRestored = restoreChoiceParam("quantize", "quantize", 0, 9) || anyRestored;
+    anyRestored = restoreChoiceParam("innerLoopLength", "innerLoopLength", 0, 4) || anyRestored;
+    anyRestored = restoreChoiceParam("quality", "quality", 0, 3) || anyRestored;
+    anyRestored = restoreFloatParam("pitchSmoothing", "pitchSmoothing", 0.0, 1.0) || anyRestored;
+    anyRestored = restoreFloatParam("inputMonitor", "inputMonitor", 0.0, 1.0) || anyRestored;
+    anyRestored = restoreFloatParam("crossfadeLength", "crossfadeLength", 1.0, 50.0) || anyRestored;
+    anyRestored = restoreFloatParam("triggerFadeIn", "triggerFadeIn", 0.1, 120.0) || anyRestored;
+    anyRestored = restoreChoiceParam("outputRouting", "outputRouting", 0, 1) || anyRestored;
+    anyRestored = restoreChoiceParam("pitchControlMode", "pitchControlMode", 0, 1) || anyRestored;
+    anyRestored = restoreBoolParam("soundTouchEnabled", "soundTouchEnabled") || anyRestored;
+    suppressPersistentGlobalControlsSave.store(0, std::memory_order_release);
+    persistentGlobalControlsDirty.store(0, std::memory_order_release);
+
+    if (!anyRestored)
+        savePersistentControlPages();
+    else
+        saveGlobalSettingsXml(*xml);
+
+    persistentGlobalControlsReady.store(1, std::memory_order_release);
+    appendGlobalSettingsDiagnostic("load-globals", xml.get());
 }
 
 void MlrVSTAudioProcessor::savePersistentControlPages() const
 {
-    auto settingsFile = getGlobalSettingsFile();
-    auto settingsDir = settingsFile.getParentDirectory();
-    if (!settingsDir.exists())
-        settingsDir.createDirectory();
-
+    if (suppressPersistentGlobalControlsSave.load(std::memory_order_acquire) != 0)
+        return;
     juce::XmlElement xml("GlobalSettings");
     const auto orderSnapshot = getControlPageOrder();
     for (int i = 0; i < NumControlRowPages; ++i)
@@ -3649,8 +4156,34 @@ void MlrVSTAudioProcessor::savePersistentControlPages() const
     }
     xml.setAttribute("momentary", isControlPageMomentary());
     xml.setAttribute("swingDivision", swingDivisionSelection.load(std::memory_order_acquire));
-
-    xml.writeTo(settingsFile);
+    if (masterVolumeParam)
+        xml.setAttribute("masterVolume", static_cast<double>(masterVolumeParam->load(std::memory_order_acquire)));
+    if (limiterThresholdParam)
+        xml.setAttribute("limiterThreshold", static_cast<double>(limiterThresholdParam->load(std::memory_order_acquire)));
+    if (limiterEnabledParam)
+        xml.setAttribute("limiterEnabled", limiterEnabledParam->load(std::memory_order_acquire) >= 0.5f);
+    if (quantizeParam)
+        xml.setAttribute("quantize", static_cast<int>(quantizeParam->load(std::memory_order_acquire)));
+    if (innerLoopLengthParam)
+        xml.setAttribute("innerLoopLength", static_cast<int>(innerLoopLengthParam->load(std::memory_order_acquire)));
+    if (grainQualityParam)
+        xml.setAttribute("quality", static_cast<int>(grainQualityParam->load(std::memory_order_acquire)));
+    if (pitchSmoothingParam)
+        xml.setAttribute("pitchSmoothing", static_cast<double>(pitchSmoothingParam->load(std::memory_order_acquire)));
+    if (inputMonitorParam)
+        xml.setAttribute("inputMonitor", static_cast<double>(inputMonitorParam->load(std::memory_order_acquire)));
+    if (crossfadeLengthParam)
+        xml.setAttribute("crossfadeLength", static_cast<double>(crossfadeLengthParam->load(std::memory_order_acquire)));
+    if (triggerFadeInParam)
+        xml.setAttribute("triggerFadeIn", static_cast<double>(triggerFadeInParam->load(std::memory_order_acquire)));
+    if (outputRoutingParam)
+        xml.setAttribute("outputRouting", static_cast<int>(outputRoutingParam->load(std::memory_order_acquire)));
+    if (pitchControlModeParam)
+        xml.setAttribute("pitchControlMode", static_cast<int>(pitchControlModeParam->load(std::memory_order_acquire)));
+    if (soundTouchEnabledParam)
+        xml.setAttribute("soundTouchEnabled", soundTouchEnabledParam->load(std::memory_order_acquire) >= 0.5f);
+    saveGlobalSettingsXml(xml);
+    appendGlobalSettingsDiagnostic("save-globals", &xml);
 }
 
 void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
@@ -3739,7 +4272,7 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     audioEngine->setQuantization(quantizeValue);
     
     // Apply quantization if enabled
-    bool useQuantize = quantizeEnabled && quantizeValue > 1;
+    bool useQuantize = quantizeValue > 1;
     const bool isHoldScratchTransition = (strip->getScratchAmount() > 0.0f
         && ((strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
             ? strip->isButtonHeld()
@@ -3770,7 +4303,6 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
                 "  globalSample:   " + juce::String(globalSample) + "\n"
                 "───────────────────────────────────────────────────────\n"
                 "QUANTIZATION SETTINGS:\n"
-                "  quantizeEnabled: " + juce::String(quantizeEnabled ? "YES" : "NO") + "\n"
                 "  quantizeChoice:  " + juce::String(quantizeChoice) + " (UI selection)\n"
                 "  quantizeValue:   " + juce::String(quantizeValue) + " (divisions per bar)\n"
                 "  quantBeats:      " + juce::String(quantBeats, 4) + " beats per division\n"
@@ -3862,6 +4394,38 @@ void MlrVSTAudioProcessor::timerCallback()
 {
     applyCompletedPresetSaves();
 
+    if (persistentGlobalControlsDirty.load(std::memory_order_acquire) != 0)
+    {
+        const auto nowMs = juce::Time::currentTimeMillis();
+        if (lastPersistentGlobalControlsSaveMs == 0
+            || (nowMs - lastPersistentGlobalControlsSaveMs) >= kPersistentGlobalControlsSaveDebounceMs)
+        {
+            savePersistentControlPages();
+            persistentGlobalControlsDirty.store(0, std::memory_order_release);
+            lastPersistentGlobalControlsSaveMs = nowMs;
+        }
+    }
+
+    if (pendingPersistentGlobalControlsRestore.load(std::memory_order_acquire) != 0)
+    {
+        const auto nowMs = juce::Time::currentTimeMillis();
+        if (nowMs >= pendingPersistentGlobalControlsRestoreMs)
+        {
+            loadPersistentGlobalControls();
+            persistentGlobalControlsApplied = true;
+            if (pendingPersistentGlobalControlsRestoreRemaining > 1)
+            {
+                --pendingPersistentGlobalControlsRestoreRemaining;
+                pendingPersistentGlobalControlsRestoreMs = nowMs + 400;
+            }
+            else
+            {
+                pendingPersistentGlobalControlsRestoreRemaining = 0;
+                pendingPersistentGlobalControlsRestore.store(0, std::memory_order_release);
+            }
+        }
+    }
+
     const int pendingPreset = pendingPresetLoadIndex.load(std::memory_order_acquire);
     if (pendingPreset >= 0)
     {
@@ -3900,7 +4464,9 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
     // Get current file for this strip.
     // If strip has no loaded audio, force first-file fallback regardless of any
     // stale path cached in currentStripFiles.
-    juce::File currentFile = strip->hasAudio() ? currentStripFiles[stripIndex] : juce::File();
+    juce::File currentFile = strip->hasAudio()
+        ? currentStripFiles[static_cast<size_t>(stripIndex)]
+        : juce::File();
 
     // Determine folder to browse from strip-specific browser path context.
     juce::File folderToUse = getCurrentBrowserDirectoryForStrip(stripIndex);
@@ -4067,17 +4633,19 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
     pendingStutterStartActive.store(0, std::memory_order_release);
     pendingStutterStartPpq.store(-1.0, std::memory_order_release);
     pendingStutterStartDivisionBeats.store(1.0, std::memory_order_release);
+    pendingStutterStartQuantizeDivision.store(8, std::memory_order_release);
     pendingStutterStartSampleTarget.store(-1, std::memory_order_release);
     for (auto& saved : momentaryStutterSavedState)
         saved = MomentaryStutterSavedStripState{};
     pendingStutterReleaseActive.store(0, std::memory_order_release);
     pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
     pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
+    audioEngine->setMomentaryStutterRetriggerFadeMs(0.7f);
     audioEngine->clearMomentaryStutterStrips();
 
     for (int i = 0; i < MaxStrips; ++i)
     {
-        currentStripFiles[i] = juce::File();
+        currentStripFiles[static_cast<size_t>(i)] = juce::File();
 
         if (auto* strip = audioEngine->getStrip(i))
         {
@@ -4326,7 +4894,7 @@ void MlrVSTAudioProcessor::savePreset(int presetIndex)
     PresetSaveRequest request;
     request.presetIndex = presetIndex;
     for (int i = 0; i < MaxStrips; ++i)
-        request.stripFiles[static_cast<size_t>(i)] = currentStripFiles[i];
+        request.stripFiles[static_cast<size_t>(i)] = currentStripFiles[static_cast<size_t>(i)];
 
     auto* job = new PresetSaveJob(*this, std::move(request));
     presetSaveJobsInFlight.fetch_add(1, std::memory_order_acq_rel);

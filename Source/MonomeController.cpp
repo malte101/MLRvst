@@ -12,13 +12,13 @@ namespace
 double stutterDivisionBeatsFromButton(int x)
 {
     static constexpr std::array<double, 7> kDivisionBeats{
-        1.0,            // col 9  -> 1/4
-        2.0 / 3.0,      // col 10 -> 1/4T
+        2.0,            // col 9  -> 1/2
+        1.0,            // col 10 -> 1/4
         0.5,            // col 11 -> 1/8
-        1.0 / 3.0,      // col 12 -> 1/8T
-        0.25,           // col 13 -> 1/16
-        0.125,          // col 14 -> 1/32
-        1.0 / 12.0      // col 15 -> 1/32T (safer than 1/64 for click-free musical use)
+        0.25,           // col 12 -> 1/16
+        0.125,          // col 13 -> 1/32
+        0.0625,         // col 14 -> 1/64
+        0.03125         // col 15 -> 1/128
     };
 
     const int idx = juce::jlimit(0, 6, x - 9);
@@ -135,6 +135,8 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
         pendingStutterReleaseActive.store(0, std::memory_order_release);
         pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
         pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
+        const int startQuantizeDivision = juce::jmax(1, getQuantizeDivision());
+        pendingStutterStartQuantizeDivision.store(startQuantizeDivision, std::memory_order_release);
         const double entryDivision = juce::jlimit(0.03125, 4.0, momentaryStutterDivisionBeats);
         pendingStutterStartDivisionBeats.store(entryDivision, std::memory_order_release);
         audioEngine->setMomentaryStutterDivision(entryDivision);
@@ -186,6 +188,8 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
         }
 
         const double entryDivision = juce::jlimit(0.03125, 4.0, momentaryStutterDivisionBeats);
+        const int startQuantizeDivision = juce::jmax(1, getQuantizeDivision());
+        pendingStutterStartQuantizeDivision.store(startQuantizeDivision, std::memory_order_release);
         pendingStutterStartDivisionBeats.store(entryDivision, std::memory_order_release);
         pendingStutterStartPpq.store(std::numeric_limits<double>::quiet_NaN(), std::memory_order_release);
         pendingStutterStartSampleTarget.store(-1, std::memory_order_release);
@@ -289,6 +293,7 @@ void MlrVSTAudioProcessor::performMomentaryStutterStartNow(double hostPpqNow, in
     momentaryStutterTwoButtonStepBase = 0;
 
     audioEngine->setMomentaryStutterDivision(entryDivision);
+    audioEngine->setMomentaryStutterRetriggerFadeMs(0.7f);
     audioEngine->setMomentaryStutterStartPpq(entryPpq);
     audioEngine->clearMomentaryStutterStrips();
     for (int i = 0; i < MaxStrips; ++i)
@@ -296,15 +301,19 @@ void MlrVSTAudioProcessor::performMomentaryStutterStartNow(double hostPpqNow, in
         auto* strip = audioEngine->getStrip(i);
         const auto idx = static_cast<size_t>(i);
         momentaryStutterStripArmed[idx] = false;
-        if (!strip || !strip->hasAudio() || !strip->isPlaying())
+        const bool stepMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+        const bool hasStepAudio = stepMode && strip->getStepSampler() && strip->getStepSampler()->getHasAudio();
+        const bool hasPlayableContent = (strip && (strip->hasAudio() || hasStepAudio));
+        if (!strip || !hasPlayableContent || !strip->isPlaying())
         {
-            audioEngine->setMomentaryStutterStrip(i, 0, false);
+            audioEngine->setMomentaryStutterStrip(i, 0, 0.0, false);
             continue;
         }
 
         strip->captureMomentaryPhaseReference(entryPpq);
-        const int stutterColumn = juce::jlimit(0, 15, strip->getCurrentColumn());
-        audioEngine->setMomentaryStutterStrip(i, stutterColumn, true);
+        const int stutterColumn = juce::jlimit(0, 15, strip->getStutterEntryColumn());
+        const double stutterOffsetRatio = strip->getStutterEntryOffsetRatio();
+        audioEngine->setMomentaryStutterStrip(i, stutterColumn, stutterOffsetRatio, true);
         audioEngine->clearPendingQuantizedTriggersForStrip(i);
         momentaryStutterStripArmed[idx] = true;
     }
@@ -329,6 +338,7 @@ void MlrVSTAudioProcessor::performMomentaryStutterReleaseNow(double hostPpqNow, 
     momentaryStutterTwoButtonStepBase = 0;
     restoreMomentaryStutterMacroBaseline();
     audioEngine->setMomentaryStutterActive(false);
+    audioEngine->setMomentaryStutterRetriggerFadeMs(0.7f);
     audioEngine->setMomentaryStutterStartPpq(-1.0);
     audioEngine->clearMomentaryStutterStrips();
     momentaryStutterButtonMask.store(0, std::memory_order_release);
@@ -345,10 +355,36 @@ void MlrVSTAudioProcessor::performMomentaryStutterReleaseNow(double hostPpqNow, 
 void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 {
     if (!audioEngine) return;
-    
+
+    const int gridWidth = getMonomeGridWidth();
+    const int gridHeight = getMonomeGridHeight();
+    if (x < 0 || y < 0 || x >= gridWidth || y >= gridHeight)
+        return;
+
     const int GROUP_ROW = 0;
-    const int CONTROL_ROW = 7;
+    const int CONTROL_ROW = getMonomeControlRow();
     const int FIRST_STRIP_ROW = 1;
+    const int visibleStripCount = juce::jmax(0, getMonomeActiveStripCount());
+    const int stepEditBankSize = 6;
+    const int maxStepEditBank = juce::jmax(0, (visibleStripCount - 1) / stepEditBankSize);
+    stepEditStripBank = juce::jlimit(0, maxStepEditBank, stepEditStripBank);
+    const int maxVisibleStripIndex = juce::jmax(0, visibleStripCount - 1);
+    const int stripRowsDenom = juce::jmax(1, visibleStripCount - 1);
+    const int modulationRowsDenom = juce::jmax(1, visibleStripCount);
+    const auto clampVisibleStrip = [maxVisibleStripIndex](int index)
+    {
+        return juce::jlimit(0, maxVisibleStripIndex, index);
+    };
+    const auto stripRowToUnit = [CONTROL_ROW, stripRowsDenom](int row)
+    {
+        return juce::jlimit(0.0f, 1.0f, static_cast<float>((CONTROL_ROW - 1) - row)
+            / static_cast<float>(stripRowsDenom));
+    };
+    const auto modulationRowToUnit = [CONTROL_ROW, modulationRowsDenom](int row)
+    {
+        return juce::jlimit(0.0f, 1.0f, static_cast<float>((CONTROL_ROW - 1) - row)
+            / static_cast<float>(modulationRowsDenom));
+    };
     const auto isPresetCell = [](int gridX, int gridY)
     {
         return gridX >= 0 && gridX < PresetColumns
@@ -398,6 +434,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
             if (stepEditModeActive)
             {
+                const int bankStart = stepEditStripBank * stepEditBankSize;
+
                 if (x >= 0 && x <= 7)
                 {
                     const auto previousTool = stepEditTool;
@@ -422,9 +460,45 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
                 if (x >= 8 && x <= 13)
                 {
-                    stepEditSelectedStrip = juce::jlimit(0, MaxStrips - 1, x - 8);
-                    lastMonomePressedStripRow.store(stepEditSelectedStrip, std::memory_order_release);
-                    resetStepEditVelocityGestures();
+                    const int targetStrip = bankStart + (x - 8);
+                    if (targetStrip >= 0 && targetStrip < visibleStripCount)
+                    {
+                        stepEditSelectedStrip = clampVisibleStrip(targetStrip);
+                        lastMonomePressedStripRow.store(stepEditSelectedStrip, std::memory_order_release);
+                        resetStepEditVelocityGestures();
+                    }
+                    updateMonomeLEDs();
+                    return;
+                }
+
+                if (x == 14 && stepEditStripBank > 0)
+                {
+                    --stepEditStripBank;
+                    stepEditStripBank = juce::jlimit(0, maxStepEditBank, stepEditStripBank);
+                    const int bankStartAfter = stepEditStripBank * stepEditBankSize;
+                    if (stepEditSelectedStrip < bankStartAfter
+                        || stepEditSelectedStrip >= (bankStartAfter + stepEditBankSize))
+                    {
+                        stepEditSelectedStrip = clampVisibleStrip(bankStartAfter);
+                        lastMonomePressedStripRow.store(stepEditSelectedStrip, std::memory_order_release);
+                        resetStepEditVelocityGestures();
+                    }
+                    updateMonomeLEDs();
+                    return;
+                }
+
+                if (x == 15 && stepEditStripBank < maxStepEditBank)
+                {
+                    ++stepEditStripBank;
+                    stepEditStripBank = juce::jlimit(0, maxStepEditBank, stepEditStripBank);
+                    const int bankStartAfter = stepEditStripBank * stepEditBankSize;
+                    if (stepEditSelectedStrip < bankStartAfter
+                        || stepEditSelectedStrip >= (bankStartAfter + stepEditBankSize))
+                    {
+                        stepEditSelectedStrip = clampVisibleStrip(bankStartAfter);
+                        lastMonomePressedStripRow.store(stepEditSelectedStrip, std::memory_order_release);
+                        resetStepEditVelocityGestures();
+                    }
                     updateMonomeLEDs();
                     return;
                 }
@@ -436,7 +510,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             // This prevents accidental access to group/pattern/scratch/transient controls.
             if (controlModeActive
                 && currentControlMode != ControlMode::Normal
-                && currentControlMode != ControlMode::Modulation)
+                && currentControlMode != ControlMode::Modulation
+                && currentControlMode != ControlMode::Filter)
             {
                 return;
             }
@@ -490,7 +565,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
             if (controlModeActive && currentControlMode == ControlMode::Modulation)
             {
-                const int targetStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+                const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
                 auto* engine = getAudioEngine();
                 if (!engine)
                     return;
@@ -639,7 +714,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 {
                     if (stepEditTool == StepEditTool::Gate)
                         stepEditTool = StepEditTool::Velocity;
-                    stepEditSelectedStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+                    stepEditSelectedStrip = clampVisibleStrip(getLastMonomePressedStripRow());
+                    stepEditStripBank = juce::jlimit(0, maxStepEditBank, stepEditSelectedStrip / stepEditBankSize);
                     resetStepEditVelocityGestures();
                 }
                 else if (wasStepEditMode)
@@ -652,7 +728,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
             else if (stepEditModeActive && (x == 13 || x == 14))
             {
-                const int selectedStripIndex = juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip);
+                const int selectedStripIndex = clampVisibleStrip(stepEditSelectedStrip);
                 if (auto* strip = audioEngine->getStrip(selectedStripIndex))
                 {
                     const float currentSemitones = getPitchSemitonesForDisplay(*strip);
@@ -672,7 +748,6 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
             else if (x == 15)
             {
-                quantizeEnabled = !quantizeEnabled;
                 return;  // Don't process as strip trigger!
             }
         }
@@ -711,7 +786,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 if (stepEditTool == StepEditTool::Gate)
                     stepEditTool = StepEditTool::Velocity;
 
-                const int selectedStripIndex = juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip);
+                const int selectedStripIndex = clampVisibleStrip(stepEditSelectedStrip);
                 auto* targetStrip = audioEngine->getStrip(selectedStripIndex);
                 if (!targetStrip)
                 {
@@ -719,7 +794,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     return;
                 }
 
-                const float rowValue = juce::jlimit(0.0f, 1.0f, (6.0f - static_cast<float>(y)) / 5.0f);
+                const float rowValue = stripRowToUnit(y);
                 const float columnNorm = juce::jlimit(0.0f, 1.0f, static_cast<float>(x) / 15.0f);
                 auto setStepEnabled = [targetStrip](int absoluteStep, bool shouldEnable)
                 {
@@ -908,7 +983,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
 
             int stripIndex = y - FIRST_STRIP_ROW;
-            if (stripIndex < MaxStrips && x < 16)
+            if (stripIndex >= 0 && stripIndex < visibleStripCount && x < MaxColumns)
             {
                 if (!(controlModeActive && (currentControlMode == ControlMode::GrainSize
                     || currentControlMode == ControlMode::Modulation)))
@@ -926,6 +1001,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Step
                     && loopSetFirstButton >= 0
                     && loopSetStrip == stripIndex
+                    && strip->isButtonHeld(loopSetFirstButton)
                     && strip->getScratchAmount() == 0.0f)
                 {
                     const int firstButton = juce::jlimit(0, MaxColumns - 1, loopSetFirstButton);
@@ -997,7 +1073,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     }
                     else if (currentControlMode == ControlMode::GrainSize)
                     {
-                        const int targetStripIndex = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+                        const int targetStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
                         if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
                             MonomeMixActions::handleGrainPageButtonPress(*targetStrip, stripIndex, x);
                     }
@@ -1016,9 +1092,9 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     }
                     else if (currentControlMode == ControlMode::Modulation)
                     {
-                        const int targetStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+                        const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
                         const bool bipolar = audioEngine->isModBipolar(targetStrip);
-                        const float normalizedY = juce::jlimit(0.0f, 1.0f, (6.0f - static_cast<float>(y)) / 6.0f);
+                        const float normalizedY = modulationRowToUnit(y);
                         float value = normalizedY;
                         if (bipolar)
                         {
@@ -1086,7 +1162,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         if (y >= FIRST_STRIP_ROW && y < CONTROL_ROW)
         {
             int stripIndex = y - FIRST_STRIP_ROW;
-            if (stripIndex < MaxStrips && x >= 3 && x < (3 + BrowserFavoriteSlots))
+            if (stripIndex >= 0 && stripIndex < visibleStripCount && x >= 3 && x < (3 + BrowserFavoriteSlots))
             {
                 const int slot = x - 3;
                 const bool browserModeActive = controlModeActive && currentControlMode == ControlMode::FileBrowser;
@@ -1150,7 +1226,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         if (y >= FIRST_STRIP_ROW && y < CONTROL_ROW)
         {
             int stripIndex = y - FIRST_STRIP_ROW;
-            if (stripIndex < MaxStrips && x < 16)
+            if (stripIndex >= 0 && stripIndex < visibleStripCount && x < MaxColumns)
             {
                 auto* strip = audioEngine->getStrip(stripIndex);
                 if (strip)
@@ -1165,7 +1241,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         if (y >= FIRST_STRIP_ROW && y < CONTROL_ROW)
         {
             int stripIndex = y - FIRST_STRIP_ROW;
-            if (stripIndex < MaxStrips && x < 16)
+            if (stripIndex >= 0 && stripIndex < visibleStripCount && x < MaxColumns)
             {
                 auto* strip = audioEngine->getStrip(stripIndex);
                 if (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Gate)
@@ -1205,12 +1281,30 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     if (!monomeConnection.isConnected() || !audioEngine || !monomeConnection.supportsGrid())
         return;
     
+    const int gridWidth = getMonomeGridWidth();
+    const int gridHeight = getMonomeGridHeight();
     const int GROUP_ROW = 0;
     const int FIRST_STRIP_ROW = 1;
-    const int CONTROL_ROW = 7;
+    const int CONTROL_ROW = getMonomeControlRow();
+    const int visibleStripCount = juce::jmax(0, getMonomeActiveStripCount());
+    const int stepEditBankSize = 6;
+    const int maxStepEditBank = juce::jmax(0, (visibleStripCount - 1) / stepEditBankSize);
+    stepEditStripBank = juce::jlimit(0, maxStepEditBank, stepEditStripBank);
+    const int maxVisibleStripIndex = juce::jmax(0, visibleStripCount - 1);
+    const int modulationMaxRow = juce::jmax(1, visibleStripCount);
+    const auto clampVisibleStrip = [maxVisibleStripIndex](int index)
+    {
+        return juce::jlimit(0, maxVisibleStripIndex, index);
+    };
+    const auto stepEditRowNorm = [CONTROL_ROW, visibleStripCount](int row)
+    {
+        const int denom = juce::jmax(1, visibleStripCount - 1);
+        return juce::jlimit(0.0f, 1.0f,
+            static_cast<float>((CONTROL_ROW - 1) - row) / static_cast<float>(denom));
+    };
     
     // Temporary LED state
-    int newLedState[16][8] = {{0}};
+    int newLedState[MaxGridWidth][MaxGridHeight] = {{0}};
     const double beatNow = audioEngine->getTimelineBeat();
     const bool fastBlinkOn = std::fmod(beatNow * 2.0, 1.0) < 0.5;  // Twice per beat
     const bool slowBlinkOn = std::fmod(beatNow, 1.0) < 0.5;        // Once per beat
@@ -1287,21 +1381,21 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
 
         // Keep control row visible while preset grid is active.
-        for (int x = 0; x < NumControlRowPages; ++x)
+        for (int x = 0; x < NumControlRowPages && x < gridWidth; ++x)
             newLedState[x][CONTROL_ROW] = 5;
         const int activeButton = getControlButtonForMode(currentControlMode);
-        if (activeButton >= 0 && activeButton < NumControlRowPages)
+        if (activeButton >= 0 && activeButton < NumControlRowPages && activeButton < gridWidth)
             newLedState[activeButton][CONTROL_ROW] = 15;
         // Metronome pulse on control-row quantize button (row 7, col 15):
         // beat pulses dim, bar "1" pulses bright.
         if (metroPulseOn)
             newLedState[15][CONTROL_ROW] = metroDownbeat ? 15 : 7;
         else
-            newLedState[15][CONTROL_ROW] = quantizeEnabled ? 5 : 2;
+            newLedState[15][CONTROL_ROW] = 5;
 
-        for (int y = 0; y < 8; ++y)
+        for (int y = 0; y < gridHeight; ++y)
         {
-            for (int x = 0; x < 16; ++x)
+            for (int x = 0; x < gridWidth; ++x)
             {
                 if (newLedState[x][y] != ledCache[x][y])
                 {
@@ -1342,12 +1436,19 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         for (int col = 0; col <= 7; ++col)
             newLedState[col][GROUP_ROW] = (col == toolColumn) ? 15 : 4;
 
-        const int selectedStripIndex = juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip);
+        stepEditSelectedStrip = clampVisibleStrip(stepEditSelectedStrip);
+        const int selectedStripIndex = stepEditSelectedStrip;
+        if (selectedStripIndex < (stepEditStripBank * stepEditBankSize)
+            || selectedStripIndex >= ((stepEditStripBank + 1) * stepEditBankSize))
+        {
+            stepEditStripBank = juce::jlimit(0, maxStepEditBank, selectedStripIndex / stepEditBankSize);
+        }
+        const int bankStart = stepEditStripBank * stepEditBankSize;
 
         for (int col = 8; col <= 13; ++col)
         {
-            const int stripIndex = col - 8;
-            if (stripIndex >= MaxStrips)
+            const int stripIndex = bankStart + (col - 8);
+            if (stripIndex >= visibleStripCount)
                 continue;
 
             auto* strip = audioEngine->getStrip(stripIndex);
@@ -1358,12 +1459,15 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             newLedState[col][GROUP_ROW] = level;
         }
 
-        newLedState[14][GROUP_ROW] = 0;
-        newLedState[15][GROUP_ROW] = 0;
+        const bool bankDownAvailable = (stepEditStripBank > 0);
+        const bool bankUpAvailable = (stepEditStripBank < maxStepEditBank);
+        newLedState[14][GROUP_ROW] = bankDownAvailable ? 9 : 2;
+        newLedState[15][GROUP_ROW] = bankUpAvailable ? 9 : 2;
     }
     else if (controlModeActive
         && currentControlMode != ControlMode::Normal
         && currentControlMode != ControlMode::Modulation
+        && currentControlMode != ControlMode::Filter
         && currentControlMode != ControlMode::Preset)
     {
         // In non-modulation control pages, top row is intentionally disabled.
@@ -1384,7 +1488,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     }
     else if (currentControlMode == ControlMode::Modulation && controlModeActive)
     {
-        const int targetStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+        const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
         const auto seq = audioEngine->getModSequencerState(targetStrip);
         const int activeGlobalStep = audioEngine->getModCurrentGlobalStep(targetStrip);
         const int playbackPage = juce::jlimit(
@@ -1396,6 +1500,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             : -1;
         const bool stripPlaying = audioEngine->getStrip(targetStrip) && audioEngine->getStrip(targetStrip)->isPlaying();
         const int displayRow = 0; // Top row is highest value in modulation mode.
+        const int modulationBaseRow = seq.bipolar ? (modulationMaxRow / 2) : modulationMaxRow;
 
         auto valueToRow = [&](float v)
         {
@@ -1404,15 +1509,15 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             {
                 const float signedV = (v * 2.0f) - 1.0f;
                 const float n = (signedV + 1.0f) * 0.5f;
-                return juce::jlimit(0, 6, static_cast<int>(std::round((1.0f - n) * 6.0f)));
+                return juce::jlimit(0, modulationMaxRow, static_cast<int>(std::round((1.0f - n) * modulationMaxRow)));
             }
-            return juce::jlimit(0, 6, static_cast<int>(std::round((1.0f - v) * 6.0f)));
+            return juce::jlimit(0, modulationMaxRow, static_cast<int>(std::round((1.0f - v) * modulationMaxRow)));
         };
         auto curveLevelForRow = [&](int row, bool isPoint)
         {
             // Value-encoded intensity: high values (top rows) are more solid,
             // low values (bottom rows) are dimmer.
-            const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / 6.0f));
+            const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
             const int base = juce::jlimit(1, 15, static_cast<int>(std::round(juce::jmap(rowValue01, 2.0f, 12.0f))));
             return juce::jlimit(1, 15, isPoint ? (base + 2) : base);
         };
@@ -1428,7 +1533,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             const float t = (barRange > 0.0f) ? (fromBase / barRange) : 1.0f; // 0 at base, 1 at point
             const float shapedT = std::pow(juce::jlimit(0.0f, 1.0f, t), 0.72f);
 
-            const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / 6.0f));
+            const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
             const float minLevel = seq.bipolar ? 3.0f : 2.0f;
             const float maxLevel = 9.0f + (4.0f * rowValue01); // 9..13, brighter for higher values
             int level = static_cast<int>(std::round(minLevel + ((maxLevel - minLevel) * shapedT)));
@@ -1460,8 +1565,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             }
             else
             {
-                const int baseRow = seq.bipolar ? 3 : 6;
-                newLedState[x][GROUP_ROW] = stepLevelForRow(displayRow, pointRow, baseRow);
+                newLedState[x][GROUP_ROW] = stepLevelForRow(displayRow, pointRow, modulationBaseRow);
             }
 
             if (stripPlaying && x == activeStep)
@@ -1565,15 +1669,15 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
     }
     
-    // ROWS 1-6: Strip displays
-    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    // Strip rows (between group row and control row).
+    for (int stripIndex = 0; stripIndex < visibleStripCount; ++stripIndex)
     {
         int y = FIRST_STRIP_ROW + stripIndex;
         auto* strip = audioEngine->getStrip(stripIndex);
 
         if (controlModeActive && currentControlMode == ControlMode::StepEdit)
         {
-            const int selectedStripIndex = juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip);
+            const int selectedStripIndex = clampVisibleStrip(stepEditSelectedStrip);
             auto* selectedStrip = audioEngine->getStrip(selectedStripIndex);
             if (!selectedStrip)
             {
@@ -1587,7 +1691,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             const int visibleCurrentStep = selectedStrip->getVisibleCurrentStep();
             const bool stripPlaying = selectedStrip->isPlaying()
                 && selectedStrip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step;
-            const float rowNorm = juce::jlimit(0.0f, 1.0f, (6.0f - static_cast<float>(y)) / 5.0f);
+            const float rowNorm = stepEditRowNorm(y);
 
             if (stepEditTool == StepEditTool::Attack
                 || stepEditTool == StepEditTool::Decay
@@ -1740,7 +1844,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
         else if (controlModeActive && currentControlMode == ControlMode::GrainSize)
         {
-            const int targetStripIndex = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+            const int targetStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
             if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
                 MonomeMixActions::renderGrainPageRow(*targetStrip, stripIndex, y, newLedState);
         }
@@ -1758,7 +1862,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
         else if (controlModeActive && currentControlMode == ControlMode::Modulation)
         {
-            const int selectedStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+            const int selectedStrip = clampVisibleStrip(getLastMonomePressedStripRow());
             const auto seq = audioEngine->getModSequencerState(selectedStrip);
             const int activeGlobalStep = audioEngine->getModCurrentGlobalStep(selectedStrip);
             const int playbackPage = juce::jlimit(
@@ -1769,7 +1873,8 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                 ? (activeGlobalStep % ModernAudioEngine::ModSteps)
                 : -1;
             const bool stripPlaying = audioEngine->getStrip(selectedStrip) && audioEngine->getStrip(selectedStrip)->isPlaying();
-            const int displayRow = y; // 1..6, with row 0 rendered in GROUP_ROW branch
+            const int displayRow = y; // Strip rows, with row 0 rendered in GROUP_ROW branch.
+            const int modulationBaseRow = seq.bipolar ? (modulationMaxRow / 2) : modulationMaxRow;
 
             auto valueToRow = [&](float v)
             {
@@ -1778,15 +1883,15 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                 {
                     const float signedV = (v * 2.0f) - 1.0f;
                     const float n = (signedV + 1.0f) * 0.5f;
-                    return juce::jlimit(0, 6, static_cast<int>(std::round((1.0f - n) * 6.0f)));
+                    return juce::jlimit(0, modulationMaxRow, static_cast<int>(std::round((1.0f - n) * modulationMaxRow)));
                 }
-                return juce::jlimit(0, 6, static_cast<int>(std::round((1.0f - v) * 6.0f)));
+                return juce::jlimit(0, modulationMaxRow, static_cast<int>(std::round((1.0f - v) * modulationMaxRow)));
             };
             auto curveLevelForRow = [&](int row, bool isPoint)
             {
                 // Value-encoded intensity: high values (top rows) are more solid,
                 // low values (bottom rows) are dimmer.
-                const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / 6.0f));
+                const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
                 const int base = juce::jlimit(1, 15, static_cast<int>(std::round(juce::jmap(rowValue01, 2.0f, 12.0f))));
                 return juce::jlimit(1, 15, isPoint ? (base + 2) : base);
             };
@@ -1802,7 +1907,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                 const float t = (barRange > 0.0f) ? (fromBase / barRange) : 1.0f; // 0 at base, 1 at point
                 const float shapedT = std::pow(juce::jlimit(0.0f, 1.0f, t), 0.72f);
 
-                const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / 6.0f));
+                const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
                 const float minLevel = seq.bipolar ? 3.0f : 2.0f;
                 const float maxLevel = 9.0f + (4.0f * rowValue01); // 9..13, brighter for higher values
                 int level = static_cast<int>(std::round(minLevel + ((maxLevel - minLevel) * shapedT)));
@@ -1836,8 +1941,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                 else
                 {
                     // Step-slider mode: vertical bar to value.
-                    const int baseRow = seq.bipolar ? 3 : 6;
-                    newLedState[x][y] = stepLevelForRow(displayRow, pointRow, baseRow);
+                    newLedState[x][y] = stepLevelForRow(displayRow, pointRow, modulationBaseRow);
                 }
 
                 if (stripPlaying && x == activeStep)
@@ -1986,20 +2090,20 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
     }
     
-    // ROW 7: Controls
-    for (int x = 0; x < NumControlRowPages; ++x)
+    // Control row (bottom row): page buttons and quantize indicator.
+    for (int x = 0; x < NumControlRowPages && x < gridWidth; ++x)
         newLedState[x][CONTROL_ROW] = 5;
 
     if (controlModeActive)
     {
         const int activeButton = getControlButtonForMode(currentControlMode);
-        if (activeButton >= 0 && activeButton < NumControlRowPages)
+        if (activeButton >= 0 && activeButton < NumControlRowPages && activeButton < gridWidth)
             newLedState[activeButton][CONTROL_ROW] = 15;
     }
 
     if (controlModeActive && currentControlMode == ControlMode::StepEdit)
     {
-        const int selectedStripIndex = juce::jlimit(0, MaxStrips - 1, stepEditSelectedStrip);
+        const int selectedStripIndex = clampVisibleStrip(stepEditSelectedStrip);
         bool hasSelectedStrip = false;
         int pitchSemitones = 0;
 
@@ -2038,12 +2142,12 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     if (metroPulseOn)
         newLedState[15][CONTROL_ROW] = metroDownbeat ? 15 : 7;
     else
-        newLedState[15][CONTROL_ROW] = quantizeEnabled ? 5 : 2;
+        newLedState[15][CONTROL_ROW] = 5;
     
     // Differential update
-    for (int y = 0; y < 8; ++y)
+    for (int y = 0; y < gridHeight; ++y)
     {
-        for (int x = 0; x < 16; ++x)
+        for (int x = 0; x < gridWidth; ++x)
         {
             if (newLedState[x][y] != ledCache[x][y])
             {

@@ -112,12 +112,6 @@ private:
     juce::Label filterResLabel;
     juce::Label filterMorphLabel;
     juce::Label filterAlgoLabel;
-    juce::Label gateSpeedLabel;
-    juce::Label gateEnvLabel;
-    juce::Label gateShapeLabel;
-    juce::ComboBox gateSpeedBox;
-    juce::Slider gateEnvSlider;
-    juce::Slider gateShapeSlider;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FXStripControl)
 };
@@ -448,8 +442,10 @@ private:
     // Compact controls on the right
     juce::Slider volumeSlider;      // Compact rotary
     juce::Slider panSlider;         // Compact rotary
-    juce::Slider speedSlider;       // Compact rotary - pitch
-    juce::Slider scratchSlider;     // Compact rotary - playhead speed
+    juce::Slider pitchSlider;       // Compact rotary - pitch semitones
+    juce::Slider speedSlider;       // Compact rotary - playhead speed
+    juce::Slider scratchSlider;     // Compact rotary - scratch amount
+    juce::Slider sliceLengthSlider; // Compact rotary - loop slice length
     juce::ComboBox patternLengthBox; // Step mode pattern length (16..64)
     DraggableNumberBox stepLengthReadoutBox; // Step mode draggable numeric length (1..64)
     juce::Slider stepAttackSlider;  // Step mode attack (ms)
@@ -462,8 +458,10 @@ private:
     juce::Label recordLengthLabel;  // Shows input recording buffer length for this strip
     juce::Label volumeLabel;        // Label below knob
     juce::Label panLabel;           // Label below knob
+    juce::Label pitchLabel;         // Label below knob
     juce::Label speedLabel;         // Label below knob
     juce::Label scratchLabel;       // Label below knob
+    juce::Label sliceLengthLabel;   // Label below knob
     juce::Label stepAttackLabel;    // Step envelope labels
     juce::Label stepDecayLabel;
     juce::Label stepReleaseLabel;
@@ -534,8 +532,9 @@ private:
     // Attachments
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> volumeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> panAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> pitchAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> speedAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> scratchAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> sliceLengthAttachment;
     
     void setupComponents();
     void loadSample();
@@ -736,6 +735,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> outputRoutingAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> pitchControlModeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> soundTouchEnabledAttachment;
+    bool globalUiReady = false;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GlobalControlPanel)
 };
@@ -1073,6 +1073,10 @@ private:
     std::unique_ptr<juce::TooltipWindow> tooltipWindow;
     bool tooltipsEnabled = true;
     uint32_t lastPresetRefreshToken = 0;
+    int activeGuiStripCount = 6;
+
+    int getDetectedGuiStripCount() const;
+    void setActiveGuiStripCount(int stripCount, bool forceRelayout);
     void createUIComponents();
     void setupLookAndFeel();
     void layoutComponents();

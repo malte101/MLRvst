@@ -178,6 +178,7 @@ void resetStripParametersToDefaults(juce::AudioProcessorValueTreeState& paramete
     setParameterToDefault(parameters, "stripPan" + juce::String(stripIndex));
     setParameterToDefault(parameters, "stripSpeed" + juce::String(stripIndex));
     setParameterToDefault(parameters, "stripPitch" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripSliceLength" + juce::String(stripIndex));
 }
 
 void resetStripToDefaultState(int stripIndex,
@@ -197,6 +198,9 @@ void resetStripToDefaultState(int stripIndex,
     strip.setBeatsPerLoop(-1.0f);
     strip.setScratchAmount(0.0f);
     strip.setTransientSliceMode(false);
+    strip.setLoopSliceLength(1.0f);
+    strip.setResamplePitchEnabled(false);
+    strip.setResamplePitchRatio(1.0f);
     strip.setPitchShift(0.0f);
     strip.setRecordingBars(1);
     strip.setFilterFrequency(20000.0f);
@@ -612,6 +616,7 @@ bool savePreset(int presetIndex,
         stripXml->setAttribute("beatsPerLoop", strip->getBeatsPerLoop());
         stripXml->setAttribute("scratchAmount", strip->getScratchAmount());
         stripXml->setAttribute("transientSliceMode", strip->isTransientSliceMode());
+        stripXml->setAttribute("loopSliceLength", strip->getLoopSliceLength());
         if (strip->hasSampleAnalysisCache())
         {
             stripXml->setAttribute(kAnalysisSampleCountAttr, strip->getAnalysisSampleCount());
@@ -998,6 +1003,7 @@ bool loadPreset(int presetIndex,
             strip->restoreSampleAnalysisCache(cachedTransient, cachedRms, cachedZeroCross, analysisSampleCount);
         }
         strip->setTransientSliceMode(stripXml->getBoolAttribute("transientSliceMode", false));
+        strip->setLoopSliceLength(clampedFloat(stripXml->getDoubleAttribute("loopSliceLength", 1.0), 1.0f, 0.0f, 1.0f));
         strip->setPitchShift(clampedFloat(stripXml->getDoubleAttribute("pitchShift", 0.0), 0.0f, -24.0f, 24.0f));
         strip->setRecordingBars(clampedInt(stripXml->getIntAttribute("recordingBars", 1), 1, 8, 1));
         const bool restoreFilterEnabled = stripXml->getBoolAttribute("filterEnabled", false);
@@ -1180,6 +1186,16 @@ bool loadPreset(int presetIndex,
                 pitchParam->setValueNotifyingHost(
                     juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(pitchValue)));
                 }
+        }
+
+        if (auto* sliceLengthParam = parameters.getParameter("stripSliceLength" + juce::String(stripIndex)))
+        {
+            float sliceLengthValue = static_cast<float>(stripXml->getDoubleAttribute("loopSliceLength", 1.0));
+            if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(sliceLengthParam))
+            {
+                sliceLengthParam->setValueNotifyingHost(
+                    juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(sliceLengthValue)));
+            }
         }
     }
 

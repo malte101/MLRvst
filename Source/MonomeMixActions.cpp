@@ -16,6 +16,11 @@ constexpr int volumeMode = static_cast<int>(MlrVSTAudioProcessor::ControlMode::V
 constexpr int grainSizeMode = static_cast<int>(MlrVSTAudioProcessor::ControlMode::GrainSize);
 constexpr int swingMode = static_cast<int>(MlrVSTAudioProcessor::ControlMode::Swing);
 constexpr int gateMode = static_cast<int>(MlrVSTAudioProcessor::ControlMode::Gate);
+constexpr float minSliceLength = 0.02f;
+constexpr float maxSliceLength = 1.0f;
+constexpr float minStepDecayMs = 1.0f;
+constexpr float maxStepDecayMs = 4000.0f;
+constexpr float stepDecayMidpointMs = 700.0f;
 
 const std::array<int, 16> musicalPitchSemitones = {
     -24, -21, -18, -15, -12, -9, -6, -3,
@@ -39,10 +44,51 @@ float bipolarFromColumn(int x, float minValue, float maxValue)
     return minValue + (t * (maxValue - minValue));
 }
 
+const juce::NormalisableRange<float>& sliceLengthRange()
+{
+    static const juce::NormalisableRange<float> range(minSliceLength, maxSliceLength, 0.001f, 0.5f);
+    return range;
+}
+
+const juce::NormalisableRange<float>& stepDecayRange()
+{
+    static const juce::NormalisableRange<float> range = []
+    {
+        juce::NormalisableRange<float> r(minStepDecayMs, maxStepDecayMs);
+        r.setSkewForCentre(stepDecayMidpointMs);
+        return r;
+    }();
+    return range;
+}
+
+float sliceLengthFromColumn(int x)
+{
+    return sliceLengthRange().convertFrom0to1(unitFromColumn(juce::jlimit(0, 15, x)));
+}
+
+float stepDecayMsFromColumn(int x)
+{
+    return stepDecayRange().convertFrom0to1(unitFromColumn(juce::jlimit(0, 15, x)));
+}
+
 int findNearestColumn(float value, float minValue, float maxValue)
 {
     const float range = juce::jmax(1.0e-6f, maxValue - minValue);
     const float t = juce::jlimit(0.0f, 1.0f, (value - minValue) / range);
+    return juce::jlimit(0, 15, static_cast<int>(std::round(t * 15.0f)));
+}
+
+int findNearestSliceLengthColumn(float value)
+{
+    const float t = juce::jlimit(0.0f, 1.0f,
+                                 sliceLengthRange().convertTo0to1(juce::jlimit(minSliceLength, maxSliceLength, value)));
+    return juce::jlimit(0, 15, static_cast<int>(std::round(t * 15.0f)));
+}
+
+int findNearestStepDecayColumn(float valueMs)
+{
+    const float t = juce::jlimit(0.0f, 1.0f,
+                                 stepDecayRange().convertTo0to1(juce::jlimit(minStepDecayMs, maxStepDecayMs, valueMs)));
     return juce::jlimit(0, 15, static_cast<int>(std::round(t * 15.0f)));
 }
 
@@ -151,14 +197,25 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
     }
     else if (mode == gateMode)
     {
-        strip.setGateAmount(unitFromColumn(juce::jlimit(0, 15, x)));
+        const int clampedColumn = juce::jlimit(0, 15, x);
+        if (strip.playMode == EnhancedAudioStrip::PlayMode::Step)
+        {
+            strip.setStepEnvelopeDecayMs(stepDecayMsFromColumn(clampedColumn));
+        }
+        else
+        {
+            const float sliceLength = sliceLengthFromColumn(clampedColumn);
+            strip.setLoopSliceLength(sliceLength);
+            if (auto* param = processor.parameters.getParameter("stripSliceLength" + juce::String(stripIndex)))
+                param->setValueNotifyingHost(param->convertTo0to1(sliceLength));
+        }
     }
 }
 
 void renderRow(const EnhancedAudioStrip& strip,
                const MlrVSTAudioProcessor& processor,
                int y,
-               int newLedState[16][8],
+               int newLedState[16][16],
                int mode)
 {
     const bool isStepMode = (strip.playMode == EnhancedAudioStrip::PlayMode::Step);
@@ -248,7 +305,9 @@ void renderRow(const EnhancedAudioStrip& strip,
     }
     else if (mode == gateMode)
     {
-        const int activeCol = findNearestColumn(strip.getGateAmount(), 0.0f, 1.0f);
+        const int activeCol = isStepMode
+            ? findNearestStepDecayColumn(strip.getStepEnvelopeDecayMs())
+            : findNearestSliceLengthColumn(strip.getLoopSliceLength());
         for (int x = 0; x < 16; ++x)
             newLedState[x][y] = (x <= activeCol) ? (x == activeCol ? 15 : 8) : 2;
     }
@@ -269,7 +328,7 @@ void handleGrainPageButtonPress(EnhancedAudioStrip& targetStrip, int controlRow,
     }
 }
 
-void renderGrainPageRow(const EnhancedAudioStrip& targetStrip, int controlRow, int y, int newLedState[16][8])
+void renderGrainPageRow(const EnhancedAudioStrip& targetStrip, int controlRow, int y, int newLedState[16][16])
 {
     int activeCol = 0;
     switch (juce::jlimit(0, 5, controlRow))
