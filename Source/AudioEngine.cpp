@@ -119,6 +119,30 @@ float shapeGrainEnvelopeWindow(float baseWindow, float curve)
     return std::pow(clampedWindow, clampedCurve);
 }
 
+float smoothingCoeffFromMs(float ms, double sampleRate)
+{
+    const double safeMs = juce::jmax(0.001, static_cast<double>(ms));
+    const double safeRate = juce::jmax(1.0, sampleRate);
+    return static_cast<float>(std::exp(-1.0 / ((safeMs * 0.001) * safeRate)));
+}
+
+float computeDuckGainFromEnvelope(float envelope,
+                                  float thresholdDb,
+                                  float ratio)
+{
+    const float safeEnv = juce::jmax(1.0e-6f, envelope);
+    const float envDb = juce::Decibels::gainToDecibels(safeEnv, -120.0f);
+    const float safeThreshold = juce::jlimit(-60.0f, 0.0f, thresholdDb);
+    const float safeRatio = juce::jlimit(1.0f, 20.0f, ratio);
+    if (envDb <= safeThreshold || safeRatio <= 1.0f)
+        return 1.0f;
+
+    const float overDb = envDb - safeThreshold;
+    const float compressedDb = safeThreshold + (overDb / safeRatio);
+    const float reductionDb = compressedDb - envDb;
+    return juce::Decibels::decibelsToGain(reductionDb);
+}
+
 #if MLRVST_ENABLE_SOUNDTOUCH
 double swingUnitBeatsFromDivision(EnhancedAudioStrip::SwingDivision division)
 {
@@ -1315,6 +1339,7 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     smoothedFilterFrequency.setCurrentAndTargetValue(filterFrequency.load(std::memory_order_acquire));
     smoothedFilterResonance.setCurrentAndTargetValue(filterResonance.load(std::memory_order_acquire));
     smoothedFilterMorph.setCurrentAndTargetValue(filterMorph.load(std::memory_order_acquire));
+    duckSmoothedGain = 1.0f;
     rateSmoother.setCurrentAndTargetValue(1.0);
     grainCenterSmoother.setCurrentAndTargetValue(0.0);
     grainSizeSmoother.setCurrentAndTargetValue(grainParams.sizeMs);
@@ -4038,6 +4063,13 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         lastObservedGlobalSample = globalSampleStart;
         lastObservedTempo = tempo;
     }
+
+    if (playMode == PlayMode::Sample)
+    {
+        playing = false;
+        wasPlayingBeforeStop = false;
+        return;
+    }
     
     if (playMode == PlayMode::Step && hostJustStarted)
     {
@@ -5973,6 +6005,76 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
 }
 }  // Extra closing brace to fix imbalance
 
+void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& output,
+                                                     int startSample,
+                                                     int numSamples,
+                                                     const juce::AudioPlayHead::PositionInfo& positionInfo,
+                                                     double tempo)
+{
+    juce::ScopedLock lock(bufferLock);
+
+    if (numSamples <= 0 || output.getNumChannels() < 2)
+        return;
+
+    smoothedVolume.setTargetValue(volume.load(std::memory_order_acquire));
+    smoothedPan.setTargetValue(pan.load(std::memory_order_acquire));
+    smoothedFilterFrequency.setTargetValue(filterFrequency.load(std::memory_order_acquire));
+    smoothedFilterResonance.setTargetValue(filterResonance.load(std::memory_order_acquire));
+    smoothedFilterMorph.setTargetValue(filterMorph.load(std::memory_order_acquire));
+
+    const bool hasPpq = positionInfo.getPpqPosition().hasValue() && tempo > 0.0;
+    const double basePpq = hasPpq ? *positionInfo.getPpqPosition() : 0.0;
+    const double samplesPerBeatLocal = hasPpq
+        ? ((60.0 / tempo) * currentSampleRate)
+        : 0.0;
+    const float pi = 3.14159265359f;
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        float leftSample = output.getSample(0, startSample + i);
+        float rightSample = output.getSample(1, startSample + i);
+
+        const float currentPan = smoothedPan.getNextValue();
+        const float panAngle = (currentPan + 1.0f) * 0.5f * pi * 0.5f;
+        leftSample *= std::cos(panAngle);
+        rightSample *= std::sin(panAngle);
+
+        if (!isResamplePitchEnabled())
+        {
+            const float semitonesNow = smoothedPitchShift.getNextValue();
+            processPitchShift(leftSample, rightSample, semitonesNow);
+        }
+
+        if (filterEnabled)
+        {
+            const float filtFreq = smoothedFilterFrequency.getNextValue();
+            const float filtRes = smoothedFilterResonance.getNextValue();
+            const float filtMorph = smoothedFilterMorph.getNextValue();
+            processFilterSample(leftSample, rightSample, filtFreq, filtRes, filtMorph);
+        }
+
+        if (hasPpq)
+        {
+            const double ppqAtSampleRaw = basePpq + (static_cast<double>(i) / juce::jmax(1.0, samplesPerBeatLocal));
+            const float gateMod = computeGateModulation(applySwingToPpq(ppqAtSampleRaw));
+            leftSample *= gateMod;
+            rightSample *= gateMod;
+        }
+
+        const float currentVol = smoothedVolume.getNextValue();
+        leftSample *= currentVol;
+        rightSample *= currentVol;
+
+        if (!std::isfinite(leftSample)) leftSample = 0.0f;
+        if (!std::isfinite(rightSample)) rightSample = 0.0f;
+
+        output.setSample(0, startSample + i, leftSample);
+        output.setSample(1, startSample + i, rightSample);
+        lastOutputSampleL = leftSample;
+        lastOutputSampleR = rightSample;
+    }
+}
+
 void EnhancedAudioStrip::trigger(int column, double tempo, bool quantized)
 {
     juce::ScopedLock lock(bufferLock);
@@ -7892,6 +7994,51 @@ void EnhancedAudioStrip::setFilterAlgorithm(FilterAlgorithm algorithm)
         filterEnabled = true;
 }
 
+int EnhancedAudioStrip::resolveDuckDetectorStripIndex(int selfStripIndex, int masterTriggerStripIndex) const
+{
+    const int selfIndex = juce::jlimit(0, ModernAudioEngine::MaxStrips - 1, selfStripIndex);
+    const int sourceSelection = juce::jlimit(0,
+                                             ModernAudioEngine::MaxStrips + 1,
+                                             duckSourceSelection.load(std::memory_order_acquire));
+
+    if (duckFollowMaster.load(std::memory_order_acquire) != 0
+        && masterTriggerStripIndex >= 0
+        && masterTriggerStripIndex < ModernAudioEngine::MaxStrips
+        && masterTriggerStripIndex != selfIndex)
+    {
+        return masterTriggerStripIndex;
+    }
+
+    if (sourceSelection == 0)
+        return selfIndex;
+
+    if (sourceSelection == 1)
+    {
+        if (masterTriggerStripIndex >= 0
+            && masterTriggerStripIndex < ModernAudioEngine::MaxStrips
+            && masterTriggerStripIndex != selfIndex)
+        {
+            return masterTriggerStripIndex;
+        }
+        return -1;
+    }
+
+    const int selectedStrip = sourceSelection - 2;
+    if (selectedStrip >= 0 && selectedStrip < ModernAudioEngine::MaxStrips)
+        return selectedStrip;
+
+    return -1;
+}
+
+bool EnhancedAudioStrip::isDuckActiveForProcessing(int selfStripIndex, int masterTriggerStripIndex) const
+{
+    if (duckEnabled.load(std::memory_order_acquire) == 0)
+        return false;
+    if (duckRatio.load(std::memory_order_acquire) <= 1.0f)
+        return false;
+    return resolveDuckDetectorStripIndex(selfStripIndex, masterTriggerStripIndex) >= 0;
+}
+
 double EnhancedAudioStrip::applySwingToPpq(double ppq) const
 {
     const double swing = static_cast<double>(swingAmount.load(std::memory_order_acquire));
@@ -8479,7 +8626,7 @@ std::array<bool, 16> EnhancedAudioStrip::getLEDStates() const
     states.fill(false);
     
     // In Step mode, LEDs are handled separately by step pattern display
-    if (playMode == PlayMode::Step)
+    if (playMode == PlayMode::Step || playMode == PlayMode::Sample)
     {
         return states;  // All off - step display handles LEDs
     }
@@ -8647,6 +8794,7 @@ ModernAudioEngine::ModernAudioEngine()
         momentaryStutterColumns[static_cast<size_t>(i)].store(0, std::memory_order_release);
         momentaryStutterOffsetRatios[static_cast<size_t>(i)].store(0.0, std::memory_order_release);
         momentaryStutterNextPpq[static_cast<size_t>(i)].store(0.0, std::memory_order_release);
+        duckDetectorEnvelopeStates[static_cast<size_t>(i)] = 0.0f;
     }
 }
 
@@ -8748,6 +8896,18 @@ void ModernAudioEngine::prepareToPlay(double sampleRate, int maxBlockSize)
         outputLimiterL[i].reset();
         outputLimiterR[i].reset();
     }
+
+    inputMonitorScratch.setSize(juce::jmax(1, 2), juce::jmax(1, maxBlockSize), false, false, true);
+    for (size_t i = 0; i < static_cast<size_t>(MaxStrips); ++i)
+    {
+        duckStripScratchBuffers[i].setSize(2, juce::jmax(1, maxBlockSize), false, false, true);
+        duckDetectorEnvelopeBuffers[i].setSize(1, juce::jmax(1, maxBlockSize), false, false, true);
+        duckStripScratchBuffers[i].clear();
+        duckDetectorEnvelopeBuffers[i].clear();
+        duckDetectorEnvelopeStates[i] = 0.0f;
+        if (auto* strip = strips[i].get())
+            strip->resetDuckGainSmoothing();
+    }
 }
 
 void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer, 
@@ -8821,6 +8981,48 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             segmentInfo.setPpqPosition(basePpq + (static_cast<double>(sampleOffset) / samplesPerBeat));
         return segmentInfo;
     };
+
+    const int masterDuckTrigger = getMasterDuckTriggerStrip();
+    bool useDuckProcessing = false;
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        auto* strip = strips[static_cast<size_t>(stripIndex)].get();
+        if (strip == nullptr)
+            continue;
+        if (!strip->isDuckActiveForProcessing(stripIndex, masterDuckTrigger))
+            continue;
+        useDuckProcessing = true;
+        break;
+    }
+
+    if (!useDuckProcessing)
+    {
+        for (auto& strip : strips)
+        {
+            if (strip != nullptr)
+                strip->resetDuckGainSmoothing();
+        }
+    }
+
+    auto resolveFinalTargetBuffer = [&](size_t stripIndex) -> juce::AudioBuffer<float>*
+    {
+        if (stripOutputs != nullptr)
+        {
+            auto* requested = (*stripOutputs)[stripIndex];
+            if (requested != nullptr && requested->getNumChannels() > 0)
+                return requested;
+        }
+        return &buffer;
+    };
+
+    if (useDuckProcessing)
+    {
+        for (size_t i = 0; i < static_cast<size_t>(MaxStrips); ++i)
+        {
+            duckStripScratchBuffers[i].clear(0, numSamples);
+            duckDetectorEnvelopeBuffers[i].clear(0, numSamples);
+        }
+    }
 
     auto processStripsSegment = [&](int startSample, int segmentSamples)
     {
@@ -9195,13 +9397,35 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 strip->clearGrainSizeModulation();
             }
 
-            juce::AudioBuffer<float>* targetBuffer = &buffer;
-            if (stripOutputs != nullptr)
+            juce::AudioBuffer<float>* targetBuffer = useDuckProcessing
+                ? &duckStripScratchBuffers[i]
+                : resolveFinalTargetBuffer(i);
+
+            auto renderCurrentStrip = [&]()
             {
-                auto* requested = (*stripOutputs)[i];
-                if (requested != nullptr && requested->getNumChannels() > 0)
-                    targetBuffer = requested;
-            }
+                if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample
+                    && sampleModeRenderCallback)
+                {
+                    sampleModeRenderCallback(static_cast<int>(i),
+                                             *targetBuffer,
+                                             startSample,
+                                             segmentSamples,
+                                             segmentPosInfo,
+                                             segmentGlobalSample,
+                                             tempoNow,
+                                             quantizeBeatsNow);
+                }
+                else
+                {
+                    strip->process(*targetBuffer,
+                                   startSample,
+                                   segmentSamples,
+                                   segmentPosInfo,
+                                   segmentGlobalSample,
+                                   tempoNow,
+                                   quantizeBeatsNow);
+                }
+            };
 
             int groupId = strip->getGroup();
             if (groupId >= 0 && groupId < MaxGroups && groups[static_cast<size_t>(groupId)])
@@ -9212,13 +9436,13 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     float groupVol = group->getVolume();
                     float preGroupVol = strip->getVolume();
                     strip->setVolume(preGroupVol * groupVol);
-                    strip->process(*targetBuffer, startSample, segmentSamples, segmentPosInfo, segmentGlobalSample, tempoNow, quantizeBeatsNow);
+                    renderCurrentStrip();
                     strip->setVolume(preGroupVol);
                 }
             }
             else
             {
-                strip->process(*targetBuffer, startSample, segmentSamples, segmentPosInfo, segmentGlobalSample, tempoNow, quantizeBeatsNow);
+                renderCurrentStrip();
             }
 
             if (applyParamMod)
@@ -9539,6 +9763,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             {
                 const bool stepRetriggerEvent = event.isSequencerRetrigger
                     && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step;
+                const bool sampleModeEvent = strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample;
 
                 if (!stepRetriggerEvent)
                     enforceGroupExclusivity(event.stripIndex, false);
@@ -9546,6 +9771,21 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 if (stepRetriggerEvent)
                 {
                     strip->retriggerStepVoiceAtColumn(event.column, event.isMomentaryStutter);
+                }
+                else if (sampleModeEvent && sampleModeTriggerCallback)
+                {
+                    auto triggerPosInfo = makeSegmentPositionInfo(eventOffset);
+                    if (hasPpq)
+                        triggerPosInfo.setPpqPosition(event.targetPPQ);
+
+                    const int64_t triggerSample = blockStart + eventOffset;
+                    sampleModeTriggerCallback(event.stripIndex,
+                                              event.column,
+                                              triggerSample,
+                                              triggerPosInfo,
+                                              event.isMomentaryStutter);
+                    if (event.clearPendingOnFire)
+                        quantizeClock.clearPendingTriggersForStrip(event.stripIndex);
                 }
                 else
                 {
@@ -9583,6 +9823,105 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
 
     // Render remaining tail after the last event
     processStripsSegment(processedSamples, numSamples - processedSamples);
+
+    if (useDuckProcessing)
+    {
+        const float detectorAttackCoeff = smoothingCoeffFromMs(2.0f, currentSampleRate);
+        const float detectorReleaseCoeff = smoothingCoeffFromMs(35.0f, currentSampleRate);
+
+        for (size_t stripIndex = 0; stripIndex < static_cast<size_t>(MaxStrips); ++stripIndex)
+        {
+            auto& scratch = duckStripScratchBuffers[stripIndex];
+            auto& detectorBuffer = duckDetectorEnvelopeBuffers[stripIndex];
+            const auto* srcL = scratch.getReadPointer(0);
+            const auto* srcR = scratch.getReadPointer(1);
+            auto* detectorWrite = detectorBuffer.getWritePointer(0);
+            float detectorState = duckDetectorEnvelopeStates[stripIndex];
+
+            for (int sample = 0; sample < numSamples; ++sample)
+            {
+                const float mono = 0.5f * (std::abs(srcL[sample]) + std::abs(srcR[sample]));
+                const float coeff = (mono > detectorState) ? detectorAttackCoeff : detectorReleaseCoeff;
+                detectorState = mono + (coeff * (detectorState - mono));
+                detectorWrite[sample] = detectorState;
+            }
+
+            duckDetectorEnvelopeStates[stripIndex] = detectorState;
+        }
+
+        for (size_t stripIndex = 0; stripIndex < static_cast<size_t>(MaxStrips); ++stripIndex)
+        {
+            auto* strip = strips[stripIndex].get();
+            if (strip == nullptr)
+                continue;
+
+            auto& scratch = duckStripScratchBuffers[stripIndex];
+            auto* destination = resolveFinalTargetBuffer(stripIndex);
+            if (destination == nullptr || destination->getNumChannels() <= 0)
+                continue;
+
+            const auto* srcL = scratch.getReadPointer(0);
+            const auto* srcR = scratch.getReadPointer(1);
+            const bool applyDuck = strip->isDuckActiveForProcessing(static_cast<int>(stripIndex), masterDuckTrigger);
+            const int detectorStripIndex = applyDuck
+                ? strip->resolveDuckDetectorStripIndex(static_cast<int>(stripIndex), masterDuckTrigger)
+                : -1;
+
+            if (!applyDuck || detectorStripIndex < 0 || detectorStripIndex >= MaxStrips)
+            {
+                strip->resetDuckGainSmoothing();
+                if (destination->getNumChannels() == 1)
+                {
+                    destination->addFrom(0, 0, scratch, 0, 0, numSamples, 0.5f);
+                    destination->addFrom(0, 0, scratch, 1, 0, numSamples, 0.5f);
+                }
+                else
+                {
+                    destination->addFrom(0, 0, scratch, 0, 0, numSamples);
+                    destination->addFrom(1, 0, scratch, 1, 0, numSamples);
+                }
+                continue;
+            }
+
+            const auto& detectorBuffer = duckDetectorEnvelopeBuffers[static_cast<size_t>(detectorStripIndex)];
+            const auto* detectorRead = detectorBuffer.getReadPointer(0);
+            float smoothedGain = strip->getDuckSmoothedGain();
+            const float attackCoeff = smoothingCoeffFromMs(strip->getDuckAttackMs(), currentSampleRate);
+            const float releaseCoeff = smoothingCoeffFromMs(strip->getDuckReleaseMs(), currentSampleRate);
+            const float thresholdDb = strip->getDuckThresholdDb();
+            const float ratio = strip->getDuckRatio();
+            const float gainComp = juce::Decibels::decibelsToGain(strip->getDuckGainCompDb());
+
+            if (destination->getNumChannels() == 1)
+            {
+                auto* dst = destination->getWritePointer(0);
+                for (int sample = 0; sample < numSamples; ++sample)
+                {
+                    const float targetGain = computeDuckGainFromEnvelope(detectorRead[sample], thresholdDb, ratio);
+                    const float coeff = (targetGain < smoothedGain) ? attackCoeff : releaseCoeff;
+                    smoothedGain = targetGain + (coeff * (smoothedGain - targetGain));
+                    const float finalGain = smoothedGain * gainComp;
+                    dst[sample] += (0.5f * (srcL[sample] + srcR[sample])) * finalGain;
+                }
+            }
+            else
+            {
+                auto* dstL = destination->getWritePointer(0);
+                auto* dstR = destination->getWritePointer(1);
+                for (int sample = 0; sample < numSamples; ++sample)
+                {
+                    const float targetGain = computeDuckGainFromEnvelope(detectorRead[sample], thresholdDb, ratio);
+                    const float coeff = (targetGain < smoothedGain) ? attackCoeff : releaseCoeff;
+                    smoothedGain = targetGain + (coeff * (smoothedGain - targetGain));
+                    const float finalGain = smoothedGain * gainComp;
+                    dstL[sample] += srcL[sample] * finalGain;
+                    dstR[sample] += srcR[sample] * finalGain;
+                }
+            }
+
+            strip->setDuckSmoothedGain(smoothedGain);
+        }
+    }
 
     std::array<juce::AudioBuffer<float>*, MaxStrips + 1> buffersToPostProcess{};
     size_t buffersToPostProcessCount = 0;
@@ -9825,7 +10164,17 @@ void ModernAudioEngine::enforceGroupExclusivity(int activeStripIndex, bool immed
             continue;
 
         if (auto* otherStrip = getStrip(otherStripIndex))
-            otherStrip->stop(immediateStop);
+        {
+            if (otherStrip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample
+                && sampleModeStopCallback)
+            {
+                sampleModeStopCallback(otherStripIndex, immediateStop);
+            }
+            else
+            {
+                otherStrip->stop(immediateStop);
+            }
+        }
     }
 }
 
@@ -9916,6 +10265,34 @@ void ModernAudioEngine::clearPendingQuantizedTriggersForStrip(int stripIndex)
     quantizeClock.clearPendingTriggersForStrip(stripIndex);
 }
 
+void ModernAudioEngine::setMasterDuckTriggerStrip(int stripIndex)
+{
+    masterDuckTriggerStrip.store(
+        (stripIndex >= 0 && stripIndex < MaxStrips) ? stripIndex : -1,
+        std::memory_order_release);
+}
+
+int ModernAudioEngine::getMasterDuckTriggerStrip() const
+{
+    const int stripIndex = masterDuckTriggerStrip.load(std::memory_order_acquire);
+    return (stripIndex >= 0 && stripIndex < MaxStrips) ? stripIndex : -1;
+}
+
+void ModernAudioEngine::setSampleModeRenderCallback(SampleModeRenderCallback callback)
+{
+    sampleModeRenderCallback = std::move(callback);
+}
+
+void ModernAudioEngine::setSampleModeTriggerCallback(SampleModeTriggerCallback callback)
+{
+    sampleModeTriggerCallback = std::move(callback);
+}
+
+void ModernAudioEngine::setSampleModeStopCallback(SampleModeStopCallback callback)
+{
+    sampleModeStopCallback = std::move(callback);
+}
+
 void ModernAudioEngine::scheduleQuantizedTrigger(int stripIndex, int column, double currentPPQ)
 {
     // Use provided PPQ or fall back to last known
@@ -9952,7 +10329,18 @@ void ModernAudioEngine::triggerStripWithQuantization(int stripIndex, int column,
         // Trigger immediately with current PPQ/sample so timeline anchor can be built.
         juce::AudioPlayHead::PositionInfo immediatePosInfo;
         immediatePosInfo.setPpqPosition(lastKnownPPQ.load());
-        strip->triggerAtSample(column, currentTempo.load(), globalSampleCount.load(), immediatePosInfo);
+        if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample && sampleModeTriggerCallback)
+        {
+            sampleModeTriggerCallback(stripIndex,
+                                      column,
+                                      globalSampleCount.load(),
+                                      immediatePosInfo,
+                                      false);
+        }
+        else
+        {
+            strip->triggerAtSample(column, currentTempo.load(), globalSampleCount.load(), immediatePosInfo);
+        }
     }
 }
 

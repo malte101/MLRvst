@@ -15,6 +15,7 @@
 #include <juce_osc/juce_osc.h>
 #include <cstdint>
 #include "AudioEngine.h"
+#include "SampleMode.h"
 
 //==============================================================================
 /**
@@ -216,6 +217,9 @@ public:
     MonomeConnection& getMonomeConnection() { return monomeConnection; }
     
     bool loadSampleToStrip(int stripIndex, const juce::File& file);
+    bool loadSampleToSampleModeStrip(int stripIndex, const juce::File& file);
+    SampleModeEngine* getSampleModeEngine(int stripIndex, bool createIfMissing = true);
+    bool hasSampleModeAudio(int stripIndex) const;
     void loadAdjacentFile(int stripIndex, int direction);  // Browse files
     void captureRecentAudioToStrip(int stripIndex);
     void clearRecentAudioBuffer();
@@ -456,11 +460,20 @@ private:
     std::atomic<float>* outputRoutingParam = nullptr;
     std::atomic<float>* pitchControlModeParam = nullptr;
     std::atomic<float>* soundTouchEnabledParam = nullptr;
+    std::atomic<float>* masterDuckTriggerStripParam = nullptr;
     std::array<std::atomic<float>*, MaxStrips> stripVolumeParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPanParams{};
     std::array<std::atomic<float>*, MaxStrips> stripSpeedParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPitchParams{};
     std::array<std::atomic<float>*, MaxStrips> stripSliceLengthParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDuckEnabledParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDuckSourceParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDuckThresholdParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDuckRatioParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDuckAttackParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDuckReleaseParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDuckGainCompParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDuckFollowMasterParams{};
     juce::CriticalSection pendingLoopChangeLock;
     std::array<PendingLoopChange, MaxStrips> pendingLoopChanges{};
     juce::CriticalSection pendingBarChangeLock;
@@ -543,10 +556,26 @@ private:
     
     // Current file per strip for proper next/prev browsing
     std::array<juce::File, MaxStrips> currentStripFiles;
+    std::array<std::unique_ptr<SampleModeEngine>, MaxStrips> sampleModeEngines;
+    std::array<juce::AudioBuffer<float>, MaxStrips> sampleModeScratchBuffers;
     
     // LED update
     void updateMonomeLEDs();
     void updateMonomeArcRings();
+    void renderSampleModeStrip(int stripIndex,
+                               juce::AudioBuffer<float>& output,
+                               int startSample,
+                               int numSamples,
+                               const juce::AudioPlayHead::PositionInfo& positionInfo,
+                               int64_t globalSampleStart,
+                               double tempo,
+                               double quantizeBeats);
+    void triggerSampleModeStripAtSample(int stripIndex,
+                                        int column,
+                                        int64_t triggerSample,
+                                        const juce::AudioPlayHead::PositionInfo& positionInfo,
+                                        bool isMomentaryStutter);
+    void stopSampleModeStrip(int stripIndex, bool immediateStop);
     void timerCallback() override;
     
     void handleMonomeKeyPress(int x, int y, int state);

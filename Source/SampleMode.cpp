@@ -7,6 +7,23 @@ namespace
 {
 constexpr double kInitialSliceTargetSeconds = 1.5;
 constexpr int kMaxInitialSliceCount = 256;
+constexpr int kDefaultSliceFadeSamples = 96;
+
+float readInterpolatedSample(const juce::AudioBuffer<float>& buffer, int channel, double samplePosition)
+{
+    const int numChannels = buffer.getNumChannels();
+    const int numSamples = buffer.getNumSamples();
+    if (numChannels <= 0 || numSamples <= 0)
+        return 0.0f;
+
+    const int clampedChannel = juce::jlimit(0, numChannels - 1, channel);
+    const float* data = buffer.getReadPointer(clampedChannel);
+    const double clampedPos = juce::jlimit(0.0, static_cast<double>(juce::jmax(0, numSamples - 1)), samplePosition);
+    const int indexA = static_cast<int>(clampedPos);
+    const int indexB = juce::jmin(indexA + 1, numSamples - 1);
+    const float frac = static_cast<float>(clampedPos - static_cast<double>(indexA));
+    return juce::jmap(frac, data[indexA], data[indexB]);
+}
 
 void buildWaveformPreview(LoadedSampleData& sampleData)
 {
@@ -303,15 +320,45 @@ SampleFileManager::LoadResult SampleFileManager::decodeFile(const juce::File& fi
 void SamplePlaybackVoice::reset()
 {
     active = false;
+    releasing = false;
+    loopEnabled = false;
+    visibleSlot = -1;
+    voiceId = 0;
     activeSlice = {};
-    triggerSample = 0;
+    readPosition = 0.0;
+    fadeInRemaining = 0;
+    fadeInTotal = 0;
+    fadeOutRemaining = 0;
+    fadeOutTotal = 0;
 }
 
-void SamplePlaybackVoice::trigger(const SampleSlice& slice, int64_t triggerSampleToUse)
+void SamplePlaybackVoice::trigger(const SampleSlice& slice,
+                                  int visibleSlotToUse,
+                                  uint64_t voiceIdToUse,
+                                  bool loopEnabledToUse,
+                                  int fadeSamples)
 {
     active = true;
+    releasing = false;
+    loopEnabled = loopEnabledToUse;
+    visibleSlot = visibleSlotToUse;
+    voiceId = voiceIdToUse;
     activeSlice = slice;
-    triggerSample = triggerSampleToUse;
+    readPosition = static_cast<double>(slice.startSample);
+    fadeInTotal = juce::jmax(0, fadeSamples);
+    fadeInRemaining = fadeInTotal;
+    fadeOutRemaining = 0;
+    fadeOutTotal = 0;
+}
+
+void SamplePlaybackVoice::beginRelease(int fadeSamples)
+{
+    if (!active)
+        return;
+
+    releasing = true;
+    fadeOutTotal = juce::jmax(0, fadeSamples);
+    fadeOutRemaining = fadeOutTotal;
 }
 
 void SamplePlaybackVoice::stop()
@@ -324,6 +371,12 @@ SampleModeEngine::SampleModeEngine() = default;
 SampleModeEngine::~SampleModeEngine()
 {
     fileManager.cancelPendingLoads();
+}
+
+void SampleModeEngine::prepare(double sampleRate, int maxBlockSize)
+{
+    preparedSampleRate.store(juce::jmax(1.0, sampleRate), std::memory_order_release);
+    preparedMaxBlockSize.store(juce::jmax(1, maxBlockSize), std::memory_order_release);
 }
 
 int SampleModeEngine::loadSampleAsync(const juce::File& file)
@@ -357,13 +410,46 @@ void SampleModeEngine::clear()
         const juce::ScopedLock lock(stateLock);
         loadedSample.reset();
         sliceModel.clear();
-        previewVoice.reset();
         isLoading = false;
         activeRequestId = 0;
         statusText = "No sample loaded";
     }
 
+    stop();
+    clearPendingVisibleSlice();
+
     sendChangeMessage();
+}
+
+void SampleModeEngine::stop(bool immediate)
+{
+    const juce::SpinLock::ScopedLockType playbackScopedLock(playbackLock);
+    if (!immediate)
+    {
+        const int fadeSamples = juce::jmax(16,
+            juce::jmin(kDefaultSliceFadeSamples,
+                       static_cast<int>(preparedSampleRate.load(std::memory_order_acquire) * 0.003)));
+        bool anyActive = false;
+        for (auto& voice : playbackVoices)
+        {
+            if (voice.isActive())
+            {
+                voice.beginRelease(fadeSamples);
+                anyActive = true;
+            }
+        }
+        if (anyActive)
+        {
+            playingAtomic.store(1, std::memory_order_release);
+            return;
+        }
+    }
+
+    for (auto& voice : playbackVoices)
+        voice.stop();
+    activeVisibleSliceSlot.store(-1, std::memory_order_release);
+    playbackProgress.store(-1.0f, std::memory_order_release);
+    playingAtomic.store(0, std::memory_order_release);
 }
 
 bool SampleModeEngine::hasSample() const
@@ -382,6 +468,12 @@ SampleModeEngine::StateSnapshot SampleModeEngine::getStateSnapshot() const
     snapshot.statusText = statusText;
     snapshot.visibleSliceBankIndex = sliceModel.getVisibleBankIndex();
     snapshot.visibleSliceBankCount = sliceModel.getVisibleBankCount();
+    snapshot.canNavigateLeft = sliceModel.canNavigateLeft();
+    snapshot.canNavigateRight = sliceModel.canNavigateRight();
+    snapshot.isPlaying = (playingAtomic.load(std::memory_order_acquire) != 0);
+    snapshot.activeVisibleSliceSlot = activeVisibleSliceSlot.load(std::memory_order_acquire);
+    snapshot.pendingVisibleSliceSlot = pendingVisibleSliceSlot.load(std::memory_order_acquire);
+    snapshot.playbackProgress = playbackProgress.load(std::memory_order_acquire);
     snapshot.visibleSlices = sliceModel.getVisibleSlices();
 
     if (loadedSample != nullptr)
@@ -427,10 +519,246 @@ void SampleModeEngine::stepVisibleBank(int delta)
     sendChangeMessage();
 }
 
+bool SampleModeEngine::hasVisibleSlice(int visibleSlot) const
+{
+    SampleSlice slice;
+    return resolveVisibleSlice(visibleSlot, slice);
+}
+
+int SampleModeEngine::getActiveVisibleSliceSlot() const noexcept
+{
+    return activeVisibleSliceSlot.load(std::memory_order_acquire);
+}
+
+int SampleModeEngine::getPendingVisibleSliceSlot() const noexcept
+{
+    return pendingVisibleSliceSlot.load(std::memory_order_acquire);
+}
+
+void SampleModeEngine::setPendingVisibleSlice(int visibleSlot)
+{
+    const int clampedSlot = juce::jlimit(0, SliceModel::VisibleSliceCount - 1, visibleSlot);
+    SampleSlice resolvedSlice;
+    const bool hasSlice = resolveVisibleSlice(clampedSlot, resolvedSlice);
+    {
+        const juce::ScopedLock lock(stateLock);
+        pendingTriggerSliceValid = hasSlice;
+        if (hasSlice)
+            pendingTriggerSlice = resolvedSlice;
+    }
+    pendingVisibleSliceSlot.store(clampedSlot, std::memory_order_release);
+}
+
+void SampleModeEngine::clearPendingVisibleSlice()
+{
+    const juce::ScopedLock lock(stateLock);
+    pendingTriggerSliceValid = false;
+    pendingVisibleSliceSlot.store(-1, std::memory_order_release);
+}
+
+bool SampleModeEngine::triggerVisibleSlice(int visibleSlot, bool loopEnabled)
+{
+    SampleSlice slice;
+    const int pendingSlot = pendingVisibleSliceSlot.load(std::memory_order_acquire);
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (pendingTriggerSliceValid && pendingSlot == visibleSlot)
+        {
+            slice = pendingTriggerSlice;
+            pendingTriggerSliceValid = false;
+        }
+        else
+        {
+            if (visibleSlot < 0 || visibleSlot >= SliceModel::VisibleSliceCount)
+                return false;
+
+            const auto visibleSlices = sliceModel.getVisibleSlices();
+            const auto& resolvedSlice = visibleSlices[static_cast<size_t>(visibleSlot)];
+            if (resolvedSlice.id < 0 || resolvedSlice.endSample <= resolvedSlice.startSample)
+                return false;
+
+            slice = resolvedSlice;
+        }
+    }
+
+    const int fadeSamples = juce::jmax(16,
+        juce::jmin(kDefaultSliceFadeSamples,
+                   static_cast<int>(preparedSampleRate.load(std::memory_order_acquire) * 0.003)));
+
+    const juce::SpinLock::ScopedLockType playbackScopedLock(playbackLock);
+    for (auto& voice : playbackVoices)
+    {
+        if (voice.isActive())
+            voice.beginRelease(fadeSamples);
+    }
+
+    SamplePlaybackVoice* targetVoice = nullptr;
+    for (auto& voice : playbackVoices)
+    {
+        if (!voice.isActive())
+        {
+            targetVoice = &voice;
+            break;
+        }
+    }
+    if (targetVoice == nullptr)
+    {
+        targetVoice = &playbackVoices.front();
+        targetVoice->stop();
+    }
+
+    targetVoice->trigger(slice, visibleSlot, nextVoiceId++, loopEnabled, fadeSamples);
+    activeVisibleSliceSlot.store(visibleSlot, std::memory_order_release);
+    pendingVisibleSliceSlot.store(-1, std::memory_order_release);
+    playbackProgress.store(slice.normalizedStart, std::memory_order_release);
+    playingAtomic.store(1, std::memory_order_release);
+    return true;
+}
+
+bool SampleModeEngine::renderToBuffer(juce::AudioBuffer<float>& output,
+                                      int startSample,
+                                      int numSamples,
+                                      float playbackRate,
+                                      int fadeSamples)
+{
+    if (numSamples <= 0)
+        return false;
+
+    std::shared_ptr<const LoadedSampleData> sampleData;
+    {
+        const juce::ScopedLock lock(stateLock);
+        sampleData = loadedSample;
+    }
+
+    if (sampleData == nullptr || sampleData->audioBuffer.getNumSamples() <= 0)
+    {
+        stop(true);
+        return false;
+    }
+
+    const double renderRate = preparedSampleRate.load(std::memory_order_acquire);
+    const double sourceRate = juce::jmax(1.0, sampleData->sourceSampleRate);
+    const double rateScale = sourceRate / juce::jmax(1.0, renderRate);
+    const double increment = juce::jlimit(0.03125, 8.0, static_cast<double>(playbackRate)) * rateScale;
+    const int fadeLen = juce::jmax(16, fadeSamples);
+
+    bool renderedAnything = false;
+    int newestActiveSlot = -1;
+    uint64_t newestVoiceId = 0;
+    float latestProgress = playbackProgress.load(std::memory_order_acquire);
+
+    const juce::SpinLock::ScopedLockType playbackScopedLock(playbackLock);
+    for (auto& voice : playbackVoices)
+    {
+        if (!voice.isActive())
+            continue;
+
+        renderedAnything = true;
+        if (voice.getVoiceId() >= newestVoiceId)
+        {
+            newestVoiceId = voice.getVoiceId();
+            newestActiveSlot = voice.getVisibleSlot();
+        }
+
+        const double sliceStart = static_cast<double>(voice.getActiveSlice().startSample);
+        const double sliceEnd = static_cast<double>(juce::jmax(voice.getActiveSlice().startSample + 1,
+                                                               voice.getActiveSlice().endSample));
+        const double sliceLength = juce::jmax(1.0, sliceEnd - sliceStart);
+        const double localFade = juce::jmin(sliceLength * 0.25, static_cast<double>(fadeLen));
+
+        for (int sampleIndex = 0; sampleIndex < numSamples; ++sampleIndex)
+        {
+            if (!voice.isActive())
+                break;
+
+            if (!voice.shouldLoop() && voice.readPosition >= sliceEnd)
+            {
+                voice.stop();
+                break;
+            }
+
+            if (voice.shouldLoop())
+            {
+                while (voice.readPosition >= sliceEnd)
+                    voice.readPosition -= sliceLength;
+                while (voice.readPosition < sliceStart)
+                    voice.readPosition += sliceLength;
+            }
+
+            float gain = 1.0f;
+            const double fromStart = juce::jmax(0.0, voice.readPosition - sliceStart);
+            const double toEnd = juce::jmax(0.0, sliceEnd - voice.readPosition);
+
+            if (localFade > 1.0)
+            {
+                gain *= static_cast<float>(juce::jlimit(0.0, 1.0, fromStart / localFade));
+                gain *= static_cast<float>(juce::jlimit(0.0, 1.0, toEnd / localFade));
+            }
+
+            if (voice.fadeInRemaining > 0 && voice.fadeInTotal > 0)
+            {
+                const float fadeInGain = 1.0f - (static_cast<float>(voice.fadeInRemaining) / static_cast<float>(voice.fadeInTotal));
+                gain *= juce::jlimit(0.0f, 1.0f, fadeInGain);
+                --voice.fadeInRemaining;
+            }
+
+            if (voice.isReleasing())
+            {
+                if (voice.fadeOutRemaining > 0 && voice.fadeOutTotal > 0)
+                {
+                    const float fadeOutGain = static_cast<float>(voice.fadeOutRemaining) / static_cast<float>(voice.fadeOutTotal);
+                    gain *= juce::jlimit(0.0f, 1.0f, fadeOutGain);
+                    --voice.fadeOutRemaining;
+                }
+                else
+                {
+                    voice.stop();
+                    break;
+                }
+            }
+
+            if (gain > 1.0e-5f)
+            {
+                const float left = readInterpolatedSample(sampleData->audioBuffer, 0, voice.readPosition);
+                const float right = readInterpolatedSample(sampleData->audioBuffer, 1, voice.readPosition);
+                output.addSample(0, startSample + sampleIndex, left * gain);
+                output.addSample(1, startSample + sampleIndex, right * gain);
+            }
+
+            voice.readPosition += increment;
+            latestProgress = juce::jlimit(0.0f,
+                                          1.0f,
+                                          static_cast<float>(voice.readPosition
+                                              / juce::jmax<int64_t>(1, sampleData->sourceLengthSamples)));
+        }
+    }
+
+    activeVisibleSliceSlot.store(newestActiveSlot, std::memory_order_release);
+    playbackProgress.store(renderedAnything ? latestProgress : -1.0f, std::memory_order_release);
+    playingAtomic.store(renderedAnything ? 1 : 0, std::memory_order_release);
+
+    return renderedAnything;
+}
+
 void SampleModeEngine::setLoadStatusCallback(LoadStatusCallback callback)
 {
     const juce::ScopedLock lock(stateLock);
     loadStatusCallback = std::move(callback);
+}
+
+bool SampleModeEngine::resolveVisibleSlice(int visibleSlot, SampleSlice& sliceOut) const
+{
+    if (visibleSlot < 0 || visibleSlot >= SliceModel::VisibleSliceCount)
+        return false;
+
+    const juce::ScopedLock lock(stateLock);
+    const auto visibleSlices = sliceModel.getVisibleSlices();
+    const auto& slice = visibleSlices[static_cast<size_t>(visibleSlot)];
+    if (slice.id < 0 || slice.endSample <= slice.startSample)
+        return false;
+
+    sliceOut = slice;
+    return true;
 }
 
 void SampleModeEngine::handleLoadResult(SampleFileManager::LoadResult result)
@@ -450,17 +778,22 @@ void SampleModeEngine::handleLoadResult(SampleFileManager::LoadResult result)
             loadedSample = std::move(result.loadedSample);
             sliceModel.setSlices(analysisEngine.buildInitialSlices(*loadedSample));
             sliceModel.setVisibleBankIndex(0);
+            pendingTriggerSliceValid = false;
             statusText = "Loaded " + loadedSample->displayName;
         }
         else
         {
             loadedSample.reset();
             sliceModel.clear();
+            pendingTriggerSliceValid = false;
             statusText = result.errorMessage.isNotEmpty() ? result.errorMessage : "Sample load failed";
         }
 
         callbackToInvoke = loadStatusCallback;
     }
+
+    stop(true);
+    clearPendingVisibleSlice();
 
     if (callbackToInvoke)
         callbackToInvoke(result);
@@ -468,10 +801,14 @@ void SampleModeEngine::handleLoadResult(SampleFileManager::LoadResult result)
     sendChangeMessage();
 }
 
-SampleModeComponent::SampleModeComponent() = default;
+SampleModeComponent::SampleModeComponent()
+{
+    startTimerHz(30);
+}
 
 SampleModeComponent::~SampleModeComponent()
 {
+    stopTimer();
     setEngine(nullptr);
 }
 
@@ -505,7 +842,7 @@ void SampleModeComponent::paint(juce::Graphics& g)
     g.drawText(stateSnapshot.statusText, bounds.removeFromTop(20), juce::Justification::centredLeft);
     bounds.removeFromTop(8);
 
-    auto waveformBounds = bounds.removeFromTop(juce::jmax(140, bounds.getHeight() - 64));
+    waveformBounds = bounds.removeFromTop(juce::jmax(140, bounds.getHeight() - 64));
     g.setColour(juce::Colour(0xff171d25));
     g.fillRoundedRectangle(waveformBounds.toFloat(), 8.0f);
     g.setColour(juce::Colour(0xff263241));
@@ -547,23 +884,55 @@ void SampleModeComponent::paint(juce::Graphics& g)
                        juce::Justification::left,
                        false);
         }
+
+        if (stateSnapshot.pendingVisibleSliceSlot >= 0
+            && stateSnapshot.pendingVisibleSliceSlot < SliceModel::VisibleSliceCount)
+        {
+            const auto& pendingSlice = stateSnapshot.visibleSlices[static_cast<size_t>(stateSnapshot.pendingVisibleSliceSlot)];
+            if (pendingSlice.id >= 0)
+            {
+                const int x = waveformBounds.getX()
+                            + juce::roundToInt(pendingSlice.normalizedStart * static_cast<float>(waveformBounds.getWidth()));
+                g.setColour(juce::Colour(0x80ffffff));
+                g.drawVerticalLine(x, static_cast<float>(waveformBounds.getY() + 3), static_cast<float>(waveformBounds.getBottom() - 3));
+            }
+        }
+
+        if (stateSnapshot.playbackProgress >= 0.0f)
+        {
+            const int playheadX = waveformBounds.getX()
+                                + juce::roundToInt(stateSnapshot.playbackProgress * static_cast<float>(waveformBounds.getWidth()));
+            g.setColour(juce::Colour(0xff8df0b8));
+            g.drawVerticalLine(playheadX,
+                               static_cast<float>(waveformBounds.getY() + 2),
+                               static_cast<float>(waveformBounds.getBottom() - 2));
+        }
     }
     else
     {
         g.setColour(juce::Colour(0xff6b7787));
-        g.drawFittedText("Async loader ready. Waveform appears here after a sample is loaded.",
+        g.drawFittedText("Async loader ready. Click Load, then trigger slices directly from this view.",
                          waveformBounds.reduced(12),
                          juce::Justification::centred,
                          2);
     }
 
     auto footer = bounds.reduced(2, 8);
+    leftNavBounds = footer.removeFromLeft(34);
+    rightNavBounds = footer.removeFromRight(34);
+    auto infoBounds = footer;
+
+    g.setColour(stateSnapshot.canNavigateLeft ? juce::Colour(0xffd7dce2) : juce::Colour(0xff4d5968));
+    g.drawFittedText("<", leftNavBounds, juce::Justification::centred, 1);
+    g.setColour(stateSnapshot.canNavigateRight ? juce::Colour(0xffd7dce2) : juce::Colour(0xff4d5968));
+    g.drawFittedText(">", rightNavBounds, juce::Justification::centred, 1);
+
     g.setColour(juce::Colour(0xff8d9aab));
     const auto bankText = "Slice bank "
         + juce::String(stateSnapshot.visibleSliceBankIndex + 1)
         + "/"
         + juce::String(juce::jmax(1, stateSnapshot.visibleSliceBankCount));
-    g.drawText(bankText, footer.removeFromLeft(160), juce::Justification::centredLeft);
+    g.drawText(bankText, infoBounds.removeFromLeft(160), juce::Justification::centredLeft);
 
     if (stateSnapshot.hasSample)
     {
@@ -571,13 +940,36 @@ void SampleModeComponent::paint(juce::Graphics& g)
             ? static_cast<double>(stateSnapshot.totalSamples) / stateSnapshot.sourceSampleRate
             : 0.0;
         g.drawText(stateSnapshot.displayName + "  |  " + juce::String(seconds, 2) + " s",
-                   footer,
+                   infoBounds,
                    juce::Justification::centredRight);
     }
 }
 
 void SampleModeComponent::resized()
 {
+}
+
+void SampleModeComponent::mouseDown(const juce::MouseEvent& event)
+{
+    const auto point = event.getPosition();
+
+    if (leftNavBounds.contains(point))
+    {
+        if (onNavigateVisibleBank && stateSnapshot.canNavigateLeft)
+            onNavigateVisibleBank(-1);
+        return;
+    }
+
+    if (rightNavBounds.contains(point))
+    {
+        if (onNavigateVisibleBank && stateSnapshot.canNavigateRight)
+            onNavigateVisibleBank(1);
+        return;
+    }
+
+    const int visibleSlot = hitTestVisibleSlice(point);
+    if (visibleSlot >= 0 && onTriggerVisibleSlice)
+        onTriggerVisibleSlice(visibleSlot);
 }
 
 void SampleModeComponent::changeListenerCallback(juce::ChangeBroadcaster* source)
@@ -599,4 +991,35 @@ void SampleModeComponent::refreshFromEngine()
     stateSnapshot = engine->getStateSnapshot();
     loadedSample = engine->getLoadedSample();
     repaint();
+}
+
+int SampleModeComponent::hitTestVisibleSlice(const juce::Point<int>& point) const
+{
+    if (!waveformBounds.contains(point))
+        return -1;
+
+    const int relativeX = point.x - waveformBounds.getX();
+    const float normalizedX = juce::jlimit(0.0f,
+                                           1.0f,
+                                           static_cast<float>(relativeX)
+                                               / juce::jmax(1.0f, static_cast<float>(waveformBounds.getWidth())));
+
+    for (int slot = 0; slot < SliceModel::VisibleSliceCount; ++slot)
+    {
+        const auto& slice = stateSnapshot.visibleSlices[static_cast<size_t>(slot)];
+        if (slice.id < 0)
+            continue;
+        const bool isLastSlice = (slot == (SliceModel::VisibleSliceCount - 1));
+        if (normalizedX >= slice.normalizedStart
+            && (normalizedX < slice.normalizedEnd || (isLastSlice && normalizedX <= slice.normalizedEnd)))
+            return slot;
+    }
+
+    return -1;
+}
+
+void SampleModeComponent::timerCallback()
+{
+    if (engine != nullptr)
+        refreshFromEngine();
 }

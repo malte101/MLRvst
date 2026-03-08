@@ -15,6 +15,7 @@
 #include <functional>
 #include <vector>
 #include "PluginProcessor.h"
+#include "SampleMode.h"
 #include "StepSequencerDisplay.h"
 
 //==============================================================================
@@ -113,6 +114,28 @@ private:
     juce::Label filterResLabel;
     juce::Label filterMorphLabel;
     juce::Label filterAlgoLabel;
+    juce::ToggleButton duckEnableButton;
+    juce::ToggleButton duckFollowMasterButton;
+    juce::ComboBox duckSourceBox;
+    juce::Slider duckThresholdSlider;
+    juce::Slider duckRatioSlider;
+    juce::Slider duckAttackSlider;
+    juce::Slider duckReleaseSlider;
+    juce::Slider duckGainCompSlider;
+    juce::Label duckSourceLabel;
+    juce::Label duckThresholdLabel;
+    juce::Label duckRatioLabel;
+    juce::Label duckAttackLabel;
+    juce::Label duckReleaseLabel;
+    juce::Label duckGainCompLabel;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> duckEnableAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> duckFollowMasterAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> duckSourceAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> duckThresholdAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> duckRatioAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> duckAttackAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> duckReleaseAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> duckGainCompAttachment;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FXStripControl)
 };
@@ -430,12 +453,15 @@ private:
     
     // Main display area combines waveform + LED overlay
     WaveformDisplay waveform;
+    SampleModeComponent sampleModeComponent;
     StepSequencerDisplay stepDisplay;  // Step sequencer grid display
     bool showingStepDisplay = false;   // Toggle between waveform and step display
+    bool showingSampleMode = false;
     bool modulationLaneView = false;
     bool preModulationShowingStepDisplay = false;
     bool preModulationWaveformVisible = true;
     bool preModulationStepVisible = false;
+    bool preModulationSampleVisible = false;
     juce::Rectangle<int> modulationLaneBounds;
     int modulationLastDrawStep = -1;
     float modulationLastDrawValue = 0.0f;
@@ -1118,6 +1144,9 @@ private:
     
     // FX strips (8 rows) - FX tab
     juce::OwnedArray<FXStripControl> fxStripControls;
+    juce::Label fxMasterDuckLabel;
+    juce::ComboBox fxMasterDuckTriggerBox;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> fxMasterDuckTriggerAttachment;
     
     // Pattern and Group controls
     std::unique_ptr<PatternControlPanel> patternControl;

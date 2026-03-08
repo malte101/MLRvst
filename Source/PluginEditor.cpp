@@ -1185,6 +1185,18 @@ void StripControl::setupComponents()
     // Waveform display with rainbow color
     waveform.setWaveformColor(stripColor.withMultipliedSaturation(1.35f).withMultipliedBrightness(1.25f));
     addAndMakeVisible(waveform);
+
+    sampleModeComponent.setEngine(nullptr);
+    sampleModeComponent.onTriggerVisibleSlice = [this](int visibleSlot)
+    {
+        processor.triggerStrip(stripIndex, visibleSlot);
+    };
+    sampleModeComponent.onNavigateVisibleBank = [this](int delta)
+    {
+        if (auto* engine = processor.getSampleModeEngine(stripIndex, false))
+            engine->stepVisibleBank(delta);
+    };
+    addChildComponent(sampleModeComponent);
     
     // Step sequencer display with matching rainbow color
     stepDisplay.setStripColor(stripColor);
@@ -1251,6 +1263,7 @@ void StripControl::setupComponents()
     playModeBox.addItem("Gate", 3);
     playModeBox.addItem("Step", 4);  // Step sequencer mode
     playModeBox.addItem("Grain", 5);
+    playModeBox.addItem("Sample", 6);
     playModeBox.setJustificationType(juce::Justification::centredLeft);
     playModeBox.setSelectedId(2);  // Default Loop
     playModeBox.setTooltip("Playback mode for this strip.");
@@ -1260,14 +1273,23 @@ void StripControl::setupComponents()
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
         {
             int modeId = playModeBox.getSelectedId() - 1;
-            strip->setPlayMode(static_cast<EnhancedAudioStrip::PlayMode>(modeId));
+            const auto playMode = static_cast<EnhancedAudioStrip::PlayMode>(modeId);
+            strip->setPlayMode(playMode);
             
             // Switch between waveform and step display
-            bool isStepMode = (modeId == 3);  // Step mode is now index 3
+            const bool isStepMode = (playMode == EnhancedAudioStrip::PlayMode::Step);
+            const bool isSampleMode = (playMode == EnhancedAudioStrip::PlayMode::Sample);
             showingStepDisplay = isStepMode;
+            showingSampleMode = isSampleMode;
+
+            if (isSampleMode)
+                sampleModeComponent.setEngine(processor.getSampleModeEngine(stripIndex, true));
+            else
+                sampleModeComponent.setEngine(processor.getSampleModeEngine(stripIndex, false));
             
-            waveform.setVisible(!isStepMode);
+            waveform.setVisible(!isStepMode && !isSampleMode);
             stepDisplay.setVisible(isStepMode);
+            sampleModeComponent.setVisible(isSampleMode);
             patternLengthBox.setVisible(isStepMode);
             updateGrainOverlayVisibility();
             
@@ -1276,8 +1298,7 @@ void StripControl::setupComponents()
             
             resized();  // Re-layout components
             
-            DBG("Strip " << stripIndex << " mode changed to " 
-                << (isStepMode ? "STEP SEQUENCER" : "normal"));
+            DBG("Strip " << stripIndex << " mode changed to " << modeId);
         }
     };
     addAndMakeVisible(playModeBox);
@@ -2106,18 +2127,33 @@ void StripControl::updateGrainOverlayVisibility()
                           && processor.getAudioEngine()
                           && processor.getAudioEngine()->getStrip(stripIndex)
                           && processor.getAudioEngine()->getStrip(stripIndex)->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain;
+    const bool isSampleMode = !showingStepDisplay
+                           && processor.getAudioEngine()
+                           && processor.getAudioEngine()->getStrip(stripIndex)
+                           && processor.getAudioEngine()->getStrip(stripIndex)->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample;
     const bool isStepMode = showingStepDisplay;
     grainOverlayVisible = isGrainMode;
+    showingSampleMode = isSampleMode;
     const bool showPitchPage = isGrainMode && grainSubPage == GrainSubPage::Pitch;
     const bool showSpacePage = isGrainMode && grainSubPage == GrainSubPage::Space;
     const bool showShapePage = isGrainMode && grainSubPage == GrainSubPage::Shape;
+
+    if (isSampleMode)
+        sampleModeComponent.setEngine(processor.getSampleModeEngine(stripIndex, true));
+    else
+        sampleModeComponent.setEngine(processor.getSampleModeEngine(stripIndex, false));
+
+    waveform.setVisible(!isStepMode && !isSampleMode && !modulationLaneView);
+    stepDisplay.setVisible(isStepMode && !modulationLaneView);
+    sampleModeComponent.setVisible(isSampleMode && !modulationLaneView);
 
     volumeSlider.setVisible(!isGrainMode);
     panSlider.setVisible(!isGrainMode);
     volumeLabel.setVisible(!isGrainMode);
     panLabel.setVisible(!isGrainMode);
 
-    const bool showLoopKnobs = !showingStepDisplay && !isGrainMode;
+    const bool showLoopKnobs = !showingStepDisplay && !isGrainMode && !isSampleMode;
+    const bool showSampleModeKnobs = isSampleMode;
     bool showSliceLength = false;
     if (showLoopKnobs && processor.getAudioEngine())
     {
@@ -2125,12 +2161,12 @@ void StripControl::updateGrainOverlayVisibility()
             showSliceLength = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Loop);
     }
 
-    pitchSlider.setVisible(showLoopKnobs);
-    speedSlider.setVisible(showLoopKnobs);
+    pitchSlider.setVisible(showLoopKnobs || showSampleModeKnobs);
+    speedSlider.setVisible(showLoopKnobs || showSampleModeKnobs);
     scratchSlider.setVisible(showLoopKnobs);
     sliceLengthSlider.setVisible(showSliceLength);
-    pitchLabel.setVisible(showLoopKnobs);
-    speedLabel.setVisible(showLoopKnobs);
+    pitchLabel.setVisible(showLoopKnobs || showSampleModeKnobs);
+    speedLabel.setVisible(showLoopKnobs || showSampleModeKnobs);
     scratchLabel.setVisible(showLoopKnobs);
     sliceLengthLabel.setVisible(showSliceLength);
     patternLengthBox.setVisible(isStepMode && !isGrainMode);
@@ -2227,7 +2263,7 @@ void StripControl::paint(juce::Graphics& g)
     {
         paintModulationLane(g);
     }
-    else
+    else if (!showingSampleMode)
     {
         // Paint LED overlay on top of waveform area
         paintLEDOverlay(g);
@@ -2244,6 +2280,7 @@ void StripControl::setModulationLaneView(bool shouldShow)
         preModulationShowingStepDisplay = showingStepDisplay;
         preModulationWaveformVisible = waveform.isVisible();
         preModulationStepVisible = stepDisplay.isVisible();
+        preModulationSampleVisible = sampleModeComponent.isVisible();
     }
     modulationLaneView = shouldShow;
     if (!shouldShow)
@@ -2251,6 +2288,7 @@ void StripControl::setModulationLaneView(bool shouldShow)
         showingStepDisplay = preModulationShowingStepDisplay;
         waveform.setVisible(preModulationWaveformVisible);
         stepDisplay.setVisible(preModulationStepVisible);
+        sampleModeComponent.setVisible(preModulationSampleVisible);
         modulationLastDrawStep = -1;
         updateGrainOverlayVisibility();
         updateFromEngine();
@@ -2852,6 +2890,7 @@ void StripControl::resized()
     
     // Waveform OR step display gets all remaining space
     waveform.setBounds(bounds);
+    sampleModeComponent.setBounds(bounds);
     stepDisplay.setBounds(bounds);  // Same position, visibility toggled
     modulationLaneBounds = bounds;  // Match waveform/step display exactly
     
@@ -2862,6 +2901,7 @@ void StripControl::resized()
         const bool showRetriggerHint = (currentModTarget == ModernAudioEngine::ModTarget::Retrigger);
         waveform.setVisible(false);
         stepDisplay.setVisible(false);
+        sampleModeComponent.setVisible(false);
         hideAllPrimaryControls();
         hideAllGrainControls();
 
@@ -3408,11 +3448,18 @@ void StripControl::updateFromEngine()
     }
 
     const bool isStepMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
-    if (showingStepDisplay != isStepMode)
+    const bool isSampleMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample);
+    if (showingStepDisplay != isStepMode || showingSampleMode != isSampleMode)
     {
         showingStepDisplay = isStepMode;
-        waveform.setVisible(!isStepMode);
+        showingSampleMode = isSampleMode;
+        if (isSampleMode)
+            sampleModeComponent.setEngine(processor.getSampleModeEngine(stripIndex, true));
+        else
+            sampleModeComponent.setEngine(processor.getSampleModeEngine(stripIndex, false));
+        waveform.setVisible(!isStepMode && !isSampleMode);
         stepDisplay.setVisible(isStepMode);
+        sampleModeComponent.setVisible(isSampleMode);
         patternLengthBox.setVisible(isStepMode);
         stepLengthReadoutBox.setVisible(isStepMode);
         updateGrainOverlayVisibility();
@@ -3455,7 +3502,7 @@ void StripControl::updateFromEngine()
     }
     
     // Update waveform display (only if visible - i.e., not in step mode)
-    if (!showingStepDisplay && strip->hasAudio())
+    if (!showingStepDisplay && !showingSampleMode && strip->hasAudio())
     {
         auto* buffer = strip->getAudioBuffer();
         if (buffer && buffer->getNumSamples() > 0)
@@ -3509,7 +3556,7 @@ void StripControl::updateFromEngine()
                                         strip->getGrainPitch(), strip->getGrainArpDepth(), strip->getGrainPitchJitter());
         }
     }
-    else if (!showingStepDisplay)
+    else if (!showingStepDisplay && !showingSampleMode)
     {
         if (waveform.hasLoadedAudio())
             waveform.clear();
@@ -3990,6 +4037,104 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     };
     addAndMakeVisible(filterAlgoBox);
 
+    duckEnableButton.setButtonText("Duck");
+    duckEnableButton.setClickingTogglesState(true);
+    duckEnableButton.setTooltip("Enable strip ducking");
+    addAndMakeVisible(duckEnableButton);
+
+    duckFollowMasterButton.setButtonText("Follow M");
+    duckFollowMasterButton.setClickingTogglesState(true);
+    duckFollowMasterButton.setTooltip("Use the global master duck trigger strip when available");
+    addAndMakeVisible(duckFollowMasterButton);
+
+    duckSourceLabel.setText("Src", juce::dontSendNotification);
+    duckSourceLabel.setJustificationType(juce::Justification::centred);
+    duckSourceLabel.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+    duckSourceLabel.setColour(juce::Label::textColourId, stripColor);
+    addAndMakeVisible(duckSourceLabel);
+
+    duckSourceBox.addItem("Self", 1);
+    duckSourceBox.addItem("Master", 2);
+    for (int sourceStrip = 0; sourceStrip < MlrVSTAudioProcessor::MaxStrips; ++sourceStrip)
+        duckSourceBox.addItem("S" + juce::String(sourceStrip + 1), sourceStrip + 3);
+    styleUiCombo(duckSourceBox);
+    duckSourceBox.setJustificationType(juce::Justification::centred);
+    duckSourceBox.setSelectedId(1);
+    addAndMakeVisible(duckSourceBox);
+
+    auto setupDuckLabel = [this](juce::Label& label, const juce::String& text)
+    {
+        label.setText(text, juce::dontSendNotification);
+        label.setJustificationType(juce::Justification::centred);
+        label.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+        label.setColour(juce::Label::textColourId, stripColor);
+        addAndMakeVisible(label);
+    };
+
+    auto setupDuckSlider = [](juce::Slider& slider)
+    {
+        slider.setSliderStyle(juce::Slider::Rotary);
+        slider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+    };
+
+    setupDuckLabel(duckThresholdLabel, "Thresh");
+    setupDuckSlider(duckThresholdSlider);
+    duckThresholdSlider.setRange(-60.0, 0.0, 0.1);
+    duckThresholdSlider.setValue(-24.0);
+    enableAltClickReset(duckThresholdSlider, -24.0);
+    duckThresholdSlider.setTooltip("Duck threshold in dB");
+    addAndMakeVisible(duckThresholdSlider);
+
+    setupDuckLabel(duckRatioLabel, "Ratio");
+    setupDuckSlider(duckRatioSlider);
+    duckRatioSlider.setRange(1.0, 20.0, 0.01);
+    duckRatioSlider.setValue(4.0);
+    enableAltClickReset(duckRatioSlider, 4.0);
+    duckRatioSlider.setTooltip("Duck ratio");
+    addAndMakeVisible(duckRatioSlider);
+
+    setupDuckLabel(duckAttackLabel, "Atk");
+    setupDuckSlider(duckAttackSlider);
+    duckAttackSlider.setRange(0.1, 200.0, 0.1);
+    duckAttackSlider.setValue(10.0);
+    enableAltClickReset(duckAttackSlider, 10.0);
+    duckAttackSlider.setTooltip("Duck attack in milliseconds");
+    addAndMakeVisible(duckAttackSlider);
+
+    setupDuckLabel(duckReleaseLabel, "Rel");
+    setupDuckSlider(duckReleaseSlider);
+    duckReleaseSlider.setRange(5.0, 1000.0, 0.1);
+    duckReleaseSlider.setValue(180.0);
+    enableAltClickReset(duckReleaseSlider, 180.0);
+    duckReleaseSlider.setTooltip("Duck release in milliseconds");
+    addAndMakeVisible(duckReleaseSlider);
+
+    setupDuckLabel(duckGainCompLabel, "Gain");
+    duckGainCompSlider.setSliderStyle(juce::Slider::LinearVertical);
+    duckGainCompSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+    duckGainCompSlider.setRange(0.0, 24.0, 0.1);
+    duckGainCompSlider.setValue(0.0);
+    enableAltClickReset(duckGainCompSlider, 0.0);
+    duckGainCompSlider.setTooltip("Compressor output gain compensation in dB");
+    addAndMakeVisible(duckGainCompSlider);
+
+    duckEnableAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+        processor.parameters, "stripDuckEnabled" + juce::String(stripIndex), duckEnableButton);
+    duckFollowMasterAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+        processor.parameters, "stripDuckFollowMaster" + juce::String(stripIndex), duckFollowMasterButton);
+    duckSourceAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "stripDuckSource" + juce::String(stripIndex), duckSourceBox);
+    duckThresholdAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "stripDuckThreshold" + juce::String(stripIndex), duckThresholdSlider);
+    duckRatioAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "stripDuckRatio" + juce::String(stripIndex), duckRatioSlider);
+    duckAttackAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "stripDuckAttack" + juce::String(stripIndex), duckAttackSlider);
+    duckReleaseAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "stripDuckRelease" + juce::String(stripIndex), duckReleaseSlider);
+    duckGainCompAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "stripDuckGainComp" + juce::String(stripIndex), duckGainCompSlider);
+
     // Start timer for updating from engine
     startTimer(50);  // Update at 20Hz
 }
@@ -4000,17 +4145,26 @@ void FXStripControl::paint(juce::Graphics& g)
 
     drawPanel(g, bounds, stripColor, 10.0f);
 
-    // TWO vertical dividers creating 3 equal fields
-    float thirdWidth = bounds.getWidth() / 3.0f;
+    const auto inner = bounds.reduced(8.0f, 8.0f);
+    const float filterWidth = inner.getWidth() / 3.0f;
+    const float dividerX = inner.getX() + filterWidth;
+
     g.setColour(kPanelStroke.withAlpha(0.7f));
+    g.fillRect(dividerX - 1.0f, inner.getY() + 22.0f, 2.0f, inner.getHeight() - 30.0f);
 
-    // First divider (1/3 from left)
-    float divider1X = bounds.getX() + thirdWidth;
-    g.fillRect(divider1X - 1.0f, bounds.getY() + 20.0f, 2.0f, bounds.getHeight() - 40.0f);
+    auto drawTabHeader = [&](juce::Rectangle<float> area, const juce::String& text, juce::Colour accent)
+    {
+        g.setColour(juce::Colour(0xff1d1d1d).withAlpha(0.95f));
+        g.fillRoundedRectangle(area, 6.0f);
+        g.setColour(accent.withAlpha(0.75f));
+        g.drawRoundedRectangle(area, 6.0f, 1.1f);
+        g.setColour(kTextPrimary);
+        g.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
+        g.drawFittedText(text, area.toNearestInt(), juce::Justification::centred, 1);
+    };
 
-    // Second divider (2/3 from left)
-    float divider2X = bounds.getX() + (thirdWidth * 2.0f);
-    g.fillRect(divider2X - 1.0f, bounds.getY() + 20.0f, 2.0f, bounds.getHeight() - 40.0f);
+    drawTabHeader({ inner.getX() + 4.0f, inner.getY(), 74.0f, 18.0f }, "FILTER", stripColor);
+    drawTabHeader({ dividerX + 10.0f, inner.getY(), 64.0f, 18.0f }, "COMP", stripColor.brighter(0.1f));
 }
 
 void FXStripControl::resized()
@@ -4020,15 +4174,15 @@ void FXStripControl::resized()
     // Match Play strip padding
     bounds.reduce(8, 8);
     
-    // SPLIT INTO THREE FIELDS
-    int fieldWidth = bounds.getWidth() / 3;
+    const int filterWidth = bounds.getWidth() / 3;
 
     // Field 1: Filter controls (left third)
-    auto field1 = bounds.removeFromLeft(fieldWidth).reduced(6, 0);
+    auto field1 = bounds.removeFromLeft(filterWidth).reduced(6, 0);
 
-    // Field 2/3: reserved for future controls
-    auto field2 = bounds.removeFromLeft(fieldWidth).reduced(6, 0);
-    auto field3 = bounds.reduced(6, 0);
+    // Right pane: compressor/duck controls
+    auto compField = bounds.reduced(6, 0);
+    field1.removeFromTop(20);
+    compField.removeFromTop(20);
     
     // Top row: Filter enable + compact algorithm selector
     auto topRow = field1.removeFromTop(22);
@@ -4055,8 +4209,40 @@ void FXStripControl::resized()
     filterMorphLabel.setBounds(morphCol.removeFromTop(12));
     filterMorphSlider.setBounds(morphCol);
 
-    (void) field2;
-    (void) field3;
+    auto duckTopRow = compField.removeFromTop(22);
+    duckEnableButton.setBounds(duckTopRow.removeFromLeft(54));
+    duckTopRow.removeFromLeft(4);
+    duckFollowMasterButton.setBounds(duckTopRow.removeFromLeft(78));
+    compField.removeFromTop(3);
+
+    auto duckSourceRow = compField.removeFromTop(22);
+    duckSourceLabel.setBounds(duckSourceRow.removeFromLeft(26));
+    duckSourceRow.removeFromLeft(4);
+    duckSourceBox.setBounds(duckSourceRow);
+    compField.removeFromTop(4);
+
+    auto duckMainArea = compField.removeFromTop(86);
+    auto gainCompArea = duckMainArea.removeFromRight(42).reduced(2, 0);
+    auto duckMainRow = duckMainArea;
+    const int duckColumnWidth = duckMainRow.getWidth() / 4;
+    auto thresholdCol = duckMainRow.removeFromLeft(duckColumnWidth).reduced(2, 0);
+    duckThresholdLabel.setBounds(thresholdCol.removeFromTop(12));
+    duckThresholdSlider.setBounds(thresholdCol);
+
+    auto ratioCol = duckMainRow.removeFromLeft(duckColumnWidth).reduced(2, 0);
+    duckRatioLabel.setBounds(ratioCol.removeFromTop(12));
+    duckRatioSlider.setBounds(ratioCol);
+
+    auto attackCol = duckMainRow.removeFromLeft(duckColumnWidth).reduced(2, 0);
+    duckAttackLabel.setBounds(attackCol.removeFromTop(12));
+    duckAttackSlider.setBounds(attackCol);
+
+    auto releaseCol = duckMainRow.removeFromLeft(duckColumnWidth).reduced(2, 0);
+    duckReleaseLabel.setBounds(releaseCol.removeFromTop(12));
+    duckReleaseSlider.setBounds(releaseCol);
+
+    duckGainCompLabel.setBounds(gainCompArea.removeFromTop(12));
+    duckGainCompSlider.setBounds(gainCompArea.reduced(3, 0));
 }
 
 void FXStripControl::updateFromEngine()
@@ -4097,6 +4283,7 @@ void FXStripControl::updateFromEngine()
         s.setColour(juce::Slider::trackColourId, c.withAlpha(0.78f));
         s.setColour(juce::Slider::thumbColourId, c.brighter(0.18f));
         s.setColour(juce::Slider::rotarySliderOutlineColourId, c.darker(0.72f).withAlpha(0.82f));
+        s.setColour(juce::Slider::backgroundColourId, c.darker(0.88f).withAlpha(0.92f));
     };
     auto pickVisibleModColour = [](juce::Colour baseColour)
     {
@@ -4114,6 +4301,11 @@ void FXStripControl::updateFromEngine()
     setBaseSliderTint(filterFreqSlider, base);
     setBaseSliderTint(filterResSlider, base);
     setBaseSliderTint(filterMorphSlider, base);
+    setBaseSliderTint(duckThresholdSlider, base);
+    setBaseSliderTint(duckRatioSlider, base);
+    setBaseSliderTint(duckAttackSlider, base);
+    setBaseSliderTint(duckReleaseSlider, base);
+    setBaseSliderTint(duckGainCompSlider, base);
 
     const auto algo = strip->getFilterAlgorithm();
     int algoId = 1;
@@ -4153,6 +4345,16 @@ void FXStripControl::updateFromEngine()
                 setBaseSliderTint(filterMorphSlider, modColour);
         }
     }
+
+    const bool duckEnabled = duckEnableButton.getToggleState();
+    const bool followMaster = duckFollowMasterButton.getToggleState();
+    duckFollowMasterButton.setEnabled(duckEnabled);
+    duckSourceBox.setEnabled(duckEnabled && !followMaster);
+    duckThresholdSlider.setEnabled(duckEnabled);
+    duckRatioSlider.setEnabled(duckEnabled);
+    duckAttackSlider.setEnabled(duckEnabled);
+    duckReleaseSlider.setEnabled(duckEnabled);
+    duckGainCompSlider.setEnabled(duckEnabled);
 }
 
 void FXStripControl::timerCallback()
@@ -4430,6 +4632,29 @@ void MonomeGridDisplay::updateFromEngine()
                     << ledState[1][monomeRow] << " " 
                     << ledState[2][monomeRow] << " " 
                     << ledState[3][monomeRow]);
+            }
+            else if (strip->playMode == EnhancedAudioStrip::PlayMode::Sample && !controlModeActive)
+            {
+                if (auto* sampleEngine = processor.getSampleModeEngine(stripIndex, false))
+                {
+                    const auto snapshot = sampleEngine->getStateSnapshot();
+                    for (int x = 0; x < gridWidth && x < 16; ++x)
+                    {
+                        int brightness = 0;
+                        if (snapshot.visibleSlices[static_cast<size_t>(x)].id >= 0)
+                            brightness = snapshot.isPlaying ? 4 : 2;
+                        if (snapshot.pendingVisibleSliceSlot == x)
+                            brightness = juce::jmax(brightness, 9);
+                        if (snapshot.activeVisibleSliceSlot == x)
+                            brightness = 15;
+                        ledState[x][monomeRow] = brightness;
+                    }
+                }
+                else
+                {
+                    for (int x = 0; x < gridWidth && x < 16; ++x)
+                        ledState[x][monomeRow] = 0;
+                }
             }
             else if (strip->playMode != EnhancedAudioStrip::PlayMode::Step && !controlModeActive)
             {
@@ -7126,13 +7351,26 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     {
         juce::OwnedArray<FXStripControl>& strips;
         int& visibleStripCount;
+        juce::Label& masterDuckLabel;
+        juce::ComboBox& masterDuckTriggerBox;
         
-        FXPanel(juce::OwnedArray<FXStripControl>& s, int& visibleCount)
-            : strips(s), visibleStripCount(visibleCount) {}
+        FXPanel(juce::OwnedArray<FXStripControl>& s,
+                int& visibleCount,
+                juce::Label& headerLabel,
+                juce::ComboBox& headerBox)
+            : strips(s),
+              visibleStripCount(visibleCount),
+              masterDuckLabel(headerLabel),
+              masterDuckTriggerBox(headerBox) {}
         
         void resized() override
         {
             auto bounds = getLocalBounds();
+            auto header = bounds.removeFromTop(28).reduced(8, 2);
+            masterDuckLabel.setBounds(header.removeFromLeft(122));
+            header.removeFromLeft(6);
+            masterDuckTriggerBox.setBounds(header.removeFromLeft(116));
+            bounds.removeFromTop(4);
             const int gap = 1;
             const int totalStrips = strips.size();
             if (totalStrips <= 0)
@@ -7164,9 +7402,23 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
         stripControls.add(strip);
         playPanel->addAndMakeVisible(strip);
     }
+
+    fxMasterDuckLabel.setText("Master Duck", juce::dontSendNotification);
+    fxMasterDuckLabel.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+    fxMasterDuckLabel.setJustificationType(juce::Justification::centredLeft);
+    fxMasterDuckLabel.setColour(juce::Label::textColourId, kTextPrimary);
+    fxMasterDuckTriggerBox.addItem("None", 1);
+    for (int i = 0; i < kTotalSampleStrips; ++i)
+        fxMasterDuckTriggerBox.addItem("S" + juce::String(i + 1), i + 2);
+    styleUiCombo(fxMasterDuckTriggerBox);
+    fxMasterDuckTriggerBox.setJustificationType(juce::Justification::centred);
+    fxMasterDuckTriggerAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        audioProcessor.parameters, "masterDuckTriggerStrip", fxMasterDuckTriggerBox);
     
     // FX TAB - filter controls for each strip
-    auto* fxPanel = new FXPanel(fxStripControls, activeGuiStripCount);
+    auto* fxPanel = new FXPanel(fxStripControls, activeGuiStripCount, fxMasterDuckLabel, fxMasterDuckTriggerBox);
+    fxPanel->addAndMakeVisible(fxMasterDuckLabel);
+    fxPanel->addAndMakeVisible(fxMasterDuckTriggerBox);
     for (int i = 0; i < kTotalSampleStrips; ++i)
     {
         auto* fxStrip = new FXStripControl(i, audioProcessor);

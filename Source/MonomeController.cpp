@@ -1084,11 +1084,12 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 const bool stopRowComboPressed =
                     normalPlaybackMode
                     && strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Step
+                    && strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample
                     && ((x == 0 && strip->isButtonHeld(1))
                         || (x == 1 && strip->isButtonHeld(0)));
                 if (stopRowComboPressed)
                 {
-                    strip->stop(false);
+                    stopStrip(stripIndex);
                     loopSetFirstButton = -1;
                     loopSetStrip = -1;
                     updateMonomeLEDs();
@@ -1097,6 +1098,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 
                 // Loop length setting mode - ONLY if scratch is disabled and strip is not in Step mode.
                 if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Step
+                    && strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample
                     && loopSetFirstButton >= 0
                     && loopSetStrip == stripIndex
                     && strip->isButtonHeld(loopSetFirstButton)
@@ -1210,20 +1212,25 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     // - Loop/Grain/Gate: requires loaded strip audio
                     // - Step mode: allow direct step toggling on main page
                     const bool canTriggerFromMainPage = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
-                        || strip->hasAudio();
+                        || strip->hasAudio()
+                        || (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample && hasSampleModeAudio(stripIndex));
                     if (canTriggerFromMainPage)
                     {
                         // Always notify strip of press for scratch hold-state.
                         // Actual scratch motion still starts when trigger fires,
                         // so quantized scheduling remains sample-accurate.
-                        int64_t globalSample = audioEngine->getGlobalSampleCount();
-                        strip->onButtonPress(x, globalSample);
+                        if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample)
+                        {
+                            int64_t globalSample = audioEngine->getGlobalSampleCount();
+                            strip->onButtonPress(x, globalSample);
+                        }
                         
                         // Trigger the strip (quantized or immediate)
                         triggerStrip(stripIndex, x);
                         
                         // Set up for potential loop range setting (non-step modes only).
-                        if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Step)
+                        if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Step
+                            && strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample)
                         {
                             loopSetFirstButton = x;
                             loopSetStrip = stripIndex;
@@ -1329,8 +1336,11 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 auto* strip = audioEngine->getStrip(stripIndex);
                 if (strip)
                 {
-                    int64_t globalSample = audioEngine->getGlobalSampleCount();
-                    strip->onButtonRelease(x, globalSample);
+                    if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample)
+                    {
+                        int64_t globalSample = audioEngine->getGlobalSampleCount();
+                        strip->onButtonRelease(x, globalSample);
+                    }
                 }
             }
         }
@@ -2121,6 +2131,32 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                     {
                         // Inactive step - dim
                         newLedState[x][y] = 2;
+                    }
+                }
+            }
+            else if (strip->playMode == EnhancedAudioStrip::PlayMode::Sample)
+            {
+                for (int x = 0; x < 16; ++x)
+                    newLedState[x][y] = 0;
+
+                if (auto* sampleEngine = getSampleModeEngine(stripIndex, false))
+                {
+                    const auto snapshot = sampleEngine->getStateSnapshot();
+                    for (int x = 0; x < 16; ++x)
+                    {
+                        const auto& slice = snapshot.visibleSlices[static_cast<size_t>(x)];
+                        if (slice.id >= 0)
+                            newLedState[x][y] = snapshot.isPlaying ? 4 : 2;
+                    }
+
+                    if (snapshot.pendingVisibleSliceSlot >= 0 && snapshot.pendingVisibleSliceSlot < 16)
+                        newLedState[snapshot.pendingVisibleSliceSlot][y] = juce::jmax(newLedState[snapshot.pendingVisibleSliceSlot][y], 9);
+
+                    if (!isGroupMuted
+                        && snapshot.activeVisibleSliceSlot >= 0
+                        && snapshot.activeVisibleSliceSlot < 16)
+                    {
+                        newLedState[snapshot.activeVisibleSliceSlot][y] = 15;
                     }
                 }
             }

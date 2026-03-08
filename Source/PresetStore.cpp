@@ -179,6 +179,14 @@ void resetStripParametersToDefaults(juce::AudioProcessorValueTreeState& paramete
     setParameterToDefault(parameters, "stripSpeed" + juce::String(stripIndex));
     setParameterToDefault(parameters, "stripPitch" + juce::String(stripIndex));
     setParameterToDefault(parameters, "stripSliceLength" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripDuckEnabled" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripDuckSource" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripDuckThreshold" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripDuckRatio" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripDuckAttack" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripDuckRelease" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripDuckGainComp" + juce::String(stripIndex));
+    setParameterToDefault(parameters, "stripDuckFollowMaster" + juce::String(stripIndex));
 }
 
 void resetStripToDefaultState(int stripIndex,
@@ -208,6 +216,15 @@ void resetStripToDefaultState(int stripIndex,
     strip.setFilterMorph(0.0f);
     strip.setFilterAlgorithm(EnhancedAudioStrip::FilterAlgorithm::Tpt12);
     strip.setFilterEnabled(false);
+    strip.setDuckEnabled(false);
+    strip.setDuckSourceSelection(0);
+    strip.setDuckThresholdDb(-24.0f);
+    strip.setDuckRatio(4.0f);
+    strip.setDuckAttackMs(10.0f);
+    strip.setDuckReleaseMs(180.0f);
+    strip.setDuckGainCompDb(0.0f);
+    strip.setDuckFollowMaster(false);
+    strip.resetDuckGainSmoothing();
     strip.setSwingAmount(0.0f);
     strip.setGateAmount(0.0f);
     strip.setGateSpeed(4.0f);
@@ -566,7 +583,8 @@ bool savePreset(int presetIndex,
         auto* stripXml = preset.createNewChildElement("Strip");
         stripXml->setAttribute("index", i);
 
-        if (strip->hasAudio())
+        const auto playMode = strip->getPlayMode();
+        if (strip->hasAudio() || playMode == EnhancedAudioStrip::PlayMode::Sample)
         {
             const juce::String storedPath = currentStripFiles[i].getFullPathName().trim();
             if (isValidStoredSamplePath(storedPath))
@@ -594,8 +612,8 @@ bool savePreset(int presetIndex,
         stripXml->setAttribute("speed", savedSpeedRatio);
         stripXml->setAttribute("loopStart", strip->getLoopStart());
         stripXml->setAttribute("loopEnd", strip->getLoopEnd());
-        stripXml->setAttribute("playMode", static_cast<int>(strip->getPlayMode()));
-        stripXml->setAttribute("isPlaying", strip->isPlaying());
+        stripXml->setAttribute("playMode", static_cast<int>(playMode));
+        stripXml->setAttribute("isPlaying", strip->isPlayingForPresetSave());
         stripXml->setAttribute("playbackColumn", strip->getCurrentColumn());
         stripXml->setAttribute("ppqTimelineAnchored", strip->isPpqTimelineAnchored());
         stripXml->setAttribute("ppqTimelineOffsetBeats", strip->getPpqTimelineOffsetBeats());
@@ -875,6 +893,10 @@ bool loadPreset(int presetIndex,
         if (strip == nullptr)
             continue;
 
+        const auto restoredPlayMode = static_cast<EnhancedAudioStrip::PlayMode>(
+            juce::jlimit(0, 5, stripXml->getIntAttribute("playMode", 1)));
+        strip->setPlayMode(restoredPlayMode);
+
         const juce::String samplePath = stripXml->getStringAttribute("samplePath").trim();
         bool loadedStripAudio = false;
         if (samplePath.isNotEmpty() && isValidStoredSamplePath(samplePath))
@@ -933,8 +955,6 @@ bool loadPreset(int presetIndex,
         const int safeLoopStart = clampedInt(stripXml->getIntAttribute("loopStart", 0), 0, 15, 0);
         const int safeLoopEnd = clampedInt(stripXml->getIntAttribute("loopEnd", 16), 1, 16, 16);
         strip->setLoop(safeLoopStart, safeLoopEnd);
-        strip->setPlayMode(static_cast<EnhancedAudioStrip::PlayMode>(
-            clampedInt(stripXml->getIntAttribute("playMode", 1), 0, 4, 1)));
         strip->setDirectionMode(static_cast<EnhancedAudioStrip::DirectionMode>(
             clampedInt(stripXml->getIntAttribute("directionMode", 0), 0, 5, 0)));
         strip->setReverse(stripXml->getBoolAttribute("reversed", false));

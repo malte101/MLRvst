@@ -1187,6 +1187,43 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
 {
     // Initialize audio engine
     audioEngine = std::make_unique<ModernAudioEngine>();
+    audioEngine->setSampleModeRenderCallback(
+        [this](int stripIndex,
+               juce::AudioBuffer<float>& output,
+               int startSample,
+               int numSamples,
+               const juce::AudioPlayHead::PositionInfo& positionInfo,
+               int64_t globalSampleStart,
+               double tempo,
+               double quantizeBeats)
+        {
+            renderSampleModeStrip(stripIndex,
+                                  output,
+                                  startSample,
+                                  numSamples,
+                                  positionInfo,
+                                  globalSampleStart,
+                                  tempo,
+                                  quantizeBeats);
+        });
+    audioEngine->setSampleModeTriggerCallback(
+        [this](int stripIndex,
+               int column,
+               int64_t triggerSample,
+               const juce::AudioPlayHead::PositionInfo& positionInfo,
+               bool isMomentaryStutter)
+        {
+            triggerSampleModeStripAtSample(stripIndex,
+                                           column,
+                                           triggerSample,
+                                           positionInfo,
+                                           isMomentaryStutter);
+        });
+    audioEngine->setSampleModeStopCallback(
+        [this](int stripIndex, bool immediateStop)
+        {
+            stopSampleModeStrip(stripIndex, immediateStop);
+        });
     for (int i = 0; i < MacroCount; ++i)
     {
         macroMidiCcAssignments[static_cast<size_t>(i)].store(getDefaultMacroMidiCc(i), std::memory_order_release);
@@ -1282,6 +1319,7 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
     outputRoutingParam = parameters.getRawParameterValue("outputRouting");
     pitchControlModeParam = parameters.getRawParameterValue("pitchControlMode");
     soundTouchEnabledParam = parameters.getRawParameterValue("soundTouchEnabled");
+    masterDuckTriggerStripParam = parameters.getRawParameterValue("masterDuckTriggerStrip");
 
     for (int i = 0; i < MaxStrips; ++i)
     {
@@ -1290,6 +1328,14 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
         stripSpeedParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripSpeed" + juce::String(i));
         stripPitchParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripPitch" + juce::String(i));
         stripSliceLengthParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripSliceLength" + juce::String(i));
+        stripDuckEnabledParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckEnabled" + juce::String(i));
+        stripDuckSourceParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckSource" + juce::String(i));
+        stripDuckThresholdParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckThreshold" + juce::String(i));
+        stripDuckRatioParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckRatio" + juce::String(i));
+        stripDuckAttackParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckAttack" + juce::String(i));
+        stripDuckReleaseParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckRelease" + juce::String(i));
+        stripDuckGainCompParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckGainComp" + juce::String(i));
+        stripDuckFollowMasterParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckFollowMaster" + juce::String(i));
     }
 }
 
@@ -1996,6 +2042,17 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         0,
         globalChoiceAttrs));
 
+    juce::StringArray duckTriggerChoices{"None"};
+    for (int i = 0; i < MaxStrips; ++i)
+        duckTriggerChoices.add("S" + juce::String(i + 1));
+
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "masterDuckTriggerStrip",
+        "Master Duck Trigger Strip",
+        duckTriggerChoices,
+        0,
+        globalChoiceAttrs));
+
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "pitchControlMode",
         "Pitch Control Mode",
@@ -2040,6 +2097,64 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
             "Strip " + juce::String(i + 1) + " Slice Length",
             juce::NormalisableRange<float>(0.02f, 1.0f, 0.001f, 0.5f),
             1.0f));
+
+        layout.add(std::make_unique<juce::AudioParameterBool>(
+            "stripDuckEnabled" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Duck Enabled",
+            false,
+            globalBoolAttrs));
+
+        juce::StringArray duckSourceChoices{"Self", "Master"};
+        for (int otherStrip = 0; otherStrip < MaxStrips; ++otherStrip)
+            duckSourceChoices.add("S" + juce::String(otherStrip + 1));
+
+        layout.add(std::make_unique<juce::AudioParameterChoice>(
+            "stripDuckSource" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Duck Source",
+            duckSourceChoices,
+            0,
+            globalChoiceAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripDuckThreshold" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Duck Threshold",
+            juce::NormalisableRange<float>(-60.0f, 0.0f, 0.1f),
+            -24.0f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripDuckRatio" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Duck Ratio",
+            juce::NormalisableRange<float>(1.0f, 20.0f, 0.01f, 0.35f),
+            4.0f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripDuckAttack" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Duck Attack",
+            juce::NormalisableRange<float>(0.1f, 200.0f, 0.1f, 0.35f),
+            10.0f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripDuckRelease" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Duck Release",
+            juce::NormalisableRange<float>(5.0f, 1000.0f, 0.1f, 0.35f),
+            180.0f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripDuckGainComp" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Duck Gain Compensation",
+            juce::NormalisableRange<float>(0.0f, 24.0f, 0.1f),
+            0.0f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterBool>(
+            "stripDuckFollowMaster" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Duck Follow Master",
+            false,
+            globalBoolAttrs));
     }
     
     return layout;
@@ -2050,6 +2165,13 @@ void MlrVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate;
     audioEngine->prepareToPlay(sampleRate, samplesPerBlock);
+    for (auto& scratch : sampleModeScratchBuffers)
+        scratch.setSize(2, samplesPerBlock, false, false, true);
+    for (auto& engine : sampleModeEngines)
+    {
+        if (engine != nullptr)
+            engine->prepare(sampleRate, samplesPerBlock);
+    }
     lastAppliedSoundTouchEnabled = -1;
     lastGridLedUpdateTimeMs = 0;
 
@@ -2219,6 +2341,12 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         }
     }
 
+    if (masterDuckTriggerStripParam)
+    {
+        const int triggerChoice = juce::jlimit(0, MaxStrips, static_cast<int>(masterDuckTriggerStripParam->load(std::memory_order_acquire)));
+        audioEngine->setMasterDuckTriggerStrip(triggerChoice - 1);
+    }
+
     // Apply any pending loop enter/exit actions that were quantized to timeline.
     applyPendingLoopChanges(posInfo);
     applyPendingBarChanges(posInfo);
@@ -2254,6 +2382,38 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
             auto* sliceLengthParam = stripSliceLengthParams[static_cast<size_t>(i)];
             if (sliceLengthParam)
                 strip->setLoopSliceLength(sliceLengthParam->load(std::memory_order_acquire));
+
+            auto* duckEnabledParam = stripDuckEnabledParams[static_cast<size_t>(i)];
+            if (duckEnabledParam)
+                strip->setDuckEnabled(duckEnabledParam->load(std::memory_order_acquire) > 0.5f);
+
+            auto* duckSourceParam = stripDuckSourceParams[static_cast<size_t>(i)];
+            if (duckSourceParam)
+                strip->setDuckSourceSelection(static_cast<int>(duckSourceParam->load(std::memory_order_acquire)));
+
+            auto* duckThresholdParam = stripDuckThresholdParams[static_cast<size_t>(i)];
+            if (duckThresholdParam)
+                strip->setDuckThresholdDb(duckThresholdParam->load(std::memory_order_acquire));
+
+            auto* duckRatioParam = stripDuckRatioParams[static_cast<size_t>(i)];
+            if (duckRatioParam)
+                strip->setDuckRatio(duckRatioParam->load(std::memory_order_acquire));
+
+            auto* duckAttackParam = stripDuckAttackParams[static_cast<size_t>(i)];
+            if (duckAttackParam)
+                strip->setDuckAttackMs(duckAttackParam->load(std::memory_order_acquire));
+
+            auto* duckReleaseParam = stripDuckReleaseParams[static_cast<size_t>(i)];
+            if (duckReleaseParam)
+                strip->setDuckReleaseMs(duckReleaseParam->load(std::memory_order_acquire));
+
+            auto* duckGainCompParam = stripDuckGainCompParams[static_cast<size_t>(i)];
+            if (duckGainCompParam)
+                strip->setDuckGainCompDb(duckGainCompParam->load(std::memory_order_acquire));
+
+            auto* duckFollowMasterParam = stripDuckFollowMasterParams[static_cast<size_t>(i)];
+            if (duckFollowMasterParam)
+                strip->setDuckFollowMaster(duckFollowMasterParam->load(std::memory_order_acquire) > 0.5f);
         }
     }
 
@@ -2389,6 +2549,12 @@ bool MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& f
         // manual path selections (load button / Paths tab).
         lastSampleFolder = file.getParentDirectory();
 
+        if (auto* strip = audioEngine != nullptr ? audioEngine->getStrip(stripIndex) : nullptr)
+        {
+            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
+                return loadSampleToSampleModeStrip(stripIndex, file);
+        }
+
         const bool loaded = audioEngine->loadSampleToStrip(stripIndex, file);
         if (loaded)
             currentStripFiles[static_cast<size_t>(stripIndex)] = file;
@@ -2397,6 +2563,121 @@ bool MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& f
     }
 
     return false;
+}
+
+bool MlrVSTAudioProcessor::loadSampleToSampleModeStrip(int stripIndex, const juce::File& file)
+{
+    if (!file.existsAsFile() || stripIndex < 0 || stripIndex >= MaxStrips)
+        return false;
+
+    lastSampleFolder = file.getParentDirectory();
+
+    if (auto* engine = getSampleModeEngine(stripIndex, true))
+    {
+        const int requestId = engine->loadSampleAsync(file);
+        if (requestId > 0)
+        {
+            currentStripFiles[static_cast<size_t>(stripIndex)] = file;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+SampleModeEngine* MlrVSTAudioProcessor::getSampleModeEngine(int stripIndex, bool createIfMissing)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return nullptr;
+
+    auto& engine = sampleModeEngines[static_cast<size_t>(stripIndex)];
+    if (engine == nullptr && createIfMissing)
+    {
+        engine = std::make_unique<SampleModeEngine>();
+        if (currentSampleRate > 0.0)
+            engine->prepare(currentSampleRate, juce::jmax(1, getBlockSize()));
+    }
+
+    return engine.get();
+}
+
+bool MlrVSTAudioProcessor::hasSampleModeAudio(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return false;
+
+    auto& engine = sampleModeEngines[static_cast<size_t>(stripIndex)];
+    return engine != nullptr && engine->hasSample();
+}
+
+void MlrVSTAudioProcessor::renderSampleModeStrip(int stripIndex,
+                                                 juce::AudioBuffer<float>& output,
+                                                 int startSample,
+                                                 int numSamples,
+                                                 const juce::AudioPlayHead::PositionInfo& positionInfo,
+                                                 int64_t /*globalSampleStart*/,
+                                                 double tempo,
+                                                 double /*quantizeBeats*/)
+{
+    auto* strip = audioEngine ? audioEngine->getStrip(stripIndex) : nullptr;
+    auto* engine = getSampleModeEngine(stripIndex, false);
+    if (strip == nullptr || engine == nullptr || strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample)
+        return;
+
+    auto& scratch = sampleModeScratchBuffers[static_cast<size_t>(stripIndex)];
+    if (scratch.getNumChannels() < 2 || scratch.getNumSamples() < numSamples)
+    {
+        jassertfalse;
+        return;
+    }
+    scratch.clear(0, numSamples);
+
+    float playbackRate = juce::jmax(0.03125f, strip->getPlayheadSpeedRatio())
+                       * juce::jmax(0.03125f, strip->getPlaybackSpeed());
+    if (strip->isResamplePitchEnabled())
+        playbackRate = juce::jlimit(0.03125f, 8.0f, playbackRate * strip->getResamplePitchRatio());
+    else
+        playbackRate = juce::jlimit(0.03125f, 8.0f, playbackRate);
+
+    const int fadeSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.003));
+    const bool rendered = engine->renderToBuffer(scratch,
+                                                 0,
+                                                 numSamples,
+                                                 playbackRate,
+                                                 fadeSamples);
+    if (rendered)
+    {
+        strip->processExternalOutputBuffer(scratch, 0, numSamples, positionInfo, tempo);
+        output.addFrom(0, startSample, scratch, 0, 0, numSamples);
+        output.addFrom(1, startSample, scratch, 1, 0, numSamples);
+    }
+}
+
+void MlrVSTAudioProcessor::triggerSampleModeStripAtSample(int stripIndex,
+                                                          int column,
+                                                          int64_t /*triggerSample*/,
+                                                          const juce::AudioPlayHead::PositionInfo& /*positionInfo*/,
+                                                          bool isMomentaryStutter)
+{
+    auto* strip = audioEngine ? audioEngine->getStrip(stripIndex) : nullptr;
+    auto* engine = getSampleModeEngine(stripIndex, false);
+    if (strip == nullptr || engine == nullptr || strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample)
+        return;
+
+    const int visibleSlot = juce::jlimit(0, SliceModel::VisibleSliceCount - 1, column);
+    engine->triggerVisibleSlice(visibleSlot, isMomentaryStutter);
+}
+
+void MlrVSTAudioProcessor::stopSampleModeStrip(int stripIndex, bool immediateStop)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    if (auto* engine = getSampleModeEngine(stripIndex, false))
+    {
+        engine->clearPendingVisibleSlice();
+        engine->stop(immediateStop);
+    }
 }
 
 void MlrVSTAudioProcessor::captureRecentAudioToStrip(int stripIndex)
@@ -4684,6 +4965,7 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     
     auto* strip = audioEngine->getStrip(stripIndex);
     if (!strip) return;
+    const bool isSampleMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample);
 
     // If bar length was changed while playing, apply it on the next row trigger.
     const auto stripIdx = static_cast<size_t>(stripIndex);
@@ -4695,7 +4977,7 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     }
 
     // CHECK: If inner loop is active, clear it and return to full loop
-    if (strip->getLoopStart() != 0 || strip->getLoopEnd() != MaxColumns)
+    if (!isSampleMode && (strip->getLoopStart() != 0 || strip->getLoopEnd() != MaxColumns))
     {
         const int targetColumn = juce::jlimit(0, MaxColumns - 1, column);
         bool updatedPendingClear = false;
@@ -4822,6 +5104,17 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
         DBG("=== SCHEDULING QUANTIZED TRIGGER === Strip " << stripIndex 
             << " Column " << column 
             << " Quantize: " << quantizeValue);
+        if (isSampleMode)
+        {
+            auto* sampleEngine = getSampleModeEngine(stripIndex, false);
+            const int visibleSlot = juce::jlimit(0, SliceModel::VisibleSliceCount - 1, column);
+            if (sampleEngine == nullptr || !sampleEngine->hasVisibleSlice(visibleSlot))
+            {
+                updateMonomeLEDs();
+                return;
+            }
+            sampleEngine->setPendingVisibleSlice(visibleSlot);
+        }
         audioEngine->scheduleQuantizedTrigger(stripIndex, column, currentPPQ);
     }
     else
@@ -4831,8 +5124,22 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
         
         // Trigger immediately with PPQ sync
         int64_t triggerGlobalSample = audioEngine->getGlobalSampleCount();
-        
-        strip->triggerAtSample(column, audioEngine->getCurrentTempo(), triggerGlobalSample, posInfo);
+        if (isSampleMode)
+        {
+            auto* sampleEngine = getSampleModeEngine(stripIndex, false);
+            const int visibleSlot = juce::jlimit(0, SliceModel::VisibleSliceCount - 1, column);
+            if (sampleEngine == nullptr || !sampleEngine->hasVisibleSlice(visibleSlot))
+            {
+                updateMonomeLEDs();
+                return;
+            }
+            sampleEngine->clearPendingVisibleSlice();
+            triggerSampleModeStripAtSample(stripIndex, column, triggerGlobalSample, posInfo, false);
+        }
+        else
+        {
+            strip->triggerAtSample(column, audioEngine->getCurrentTempo(), triggerGlobalSample, posInfo);
+        }
     }
 
     // Record pattern events at the exact trigger timeline position.
@@ -4854,7 +5161,11 @@ void MlrVSTAudioProcessor::stopStrip(int stripIndex)
 {
     if (auto* strip = audioEngine->getStrip(stripIndex))
     {
-        strip->stop(false);
+        audioEngine->clearPendingQuantizedTriggersForStrip(stripIndex);
+        if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
+            stopSampleModeStrip(stripIndex, false);
+        else
+            strip->stop(false);
     }
 }
 
@@ -5137,6 +5448,13 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
     for (int i = 0; i < MaxStrips; ++i)
     {
         currentStripFiles[static_cast<size_t>(i)] = juce::File();
+
+        if (auto* sampleEngine = getSampleModeEngine(i, false))
+        {
+            sampleEngine->clearPendingVisibleSlice();
+            sampleEngine->stop();
+            sampleEngine->clear();
+        }
 
         if (auto* strip = audioEngine->getStrip(i))
         {

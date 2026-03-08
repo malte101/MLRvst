@@ -24,6 +24,7 @@
 #include <atomic>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <set>
 #include <random>
@@ -322,7 +323,8 @@ public:
         Loop,
         Gate,
         Step,       // Step sequencer mode
-        Grain       // Granular freeze/scratch mode
+        Grain,      // Granular freeze/scratch mode
+        Sample      // Separate sample-mode subsystem/UI
     };
     
     enum class DirectionMode
@@ -437,6 +439,11 @@ public:
                 int64_t globalSampleStart,
                 double tempo,
                 double quantizeBeats);
+    void processExternalOutputBuffer(juce::AudioBuffer<float>& output,
+                                     int startSample,
+                                     int numSamples,
+                                     const juce::AudioPlayHead::PositionInfo& positionInfo,
+                                     double tempo);
     
     // Playback control
     void trigger(int column, double tempo, bool quantized = false);
@@ -645,6 +652,27 @@ public:
     {
         return static_cast<FilterAlgorithm>(juce::jlimit(0, 5, filterAlgorithm.load(std::memory_order_acquire)));
     }
+    void setDuckEnabled(bool enabled) { duckEnabled.store(enabled ? 1 : 0, std::memory_order_release); }
+    bool isDuckEnabled() const { return duckEnabled.load(std::memory_order_acquire) != 0; }
+    void setDuckSourceSelection(int source) { duckSourceSelection.store(juce::jlimit(0, 15, source), std::memory_order_release); }
+    int getDuckSourceSelection() const { return duckSourceSelection.load(std::memory_order_acquire); }
+    void setDuckThresholdDb(float thresholdDb) { duckThresholdDb.store(juce::jlimit(-60.0f, 0.0f, thresholdDb), std::memory_order_release); }
+    float getDuckThresholdDb() const { return duckThresholdDb.load(std::memory_order_acquire); }
+    void setDuckRatio(float ratio) { duckRatio.store(juce::jlimit(1.0f, 20.0f, ratio), std::memory_order_release); }
+    float getDuckRatio() const { return duckRatio.load(std::memory_order_acquire); }
+    void setDuckAttackMs(float attackMs) { duckAttackMs.store(juce::jlimit(0.1f, 200.0f, attackMs), std::memory_order_release); }
+    float getDuckAttackMs() const { return duckAttackMs.load(std::memory_order_acquire); }
+    void setDuckReleaseMs(float releaseMs) { duckReleaseMs.store(juce::jlimit(5.0f, 1000.0f, releaseMs), std::memory_order_release); }
+    float getDuckReleaseMs() const { return duckReleaseMs.load(std::memory_order_acquire); }
+    void setDuckGainCompDb(float gainDb) { duckGainCompDb.store(juce::jlimit(0.0f, 24.0f, gainDb), std::memory_order_release); }
+    float getDuckGainCompDb() const { return duckGainCompDb.load(std::memory_order_acquire); }
+    void setDuckFollowMaster(bool follow) { duckFollowMaster.store(follow ? 1 : 0, std::memory_order_release); }
+    bool isDuckFollowMaster() const { return duckFollowMaster.load(std::memory_order_acquire) != 0; }
+    int resolveDuckDetectorStripIndex(int selfStripIndex, int masterTriggerStripIndex) const;
+    bool isDuckActiveForProcessing(int selfStripIndex, int masterTriggerStripIndex) const;
+    void resetDuckGainSmoothing() { duckSmoothedGain = 1.0f; }
+    float getDuckSmoothedGain() const { return duckSmoothedGain; }
+    void setDuckSmoothedGain(float gain) { duckSmoothedGain = gain; }
     void setSwingAmount(float amount) { swingAmount = juce::jlimit(0.0f, 1.0f, amount); }
     float getSwingAmount() const { return swingAmount.load(std::memory_order_acquire); }
     void setSwingDivision(SwingDivision division) { swingDivision.store(static_cast<int>(division), std::memory_order_release); }
@@ -731,6 +759,28 @@ public:
             triggerOutputBlendActive = true;
             playing = true;
         }
+        else if (mode == PlayMode::Sample)
+        {
+            stepSampler.allNotesOff();
+            scrubActive = false;
+            tapeStopActive = false;
+            scratchGestureActive = false;
+            buttonHeld = false;
+            heldButton = -1;
+            patternActive = false;
+            activePattern = -1;
+            resetGrainState();
+            playing = false;
+            wasPlayingBeforeStop = false;
+            stepSamplePlaying = false;
+            lastStepTime = -1.0;
+            stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+            stepTraversalTick = std::numeric_limits<int64_t>::min();
+            stepSubdivisionTriggerIndex = 0;
+            stepSubdivisionGateOpen = true;
+            stepTraversalRatioAtLastTick = -1.0;
+            stepTraversalPhaseOffsetTicks = 0.0;
+        }
         else if (oldMode == PlayMode::Step && mode != PlayMode::Step)
         {
             stepSampler.allNotesOff();
@@ -762,6 +812,8 @@ public:
     
     // State
     bool isPlaying() const { return playing; }
+    bool isStoppingAfterFade() const { return stopAfterFade; }
+    bool isPlayingForPresetSave() const { return playing && !stopAfterFade; }
     double getPlaybackPosition() const { return playbackPosition; }
     double getNormalizedPosition() const;
     bool isPpqTimelineAnchored() const { return ppqTimelineAnchored; }
@@ -917,6 +969,7 @@ private:
     juce::SmoothedValue<float> smoothedFilterFrequency{20000.0f};
     juce::SmoothedValue<float> smoothedFilterResonance{0.707f};
     juce::SmoothedValue<float> smoothedFilterMorph{0.0f};
+    float duckSmoothedGain = 1.0f;
     std::atomic<float> pitchShiftSemitones{0.0f};
     juce::AudioBuffer<float> pitchShiftDelayBuffer;
     int pitchShiftWritePos = 0;
@@ -1019,7 +1072,15 @@ private:
     int64_t scratchDuration = 0;      // How long forward scratch took (samples)
     double scratchStartPosition = 0.0; // Position when scratch started
     double scratchTravelDistance = 0.0; // Signed shortest travel distance for active scratch
-    
+    std::atomic<int> duckEnabled{0};
+    std::atomic<int> duckSourceSelection{0}; // 0=self, 1=master, 2..=strip index + 1
+    std::atomic<float> duckThresholdDb{-24.0f};
+    std::atomic<float> duckRatio{4.0f};
+    std::atomic<float> duckAttackMs{10.0f};
+    std::atomic<float> duckReleaseMs{180.0f};
+    std::atomic<float> duckGainCompDb{0.0f};
+    std::atomic<int> duckFollowMaster{0};
+
     // Rhythmic scratch patterns - multi-button hold system
     std::set<int> heldButtons;        // All currently held buttons
     std::vector<int> heldButtonOrder; // Press order for held buttons (latest at back)
@@ -1265,6 +1326,21 @@ public:
         Sine,
         Square
     };
+
+    using SampleModeRenderCallback = std::function<void(int stripIndex,
+                                                        juce::AudioBuffer<float>& output,
+                                                        int startSample,
+                                                        int numSamples,
+                                                        const juce::AudioPlayHead::PositionInfo& positionInfo,
+                                                        int64_t globalSampleStart,
+                                                        double tempo,
+                                                        double quantizeBeats)>;
+    using SampleModeTriggerCallback = std::function<void(int stripIndex,
+                                                         int column,
+                                                         int64_t triggerSample,
+                                                         const juce::AudioPlayHead::PositionInfo& positionInfo,
+                                                         bool isMomentaryStutter)>;
+    using SampleModeStopCallback = std::function<void(int stripIndex, bool immediateStop)>;
     
     ModernAudioEngine();
     
@@ -1296,7 +1372,12 @@ public:
     void setMomentaryStutterStrip(int stripIndex, int column, double offsetRatio, bool enabled);
     void clearMomentaryStutterStrips();
     void clearPendingQuantizedTriggersForStrip(int stripIndex);
-    
+    void setMasterDuckTriggerStrip(int stripIndex);
+    int getMasterDuckTriggerStrip() const;
+    void setSampleModeRenderCallback(SampleModeRenderCallback callback);
+    void setSampleModeTriggerCallback(SampleModeTriggerCallback callback);
+    void setSampleModeStopCallback(SampleModeStopCallback callback);
+
     // Pattern recording
     void startPatternRecording(int patternIndex);
     void stopPatternRecording(int patternIndex);
@@ -1449,7 +1530,11 @@ private:
     std::array<std::atomic<int>, MaxStrips> momentaryStutterStripEnabled{};
     std::array<std::atomic<int>, MaxStrips> momentaryStutterColumns{};
     std::array<std::atomic<double>, MaxStrips> momentaryStutterOffsetRatios{};
+    SampleModeRenderCallback sampleModeRenderCallback;
+    SampleModeTriggerCallback sampleModeTriggerCallback;
+    SampleModeStopCallback sampleModeStopCallback;
     std::array<std::atomic<double>, MaxStrips> momentaryStutterNextPpq{};
+    std::atomic<int> masterDuckTriggerStrip{-1};
     std::unique_ptr<LiveRecorder> liveRecorder;
     
     QuantizationClock quantizeClock;
@@ -1480,7 +1565,10 @@ private:
     double currentSampleRate = 44100.0;
     int currentBlockSize = 512;
     juce::AudioBuffer<float> inputMonitorScratch;
-    
+    std::array<juce::AudioBuffer<float>, MaxStrips> duckStripScratchBuffers;
+    std::array<juce::AudioBuffer<float>, MaxStrips> duckDetectorEnvelopeBuffers;
+    std::array<float, MaxStrips> duckDetectorEnvelopeStates{};
+
     void updateTempo(const juce::AudioPlayHead::PositionInfo& positionInfo);
     void advanceBeat(int numSamples, bool hasHostPpq);
     void processPatterns();

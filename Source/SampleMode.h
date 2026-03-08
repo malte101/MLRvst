@@ -110,17 +110,34 @@ class SamplePlaybackVoice
 {
 public:
     void reset();
-    void trigger(const SampleSlice& slice, int64_t triggerSample);
+    void trigger(const SampleSlice& slice,
+                 int visibleSlot,
+                 uint64_t voiceIdToUse,
+                 bool loopEnabled,
+                 int fadeSamples);
+    void beginRelease(int fadeSamples);
     void stop();
 
     bool isActive() const noexcept { return active; }
     const SampleSlice& getActiveSlice() const noexcept { return activeSlice; }
-    int64_t getTriggerSample() const noexcept { return triggerSample; }
+    int getVisibleSlot() const noexcept { return visibleSlot; }
+    uint64_t getVoiceId() const noexcept { return voiceId; }
+    bool shouldLoop() const noexcept { return loopEnabled; }
+    bool isReleasing() const noexcept { return releasing; }
+
+    double readPosition = 0.0;
+    int fadeInRemaining = 0;
+    int fadeInTotal = 0;
+    int fadeOutRemaining = 0;
+    int fadeOutTotal = 0;
 
 private:
     bool active = false;
+    bool releasing = false;
+    bool loopEnabled = false;
+    int visibleSlot = -1;
+    uint64_t voiceId = 0;
     SampleSlice activeSlice;
-    int64_t triggerSample = 0;
 };
 
 class SampleModeEngine : public juce::ChangeBroadcaster
@@ -137,45 +154,77 @@ public:
         int64_t totalSamples = 0;
         int visibleSliceBankIndex = 0;
         int visibleSliceBankCount = 0;
+        bool canNavigateLeft = false;
+        bool canNavigateRight = false;
+        bool isPlaying = false;
+        int activeVisibleSliceSlot = -1;
+        int pendingVisibleSliceSlot = -1;
+        float playbackProgress = -1.0f;
         std::array<SampleSlice, SliceModel::VisibleSliceCount> visibleSlices {};
     };
 
     SampleModeEngine();
     ~SampleModeEngine() override;
 
+    void prepare(double sampleRate, int maxBlockSize);
     int loadSampleAsync(const juce::File& file);
     void clear();
+    void stop(bool immediate = true);
 
     bool hasSample() const;
+    bool isPlaying() const noexcept { return playingAtomic.load(std::memory_order_acquire) != 0; }
     StateSnapshot getStateSnapshot() const;
     std::shared_ptr<const LoadedSampleData> getLoadedSample() const;
 
     bool canNavigateVisibleBankLeft() const;
     bool canNavigateVisibleBankRight() const;
     void stepVisibleBank(int delta);
+    bool hasVisibleSlice(int visibleSlot) const;
+    int getActiveVisibleSliceSlot() const noexcept;
+    int getPendingVisibleSliceSlot() const noexcept;
+    void setPendingVisibleSlice(int visibleSlot);
+    void clearPendingVisibleSlice();
+    bool triggerVisibleSlice(int visibleSlot, bool loopEnabled = false);
+    bool renderToBuffer(juce::AudioBuffer<float>& output,
+                        int startSample,
+                        int numSamples,
+                        float playbackRate,
+                        int fadeSamples);
 
     using LoadStatusCallback = std::function<void(const SampleFileManager::LoadResult&)>;
     void setLoadStatusCallback(LoadStatusCallback callback);
 
 private:
+    bool resolveVisibleSlice(int visibleSlot, SampleSlice& sliceOut) const;
     void handleLoadResult(SampleFileManager::LoadResult result);
 
     mutable juce::CriticalSection stateLock;
+    juce::SpinLock playbackLock;
     SampleFileManager fileManager;
     SampleAnalysisEngine analysisEngine;
     SliceModel sliceModel;
-    SamplePlaybackVoice previewVoice;
+    std::array<SamplePlaybackVoice, 4> playbackVoices;
     std::shared_ptr<const LoadedSampleData> loadedSample;
     LoadStatusCallback loadStatusCallback;
     bool isLoading = false;
     juce::String statusText { "No sample loaded" };
     int activeRequestId = 0;
+    bool pendingTriggerSliceValid = false;
+    SampleSlice pendingTriggerSlice;
+    std::atomic<double> preparedSampleRate { 44100.0 };
+    std::atomic<int> preparedMaxBlockSize { 512 };
+    std::atomic<int> activeVisibleSliceSlot { -1 };
+    std::atomic<int> pendingVisibleSliceSlot { -1 };
+    std::atomic<float> playbackProgress { -1.0f };
+    std::atomic<int> playingAtomic { 0 };
+    uint64_t nextVoiceId = 1;
 
     JUCE_DECLARE_WEAK_REFERENCEABLE(SampleModeEngine)
 };
 
 class SampleModeComponent : public juce::Component,
-                            public juce::ChangeListener
+                            public juce::ChangeListener,
+                            private juce::Timer
 {
 public:
     SampleModeComponent();
@@ -185,14 +234,23 @@ public:
 
     void paint(juce::Graphics& g) override;
     void resized() override;
+    void mouseDown(const juce::MouseEvent& event) override;
     void changeListenerCallback(juce::ChangeBroadcaster* source) override;
+
+    std::function<void(int visibleSlot)> onTriggerVisibleSlice;
+    std::function<void(int delta)> onNavigateVisibleBank;
 
 private:
     void refreshFromEngine();
+    int hitTestVisibleSlice(const juce::Point<int>& point) const;
+    void timerCallback() override;
 
     SampleModeEngine* engine = nullptr;
     SampleModeEngine::StateSnapshot stateSnapshot;
     std::shared_ptr<const LoadedSampleData> loadedSample;
+    juce::Rectangle<int> waveformBounds;
+    juce::Rectangle<int> leftNavBounds;
+    juce::Rectangle<int> rightNavBounds;
 };
 
 class MonomeSamplePage
