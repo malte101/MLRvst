@@ -97,6 +97,8 @@ target_sources(mlrVST
         Source/AudioEngine.h
         Source/PresetStore.cpp
         Source/PresetStore.h
+        Source/SampleMode.cpp
+        Source/SampleMode.h
         Source/MonomeController.cpp
         Source/ArcController.cpp
         Source/MonomeFilterActions.cpp
