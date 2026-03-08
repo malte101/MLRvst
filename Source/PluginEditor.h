@@ -1070,6 +1070,7 @@ private:
     juce::Label headerStripLabel;
     juce::Label headerLoopLabel;
     juce::Label headerStepLabel;
+    juce::Label headerFlipLabel;
     
     struct PathRow
     {
@@ -1080,6 +1081,9 @@ private:
         juce::Label stepPathLabel;
         juce::TextButton stepSetButton;
         juce::TextButton stepClearButton;
+        juce::Label flipPathLabel;
+        juce::TextButton flipSetButton;
+        juce::TextButton flipClearButton;
     };
     std::array<PathRow, MlrVSTAudioProcessor::MaxStrips> rows;
     

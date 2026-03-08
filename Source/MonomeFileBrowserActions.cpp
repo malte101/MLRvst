@@ -59,7 +59,7 @@ void renderRow(const MlrVSTAudioProcessor& processor, const ModernAudioEngine& e
     for (int slot = 0; slot < kFavoriteButtonCount; ++slot)
     {
         const int buttonX = kFavoriteFirstButton + slot;
-        const auto favoriteDirectory = processor.getBrowserFavoriteDirectory(slot);
+        const auto favoriteDirectory = processor.getBrowserFavoriteDirectory(stripIndex, slot);
         const bool saveBurstActive = processor.isBrowserFavoriteSaveBurstActive(slot, nowMs);
         const bool missingBurstActive = processor.isBrowserFavoriteMissingBurstActive(slot, nowMs);
 
@@ -89,7 +89,9 @@ void renderRow(const MlrVSTAudioProcessor& processor, const ModernAudioEngine& e
         newLedState[buttonX][y] = level;
     }
 
-    const bool isArmed = !strip.hasAudio();
+    const bool isArmed = (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
+        ? !processor.hasSampleModeAudio(stripIndex)
+        : !strip.hasAudio();
 
     double beatPos = engine.getCurrentBeat();
     if (!std::isfinite(beatPos) || beatPos < 0.0)

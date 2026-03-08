@@ -1263,7 +1263,7 @@ void StripControl::setupComponents()
     playModeBox.addItem("Gate", 3);
     playModeBox.addItem("Step", 4);  // Step sequencer mode
     playModeBox.addItem("Grain", 5);
-    playModeBox.addItem("Sample", 6);
+    playModeBox.addItem("Flip", 6);
     playModeBox.setJustificationType(juce::Justification::centredLeft);
     playModeBox.setSelectedId(2);  // Default Loop
     playModeBox.setTooltip("Playback mode for this strip.");
@@ -2884,9 +2884,11 @@ void StripControl::resized()
     // Label at very top
     auto labelArea = bounds.removeFromTop(14);
     stripLabel.setBounds(labelArea.removeFromLeft(30));
+
+    const bool isSampleMode = showingSampleMode;
     
     // Main area splits: waveform left, controls right
-    auto controlsArea = bounds.removeFromRight(228);
+    auto controlsArea = bounds.removeFromRight(isSampleMode ? 184 : 228);
     
     // Waveform OR step display gets all remaining space
     waveform.setBounds(bounds);
@@ -3012,9 +3014,9 @@ void StripControl::resized()
     }
 
     loadButton.setVisible(true);
-    transientSliceButton.setVisible(true);
+    transientSliceButton.setVisible(!isSampleMode);
     playModeBox.setVisible(true);
-    directionModeBox.setVisible(true);
+    directionModeBox.setVisible(!isSampleMode);
     groupSelector.setVisible(true);
     modTargetLabel.setVisible(false);
     modTargetBox.setVisible(false);
@@ -3051,28 +3053,46 @@ void StripControl::resized()
     // Top row: Load + slice mode
     const int topRowHeight = isGrainMode ? (isGrainSpacePage ? 12 : 14) : 18;
     auto topRow = controlsArea.removeFromTop(topRowHeight);
-    const int half = topRow.getWidth() / 2;
-    auto loadArea = topRow.removeFromLeft(half);
-    loadButton.setBounds(loadArea.reduced(0, 0));
-    topRow.removeFromLeft(2);
-    transientSliceButton.setBounds(topRow);
+    if (isSampleMode)
+    {
+        loadButton.setBounds(topRow.reduced(0, 0));
+        transientSliceButton.setBounds({});
+    }
+    else
+    {
+        const int half = topRow.getWidth() / 2;
+        auto loadArea = topRow.removeFromLeft(half);
+        loadButton.setBounds(loadArea.reduced(0, 0));
+        topRow.removeFromLeft(2);
+        transientSliceButton.setBounds(topRow);
+    }
     controlsArea.removeFromTop(rowGap);
     
     // Second row: Play mode and Direction mode (2/3 width each), Group (1/3 width)
     const int modesRowHeight = isGrainMode ? (isGrainSpacePage ? 12 : 14) : 18;
     auto modesRow = controlsArea.removeFromTop(modesRowHeight);
-    int thirdWidth = modesRow.getWidth() / 3;
-    playModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
-    directionModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
-    groupSelector.setBounds(modesRow.reduced(1, 0));  // Remaining space
+    if (isSampleMode)
+    {
+        int modeWidth = (modesRow.getWidth() * 2) / 3;
+        playModeBox.setBounds(modesRow.removeFromLeft(modeWidth).reduced(1, 0));
+        groupSelector.setBounds(modesRow.reduced(1, 0));
+        directionModeBox.setBounds({});
+    }
+    else
+    {
+        int thirdWidth = modesRow.getWidth() / 3;
+        playModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
+        directionModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
+        groupSelector.setBounds(modesRow.reduced(1, 0));  // Remaining space
+    }
     controlsArea.removeFromTop(rowGap);
     
     // Check if we have enough height for compact transport + record controls.
     const int requiredTopControlsHeight = 22 + 2 + 20 + 2 + 30 + 10 + 10;
-    bool showTempoControls = (!isGrainMode) && (controlsArea.getHeight() >= requiredTopControlsHeight);
+    bool showTempoControls = (!isGrainMode) && !isSampleMode && (controlsArea.getHeight() >= requiredTopControlsHeight);
 
     // Update visibility
-    const bool showRecordBars = (!isGrainMode) && controlsArea.getHeight() >= 18;
+    const bool showRecordBars = (!isGrainMode) && !isSampleMode && controlsArea.getHeight() >= 18;
     tempoLabel.setVisible(showTempoControls);
     recordBarsBox.setVisible(showRecordBars);
     recordButton.setVisible(showRecordBars);
@@ -3331,8 +3351,10 @@ void StripControl::loadSample()
     // Get current play mode to determine which path to use
     auto* strip = processor.getAudioEngine()->getStrip(stripIndex);
     bool isStepMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+    bool isFlipMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample);
     auto mode = isStepMode ? MlrVSTAudioProcessor::SamplePathMode::Step
-                           : MlrVSTAudioProcessor::SamplePathMode::Loop;
+                           : (isFlipMode ? MlrVSTAudioProcessor::SamplePathMode::Flip
+                                         : MlrVSTAudioProcessor::SamplePathMode::Loop);
     juce::File startingDirectory = processor.getDefaultSampleDirectory(stripIndex, mode);
     
     // If no last path, use default
@@ -3364,8 +3386,10 @@ void StripControl::loadSampleFromFile(const juce::File& file)
 
     auto* strip = processor.getAudioEngine() ? processor.getAudioEngine()->getStrip(stripIndex) : nullptr;
     const bool isStepMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+    const bool isFlipMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample);
     auto mode = isStepMode ? MlrVSTAudioProcessor::SamplePathMode::Step
-                           : MlrVSTAudioProcessor::SamplePathMode::Loop;
+                           : (isFlipMode ? MlrVSTAudioProcessor::SamplePathMode::Flip
+                                         : MlrVSTAudioProcessor::SamplePathMode::Loop);
     processor.setDefaultSampleDirectory(stripIndex, mode, file.getParentDirectory());
 }
 
@@ -5598,6 +5622,11 @@ PathsControlPanel::PathsControlPanel(MlrVSTAudioProcessor& p)
     headerStepLabel.setJustificationType(juce::Justification::centredLeft);
     scrollContent.addAndMakeVisible(headerStepLabel);
 
+    headerFlipLabel.setText("Flip Mode Path", juce::dontSendNotification);
+    headerFlipLabel.setColour(juce::Label::textColourId, kTextMuted);
+    headerFlipLabel.setJustificationType(juce::Justification::centredLeft);
+    scrollContent.addAndMakeVisible(headerFlipLabel);
+
     for (int i = 0; i < MlrVSTAudioProcessor::MaxStrips; ++i)
     {
         auto& row = rows[static_cast<size_t>(i)];
@@ -5634,6 +5663,20 @@ PathsControlPanel::PathsControlPanel(MlrVSTAudioProcessor& p)
         row.stepClearButton.setTooltip("Clear default step-mode folder.");
         row.stepClearButton.onClick = [this, i]() { clearDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Step); };
         scrollContent.addAndMakeVisible(row.stepClearButton);
+
+        row.flipPathLabel.setColour(juce::Label::textColourId, kTextPrimary);
+        row.flipPathLabel.setJustificationType(juce::Justification::centredLeft);
+        scrollContent.addAndMakeVisible(row.flipPathLabel);
+
+        row.flipSetButton.setButtonText("Set");
+        row.flipSetButton.setTooltip("Set default flip-mode sample folder.");
+        row.flipSetButton.onClick = [this, i]() { chooseDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Flip); };
+        scrollContent.addAndMakeVisible(row.flipSetButton);
+
+        row.flipClearButton.setButtonText("Clear");
+        row.flipClearButton.setTooltip("Clear default flip-mode folder.");
+        row.flipClearButton.onClick = [this, i]() { clearDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Flip); };
+        scrollContent.addAndMakeVisible(row.flipClearButton);
     }
 
     refreshLabels();
@@ -5664,13 +5707,15 @@ void PathsControlPanel::resized()
     const int stripWidth = 42;
     const int buttonWidth = 48;
     const int gap = 4;
-    const int pathAreaWidth = (header.getWidth() - stripWidth - (4 * buttonWidth) - (6 * gap)) / 2;
+    const int pathAreaWidth = (header.getWidth() - stripWidth - (6 * buttonWidth) - (9 * gap)) / 3;
 
     headerStripLabel.setBounds(header.removeFromLeft(stripWidth));
     header.removeFromLeft(gap);
     headerLoopLabel.setBounds(header.removeFromLeft(pathAreaWidth + (2 * buttonWidth) + (2 * gap)));
     header.removeFromLeft(gap);
-    headerStepLabel.setBounds(header);
+    headerStepLabel.setBounds(header.removeFromLeft(pathAreaWidth + (2 * buttonWidth) + (2 * gap)));
+    header.removeFromLeft(gap);
+    headerFlipLabel.setBounds(header);
 
     layout.removeFromTop(4);
 
@@ -5695,6 +5740,13 @@ void PathsControlPanel::resized()
         row.stepSetButton.setBounds(rowArea.removeFromLeft(buttonWidth));
         rowArea.removeFromLeft(gap);
         row.stepClearButton.setBounds(rowArea.removeFromLeft(buttonWidth));
+        rowArea.removeFromLeft(gap * 2);
+
+        row.flipPathLabel.setBounds(rowArea.removeFromLeft(pathAreaWidth));
+        rowArea.removeFromLeft(gap);
+        row.flipSetButton.setBounds(rowArea.removeFromLeft(buttonWidth));
+        rowArea.removeFromLeft(gap);
+        row.flipClearButton.setBounds(rowArea.removeFromLeft(buttonWidth));
     }
 }
 
@@ -5710,11 +5762,14 @@ void PathsControlPanel::refreshLabels()
         const auto idx = static_cast<size_t>(i);
         const auto loopDir = processor.getDefaultSampleDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Loop);
         const auto stepDir = processor.getDefaultSampleDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Step);
+        const auto flipDir = processor.getDefaultSampleDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Flip);
 
         rows[idx].loopPathLabel.setText(pathToDisplay(loopDir), juce::dontSendNotification);
         rows[idx].loopPathLabel.setTooltip(loopDir.getFullPathName());
         rows[idx].stepPathLabel.setText(pathToDisplay(stepDir), juce::dontSendNotification);
         rows[idx].stepPathLabel.setTooltip(stepDir.getFullPathName());
+        rows[idx].flipPathLabel.setText(pathToDisplay(flipDir), juce::dontSendNotification);
+        rows[idx].flipPathLabel.setTooltip(flipDir.getFullPathName());
     }
 }
 
@@ -5724,7 +5779,11 @@ void PathsControlPanel::chooseDirectory(int stripIndex, MlrVSTAudioProcessor::Sa
     if (!startDir.exists() || !startDir.isDirectory())
         startDir = juce::File::getSpecialLocation(juce::File::userHomeDirectory);
 
-    const juce::String modeName = (mode == MlrVSTAudioProcessor::SamplePathMode::Step) ? "Step" : "Loop";
+    juce::String modeName = "Loop";
+    if (mode == MlrVSTAudioProcessor::SamplePathMode::Step)
+        modeName = "Step";
+    else if (mode == MlrVSTAudioProcessor::SamplePathMode::Flip)
+        modeName = "Flip";
     juce::FileChooser chooser("Select " + modeName + " Default Path for Strip " + juce::String(stripIndex + 1),
                               startDir,
                               "*");

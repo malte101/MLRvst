@@ -232,13 +232,14 @@ public:
     enum class SamplePathMode
     {
         Loop,
-        Step
+        Step,
+        Flip
     };
     static constexpr int BrowserFavoriteSlots = 6;
     juce::File getDefaultSampleDirectory(int stripIndex, SamplePathMode mode) const;
     void setDefaultSampleDirectory(int stripIndex, SamplePathMode mode, const juce::File& directory);
     juce::File getCurrentBrowserDirectoryForStrip(int stripIndex) const;
-    juce::File getBrowserFavoriteDirectory(int slot) const;
+    juce::File getBrowserFavoriteDirectory(int stripIndex, int slot) const;
     bool isBrowserFavoritePadHeld(int stripIndex, int slot) const;
     bool isBrowserFavoriteSaveBurstActive(int slot, uint32_t nowMs) const;
     bool isBrowserFavoriteMissingBurstActive(int slot, uint32_t nowMs) const;
@@ -524,7 +525,9 @@ private:
     juce::File lastSampleFolder;
     std::array<juce::File, MaxStrips> defaultLoopDirectories;
     std::array<juce::File, MaxStrips> defaultStepDirectories;
+    std::array<juce::File, MaxStrips> defaultFlipDirectories;
     std::array<juce::File, BrowserFavoriteSlots> browserFavoriteDirectories;
+    std::array<juce::File, BrowserFavoriteSlots> browserFlipFavoriteDirectories;
     std::atomic<int> persistentGlobalControlsDirty{0};
     std::atomic<int> suppressPersistentGlobalControlsSave{0};
     std::atomic<int> persistentGlobalControlsSaveQueued{0};

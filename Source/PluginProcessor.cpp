@@ -4341,7 +4341,13 @@ juce::File MlrVSTAudioProcessor::getDefaultSampleDirectory(int stripIndex, Sampl
         return {};
 
     const auto idx = static_cast<size_t>(stripIndex);
-    return mode == SamplePathMode::Step ? defaultStepDirectories[idx] : defaultLoopDirectories[idx];
+    switch (mode)
+    {
+        case SamplePathMode::Step: return defaultStepDirectories[idx];
+        case SamplePathMode::Flip: return defaultFlipDirectories[idx];
+        case SamplePathMode::Loop:
+        default: return defaultLoopDirectories[idx];
+    }
 }
 
 MlrVSTAudioProcessor::SamplePathMode MlrVSTAudioProcessor::getSamplePathModeForStrip(int stripIndex) const
@@ -4353,6 +4359,8 @@ MlrVSTAudioProcessor::SamplePathMode MlrVSTAudioProcessor::getSamplePathModeForS
     {
         if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
             return SamplePathMode::Step;
+        if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
+            return SamplePathMode::Flip;
     }
 
     return SamplePathMode::Loop;
@@ -4373,12 +4381,19 @@ juce::File MlrVSTAudioProcessor::getCurrentBrowserDirectoryForStrip(int stripInd
     if (isValidDir(selectedDir))
         return selectedDir;
 
-    const auto fallbackMode = (mode == SamplePathMode::Step)
-        ? SamplePathMode::Loop
-        : SamplePathMode::Step;
-    auto fallbackDir = getDefaultSampleDirectory(stripIndex, fallbackMode);
-    if (isValidDir(fallbackDir))
-        return fallbackDir;
+    const std::array<SamplePathMode, 3> fallbackModes {
+        SamplePathMode::Flip,
+        SamplePathMode::Step,
+        SamplePathMode::Loop
+    };
+    for (const auto fallbackMode : fallbackModes)
+    {
+        if (fallbackMode == mode)
+            continue;
+        auto fallbackDir = getDefaultSampleDirectory(stripIndex, fallbackMode);
+        if (isValidDir(fallbackDir))
+            return fallbackDir;
+    }
 
     const auto currentFile = currentStripFiles[static_cast<size_t>(stripIndex)];
     auto currentDir = currentFile.getParentDirectory();
@@ -4390,6 +4405,8 @@ juce::File MlrVSTAudioProcessor::getCurrentBrowserDirectoryForStrip(int stripInd
     {
         if (isValidDir(defaultStepDirectories[static_cast<size_t>(i)]))
             return defaultStepDirectories[static_cast<size_t>(i)];
+        if (isValidDir(defaultFlipDirectories[static_cast<size_t>(i)]))
+            return defaultFlipDirectories[static_cast<size_t>(i)];
         if (isValidDir(defaultLoopDirectories[static_cast<size_t>(i)]))
             return defaultLoopDirectories[static_cast<size_t>(i)];
 
@@ -4398,7 +4415,10 @@ juce::File MlrVSTAudioProcessor::getCurrentBrowserDirectoryForStrip(int stripInd
             return otherCurrentDir;
     }
 
-    for (const auto& favoriteDir : browserFavoriteDirectories)
+    const auto& favoriteSet = (mode == SamplePathMode::Flip)
+        ? browserFlipFavoriteDirectories
+        : browserFavoriteDirectories;
+    for (const auto& favoriteDir : favoriteSet)
     {
         if (isValidDir(favoriteDir))
             return favoriteDir;
@@ -4415,12 +4435,15 @@ juce::File MlrVSTAudioProcessor::getCurrentBrowserDirectoryForStrip(int stripInd
     return {};
 }
 
-juce::File MlrVSTAudioProcessor::getBrowserFavoriteDirectory(int slot) const
+juce::File MlrVSTAudioProcessor::getBrowserFavoriteDirectory(int stripIndex, int slot) const
 {
-    if (slot < 0 || slot >= BrowserFavoriteSlots)
+    if (stripIndex < 0 || stripIndex >= MaxStrips || slot < 0 || slot >= BrowserFavoriteSlots)
         return {};
 
-    return browserFavoriteDirectories[static_cast<size_t>(slot)];
+    const auto mode = getSamplePathModeForStrip(stripIndex);
+    return (mode == SamplePathMode::Flip)
+        ? browserFlipFavoriteDirectories[static_cast<size_t>(slot)]
+        : browserFavoriteDirectories[static_cast<size_t>(slot)];
 }
 
 bool MlrVSTAudioProcessor::isBrowserFavoritePadHeld(int stripIndex, int slot) const
@@ -4490,6 +4513,8 @@ void MlrVSTAudioProcessor::setDefaultSampleDirectory(int stripIndex, SamplePathM
     {
         if (mode == SamplePathMode::Step)
             defaultStepDirectories[idx] = juce::File();
+        else if (mode == SamplePathMode::Flip)
+            defaultFlipDirectories[idx] = juce::File();
         else
             defaultLoopDirectories[idx] = juce::File();
         savePersistentDefaultPaths();
@@ -4501,6 +4526,8 @@ void MlrVSTAudioProcessor::setDefaultSampleDirectory(int stripIndex, SamplePathM
 
     if (mode == SamplePathMode::Step)
         defaultStepDirectories[idx] = directory;
+    else if (mode == SamplePathMode::Flip)
+        defaultFlipDirectories[idx] = directory;
     else
         defaultLoopDirectories[idx] = directory;
 
@@ -4516,7 +4543,11 @@ bool MlrVSTAudioProcessor::saveBrowserFavoriteDirectoryFromStrip(int stripIndex,
     if (!directory.exists() || !directory.isDirectory())
         return false;
 
-    browserFavoriteDirectories[static_cast<size_t>(slot)] = directory;
+    const auto mode = getSamplePathModeForStrip(stripIndex);
+    if (mode == SamplePathMode::Flip)
+        browserFlipFavoriteDirectories[static_cast<size_t>(slot)] = directory;
+    else
+        browserFavoriteDirectories[static_cast<size_t>(slot)] = directory;
     savePersistentDefaultPaths();
     return true;
 }
@@ -4527,15 +4558,20 @@ bool MlrVSTAudioProcessor::recallBrowserFavoriteDirectoryForStrip(int stripIndex
         return false;
 
     const auto slotIdx = static_cast<size_t>(slot);
-    const auto directory = browserFavoriteDirectories[slotIdx];
+    const auto mode = getSamplePathModeForStrip(stripIndex);
+    const auto directory = (mode == SamplePathMode::Flip)
+        ? browserFlipFavoriteDirectories[slotIdx]
+        : browserFavoriteDirectories[slotIdx];
     if (!directory.exists() || !directory.isDirectory())
     {
-        browserFavoriteDirectories[slotIdx] = juce::File();
+        if (mode == SamplePathMode::Flip)
+            browserFlipFavoriteDirectories[slotIdx] = juce::File();
+        else
+            browserFavoriteDirectories[slotIdx] = juce::File();
         savePersistentDefaultPaths();
         return false;
     }
 
-    const auto mode = getSamplePathModeForStrip(stripIndex);
     setDefaultSampleDirectory(stripIndex, mode, directory);
     lastSampleFolder = directory;
     return true;
@@ -4562,14 +4598,18 @@ void MlrVSTAudioProcessor::appendDefaultPathsToState(juce::ValueTree& state) con
         const auto idx = static_cast<size_t>(i);
         const auto loopKey = "loopDir" + juce::String(i);
         const auto stepKey = "stepDir" + juce::String(i);
+        const auto flipKey = "flipDir" + juce::String(i);
         paths.setProperty(loopKey, defaultLoopDirectories[idx].getFullPathName(), nullptr);
         paths.setProperty(stepKey, defaultStepDirectories[idx].getFullPathName(), nullptr);
+        paths.setProperty(flipKey, defaultFlipDirectories[idx].getFullPathName(), nullptr);
     }
 
     for (int slot = 0; slot < BrowserFavoriteSlots; ++slot)
     {
         const auto key = "favoriteDir" + juce::String(slot);
+        const auto flipKey = "favoriteFlipDir" + juce::String(slot);
         paths.setProperty(key, browserFavoriteDirectories[static_cast<size_t>(slot)].getFullPathName(), nullptr);
+        paths.setProperty(flipKey, browserFlipFavoriteDirectories[static_cast<size_t>(slot)].getFullPathName(), nullptr);
     }
 }
 
@@ -4598,9 +4638,11 @@ void MlrVSTAudioProcessor::loadDefaultPathsFromState(const juce::ValueTree& stat
         const auto idx = static_cast<size_t>(i);
         const auto loopKey = "loopDir" + juce::String(i);
         const auto stepKey = "stepDir" + juce::String(i);
+        const auto flipKey = "flipDir" + juce::String(i);
 
         juce::File loopDir(paths.getProperty(loopKey).toString());
         juce::File stepDir(paths.getProperty(stepKey).toString());
+        juce::File flipDir(paths.getProperty(flipKey).toString());
 
         if (loopDir.exists() && loopDir.isDirectory())
             defaultLoopDirectories[idx] = loopDir;
@@ -4611,16 +4653,28 @@ void MlrVSTAudioProcessor::loadDefaultPathsFromState(const juce::ValueTree& stat
             defaultStepDirectories[idx] = stepDir;
         else
             defaultStepDirectories[idx] = juce::File();
+
+        if (flipDir.exists() && flipDir.isDirectory())
+            defaultFlipDirectories[idx] = flipDir;
+        else
+            defaultFlipDirectories[idx] = juce::File();
     }
 
     for (int slot = 0; slot < BrowserFavoriteSlots; ++slot)
     {
         const auto key = "favoriteDir" + juce::String(slot);
+        const auto flipKey = "favoriteFlipDir" + juce::String(slot);
         juce::File favoriteDir(paths.getProperty(key).toString());
+        juce::File favoriteFlipDir(paths.getProperty(flipKey).toString());
         if (favoriteDir.exists() && favoriteDir.isDirectory())
             browserFavoriteDirectories[static_cast<size_t>(slot)] = favoriteDir;
         else
             browserFavoriteDirectories[static_cast<size_t>(slot)] = juce::File();
+
+        if (favoriteFlipDir.exists() && favoriteFlipDir.isDirectory())
+            browserFlipFavoriteDirectories[static_cast<size_t>(slot)] = favoriteFlipDir;
+        else
+            browserFlipFavoriteDirectories[static_cast<size_t>(slot)] = juce::File();
     }
 
     savePersistentDefaultPaths();
@@ -4731,6 +4785,7 @@ void MlrVSTAudioProcessor::loadPersistentDefaultPaths()
         const auto idx = static_cast<size_t>(i);
         juce::File loopDir(xml->getStringAttribute("loopDir" + juce::String(i)));
         juce::File stepDir(xml->getStringAttribute("stepDir" + juce::String(i)));
+        juce::File flipDir(xml->getStringAttribute("flipDir" + juce::String(i)));
 
         if (loopDir.exists() && loopDir.isDirectory())
             defaultLoopDirectories[idx] = loopDir;
@@ -4741,15 +4796,26 @@ void MlrVSTAudioProcessor::loadPersistentDefaultPaths()
             defaultStepDirectories[idx] = stepDir;
         else
             defaultStepDirectories[idx] = juce::File();
+
+        if (flipDir.exists() && flipDir.isDirectory())
+            defaultFlipDirectories[idx] = flipDir;
+        else
+            defaultFlipDirectories[idx] = juce::File();
     }
 
     for (int slot = 0; slot < BrowserFavoriteSlots; ++slot)
     {
         juce::File favoriteDir(xml->getStringAttribute("favoriteDir" + juce::String(slot)));
+        juce::File favoriteFlipDir(xml->getStringAttribute("favoriteFlipDir" + juce::String(slot)));
         if (favoriteDir.exists() && favoriteDir.isDirectory())
             browserFavoriteDirectories[static_cast<size_t>(slot)] = favoriteDir;
         else
             browserFavoriteDirectories[static_cast<size_t>(slot)] = juce::File();
+
+        if (favoriteFlipDir.exists() && favoriteFlipDir.isDirectory())
+            browserFlipFavoriteDirectories[static_cast<size_t>(slot)] = favoriteFlipDir;
+        else
+            browserFlipFavoriteDirectories[static_cast<size_t>(slot)] = juce::File();
     }
 }
 
@@ -4768,10 +4834,14 @@ void MlrVSTAudioProcessor::savePersistentDefaultPaths() const
         const auto idx = static_cast<size_t>(i);
         xml.setAttribute("loopDir" + juce::String(i), defaultLoopDirectories[idx].getFullPathName());
         xml.setAttribute("stepDir" + juce::String(i), defaultStepDirectories[idx].getFullPathName());
+        xml.setAttribute("flipDir" + juce::String(i), defaultFlipDirectories[idx].getFullPathName());
     }
 
     for (int slot = 0; slot < BrowserFavoriteSlots; ++slot)
+    {
         xml.setAttribute("favoriteDir" + juce::String(slot), browserFavoriteDirectories[static_cast<size_t>(slot)].getFullPathName());
+        xml.setAttribute("favoriteFlipDir" + juce::String(slot), browserFlipFavoriteDirectories[static_cast<size_t>(slot)].getFullPathName());
+    }
 
     xml.writeTo(settingsFile);
 }
@@ -5262,7 +5332,10 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
     // Get current file for this strip.
     // If strip has no loaded audio, force first-file fallback regardless of any
     // stale path cached in currentStripFiles.
-    juce::File currentFile = strip->hasAudio()
+    const bool hasCurrentAudio = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
+        ? hasSampleModeAudio(stripIndex)
+        : strip->hasAudio();
+    juce::File currentFile = hasCurrentAudio
         ? currentStripFiles[static_cast<size_t>(stripIndex)]
         : juce::File();
 
@@ -5330,11 +5403,14 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
     }
     
     // Save playback state
-    bool wasPlaying = strip->isPlaying();
     const bool isStepMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+    const bool isFlipMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample);
+    bool wasPlaying = isFlipMode
+        ? (getSampleModeEngine(stripIndex, false) != nullptr && getSampleModeEngine(stripIndex, false)->isPlaying())
+        : strip->isPlaying();
     // Step mode playback is host-clock driven and does not rely on the loop PPQ anchor.
     // Do not block browse-load on missing timeline anchor in this mode.
-    const bool requiresTimelineAnchor = wasPlaying && !isStepMode;
+    const bool requiresTimelineAnchor = wasPlaying && !isStepMode && !isFlipMode;
     float savedSpeed = strip->getPlaybackSpeed();
     float savedVolume = strip->getVolume();
     float savedPan = strip->getPan();

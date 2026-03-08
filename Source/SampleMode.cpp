@@ -272,7 +272,7 @@ SampleFileManager::LoadResult SampleFileManager::decodeFile(const juce::File& fi
 
     if (reader->lengthInSamples > std::numeric_limits<int>::max())
     {
-        result.errorMessage = "Audio file is too large for the current Sample Mode MVP";
+        result.errorMessage = "Audio file is too large for the current Flip mode MVP";
         return result;
     }
 
@@ -830,19 +830,18 @@ void SampleModeComponent::setEngine(SampleModeEngine* engineToUse)
 
 void SampleModeComponent::paint(juce::Graphics& g)
 {
-    auto bounds = getLocalBounds().reduced(12);
+    auto bounds = getLocalBounds().reduced(8);
     g.fillAll(juce::Colour(0xff0d1014));
 
     g.setColour(juce::Colour(0xffd7dce2));
-    g.setFont(juce::FontOptions(18.0f, juce::Font::bold));
-    g.drawText("Sample Mode", bounds.removeFromTop(24), juce::Justification::centredLeft);
+    g.setFont(juce::FontOptions(15.0f, juce::Font::bold));
+    const juce::String headerText = stateSnapshot.displayName.isNotEmpty()
+        ? stateSnapshot.displayName
+        : stateSnapshot.statusText;
+    g.drawText(headerText, bounds.removeFromTop(18), juce::Justification::centredLeft);
+    bounds.removeFromTop(4);
 
-    g.setFont(juce::FontOptions(13.0f));
-    g.setColour(juce::Colour(0xff8d9aab));
-    g.drawText(stateSnapshot.statusText, bounds.removeFromTop(20), juce::Justification::centredLeft);
-    bounds.removeFromTop(8);
-
-    waveformBounds = bounds.removeFromTop(juce::jmax(140, bounds.getHeight() - 64));
+    waveformBounds = bounds.removeFromTop(juce::jmax(160, bounds.getHeight() - 40));
     g.setColour(juce::Colour(0xff171d25));
     g.fillRoundedRectangle(waveformBounds.toFloat(), 8.0f);
     g.setColour(juce::Colour(0xff263241));
@@ -917,7 +916,7 @@ void SampleModeComponent::paint(juce::Graphics& g)
                          2);
     }
 
-    auto footer = bounds.reduced(2, 8);
+    auto footer = bounds.reduced(2, 4);
     leftNavBounds = footer.removeFromLeft(34);
     rightNavBounds = footer.removeFromRight(34);
     auto infoBounds = footer;
