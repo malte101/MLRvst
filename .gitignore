@@ -32,6 +32,8 @@ Thumbs.db
 *.ilk
 
 # JUCE binary data
+JUCE
+JUCE/
 JuceLibraryCode/
 **/JuceLibraryCode/
 

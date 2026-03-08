@@ -1,0 +1,48 @@
+{
+  "Name": "mlrVST",
+  "Version": "2.0.0",
+  "Factory Info": {
+    "Vendor": "mlrVST",
+    "URL": "",
+    "E-Mail": "",
+    "Flags": {
+      "Unicode": true,
+      "Classes Discardable": false,
+      "Component Non Discardable": false,
+    },
+  },
+  "Classes": [
+    {
+      "CID": "ABCDEF019182FAEB4D6C72784D6C7276",
+      "Category": "Audio Module Class",
+      "Name": "mlrVST",
+      "Vendor": "mlrVST",
+      "Version": "2.0.0",
+      "SDKVersion": "VST 3.8.0",
+      "Sub Categories": [
+        "Fx",
+        "Sampler",
+      ],
+      "Class Flags": 0,
+      "Cardinality": 2147483647,
+      "Snapshots": [
+      ],
+    },
+    {
+      "CID": "ABCDEF011234ABCD4D6C72784D6C7276",
+      "Category": "Component Controller Class",
+      "Name": "mlrVST",
+      "Vendor": "mlrVST",
+      "Version": "2.0.0",
+      "SDKVersion": "VST 3.8.0",
+      "Sub Categories": [
+        "Fx",
+        "Sampler",
+      ],
+      "Class Flags": 0,
+      "Cardinality": 2147483647,
+      "Snapshots": [
+      ],
+    },
+  ],
+}

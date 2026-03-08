@@ -118,6 +118,89 @@ juce::PropertiesFile::Options getLegacySettingsOptions()
     return options;
 }
 
+const juce::NormalisableRange<float>& macroCutoffRange()
+{
+    static const juce::NormalisableRange<float> range = []
+    {
+        juce::NormalisableRange<float> r(20.0f, 20000.0f, 1.0f);
+        r.setSkewForCentre(1000.0f);
+        return r;
+    }();
+    return range;
+}
+
+float normalizeMacroCutoff(float hz)
+{
+    return juce::jlimit(0.0f, 1.0f, macroCutoffRange().convertTo0to1(juce::jlimit(20.0f, 20000.0f, hz)));
+}
+
+float denormalizeMacroCutoff(float normalized)
+{
+    return juce::jlimit(20.0f, 20000.0f, macroCutoffRange().convertFrom0to1(juce::jlimit(0.0f, 1.0f, normalized)));
+}
+
+float normalizeMacroResonance(float q)
+{
+    return juce::jmap(juce::jlimit(0.1f, 10.0f, q), 0.1f, 10.0f, 0.0f, 1.0f);
+}
+
+float denormalizeMacroResonance(float normalized)
+{
+    return juce::jmap(juce::jlimit(0.0f, 1.0f, normalized), 0.0f, 1.0f, 0.1f, 10.0f);
+}
+
+float normalizeMacroPitch(float semitones)
+{
+    return juce::jlimit(0.0f, 1.0f, juce::jmap(juce::jlimit(-24.0f, 24.0f, semitones), -24.0f, 24.0f, 0.0f, 1.0f));
+}
+
+float denormalizeMacroPitch(float normalized)
+{
+    return juce::jmap(juce::jlimit(0.0f, 1.0f, normalized), 0.0f, 1.0f, -24.0f, 24.0f);
+}
+
+float normalizeMacroLinear(float value, float minValue, float maxValue)
+{
+    return juce::jlimit(0.0f, 1.0f, juce::jmap(juce::jlimit(minValue, maxValue, value),
+                                               minValue, maxValue, 0.0f, 1.0f));
+}
+
+float denormalizeMacroLinear(float normalized, float minValue, float maxValue)
+{
+    return juce::jmap(juce::jlimit(0.0f, 1.0f, normalized), 0.0f, 1.0f, minValue, maxValue);
+}
+
+EnhancedAudioStrip::FilterType filterTypeFromMorphValue(float morph)
+{
+    if (morph >= 0.75f)
+        return EnhancedAudioStrip::FilterType::HighPass;
+    if (morph >= 0.25f)
+        return EnhancedAudioStrip::FilterType::BandPass;
+    return EnhancedAudioStrip::FilterType::LowPass;
+}
+
+FilterType stepFilterTypeFromMorphValue(float morph)
+{
+    if (morph >= 0.75f)
+        return FilterType::HighPass;
+    if (morph >= 0.25f)
+        return FilterType::BandPass;
+    return FilterType::LowPass;
+}
+
+using MacroTarget = MlrVSTAudioProcessor::MacroTarget;
+
+MacroTarget sanitizeMacroTarget(int rawTarget)
+{
+    return static_cast<MacroTarget>(juce::jlimit(0,
+                                                 static_cast<int>(MacroTarget::GrainShape),
+                                                 rawTarget));
+}
+
+constexpr std::array<int, MlrVSTAudioProcessor::MacroCount> kAkaiMpkMiniMacroCcs {
+    70, 71, 72, 73, -1, -1, -1, -1
+};
+
 std::unique_ptr<juce::XmlElement> loadGlobalSettingsXml()
 {
     auto settingsFile = getGlobalSettingsFile();
@@ -350,12 +433,24 @@ MonomeConnection::~MonomeConnection()
 
 void MonomeConnection::connect(int appPort)
 {
-    // Disconnect if already connected
-    oscReceiver.removeListener(this);
-    oscReceiver.disconnect();
+    if (receiverConnected)
+    {
+        oscReceiver.removeListener(this);
+        oscReceiver.disconnect();
+        receiverConnected = false;
+    }
 
-    // Bind to application port for receiving messages from device.
-    // After restart, preferred port can be temporarily unavailable, so fall back.
+    gridEndpoint.sender.disconnect();
+    gridEndpoint.connected = false;
+    gridEndpoint.reconnectAttempts = 0;
+    gridEndpoint.lastConnectAttemptTime = 0;
+    gridEndpoint.lastPingTime = 0;
+    arcEndpoint.sender.disconnect();
+    arcEndpoint.connected = false;
+    arcEndpoint.reconnectAttempts = 0;
+    arcEndpoint.lastConnectAttemptTime = 0;
+    arcEndpoint.lastPingTime = 0;
+
     int boundPort = -1;
     for (int offset = 0; offset < 32; ++offset)
     {
@@ -371,21 +466,10 @@ void MonomeConnection::connect(int appPort)
         return;
 
     applicationPort = boundPort;
-    
+    receiverConnected = true;
     oscReceiver.addListener(this);
-    
-    // Connect to serialosc for device discovery
     (void) serialoscSender.connect("127.0.0.1", 12002);
-
-    reconnectAttempts = 0;
-    lastMessageTime = juce::Time::currentTimeMillis();
-    lastConnectAttemptTime = lastMessageTime;
-    lastPingTime = 0;
     lastDiscoveryTime = 0;
-    lastReconnectAttemptTime = 0;
-    awaitingDeviceResponse = false;
-    
-    // Start device discovery
     discoverDevices();
 }
 
@@ -397,18 +481,17 @@ void MonomeConnection::refreshDeviceList()
 
 void MonomeConnection::disconnect()
 {
-    oscReceiver.removeListener(this);
-    oscReceiver.disconnect();
-    oscSender.disconnect();
+    if (receiverConnected)
+    {
+        oscReceiver.removeListener(this);
+        oscReceiver.disconnect();
+        receiverConnected = false;
+    }
+
+    markDisconnected(DeviceRole::Grid);
+    markDisconnected(DeviceRole::Arc);
     serialoscSender.disconnect();
-    connected = false;
-    reconnectAttempts = 0;
-    lastMessageTime = 0;
-    lastConnectAttemptTime = 0;
-    lastPingTime = 0;
     lastDiscoveryTime = 0;
-    lastReconnectAttemptTime = 0;
-    awaitingDeviceResponse = false;
 }
 
 void MonomeConnection::discoverDevices()
@@ -432,152 +515,145 @@ void MonomeConnection::selectDevice(int deviceIndex)
 {
     if (deviceIndex < 0 || deviceIndex >= static_cast<int>(devices.size()))
         return;
-    
-    const bool hadActiveConnection = connected;
-    currentDevice = devices[static_cast<size_t>(deviceIndex)];
-    
-    // Hard switch sender endpoint/state before attaching to new device.
-    oscSender.disconnect();
-    connected = false;
-    awaitingDeviceResponse = false;
-    lastConnectAttemptTime = 0;
-    lastPingTime = 0;
-    if (hadActiveConnection && onDeviceDisconnected)
-        onDeviceDisconnected();
-    
-    // Connect to the device's port
-    if (oscSender.connect(currentDevice.host, currentDevice.port))
-    {
-        configureCurrentDevice();
-        sendPing();
-        
-        // Clear all LEDs on connection
-        if (supportsGrid())
-            setAllLEDs(0);
-        
-        connected = true;
-        reconnectAttempts = 0;
-        lastMessageTime = 0;
-        lastConnectAttemptTime = juce::Time::currentTimeMillis();
-        lastPingTime = 0;
-        awaitingDeviceResponse = true;
-        
-        if (onDeviceConnected)
-            onDeviceConnected();
-
-        // Some serialosc/device combinations can ignore initial sys routing
-        // commands during rapid endpoint switching. Reassert once shortly after.
-        const auto selectedId = currentDevice.id;
-        juce::Timer::callAfterDelay(120, [this, selectedId]()
-        {
-            if (!connected || currentDevice.id != selectedId)
-                return;
-            configureCurrentDevice();
-            sendPing();
-        });
-        
-    }
+    if (deviceMatchesRole(devices[static_cast<size_t>(deviceIndex)], DeviceRole::Arc))
+        selectArcDevice(deviceIndex);
     else
-    {
-        connected = false;
-    }
+        selectGridDevice(deviceIndex);
+}
+
+void MonomeConnection::selectGridDevice(int deviceIndex)
+{
+    if (deviceIndex < 0 || deviceIndex >= static_cast<int>(devices.size()))
+        return;
+
+    const auto& device = devices[static_cast<size_t>(deviceIndex)];
+    if (!deviceMatchesRole(device, DeviceRole::Grid))
+        return;
+
+    gridEndpoint.device = device;
+    connectEndpoint(DeviceRole::Grid);
+}
+
+void MonomeConnection::selectArcDevice(int deviceIndex)
+{
+    if (deviceIndex < 0 || deviceIndex >= static_cast<int>(devices.size()))
+        return;
+
+    const auto& device = devices[static_cast<size_t>(deviceIndex)];
+    if (!deviceMatchesRole(device, DeviceRole::Arc))
+        return;
+
+    arcEndpoint.device = device;
+    connectEndpoint(DeviceRole::Arc);
 }
 
 void MonomeConnection::setLED(int x, int y, int state)
 {
-    if (!connected) return;
-    oscSender.send(juce::OSCMessage(oscPrefix + "/grid/led/set", x, y, state));
+    if (!gridEndpoint.connected)
+        return;
+    gridEndpoint.sender.send(juce::OSCMessage(prefixForRole(DeviceRole::Grid) + "/grid/led/set", x, y, state));
 }
 
 void MonomeConnection::setAllLEDs(int state)
 {
-    if (!connected) return;
-    oscSender.send(juce::OSCMessage(oscPrefix + "/grid/led/all", state));
+    if (!gridEndpoint.connected)
+        return;
+    gridEndpoint.sender.send(juce::OSCMessage(prefixForRole(DeviceRole::Grid) + "/grid/led/all", state));
 }
 
 void MonomeConnection::setLEDRow(int xOffset, int y, const std::array<int, 8>& data)
 {
-    if (!connected) return;
+    if (!gridEndpoint.connected)
+        return;
     
-    juce::OSCMessage msg(oscPrefix + "/grid/led/row");
+    juce::OSCMessage msg(prefixForRole(DeviceRole::Grid) + "/grid/led/row");
     msg.addInt32(xOffset);
     msg.addInt32(y);
     for (int val : data)
         msg.addInt32(val);
-    oscSender.send(msg);
+    gridEndpoint.sender.send(msg);
 }
 
 void MonomeConnection::setLEDColumn(int x, int yOffset, const std::array<int, 8>& data)
 {
-    if (!connected) return;
+    if (!gridEndpoint.connected)
+        return;
     
-    juce::OSCMessage msg(oscPrefix + "/grid/led/col");
+    juce::OSCMessage msg(prefixForRole(DeviceRole::Grid) + "/grid/led/col");
     msg.addInt32(x);
     msg.addInt32(yOffset);
     for (int val : data)
         msg.addInt32(val);
-    oscSender.send(msg);
+    gridEndpoint.sender.send(msg);
 }
 
 void MonomeConnection::setLEDMap(int xOffset, int yOffset, const std::array<int, 8>& data)
 {
-    if (!connected) return;
+    if (!gridEndpoint.connected)
+        return;
     
-    juce::OSCMessage msg(oscPrefix + "/grid/led/map");
+    juce::OSCMessage msg(prefixForRole(DeviceRole::Grid) + "/grid/led/map");
     msg.addInt32(xOffset);
     msg.addInt32(yOffset);
     for (int val : data)
         msg.addInt32(val);
-    oscSender.send(msg);
+    gridEndpoint.sender.send(msg);
 }
 
 void MonomeConnection::setRotation(int degrees)
 {
-    if (!connected) return;
+    if (!gridEndpoint.connected)
+        return;
     // Only 0, 90, 180, 270 are valid
     int validRotation = ((degrees / 90) * 90) % 360;
-    oscSender.send(juce::OSCMessage("/sys/rotation", validRotation));
+    gridEndpoint.sender.send(juce::OSCMessage("/sys/rotation", validRotation));
 }
 
 void MonomeConnection::setPrefix(const juce::String& newPrefix)
 {
     oscPrefix = newPrefix;
-    if (connected)
-        oscSender.send(juce::OSCMessage("/sys/prefix", oscPrefix));
+    if (gridEndpoint.connected)
+        gridEndpoint.sender.send(juce::OSCMessage("/sys/prefix", prefixForRole(DeviceRole::Grid)));
+    if (arcEndpoint.connected)
+        arcEndpoint.sender.send(juce::OSCMessage("/sys/prefix", prefixForRole(DeviceRole::Arc)));
 }
 
 void MonomeConnection::requestInfo()
 {
-    if (!connected) return;
-    oscSender.send(juce::OSCMessage("/sys/info", juce::String(currentDevice.host), applicationPort));
+    sendPing(DeviceRole::Grid);
+    sendPing(DeviceRole::Arc);
 }
 
 void MonomeConnection::requestSize()
 {
-    if (!connected) return;
-    oscSender.send(juce::OSCMessage("/sys/size"));
+    if (!gridEndpoint.connected)
+        return;
+    gridEndpoint.sender.send(juce::OSCMessage("/sys/size"));
 }
 
 // Variable brightness LED control (0-15 levels)
 void MonomeConnection::setLEDLevel(int x, int y, int level)
 {
-    if (!connected) return;
+    if (!gridEndpoint.connected)
+        return;
     int clampedLevel = juce::jlimit(0, 15, level);
-    oscSender.send(juce::OSCMessage(oscPrefix + "/grid/led/level/set", x, y, clampedLevel));
+    gridEndpoint.sender.send(juce::OSCMessage(prefixForRole(DeviceRole::Grid) + "/grid/led/level/set", x, y, clampedLevel));
 }
 
 void MonomeConnection::setAllLEDLevels(int level)
 {
-    if (!connected) return;
+    if (!gridEndpoint.connected)
+        return;
     int clampedLevel = juce::jlimit(0, 15, level);
-    oscSender.send(juce::OSCMessage(oscPrefix + "/grid/led/level/all", clampedLevel));
+    gridEndpoint.sender.send(juce::OSCMessage(prefixForRole(DeviceRole::Grid) + "/grid/led/level/all", clampedLevel));
 }
 
 void MonomeConnection::setLEDLevelRow(int xOffset, int y, const std::array<int, 8>& levels)
 {
-    if (!connected) return;
+    if (!gridEndpoint.connected)
+        return;
     
-    juce::OSCMessage msg(oscPrefix + "/grid/led/level/row");
+    juce::OSCMessage msg(prefixForRole(DeviceRole::Grid) + "/grid/led/level/row");
     msg.addInt32(xOffset);
     msg.addInt32(y);
     for (int level : levels)
@@ -585,14 +661,15 @@ void MonomeConnection::setLEDLevelRow(int xOffset, int y, const std::array<int, 
         int clampedLevel = juce::jlimit(0, 15, level);
         msg.addInt32(clampedLevel);
     }
-    oscSender.send(msg);
+    gridEndpoint.sender.send(msg);
 }
 
 void MonomeConnection::setLEDLevelColumn(int x, int yOffset, const std::array<int, 8>& levels)
 {
-    if (!connected) return;
+    if (!gridEndpoint.connected)
+        return;
     
-    juce::OSCMessage msg(oscPrefix + "/grid/led/level/col");
+    juce::OSCMessage msg(prefixForRole(DeviceRole::Grid) + "/grid/led/level/col");
     msg.addInt32(x);
     msg.addInt32(yOffset);
     for (int level : levels)
@@ -600,14 +677,15 @@ void MonomeConnection::setLEDLevelColumn(int x, int yOffset, const std::array<in
         int clampedLevel = juce::jlimit(0, 15, level);
         msg.addInt32(clampedLevel);
     }
-    oscSender.send(msg);
+    gridEndpoint.sender.send(msg);
 }
 
 void MonomeConnection::setLEDLevelMap(int xOffset, int yOffset, const std::array<int, 64>& levels)
 {
-    if (!connected) return;
+    if (!gridEndpoint.connected)
+        return;
     
-    juce::OSCMessage msg(oscPrefix + "/grid/led/level/map");
+    juce::OSCMessage msg(prefixForRole(DeviceRole::Grid) + "/grid/led/level/map");
     msg.addInt32(xOffset);
     msg.addInt32(yOffset);
     for (int level : levels)
@@ -615,39 +693,39 @@ void MonomeConnection::setLEDLevelMap(int xOffset, int yOffset, const std::array
         int clampedLevel = juce::jlimit(0, 15, level);
         msg.addInt32(clampedLevel);
     }
-    oscSender.send(msg);
+    gridEndpoint.sender.send(msg);
 }
 
 void MonomeConnection::setArcRingMap(int encoder, const std::array<int, 64>& levels)
 {
-    if (!connected || !supportsArc())
+    if (!arcEndpoint.connected)
         return;
 
     const int maxEncoders = juce::jmax(1, getArcEncoderCount());
     const int clampedEncoder = juce::jlimit(0, maxEncoders - 1, encoder);
 
-    juce::OSCMessage msg(oscPrefix + "/ring/map");
+    juce::OSCMessage msg(prefixForRole(DeviceRole::Arc) + "/ring/map");
     msg.addInt32(clampedEncoder);
     for (int level : levels)
         msg.addInt32(juce::jlimit(0, 15, level));
-    oscSender.send(msg);
+    arcEndpoint.sender.send(msg);
 }
 
 void MonomeConnection::setArcRingLevel(int encoder, int ledIndex, int level)
 {
-    if (!connected || !supportsArc())
+    if (!arcEndpoint.connected)
         return;
 
     const int maxEncoders = juce::jmax(1, getArcEncoderCount());
     const int clampedEncoder = juce::jlimit(0, maxEncoders - 1, encoder);
     const int clampedLed = juce::jlimit(0, 63, ledIndex);
     const int clampedLevel = juce::jlimit(0, 15, level);
-    oscSender.send(juce::OSCMessage(oscPrefix + "/ring/set", clampedEncoder, clampedLed, clampedLevel));
+    arcEndpoint.sender.send(juce::OSCMessage(prefixForRole(DeviceRole::Arc) + "/ring/set", clampedEncoder, clampedLed, clampedLevel));
 }
 
 void MonomeConnection::setArcRingRange(int encoder, int start, int end, int level)
 {
-    if (!connected || !supportsArc())
+    if (!arcEndpoint.connected)
         return;
 
     const int maxEncoders = juce::jmax(1, getArcEncoderCount());
@@ -655,26 +733,26 @@ void MonomeConnection::setArcRingRange(int encoder, int start, int end, int leve
     const int clampedStart = juce::jlimit(0, 63, start);
     const int clampedEnd = juce::jlimit(0, 63, end);
     const int clampedLevel = juce::jlimit(0, 15, level);
-    oscSender.send(juce::OSCMessage(oscPrefix + "/ring/range", clampedEncoder, clampedStart, clampedEnd, clampedLevel));
+    arcEndpoint.sender.send(juce::OSCMessage(prefixForRole(DeviceRole::Arc) + "/ring/range", clampedEncoder, clampedStart, clampedEnd, clampedLevel));
 }
 
 bool MonomeConnection::supportsGrid() const
 {
-    return !supportsArc();
+    return gridEndpoint.connected;
 }
 
 bool MonomeConnection::supportsArc() const
 {
-    return currentDevice.type.containsIgnoreCase("arc");
+    return arcEndpoint.connected;
 }
 
 int MonomeConnection::getArcEncoderCount() const
 {
-    if (!supportsArc())
+    if (!arcEndpoint.connected)
         return 0;
-    if (currentDevice.type.contains("2"))
+    if (arcEndpoint.device.type.contains("2"))
         return 2;
-    if (currentDevice.type.contains("4"))
+    if (arcEndpoint.device.type.contains("4"))
         return 4;
     return 4;
 }
@@ -682,44 +760,55 @@ int MonomeConnection::getArcEncoderCount() const
 // Tilt support
 void MonomeConnection::enableTilt(int sensor, bool enable)
 {
-    if (!connected) return;
-    oscSender.send(juce::OSCMessage(oscPrefix + "/tilt/set", sensor, enable ? 1 : 0));
+    if (!gridEndpoint.connected)
+        return;
+    gridEndpoint.sender.send(juce::OSCMessage(prefixForRole(DeviceRole::Grid) + "/tilt/set", sensor, enable ? 1 : 0));
 }
 
 // Connection status
 juce::String MonomeConnection::getConnectionStatus() const
 {
-    if (!connected)
-        return "Not connected";
-    
-    return "Connected to " + currentDevice.id + " (" + currentDevice.type + ") - " +
-           juce::String(currentDevice.sizeX) + "x" + juce::String(currentDevice.sizeY);
+    return getGridConnectionStatus() + " | " + getArcConnectionStatus();
+}
+
+juce::String MonomeConnection::getGridConnectionStatus() const
+{
+    if (gridEndpoint.connected)
+    {
+        return "Grid: " + gridEndpoint.device.id + " (" + gridEndpoint.device.type + ") - "
+            + juce::String(gridEndpoint.device.sizeX) + "x" + juce::String(gridEndpoint.device.sizeY);
+    }
+
+    if (gridEndpoint.device.id.isNotEmpty())
+        return "Grid: " + gridEndpoint.device.id + " (disconnected)";
+
+    return "Grid: not connected";
+}
+
+juce::String MonomeConnection::getArcConnectionStatus() const
+{
+    if (arcEndpoint.connected)
+    {
+        return "Arc: " + arcEndpoint.device.id + " (" + arcEndpoint.device.type + ")";
+    }
+
+    if (arcEndpoint.device.id.isNotEmpty())
+        return "Arc: " + arcEndpoint.device.id + " (disconnected)";
+
+    return "Arc: not connected";
 }
 
 void MonomeConnection::oscMessageReceived(const juce::OSCMessage& message)
 {
     auto address = message.getAddressPattern().toString();
 
-    // Only treat actual device/system traffic as successful handshake activity.
-    // serialosc discovery traffic can be present even if the selected device is
-    // not correctly routed to this app yet.
-    const bool isDeviceTraffic = address.startsWith("/sys")
-        || address.startsWith(oscPrefix + "/grid")
-        || address.startsWith(oscPrefix + "/tilt")
-        || address.startsWith(oscPrefix + "/enc");
-    if (isDeviceTraffic)
-    {
-        lastMessageTime = juce::Time::currentTimeMillis();
-        awaitingDeviceResponse = false;
-    }
-
     if (address.startsWith("/serialosc"))
         handleSerialOSCMessage(message);
-    else if (address.startsWith(oscPrefix + "/grid"))
+    else if (address.startsWith(prefixForRole(DeviceRole::Grid) + "/grid"))
         handleGridMessage(message);
-    else if (address.startsWith(oscPrefix + "/tilt"))
+    else if (address.startsWith(prefixForRole(DeviceRole::Grid) + "/tilt"))
         handleTiltMessage(message);
-    else if (address.startsWith(oscPrefix + "/enc"))
+    else if (address.startsWith(prefixForRole(DeviceRole::Arc) + "/enc"))
         handleArcMessage(message);
     else if (address.startsWith("/sys"))
         handleSystemMessage(message);
@@ -729,87 +818,30 @@ void MonomeConnection::timerCallback()
 {
     const auto currentTime = juce::Time::currentTimeMillis();
 
-    if (!connected)
+    if (currentTime - lastDiscoveryTime >= discoveryIntervalMs)
+        discoverDevices();
+
+    for (const auto role : { DeviceRole::Grid, DeviceRole::Arc })
     {
-        if (!autoReconnect)
-            return;
+        auto& endpoint = endpointForRole(role);
 
-        if (currentTime - lastDiscoveryTime >= discoveryIntervalMs)
-            discoverDevices();
-
-        // Attempt direct reconnection while we still have a candidate endpoint.
-        if (!currentDevice.id.isEmpty()
-            && currentDevice.port > 0
-            && reconnectAttempts < maxReconnectAttempts
-            && (currentTime - lastReconnectAttemptTime) >= reconnectIntervalMs)
+        if (!endpoint.connected
+            && autoReconnect
+            && endpoint.device.id.isNotEmpty()
+            && endpoint.device.port > 0
+            && endpoint.reconnectAttempts < maxReconnectAttempts
+            && (currentTime - endpoint.lastConnectAttemptTime) >= reconnectIntervalMs)
         {
-            lastReconnectAttemptTime = currentTime;
-            attemptReconnection();
+            attemptReconnection(role);
         }
 
-        return;
+        if (endpoint.connected
+            && (endpoint.lastPingTime == 0 || (currentTime - endpoint.lastPingTime) >= pingIntervalMs))
+        {
+            sendPing(role);
+            endpoint.lastPingTime = currentTime;
+        }
     }
-
-    // A successful UDP "connect" does not guarantee the device is reachable.
-    // Require a real response shortly after claiming an endpoint.
-    if (awaitingDeviceResponse
-        && lastConnectAttemptTime > 0
-        && (currentTime - lastConnectAttemptTime) > handshakeTimeoutMs)
-    {
-        markDisconnected();
-        discoverDevices();
-        return;
-    }
-
-    // Treat long silence as dead connection, then fall back to discovery/reconnect.
-    if (lastMessageTime > 0 && (currentTime - lastMessageTime) > connectionTimeoutMs)
-    {
-        markDisconnected();
-        discoverDevices();
-        return;
-    }
-
-    // Send periodic ping to keep connection alive and refresh sys state.
-    if (lastPingTime == 0 || (currentTime - lastPingTime) >= pingIntervalMs)
-    {
-        sendPing();
-        lastPingTime = currentTime;
-    }
-}
-
-void MonomeConnection::attemptReconnection()
-{
-    reconnectAttempts++;
-    
-    // Try to reconnect to current device
-    if (oscSender.connect(currentDevice.host, currentDevice.port))
-    {
-        configureCurrentDevice();
-        sendPing();
-        
-        connected = true;
-        reconnectAttempts = 0;
-        lastMessageTime = 0;
-        lastConnectAttemptTime = juce::Time::currentTimeMillis();
-        lastPingTime = 0;
-        awaitingDeviceResponse = true;
-        
-        if (onDeviceConnected)
-            onDeviceConnected();
-        
-    }
-    else if (autoReconnect)
-    {
-        discoverDevices();
-    }
-}
-
-void MonomeConnection::sendPing()
-{
-    if (!connected) return;
-    
-    // Request device info as a "ping"
-    oscSender.send(juce::OSCMessage("/sys/info", juce::String(currentDevice.host), applicationPort));
 }
 
 void MonomeConnection::handleSerialOSCMessage(const juce::OSCMessage& message)
@@ -856,48 +888,24 @@ void MonomeConnection::handleSerialOSCMessage(const juce::OSCMessage& message)
             devices.push_back(info);
         }
 
-        // If this is our selected device and serialosc changed its endpoint,
-        // switch to the new endpoint immediately.
-        if (currentDevice.id == info.id
-            && (currentDevice.port != info.port || currentDevice.host != info.host))
-        {
-            currentDevice.port = info.port;
-            currentDevice.host = info.host;
-
-            if (connected)
-            {
-                oscSender.disconnect();
-                markDisconnected();
-            }
-        }
-
         if (!deviceExists || endpointChanged)
         {
             if (onDeviceListUpdated)
                 onDeviceListUpdated(devices);
         }
 
-        if (!connected)
+        for (const auto role : { DeviceRole::Grid, DeviceRole::Arc })
         {
-            int bestIndex = -1;
-            if (!currentDevice.id.isEmpty())
+            auto& endpoint = endpointForRole(role);
+            if (endpoint.device.id == info.id)
             {
-                for (int i = 0; i < static_cast<int>(devices.size()); ++i)
-                {
-                    if (devices[static_cast<size_t>(i)].id == currentDevice.id)
-                    {
-                        bestIndex = i;
-                        break;
-                    }
-                }
+                endpoint.device = info;
+                if (!endpoint.connected || endpointChanged)
+                    connectEndpoint(role);
             }
-
-            if (bestIndex < 0 && !devices.empty())
-                bestIndex = 0;
-
-            if (bestIndex >= 0)
-                selectDevice(bestIndex);
         }
+
+        autoSelectAvailableDevices();
     }
     else if (address == "/serialosc/add" && message.size() >= 1)
     {
@@ -923,53 +931,160 @@ void MonomeConnection::handleSerialOSCMessage(const juce::OSCMessage& message)
             [&removedId](const DeviceInfo& info) { return info.id == removedId; }),
             devices.end());
         
-        // Check if it was our connected device
-        if (removedId == currentDevice.id)
-        {
-            markDisconnected();
-            
-            // Try to auto-connect to another device if available
-            if (!devices.empty() && autoReconnect)
-                selectDevice(0);
-        }
+        if (removedId == gridEndpoint.device.id)
+            markDisconnected(DeviceRole::Grid);
+        if (removedId == arcEndpoint.device.id)
+            markDisconnected(DeviceRole::Arc);
         
         if (onDeviceListUpdated)
             onDeviceListUpdated(devices);
+
+        autoSelectAvailableDevices();
     }
 }
 
-void MonomeConnection::markDisconnected()
+void MonomeConnection::markDisconnected(DeviceRole role)
 {
-    if (!connected)
-        return;
+    auto& endpoint = endpointForRole(role);
+    const bool wasConnected = endpoint.connected;
+    endpoint.connected = false;
+    endpoint.sender.disconnect();
+    endpoint.lastPingTime = 0;
+    endpoint.lastConnectAttemptTime = juce::Time::currentTimeMillis();
 
-    connected = false;
-    oscSender.disconnect();
-    awaitingDeviceResponse = false;
-    lastConnectAttemptTime = 0;
-    lastPingTime = 0;
-
-    if (onDeviceDisconnected)
+    if (wasConnected && onDeviceDisconnected)
         onDeviceDisconnected();
 }
 
-void MonomeConnection::configureCurrentDevice()
+MonomeConnection::EndpointState& MonomeConnection::endpointForRole(DeviceRole role)
 {
-    // Configure device to send messages to our application port.
-    oscSender.send(juce::OSCMessage("/sys/port", applicationPort));
-    oscSender.send(juce::OSCMessage("/sys/host", juce::String("127.0.0.1")));
-    oscSender.send(juce::OSCMessage("/sys/prefix", oscPrefix));
-    
-    // Request device information and refresh prefix/size state.
-    oscSender.send(juce::OSCMessage("/sys/info", juce::String("127.0.0.1"), applicationPort));
-    oscSender.send(juce::OSCMessage("/sys/size"));
+    return role == DeviceRole::Grid ? gridEndpoint : arcEndpoint;
+}
+
+const MonomeConnection::EndpointState& MonomeConnection::endpointForRole(DeviceRole role) const
+{
+    return role == DeviceRole::Grid ? gridEndpoint : arcEndpoint;
+}
+
+bool MonomeConnection::deviceMatchesRole(const DeviceInfo& device, DeviceRole role) const
+{
+    const bool isArc = device.type.containsIgnoreCase("arc");
+    return role == DeviceRole::Arc ? isArc : !isArc;
+}
+
+juce::String MonomeConnection::prefixForRole(DeviceRole role) const
+{
+    return oscPrefix + (role == DeviceRole::Grid ? "-grid" : "-arc");
+}
+
+void MonomeConnection::configureEndpoint(DeviceRole role)
+{
+    auto& endpoint = endpointForRole(role);
+    if (!endpoint.connected)
+        return;
+
+    endpoint.sender.send(juce::OSCMessage("/sys/port", applicationPort));
+    endpoint.sender.send(juce::OSCMessage("/sys/host", juce::String("127.0.0.1")));
+    endpoint.sender.send(juce::OSCMessage("/sys/prefix", prefixForRole(role)));
+    if (role == DeviceRole::Grid)
+        endpoint.sender.send(juce::OSCMessage("/sys/size"));
+}
+
+void MonomeConnection::connectEndpoint(DeviceRole role)
+{
+    auto& endpoint = endpointForRole(role);
+    if (endpoint.device.id.isEmpty() || endpoint.device.port <= 0)
+        return;
+
+    endpoint.sender.disconnect();
+    endpoint.connected = false;
+    endpoint.lastConnectAttemptTime = juce::Time::currentTimeMillis();
+
+    if (!endpoint.sender.connect(endpoint.device.host, endpoint.device.port))
+    {
+        ++endpoint.reconnectAttempts;
+        return;
+    }
+
+    endpoint.connected = true;
+    endpoint.reconnectAttempts = 0;
+    endpoint.lastPingTime = 0;
+    configureEndpoint(role);
+
+    if (role == DeviceRole::Grid)
+        setAllLEDs(0);
+
+    sendPing(role);
+    endpoint.lastPingTime = juce::Time::currentTimeMillis();
+
+    if (onDeviceConnected)
+        onDeviceConnected();
+}
+
+void MonomeConnection::attemptReconnection(DeviceRole role)
+{
+    auto& endpoint = endpointForRole(role);
+    ++endpoint.reconnectAttempts;
+    connectEndpoint(role);
+}
+
+void MonomeConnection::sendPing(DeviceRole role)
+{
+    auto& endpoint = endpointForRole(role);
+    if (!endpoint.connected)
+        return;
+
+    endpoint.sender.send(juce::OSCMessage("/sys/info", juce::String("127.0.0.1"), applicationPort));
+}
+
+void MonomeConnection::autoSelectAvailableDevices()
+{
+    auto roleNeedsSelection = [this](DeviceRole role)
+    {
+        const auto& endpoint = endpointForRole(role);
+        if (endpoint.connected)
+            return false;
+
+        if (endpoint.device.id.isEmpty())
+            return true;
+
+        return std::none_of(devices.begin(), devices.end(),
+                            [this, role, &endpoint](const DeviceInfo& device)
+                            {
+                                return deviceMatchesRole(device, role) && device.id == endpoint.device.id;
+                            });
+    };
+
+    if (roleNeedsSelection(DeviceRole::Grid))
+    {
+        for (int i = 0; i < static_cast<int>(devices.size()); ++i)
+        {
+            if (deviceMatchesRole(devices[static_cast<size_t>(i)], DeviceRole::Grid))
+            {
+                selectGridDevice(i);
+                break;
+            }
+        }
+    }
+
+    if (roleNeedsSelection(DeviceRole::Arc))
+    {
+        for (int i = 0; i < static_cast<int>(devices.size()); ++i)
+        {
+            if (deviceMatchesRole(devices[static_cast<size_t>(i)], DeviceRole::Arc))
+            {
+                selectArcDevice(i);
+                break;
+            }
+        }
+    }
 }
 
 void MonomeConnection::handleGridMessage(const juce::OSCMessage& message)
 {
     auto address = message.getAddressPattern().toString();
     
-    if (address == oscPrefix + "/grid/key" && message.size() >= 3)
+    if (address == prefixForRole(DeviceRole::Grid) + "/grid/key" && message.size() >= 3)
     {
         int x = message[0].getInt32();
         int y = message[1].getInt32();
@@ -986,28 +1101,8 @@ void MonomeConnection::handleSystemMessage(const juce::OSCMessage& message)
     
     if (address == "/sys/size" && message.size() >= 2)
     {
-        currentDevice.sizeX = message[0].getInt32();
-        currentDevice.sizeY = message[1].getInt32();
-    }
-    else if (address == "/sys/id" && message.size() >= 1)
-    {
-        currentDevice.id = message[0].getString();
-    }
-    else if (address == "/sys/rotation" && message.size() >= 1)
-    {
-        (void)message[0].getInt32();
-    }
-    else if (address == "/sys/host" && message.size() >= 1)
-    {
-        currentDevice.host = message[0].getString();
-    }
-    else if (address == "/sys/port" && message.size() >= 1)
-    {
-        // Response to our port configuration
-    }
-    else if (address == "/sys/prefix" && message.size() >= 1)
-    {
-        // Response to our prefix configuration
+        gridEndpoint.device.sizeX = message[0].getInt32();
+        gridEndpoint.device.sizeY = message[1].getInt32();
     }
 }
 
@@ -1015,7 +1110,7 @@ void MonomeConnection::handleTiltMessage(const juce::OSCMessage& message)
 {
     auto address = message.getAddressPattern().toString();
     
-    if (address == oscPrefix + "/tilt" && message.size() >= 4)
+    if (address == prefixForRole(DeviceRole::Grid) + "/tilt" && message.size() >= 4)
     {
         int sensor = message[0].getInt32();
         int x = message[1].getInt32();
@@ -1031,14 +1126,14 @@ void MonomeConnection::handleArcMessage(const juce::OSCMessage& message)
 {
     auto address = message.getAddressPattern().toString();
 
-    if (address == oscPrefix + "/enc/delta" && message.size() >= 2)
+    if (address == prefixForRole(DeviceRole::Arc) + "/enc/delta" && message.size() >= 2)
     {
         const int encoder = message[0].getInt32();
         const int delta = message[1].getInt32();
         if (onArcDelta)
             onArcDelta(encoder, delta);
     }
-    else if (address == oscPrefix + "/enc/key" && message.size() >= 2)
+    else if (address == prefixForRole(DeviceRole::Arc) + "/enc/key" && message.size() >= 2)
     {
         const int encoder = message[0].getInt32();
         const int state = message[1].getInt32();
@@ -1092,6 +1187,12 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
 {
     // Initialize audio engine
     audioEngine = std::make_unique<ModernAudioEngine>();
+    for (int i = 0; i < MacroCount; ++i)
+    {
+        macroMidiCcAssignments[static_cast<size_t>(i)].store(getDefaultMacroMidiCc(i), std::memory_order_release);
+        macroTargetAssignments[static_cast<size_t>(i)].store(static_cast<int>(getDefaultMacroTarget(i)),
+                                                             std::memory_order_release);
+    }
     cacheParameterPointers();
     loadPersistentDefaultPaths();
     loadPersistentControlPages();
@@ -1262,7 +1363,7 @@ int MlrVSTAudioProcessor::getMonomeGridWidth() const
     if (!monomeConnection.supportsGrid())
         return MaxGridWidth;
 
-    const auto device = monomeConnection.getCurrentDevice();
+    const auto device = monomeConnection.getCurrentGridDevice();
     const int reportedWidth = (device.sizeX > 0) ? device.sizeX : MaxGridWidth;
     return juce::jlimit(1, MaxGridWidth, reportedWidth);
 }
@@ -1272,7 +1373,7 @@ int MlrVSTAudioProcessor::getMonomeGridHeight() const
     if (!monomeConnection.supportsGrid())
         return 8;
 
-    const auto device = monomeConnection.getCurrentDevice();
+    const auto device = monomeConnection.getCurrentGridDevice();
     const int reportedHeight = (device.sizeY > 0) ? device.sizeY : 8;
     return juce::jlimit(2, MaxGridHeight, reportedHeight);
 }
@@ -1286,6 +1387,389 @@ int MlrVSTAudioProcessor::getMonomeActiveStripCount() const
 {
     const int stripRows = juce::jmax(0, getMonomeControlRow() - 1);
     return juce::jlimit(0, MaxStrips, stripRows);
+}
+
+int MlrVSTAudioProcessor::getDefaultMacroMidiCc(int macroIndex)
+{
+    if (macroIndex < 0 || macroIndex >= MacroCount)
+        return -1;
+
+    return kAkaiMpkMiniMacroCcs[static_cast<size_t>(macroIndex)];
+}
+
+int MlrVSTAudioProcessor::getMacroMidiCc(int macroIndex) const
+{
+    if (macroIndex < 0 || macroIndex >= MacroCount)
+        return -1;
+
+    return macroMidiCcAssignments[static_cast<size_t>(macroIndex)].load(std::memory_order_acquire);
+}
+
+MlrVSTAudioProcessor::MacroTarget MlrVSTAudioProcessor::getDefaultMacroTarget(int macroIndex)
+{
+    switch (macroIndex)
+    {
+        case 0: return MacroTarget::Cutoff;
+        case 1: return MacroTarget::Resonance;
+        case 2: return MacroTarget::FilterMorph;
+        case 3: return MacroTarget::Pitch;
+        default: return MacroTarget::None;
+    }
+}
+
+MlrVSTAudioProcessor::MacroTarget MlrVSTAudioProcessor::getMacroTarget(int macroIndex) const
+{
+    if (macroIndex < 0 || macroIndex >= MacroCount)
+        return MacroTarget::None;
+
+    return sanitizeMacroTarget(macroTargetAssignments[static_cast<size_t>(macroIndex)].load(std::memory_order_acquire));
+}
+
+void MlrVSTAudioProcessor::setMacroTarget(int macroIndex, MacroTarget target)
+{
+    if (macroIndex < 0 || macroIndex >= MacroCount)
+        return;
+
+    macroTargetAssignments[static_cast<size_t>(macroIndex)].store(static_cast<int>(sanitizeMacroTarget(static_cast<int>(target))),
+                                                                  std::memory_order_release);
+    markPersistentGlobalUserChange();
+}
+
+float MlrVSTAudioProcessor::getDefaultMacroNormalizedValue(MacroTarget target)
+{
+    switch (target)
+    {
+        case MacroTarget::Cutoff: return normalizeMacroCutoff(20000.0f);
+        case MacroTarget::Resonance: return normalizeMacroResonance(0.707f);
+        case MacroTarget::FilterMorph: return 0.0f;
+        case MacroTarget::Pitch: return 0.5f;
+        case MacroTarget::Volume: return 1.0f;
+        case MacroTarget::Pan: return 0.5f;
+        case MacroTarget::FilterEnable: return 0.0f;
+        case MacroTarget::Speed: return normalizeMacroLinear(1.0f, 0.125f, 4.0f);
+        case MacroTarget::SliceLength: return 1.0f;
+        case MacroTarget::Scratch: return 0.0f;
+        case MacroTarget::GrainSize: return normalizeMacroLinear(1240.0f, 5.0f, 2400.0f);
+        case MacroTarget::GrainDensity: return normalizeMacroLinear(0.05f, 0.05f, 0.9f);
+        case MacroTarget::GrainPitch: return 0.5f;
+        case MacroTarget::GrainPitchJitter: return 0.0f;
+        case MacroTarget::GrainSpread: return 0.0f;
+        case MacroTarget::GrainJitter: return 0.0f;
+        case MacroTarget::GrainPositionJitter: return 0.0f;
+        case MacroTarget::GrainRandom: return 0.0f;
+        case MacroTarget::GrainArp: return 0.0f;
+        case MacroTarget::GrainCloud: return 0.0f;
+        case MacroTarget::GrainEmitter: return 0.0f;
+        case MacroTarget::GrainEnvelope: return 0.0f;
+        case MacroTarget::GrainShape: return 0.5f;
+        case MacroTarget::None:
+        default: return 0.0f;
+    }
+}
+
+void MlrVSTAudioProcessor::beginMacroMidiLearn(int macroIndex)
+{
+    if (macroIndex < 0 || macroIndex >= MacroCount)
+        return;
+
+    macroMidiLearnIndex.store(macroIndex, std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::cancelMacroMidiLearn()
+{
+    macroMidiLearnIndex.store(-1, std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::resetMacroMidiCcToDefault(int macroIndex)
+{
+    if (macroIndex < 0 || macroIndex >= MacroCount)
+        return;
+
+    macroMidiCcAssignments[static_cast<size_t>(macroIndex)].store(getDefaultMacroMidiCc(macroIndex),
+                                                                  std::memory_order_release);
+    cancelMacroMidiLearn();
+    markPersistentGlobalUserChange();
+}
+
+int MlrVSTAudioProcessor::getMacroTargetStripIndex() const
+{
+    const int activeStripCount = getMonomeActiveStripCount();
+    const int maxStripIndex = (activeStripCount > 0) ? (activeStripCount - 1) : (MaxStrips - 1);
+    return juce::jlimit(0, juce::jmax(0, maxStripIndex), getLastMonomePressedStripRow());
+}
+
+float MlrVSTAudioProcessor::getMacroNormalizedValueForTarget(const EnhancedAudioStrip& strip, MacroTarget target) const
+{
+    const bool isStepMode = (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+    const auto* stepSampler = isStepMode ? strip.getStepSampler() : nullptr;
+
+    switch (target)
+    {
+        case MacroTarget::Cutoff:
+            return normalizeMacroCutoff((isStepMode && stepSampler) ? stepSampler->getFilterFrequency()
+                                                                    : strip.getFilterFrequency());
+        case MacroTarget::Resonance:
+            return normalizeMacroResonance((isStepMode && stepSampler) ? stepSampler->getFilterResonance()
+                                                                       : strip.getFilterResonance());
+        case MacroTarget::FilterMorph:
+            if (isStepMode && stepSampler != nullptr)
+            {
+                switch (stepSampler->getFilterType())
+                {
+                    case FilterType::LowPass: return 0.0f;
+                    case FilterType::BandPass: return 0.5f;
+                    case FilterType::HighPass: return 1.0f;
+                    default: break;
+                }
+            }
+            return juce::jlimit(0.0f, 1.0f, strip.getFilterMorph());
+        case MacroTarget::Pitch:
+            return normalizeMacroPitch(getPitchSemitonesForDisplay(strip));
+        case MacroTarget::Volume:
+            return juce::jlimit(0.0f, 1.0f, (isStepMode && stepSampler) ? stepSampler->getVolume()
+                                                                        : strip.getVolume());
+        case MacroTarget::Pan:
+            return normalizeMacroLinear((isStepMode && stepSampler) ? stepSampler->getPan()
+                                                                    : strip.getPan(),
+                                        -1.0f, 1.0f);
+        case MacroTarget::FilterEnable:
+            return ((isStepMode && stepSampler) ? stepSampler->isFilterEnabled()
+                                                : strip.isFilterEnabled())
+                ? 1.0f
+                : 0.0f;
+        case MacroTarget::Speed:
+            return normalizeMacroLinear((isStepMode && stepSampler) ? stepSampler->getSpeed()
+                                                                    : strip.getPlayheadSpeedRatio(),
+                                        0.125f, 4.0f);
+        case MacroTarget::SliceLength:
+            return juce::jlimit(0.0f, 1.0f, strip.getLoopSliceLength());
+        case MacroTarget::Scratch:
+            return normalizeMacroLinear(strip.getScratchAmount(), 0.0f, 100.0f);
+        case MacroTarget::GrainSize:
+            return normalizeMacroLinear(strip.getGrainSizeMs(), 5.0f, 2400.0f);
+        case MacroTarget::GrainDensity:
+            return normalizeMacroLinear(strip.getGrainDensity(), 0.05f, 0.9f);
+        case MacroTarget::GrainPitch:
+            return normalizeMacroLinear(strip.getGrainPitch(), -48.0f, 48.0f);
+        case MacroTarget::GrainPitchJitter:
+            return normalizeMacroLinear(strip.getGrainPitchJitter(), 0.0f, 48.0f);
+        case MacroTarget::GrainSpread:
+            return juce::jlimit(0.0f, 1.0f, strip.getGrainSpread());
+        case MacroTarget::GrainJitter:
+            return juce::jlimit(0.0f, 1.0f, strip.getGrainJitter());
+        case MacroTarget::GrainPositionJitter:
+            return juce::jlimit(0.0f, 1.0f, strip.getGrainPositionJitter());
+        case MacroTarget::GrainRandom:
+            return juce::jlimit(0.0f, 1.0f, strip.getGrainRandomDepth());
+        case MacroTarget::GrainArp:
+            return juce::jlimit(0.0f, 1.0f, strip.getGrainArpDepth());
+        case MacroTarget::GrainCloud:
+            return juce::jlimit(0.0f, 1.0f, strip.getGrainCloudDepth());
+        case MacroTarget::GrainEmitter:
+            return juce::jlimit(0.0f, 1.0f, strip.getGrainEmitterDepth());
+        case MacroTarget::GrainEnvelope:
+            return juce::jlimit(0.0f, 1.0f, strip.getGrainEnvelope());
+        case MacroTarget::GrainShape:
+            return normalizeMacroLinear(strip.getGrainShape(), -1.0f, 1.0f);
+        case MacroTarget::None:
+        default:
+            return getDefaultMacroNormalizedValue(target);
+    }
+}
+
+void MlrVSTAudioProcessor::applyMacroTargetValue(EnhancedAudioStrip& strip, MacroTarget target, float normalizedValue)
+{
+    const float clamped = juce::jlimit(0.0f, 1.0f, normalizedValue);
+    const bool isStepMode = (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
+    auto* stepSampler = isStepMode ? strip.getStepSampler() : nullptr;
+
+    switch (target)
+    {
+        case MacroTarget::Cutoff:
+        {
+            const float cutoffHz = denormalizeMacroCutoff(clamped);
+            strip.setFilterEnabled(true);
+            strip.setFilterFrequency(cutoffHz);
+            if (stepSampler != nullptr)
+            {
+                stepSampler->setFilterEnabled(true);
+                stepSampler->setFilterFrequency(cutoffHz);
+            }
+            break;
+        }
+        case MacroTarget::Resonance:
+        {
+            const float resonance = denormalizeMacroResonance(clamped);
+            strip.setFilterEnabled(true);
+            strip.setFilterResonance(resonance);
+            if (stepSampler != nullptr)
+            {
+                stepSampler->setFilterEnabled(true);
+                stepSampler->setFilterResonance(resonance);
+            }
+            break;
+        }
+        case MacroTarget::FilterMorph:
+        {
+            strip.setFilterEnabled(true);
+            strip.setFilterMorph(clamped);
+            strip.setFilterType(filterTypeFromMorphValue(clamped));
+            if (stepSampler != nullptr)
+            {
+                stepSampler->setFilterEnabled(true);
+                stepSampler->setFilterType(stepFilterTypeFromMorphValue(clamped));
+            }
+            break;
+        }
+        case MacroTarget::Pitch:
+        {
+            applyPitchControlToStrip(strip, denormalizeMacroPitch(clamped));
+            break;
+        }
+        case MacroTarget::Volume:
+        {
+            strip.setVolume(clamped);
+            if (stepSampler != nullptr)
+                stepSampler->setVolume(clamped);
+            break;
+        }
+        case MacroTarget::Pan:
+        {
+            const float pan = denormalizeMacroLinear(clamped, -1.0f, 1.0f);
+            strip.setPan(pan);
+            if (stepSampler != nullptr)
+                stepSampler->setPan(pan);
+            break;
+        }
+        case MacroTarget::FilterEnable:
+        {
+            const bool enabled = clamped >= 0.5f;
+            strip.setFilterEnabled(enabled);
+            if (stepSampler != nullptr)
+                stepSampler->setFilterEnabled(enabled);
+            break;
+        }
+        case MacroTarget::Speed:
+        {
+            const float speed = denormalizeMacroLinear(clamped, 0.125f, 4.0f);
+            strip.setPlayheadSpeedRatio(speed);
+            if (stepSampler != nullptr)
+                stepSampler->setSpeed(speed);
+            break;
+        }
+        case MacroTarget::SliceLength:
+            strip.setLoopSliceLength(clamped);
+            break;
+        case MacroTarget::Scratch:
+            strip.setScratchAmount(denormalizeMacroLinear(clamped, 0.0f, 100.0f));
+            break;
+        case MacroTarget::GrainSize:
+            strip.setGrainSizeMs(denormalizeMacroLinear(clamped, 5.0f, 2400.0f));
+            break;
+        case MacroTarget::GrainDensity:
+            strip.setGrainDensity(denormalizeMacroLinear(clamped, 0.05f, 0.9f));
+            break;
+        case MacroTarget::GrainPitch:
+            strip.setGrainPitch(denormalizeMacroLinear(clamped, -48.0f, 48.0f));
+            break;
+        case MacroTarget::GrainPitchJitter:
+            strip.setGrainPitchJitter(denormalizeMacroLinear(clamped, 0.0f, 48.0f));
+            break;
+        case MacroTarget::GrainSpread:
+            strip.setGrainSpread(clamped);
+            break;
+        case MacroTarget::GrainJitter:
+            strip.setGrainJitter(clamped);
+            break;
+        case MacroTarget::GrainPositionJitter:
+            strip.setGrainPositionJitter(clamped);
+            break;
+        case MacroTarget::GrainRandom:
+            strip.setGrainRandomDepth(clamped);
+            break;
+        case MacroTarget::GrainArp:
+            strip.setGrainArpDepth(clamped);
+            break;
+        case MacroTarget::GrainCloud:
+            strip.setGrainCloudDepth(clamped);
+            break;
+        case MacroTarget::GrainEmitter:
+            strip.setGrainEmitterDepth(clamped);
+            break;
+        case MacroTarget::GrainEnvelope:
+            strip.setGrainEnvelope(clamped);
+            break;
+        case MacroTarget::GrainShape:
+            strip.setGrainShape(denormalizeMacroLinear(clamped, -1.0f, 1.0f));
+            break;
+        case MacroTarget::None:
+        default:
+            break;
+        }
+}
+
+MlrVSTAudioProcessor::MacroState MlrVSTAudioProcessor::getMacroState() const
+{
+    MacroState state{};
+    state.stripIndex = getMacroTargetStripIndex();
+
+    if (!audioEngine)
+        return state;
+
+    auto* strip = audioEngine->getStrip(state.stripIndex);
+    if (strip == nullptr)
+        return state;
+
+    state.hasTargetStrip = true;
+
+    for (int macroIndex = 0; macroIndex < MacroCount; ++macroIndex)
+        state.values[static_cast<size_t>(macroIndex)] = getMacroNormalizedValueForTarget(*strip, getMacroTarget(macroIndex));
+
+    return state;
+}
+
+void MlrVSTAudioProcessor::setSelectedStripMacroValue(int macroIndex, float normalizedValue)
+{
+    if (!audioEngine || macroIndex < 0 || macroIndex >= MacroCount)
+        return;
+
+    auto* strip = audioEngine->getStrip(getMacroTargetStripIndex());
+    if (strip == nullptr)
+        return;
+
+    applyMacroTargetValue(*strip, getMacroTarget(macroIndex), normalizedValue);
+}
+
+void MlrVSTAudioProcessor::handleIncomingMacroCc(const juce::MidiBuffer& midiMessages)
+{
+    for (const auto metadata : midiMessages)
+    {
+        const auto message = metadata.getMessage();
+        if (!message.isController())
+            continue;
+
+        const int controllerNumber = message.getControllerNumber();
+        const int learnIndex = macroMidiLearnIndex.load(std::memory_order_acquire);
+        if (learnIndex >= 0 && learnIndex < MacroCount)
+        {
+            macroMidiCcAssignments[static_cast<size_t>(learnIndex)].store(controllerNumber, std::memory_order_release);
+            macroMidiLearnIndex.store(-1, std::memory_order_release);
+            markPersistentGlobalUserChange();
+            setSelectedStripMacroValue(learnIndex,
+                                       static_cast<float>(message.getControllerValue()) / 127.0f);
+            continue;
+        }
+
+        for (int macroIndex = 0; macroIndex < MacroCount; ++macroIndex)
+        {
+            if (controllerNumber != getMacroMidiCc(macroIndex))
+                continue;
+
+            setSelectedStripMacroValue(macroIndex,
+                                       static_cast<float>(message.getControllerValue()) / 127.0f);
+            break;
+        }
+    }
 }
 
 MlrVSTAudioProcessor::PitchControlMode MlrVSTAudioProcessor::getPitchControlMode() const
@@ -1772,6 +2256,8 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
                 strip->setLoopSliceLength(sliceLengthParam->load(std::memory_order_acquire));
         }
     }
+
+    handleIncomingMacroCc(midiMessages);
 
     applyMomentaryStutterMacro(posInfo);
     
@@ -4091,6 +4577,29 @@ void MlrVSTAudioProcessor::loadPersistentGlobalControls()
 
     suppressPersistentGlobalControlsSave.store(1, std::memory_order_release);
     bool anyRestored = false;
+
+    for (int i = 0; i < MacroCount; ++i)
+    {
+        const auto ccAttrName = "macroCc" + juce::String(i);
+        if (xml->hasAttribute(ccAttrName))
+        {
+            const int restoredCc = juce::jlimit(-1, 127, xml->getIntAttribute(ccAttrName, getDefaultMacroMidiCc(i)));
+            macroMidiCcAssignments[static_cast<size_t>(i)].store(restoredCc, std::memory_order_release);
+            anyRestored = true;
+        }
+
+        const auto targetAttrName = "macroTarget" + juce::String(i);
+        if (xml->hasAttribute(targetAttrName))
+        {
+            macroTargetAssignments[static_cast<size_t>(i)].store(
+                static_cast<int>(sanitizeMacroTarget(xml->getIntAttribute(targetAttrName,
+                                                                          static_cast<int>(getDefaultMacroTarget(i))))),
+                std::memory_order_release);
+            anyRestored = true;
+        }
+    }
+
+    cancelMacroMidiLearn();
     anyRestored = restoreFloatParam("masterVolume", "masterVolume", 0.0, 1.0) || anyRestored;
     anyRestored = restoreFloatParam("limiterThreshold", "limiterThreshold", -24.0, 0.0) || anyRestored;
     anyRestored = restoreBoolParam("limiterEnabled", "limiterEnabled") || anyRestored;
@@ -4155,6 +4664,11 @@ void MlrVSTAudioProcessor::savePersistentControlPages() const
         xml.setAttribute("pitchControlMode", static_cast<int>(pitchControlModeParam->load(std::memory_order_acquire)));
     if (soundTouchEnabledParam)
         xml.setAttribute("soundTouchEnabled", soundTouchEnabledParam->load(std::memory_order_acquire) >= 0.5f);
+    for (int i = 0; i < MacroCount; ++i)
+    {
+        xml.setAttribute("macroCc" + juce::String(i), getMacroMidiCc(i));
+        xml.setAttribute("macroTarget" + juce::String(i), static_cast<int>(getMacroTarget(i)));
+    }
     saveGlobalSettingsXml(xml);
     appendGlobalSettingsDiagnostic("save-globals", &xml);
 }
@@ -4326,7 +4840,7 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
     for (int i = 0; i < 4; ++i)
     {
         auto* pattern = audioEngine->getPattern(i);
-        if (pattern && pattern->isRecording())
+        if (pattern && pattern->isRecording() && audioEngine->patternRecorderMatchesStrip(i, stripIndex))
         {
             DBG("Recording to pattern " << i << ": strip=" << stripIndex << ", col=" << column << ", beat=" << eventBeat);
             pattern->recordEvent(stripIndex, column, true, eventBeat);
@@ -4602,6 +5116,7 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
     momentaryStutterLastComboMask = 0;
     momentaryStutterTwoButtonStepBaseValid = false;
     momentaryStutterTwoButtonStepBase = 0;
+    momentaryStutterStripArmed.fill(false);
     momentaryStutterPlaybackActive.store(0, std::memory_order_release);
     pendingStutterStartActive.store(0, std::memory_order_release);
     pendingStutterStartPpq.store(-1.0, std::memory_order_release);
@@ -4613,6 +5128,9 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
     pendingStutterReleaseActive.store(0, std::memory_order_release);
     pendingStutterReleasePpq.store(-1.0, std::memory_order_release);
     pendingStutterReleaseSampleTarget.store(-1, std::memory_order_release);
+    audioEngine->setMomentaryStutterActive(false);
+    audioEngine->setMomentaryStutterStartPpq(-1.0);
+    audioEngine->setMomentaryStutterReleasePpq(-1.0);
     audioEngine->setMomentaryStutterRetriggerFadeMs(0.7f);
     audioEngine->clearMomentaryStutterStrips();
 
@@ -4680,21 +5198,7 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
         audioEngine->assignStripToGroup(i, -1);
         for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
         {
-            audioEngine->setModSequencerSlot(i, slot);
-            audioEngine->setModTarget(i, ModernAudioEngine::ModTarget::None);
-            audioEngine->setModBipolar(i, false);
-            audioEngine->setModCurveMode(i, false);
-            audioEngine->setModDepth(i, 1.0f);
-            audioEngine->setModOffset(i, 0);
-            audioEngine->setModLengthBars(i, 1);
-            audioEngine->setModEditPage(i, 0);
-            audioEngine->setModSmoothingMs(i, 0.0f);
-            audioEngine->setModCurveBend(i, 0.0f);
-            audioEngine->setModCurveShape(i, ModernAudioEngine::ModCurveShape::Linear);
-            audioEngine->setModPitchScaleQuantize(i, false);
-            audioEngine->setModPitchScale(i, ModernAudioEngine::PitchScale::Chromatic);
-            for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
-                audioEngine->setModStepValueAbsolute(i, s, 0.0f);
+            audioEngine->resetModSequencerSlotToDefaults(i, slot);
         }
         audioEngine->setModSequencerSlot(i, 0);
 
@@ -4976,7 +5480,7 @@ const juce::String MlrVSTAudioProcessor::getName() const
 
 bool MlrVSTAudioProcessor::acceptsMidi() const
 {
-    return false;
+    return true;
 }
 
 bool MlrVSTAudioProcessor::producesMidi() const

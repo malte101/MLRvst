@@ -13,6 +13,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <array>
 #include <functional>
+#include <vector>
 #include "PluginProcessor.h"
 #include "StepSequencerDisplay.h"
 
@@ -513,6 +514,7 @@ private:
     std::array<juce::TextButton, ModernAudioEngine::NumModSequencers> modSequencerTabs;
     juce::ToggleButton modPitchQuantToggle;
     juce::ComboBox modPitchScaleBox;
+    juce::Label modTargetHintLabel;
     juce::Label modShapeLabel;
     juce::ComboBox modShapeBox;
     juce::Label modCurveTypeLabel;
@@ -629,6 +631,7 @@ class MonomeControlPanel : public juce::Component,
 {
 public:
     MonomeControlPanel(MlrVSTAudioProcessor& p);
+    ~MonomeControlPanel() override;
     
     void paint(juce::Graphics& g) override;
     void resized() override;
@@ -638,15 +641,23 @@ private:
     MlrVSTAudioProcessor& processor;
     
     juce::Label titleLabel;
-    juce::ComboBox deviceSelector;
+    juce::Label gridLabel;
+    juce::ComboBox gridDeviceSelector;
+    juce::TextButton gridConnectButton;
+    juce::Label gridStatusLabel;
+    juce::Label arcLabel;
+    juce::ComboBox arcDeviceSelector;
+    juce::TextButton arcConnectButton;
+    juce::Label arcStatusLabel;
     juce::TextButton refreshButton;
-    juce::TextButton connectButton;
-    juce::Label statusLabel;
     juce::ComboBox rotationSelector;
     juce::Label rotationLabel;
+    std::vector<int> gridDeviceIndices;
+    std::vector<int> arcDeviceIndices;
     
     void updateDeviceList();
-    void connectToDevice();
+    void connectToGridDevice();
+    void connectToArcDevice();
     void updateStatus();
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MonomeControlPanel)
@@ -738,6 +749,52 @@ private:
     bool globalUiReady = false;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GlobalControlPanel)
+};
+
+//==============================================================================
+/**
+ * MacroControlPanel - Monome-selected strip macro controls
+ */
+class MacroControlPanel : public juce::Component
+{
+public:
+    MacroControlPanel(MlrVSTAudioProcessor& p);
+
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void refreshFromProcessor();
+
+private:
+    MlrVSTAudioProcessor& processor;
+    StripControl::ColoredKnobLookAndFeel knobLookAndFeel;
+
+    struct MacroLearnSlider : juce::Slider
+    {
+        std::function<bool(const juce::MouseEvent&)> interceptMouseDown;
+
+        void mouseDown(const juce::MouseEvent& e) override
+        {
+            if (interceptMouseDown != nullptr && interceptMouseDown(e))
+                return;
+
+            juce::Slider::mouseDown(e);
+        }
+    };
+
+    struct MacroKnob
+    {
+        juce::Label label;
+        juce::TextButton ccButton;
+        juce::ComboBox targetBox;
+        MacroLearnSlider slider;
+    };
+
+    juce::Label titleLabel;
+    juce::Label targetStripLabel;
+    std::array<MacroKnob, MlrVSTAudioProcessor::MacroCount> macros;
+    bool isRefreshing = false;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MacroControlPanel)
 };
 
 //==============================================================================
@@ -902,6 +959,7 @@ private:
     juce::Label smoothLabel;
     juce::Slider smoothSlider;
     juce::Label gestureHintLabel;
+    juce::Label targetHintLabel;
     juce::ToggleButton pitchScaleToggle;
     juce::Label pitchScaleLabel;
     juce::ComboBox pitchScaleBox;
@@ -1044,6 +1102,7 @@ private:
     std::unique_ptr<MonomeGridDisplay> monomeGrid;
     std::unique_ptr<MonomeControlPanel> monomeControl;
     std::unique_ptr<GlobalControlPanel> globalControl;
+    std::unique_ptr<MacroControlPanel> macroControl;
     std::unique_ptr<MonomePagesPanel> monomePagesControl;
     std::unique_ptr<PresetControlPanel> presetControl;
     std::unique_ptr<PathsControlPanel> pathsControl;
@@ -1074,6 +1133,7 @@ private:
     bool tooltipsEnabled = true;
     uint32_t lastPresetRefreshToken = 0;
     int activeGuiStripCount = 6;
+    int lastTopTabIndex = -1;
 
     int getDetectedGuiStripCount() const;
     void setActiveGuiStripCount(int stripCount, bool forceRelayout);

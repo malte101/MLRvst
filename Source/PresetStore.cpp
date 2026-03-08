@@ -243,21 +243,7 @@ void resetStripToDefaultState(int stripIndex,
     audioEngine.assignStripToGroup(stripIndex, -1);
     for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
     {
-        audioEngine.setModSequencerSlot(stripIndex, slot);
-        audioEngine.setModTarget(stripIndex, ModernAudioEngine::ModTarget::None);
-        audioEngine.setModBipolar(stripIndex, false);
-        audioEngine.setModCurveMode(stripIndex, false);
-        audioEngine.setModDepth(stripIndex, 1.0f);
-        audioEngine.setModOffset(stripIndex, 0);
-        audioEngine.setModLengthBars(stripIndex, 1);
-        audioEngine.setModEditPage(stripIndex, 0);
-        audioEngine.setModSmoothingMs(stripIndex, 0.0f);
-        audioEngine.setModCurveBend(stripIndex, 0.0f);
-        audioEngine.setModCurveShape(stripIndex, ModernAudioEngine::ModCurveShape::Linear);
-        audioEngine.setModPitchScaleQuantize(stripIndex, false);
-        audioEngine.setModPitchScale(stripIndex, ModernAudioEngine::PitchScale::Chromatic);
-        for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
-            audioEngine.setModStepValueAbsolute(stripIndex, s, 0.0f);
+        audioEngine.resetModSequencerSlotToDefaults(stripIndex, slot);
     }
     audioEngine.setModSequencerSlot(stripIndex, 0);
 
@@ -1090,6 +1076,7 @@ bool loadPreset(int presetIndex,
         for (int modSlot = 0; modSlot < ModernAudioEngine::NumModSequencers; ++modSlot)
         {
             audioEngine->setModSequencerSlot(stripIndex, modSlot);
+            audioEngine->resetModSequencerSlotToDefaults(stripIndex, modSlot);
             auto slotKey = [modSlot](const juce::String& suffix)
             {
                 if (modSlot == 0)
@@ -1099,14 +1086,24 @@ bool loadPreset(int presetIndex,
 
             const auto targetKey = slotKey("Target");
             const auto stepsKey = slotKey("Steps");
-            if (modSlot > 0 && !stripXml->hasAttribute(targetKey) && stripXml->getStringAttribute(stepsKey).isEmpty())
+            if (!stripXml->hasAttribute(targetKey) && stripXml->getStringAttribute(stepsKey).isEmpty())
                 continue;
 
-            audioEngine->setModTarget(stripIndex,
-                static_cast<ModernAudioEngine::ModTarget>(clampedInt(stripXml->getIntAttribute(targetKey, 0), 0, 18, 0)));
-            audioEngine->setModBipolar(stripIndex, stripXml->getBoolAttribute(slotKey("Bipolar"), false));
+            const auto loadedTarget = static_cast<ModernAudioEngine::ModTarget>(clampedInt(
+                stripXml->getIntAttribute(targetKey, static_cast<int>(ModernAudioEngine::defaultModTargetForSlot(modSlot))),
+                0,
+                static_cast<int>(ModernAudioEngine::ModTarget::FilterMorph),
+                static_cast<int>(ModernAudioEngine::defaultModTargetForSlot(modSlot))));
+            audioEngine->setModTarget(stripIndex, loadedTarget);
+            audioEngine->setModBipolar(
+                stripIndex,
+                stripXml->getBoolAttribute(slotKey("Bipolar"), audioEngine->isModBipolar(stripIndex)));
             audioEngine->setModCurveMode(stripIndex, stripXml->getBoolAttribute(slotKey("CurveMode"), false));
-            audioEngine->setModDepth(stripIndex, clampedFloat(stripXml->getDoubleAttribute(slotKey("Depth"), 1.0), 1.0f, 0.0f, 1.0f));
+            const float requestedDepth = clampedFloat(
+                stripXml->getDoubleAttribute(slotKey("Depth"), audioEngine->getModDepth(stripIndex)),
+                audioEngine->getModDepth(stripIndex),
+                0.0f,
+                1.0f);
             audioEngine->setModOffset(stripIndex, clampedInt(stripXml->getIntAttribute(slotKey("Offset"), 0), -127, 127, 0));
             audioEngine->setModLengthBars(stripIndex, clampedInt(stripXml->getIntAttribute(slotKey("LengthBars"), 1), 1, 8, 1));
             audioEngine->setModEditPage(stripIndex, clampedInt(stripXml->getIntAttribute(slotKey("EditPage"), 0), 0, 7, 0));
@@ -1118,7 +1115,15 @@ bool loadPreset(int presetIndex,
             audioEngine->setModPitchScale(stripIndex, static_cast<ModernAudioEngine::PitchScale>(
                 clampedInt(stripXml->getIntAttribute(slotKey("PitchScale"), 0), 0, 4, 0)));
             std::array<float, ModernAudioEngine::ModTotalSteps> modSteps{};
-            decodeModSteps(stripXml->getStringAttribute(stepsKey), modSteps);
+            const auto stepsText = stripXml->getStringAttribute(stepsKey);
+            if (stepsText.isEmpty())
+            {
+                modSteps.fill(ModernAudioEngine::defaultModStepValueForTarget(loadedTarget));
+            }
+            else
+            {
+                decodeModSteps(stepsText, modSteps);
+            }
             std::array<int, ModernAudioEngine::ModTotalSteps> modStepSubdivisions{};
             modStepSubdivisions.fill(1);
             std::array<float, ModernAudioEngine::ModTotalSteps> modStepEndValues = modSteps;
@@ -1129,6 +1134,23 @@ bool loadPreset(int presetIndex,
             const auto modCurvePerStepText = stripXml->getStringAttribute(slotKey("StepCurveShapes"));
             const bool hasModShapeData = modSubdivText.isNotEmpty() || modEndText.isNotEmpty();
             const bool hasModCurvePerStepData = modCurvePerStepText.isNotEmpty();
+            const bool targetIsDefaultSlotTarget = (loadedTarget == ModernAudioEngine::defaultModTargetForSlot(modSlot));
+            const float legacyFlatValue = audioEngine->isModBipolar(stripIndex) ? 0.5f : 0.0f;
+            const bool legacyFlatSteps = std::all_of(modSteps.begin(), modSteps.end(),
+                [legacyFlatValue](float v) { return std::abs(v - legacyFlatValue) <= 1.0e-4f; });
+            const bool migrateBrokenDefault = targetIsDefaultSlotTarget
+                && requestedDepth <= 1.0e-4f
+                && legacyFlatSteps
+                && !hasModShapeData
+                && !hasModCurvePerStepData;
+
+            if (migrateBrokenDefault)
+            {
+                modSteps.fill(ModernAudioEngine::defaultModStepValueForTarget(loadedTarget));
+                modStepEndValues = modSteps;
+            }
+
+            audioEngine->setModDepth(stripIndex, migrateBrokenDefault ? 1.0f : requestedDepth);
             if (hasModShapeData)
             {
                 if (modSubdivText.isNotEmpty())

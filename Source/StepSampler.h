@@ -334,6 +334,7 @@ public:
     // Getters
     float getVolume() const { return volume; }
     float getPan() const { return pan; }
+    float getSpeed() const { return static_cast<float>(std::pow(2.0, static_cast<double>(pitchOffset) / 12.0)); }
     int getPitchOffset() const { return pitchOffset; }
     bool isFilterEnabled() const { return filterEnabled; }
     float getFilterFrequency() const { return filterFrequency; }

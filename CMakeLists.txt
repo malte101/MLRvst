@@ -16,11 +16,21 @@ option(MLRVST_ENABLE_SOUNDTOUCH "Enable SoundTouch-based swing time-stretch path
 # Export compile commands for IDE support
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Check if JUCE exists
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/JUCE/CMakeLists.txt")
+# JUCE source tree. Prefer a repo-local checkout, but allow overriding from the
+# command line and fall back to the sibling step-vsthost workspace on this machine.
+set(MLRVST_JUCE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/JUCE" CACHE PATH "Path to the JUCE source tree")
+if(NOT EXISTS "${MLRVST_JUCE_PATH}/CMakeLists.txt"
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../step-vsthost/JUCE/CMakeLists.txt")
+    set(MLRVST_JUCE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../step-vsthost/JUCE")
+endif()
+get_filename_component(MLRVST_JUCE_PATH "${MLRVST_JUCE_PATH}" ABSOLUTE)
+
+if(NOT EXISTS "${MLRVST_JUCE_PATH}/CMakeLists.txt")
     message(FATAL_ERROR 
         "JUCE not found!\n"
-        "Please clone JUCE:\n"
+        "Set MLRVST_JUCE_PATH to a JUCE checkout, or clone JUCE locally:\n"
+        "  cmake -S ${CMAKE_CURRENT_SOURCE_DIR} -B ${CMAKE_CURRENT_BINARY_DIR} -DMLRVST_JUCE_PATH=/path/to/JUCE\n"
+        "  # or\n"
         "  cd ${CMAKE_CURRENT_SOURCE_DIR}\n"
         "  git clone https://github.com/juce-framework/JUCE.git\n")
 endif()
@@ -33,7 +43,7 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 # Add JUCE
-add_subdirectory(JUCE)
+add_subdirectory("${MLRVST_JUCE_PATH}" "${CMAKE_CURRENT_BINARY_DIR}/JUCE")
 
 # Plugin formats by platform
 set(MLRVST_PLUGIN_FORMATS VST3)

@@ -37,11 +37,13 @@ public:
     
     void connect(int applicationPort);
     void disconnect();
-    bool isConnected() const { return connected; }
+    bool isConnected() const { return gridEndpoint.connected || arcEndpoint.connected; }
     
     // SerialOSC device discovery
     void discoverDevices();
     void selectDevice(int deviceIndex);
+    void selectGridDevice(int deviceIndex);
+    void selectArcDevice(int deviceIndex);
     void refreshDeviceList();
     
     // LED control - Basic (0/1 states)
@@ -87,8 +89,12 @@ public:
     };
     
     std::vector<DeviceInfo> getDiscoveredDevices() const { return devices; }
-    DeviceInfo getCurrentDevice() const { return currentDevice; }
+    DeviceInfo getCurrentDevice() const { return supportsGrid() ? gridEndpoint.device : arcEndpoint.device; }
+    DeviceInfo getCurrentGridDevice() const { return gridEndpoint.device; }
+    DeviceInfo getCurrentArcDevice() const { return arcEndpoint.device; }
     juce::String getConnectionStatus() const;
+    juce::String getGridConnectionStatus() const;
+    juce::String getArcConnectionStatus() const;
     
     // Callbacks
     std::function<void(int x, int y, int state)> onKeyPress;
@@ -100,6 +106,22 @@ public:
     std::function<void(const std::vector<DeviceInfo>&)> onDeviceListUpdated;
     
 private:
+    enum class DeviceRole
+    {
+        Grid,
+        Arc
+    };
+
+    struct EndpointState
+    {
+        juce::OSCSender sender;
+        DeviceInfo device;
+        bool connected = false;
+        int reconnectAttempts = 0;
+        juce::int64 lastConnectAttemptTime = 0;
+        juce::int64 lastPingTime = 0;
+    };
+
     void oscMessageReceived(const juce::OSCMessage& message) override;
     void handleSerialOSCMessage(const juce::OSCMessage& message);
     void handleGridMessage(const juce::OSCMessage& message);
@@ -108,37 +130,35 @@ private:
     void handleArcMessage(const juce::OSCMessage& message);
     
     void timerCallback() override;
-    void attemptReconnection();
-    void sendPing();
-    void markDisconnected();
-    void configureCurrentDevice();
+    void attemptReconnection(DeviceRole role);
+    void sendPing(DeviceRole role);
+    void markDisconnected(DeviceRole role);
+    void configureEndpoint(DeviceRole role);
+    void connectEndpoint(DeviceRole role);
+    EndpointState& endpointForRole(DeviceRole role);
+    const EndpointState& endpointForRole(DeviceRole role) const;
+    bool deviceMatchesRole(const DeviceInfo& device, DeviceRole role) const;
+    juce::String prefixForRole(DeviceRole role) const;
+    void autoSelectAvailableDevices();
     
-    juce::OSCSender oscSender;
     juce::OSCSender serialoscSender; // Separate sender for serialosc queries
     juce::OSCReceiver oscReceiver;
     
     std::vector<DeviceInfo> devices;
-    DeviceInfo currentDevice;
+    EndpointState gridEndpoint;
+    EndpointState arcEndpoint;
     
     juce::String oscPrefix = "/monome";
     int applicationPort = 8000;
-    bool connected = false;
+    bool receiverConnected = false;
     bool autoReconnect = true;
     
-    int reconnectAttempts = 0;
     static constexpr int maxReconnectAttempts = 10;
     static constexpr int reconnectIntervalMs = 2000;
     static constexpr int discoveryIntervalMs = 2000;
     
-    juce::int64 lastMessageTime = 0;
-    juce::int64 lastConnectAttemptTime = 0;
-    juce::int64 lastPingTime = 0;
     juce::int64 lastDiscoveryTime = 0;
-    juce::int64 lastReconnectAttemptTime = 0;
-    bool awaitingDeviceResponse = false;
     static constexpr int pingIntervalMs = 5000;
-    static constexpr int handshakeTimeoutMs = 3000;
-    static constexpr int connectionTimeoutMs = 15000;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MonomeConnection)
 };
@@ -264,6 +284,12 @@ public:
     void setSwingDivisionSelection(int mode);
     int getSwingDivisionSelection() const { return swingDivisionSelection.load(std::memory_order_acquire); }
     int getLastMonomePressedStripRow() const { return lastMonomePressedStripRow.load(std::memory_order_acquire); }
+    int getArcSelectedStripRow() const { return arcSelectedStripRow.load(std::memory_order_acquire); }
+    void setArcSelectedStripRow(int stripIndex)
+    {
+        arcSelectedStripRow.store(juce::jlimit(0, ModernAudioEngine::MaxStrips - 1, stripIndex),
+                                  std::memory_order_release);
+    }
     bool isStepEditModeActive() const
     {
         return controlModeActive && currentControlMode == ControlMode::StepEdit;
@@ -302,6 +328,55 @@ public:
     static constexpr int PresetColumns = 16;
     static constexpr int PresetRows = 7;
     static constexpr int MaxPresetSlots = PresetColumns * PresetRows;
+    static constexpr int MacroCount = 8;
+
+    enum class MacroTarget
+    {
+        None = 0,
+        Cutoff,
+        Resonance,
+        FilterMorph,
+        Pitch,
+        Volume,
+        Pan,
+        FilterEnable,
+        Speed,
+        SliceLength,
+        Scratch,
+        GrainSize,
+        GrainDensity,
+        GrainPitch,
+        GrainPitchJitter,
+        GrainSpread,
+        GrainJitter,
+        GrainPositionJitter,
+        GrainRandom,
+        GrainArp,
+        GrainCloud,
+        GrainEmitter,
+        GrainEnvelope,
+        GrainShape
+    };
+
+    struct MacroState
+    {
+        int stripIndex = 0;
+        bool hasTargetStrip = false;
+        std::array<float, MacroCount> values{};
+    };
+
+    MacroState getMacroState() const;
+    void setSelectedStripMacroValue(int macroIndex, float normalizedValue);
+    int getMacroMidiCc(int macroIndex) const;
+    MacroTarget getMacroTarget(int macroIndex) const;
+    int getMacroMidiLearnIndex() const { return macroMidiLearnIndex.load(std::memory_order_acquire); }
+    void beginMacroMidiLearn(int macroIndex);
+    void cancelMacroMidiLearn();
+    void resetMacroMidiCcToDefault(int macroIndex);
+    static int getDefaultMacroMidiCc(int macroIndex);
+    void setMacroTarget(int macroIndex, MacroTarget target);
+    static MacroTarget getDefaultMacroTarget(int macroIndex);
+    static float getDefaultMacroNormalizedValue(MacroTarget target);
     
     // Parameters
     juce::AudioProcessorValueTreeState parameters;
@@ -397,6 +472,7 @@ private:
     bool controlModeActive = false;  // True when control button is held
     FilterSubPage filterSubPage = FilterSubPage::Frequency;  // Current filter sub-page
     std::atomic<int> lastMonomePressedStripRow{0};
+    std::atomic<int> arcSelectedStripRow{0};
     mutable juce::CriticalSection controlPageOrderLock;
     ControlPageOrder controlPageOrder {
         ControlMode::Speed,
@@ -451,12 +527,15 @@ private:
     std::array<std::array<uint32_t, BrowserFavoriteSlots>, MaxStrips> browserFavoritePadPressStartMs{};
     std::array<uint32_t, BrowserFavoriteSlots> browserFavoriteSaveBurstUntilMs{};
     std::array<uint32_t, BrowserFavoriteSlots> browserFavoriteMissingBurstUntilMs{};
+    std::array<std::atomic<int>, MacroCount> macroMidiCcAssignments{};
+    std::array<std::atomic<int>, MacroCount> macroTargetAssignments{};
+    std::atomic<int> macroMidiLearnIndex{-1};
     std::array<int, 4> arcKeyHeld{};
     std::array<std::array<int, 64>, 4> arcRingCache{};
     ArcControlMode arcControlMode = ArcControlMode::SelectedStrip;
     int arcSelectedModStep = 0;
     juce::int64 lastGridLedUpdateTimeMs = 0;
-    static constexpr int kGridRefreshMs = 100;
+    static constexpr int kGridRefreshMs = 33;
     static constexpr int kArcRefreshMs = 33;
     static constexpr uint32_t browserFavoriteHoldSaveMs = 3000;
     static constexpr uint32_t browserFavoriteSaveBurstDurationMs = 320;
@@ -508,6 +587,10 @@ private:
     void applyMomentaryStutterMacro(const juce::AudioPlayHead::PositionInfo& posInfo);
     void restoreMomentaryStutterMacroBaseline();
     bool getHostSyncSnapshot(double& outPpq, double& outTempo) const;
+    void handleIncomingMacroCc(const juce::MidiBuffer& midiMessages);
+    int getMacroTargetStripIndex() const;
+    float getMacroNormalizedValueForTarget(const EnhancedAudioStrip& strip, MacroTarget target) const;
+    void applyMacroTargetValue(EnhancedAudioStrip& strip, MacroTarget target, float normalizedValue);
     void performPresetLoad(int presetIndex, double hostPpqSnapshot, double hostTempoSnapshot);
     struct PresetSaveRequest
     {

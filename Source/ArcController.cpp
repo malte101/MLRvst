@@ -139,7 +139,7 @@ void MlrVSTAudioProcessor::setArcControlMode(ArcControlMode mode)
 
     if (audioEngine && isArcModulationMode())
     {
-        const int targetStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+        const int targetStrip = juce::jlimit(0, MaxStrips - 1, getArcSelectedStripRow());
         arcSelectedModStep = juce::jlimit(0, ModernAudioEngine::ModSteps - 1, audioEngine->getModCurrentStep(targetStrip));
     }
 }
@@ -160,6 +160,22 @@ void MlrVSTAudioProcessor::handleMonomeArcKey(int encoder, int state)
         setArcControlMode(next);
         updateMonomeArcRings();
     }
+
+    if ((clampedEncoder == 1 || clampedEncoder == 2) && isDown && !wasDown)
+    {
+        const int currentStrip = juce::jlimit(0, MaxStrips - 1, getArcSelectedStripRow());
+        const int deltaStrip = (clampedEncoder == 1) ? -1 : 1;
+        const int nextStrip = juce::jlimit(0, MaxStrips - 1, currentStrip + deltaStrip);
+        setArcSelectedStripRow(nextStrip);
+        lastMonomePressedStripRow.store(nextStrip, std::memory_order_release);
+
+        if (audioEngine && isArcModulationMode())
+            arcSelectedModStep = juce::jlimit(0, ModernAudioEngine::ModSteps - 1, audioEngine->getModCurrentStep(nextStrip));
+
+        updateMonomeArcRings();
+        if (monomeConnection.supportsGrid())
+            updateMonomeLEDs();
+    }
 }
 
 void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
@@ -169,7 +185,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
 
     const int clampedEncoder = juce::jlimit(0, 3, encoder);
     const bool fineAdjust = (arcKeyHeld[static_cast<size_t>(clampedEncoder)] != 0) && clampedEncoder != 0;
-    const int targetStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+    const int targetStrip = juce::jlimit(0, MaxStrips - 1, getArcSelectedStripRow());
     auto* strip = audioEngine->getStrip(targetStrip);
     const bool modulationMode = isArcModulationMode();
 
@@ -365,7 +381,7 @@ void MlrVSTAudioProcessor::updateMonomeArcRings()
     if (ringCount <= 0)
         return;
 
-    const int targetStrip = juce::jlimit(0, MaxStrips - 1, getLastMonomePressedStripRow());
+    const int targetStrip = juce::jlimit(0, MaxStrips - 1, getArcSelectedStripRow());
     auto* strip = audioEngine->getStrip(targetStrip);
     const bool modulationMode = isArcModulationMode();
     const bool hasStrip = (strip != nullptr);

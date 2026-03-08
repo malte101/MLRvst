@@ -147,6 +147,246 @@ juce::String getMonomePageShortName(MlrVSTAudioProcessor::ControlMode mode)
     }
 }
 
+juce::String makePresetBubbleLabel(const juce::String& name, int fallbackIndex)
+{
+    auto trimmed = name.trim();
+    if (trimmed.isEmpty())
+        return juce::String(fallbackIndex + 1);
+
+    juce::StringArray tokens;
+    tokens.addTokens(trimmed, " _-/", "");
+    tokens.trim();
+    tokens.removeEmptyStrings();
+
+    auto isGenericToken = [](const juce::String& token)
+    {
+        const auto upper = token.trim().toUpperCase();
+        return upper == "PRESET" || upper == "PATCH";
+    };
+
+    juce::StringArray filteredTokens;
+    for (const auto& token : tokens)
+    {
+        if (!isGenericToken(token))
+            filteredTokens.add(token);
+    }
+
+    juce::String compact;
+    if (filteredTokens.size() > 1)
+    {
+        for (const auto& token : filteredTokens)
+        {
+            for (auto c : token)
+            {
+                if (juce::CharacterFunctions::isLetterOrDigit(c))
+                {
+                    compact << juce::String::charToString(juce::CharacterFunctions::toUpperCase(c));
+                    break;
+                }
+            }
+
+            if (compact.length() >= 4)
+                break;
+        }
+    }
+    else
+    {
+        const auto source = filteredTokens.isEmpty() ? trimmed : filteredTokens[0];
+        for (auto c : source)
+        {
+            if (juce::CharacterFunctions::isLetterOrDigit(c))
+                compact << juce::String::charToString(juce::CharacterFunctions::toUpperCase(c));
+            if (compact.length() >= 4)
+                break;
+        }
+    }
+
+    if (compact.isEmpty())
+        compact = juce::String(fallbackIndex + 1);
+
+    return compact;
+}
+
+const juce::NormalisableRange<float>& macroCutoffDisplayRange()
+{
+    static const juce::NormalisableRange<float> range = []
+    {
+        juce::NormalisableRange<float> r(20.0f, 20000.0f, 1.0f);
+        r.setSkewForCentre(1000.0f);
+        return r;
+    }();
+    return range;
+}
+
+float macroCutoffHzFromNormalized(float normalized)
+{
+    return juce::jlimit(20.0f, 20000.0f, macroCutoffDisplayRange().convertFrom0to1(juce::jlimit(0.0f, 1.0f, normalized)));
+}
+
+juce::String macroCutoffText(float normalized)
+{
+    const float hz = macroCutoffHzFromNormalized(normalized);
+    if (hz >= 1000.0f)
+        return juce::String(hz / 1000.0f, 2) + " kHz";
+    return juce::String(static_cast<int>(std::round(hz))) + " Hz";
+}
+
+juce::String macroResonanceText(float normalized)
+{
+    const float q = juce::jmap(juce::jlimit(0.0f, 1.0f, normalized), 0.0f, 1.0f, 0.1f, 10.0f);
+    return "Q " + juce::String(q, 2);
+}
+
+juce::String macroMorphText(float normalized)
+{
+    const float v = juce::jlimit(0.0f, 1.0f, normalized);
+    if (v < 0.25f) return "LP";
+    if (v < 0.75f) return "BP";
+    return "HP";
+}
+
+juce::String macroPitchText(float normalized)
+{
+    const float semitones = juce::jmap(juce::jlimit(0.0f, 1.0f, normalized), 0.0f, 1.0f, -24.0f, 24.0f);
+    return juce::String(semitones, 1) + " st";
+}
+
+int macroTargetToComboId(MlrVSTAudioProcessor::MacroTarget target)
+{
+    return static_cast<int>(target) + 1;
+}
+
+MlrVSTAudioProcessor::MacroTarget comboIdToMacroTargetSelection(int comboId)
+{
+    return static_cast<MlrVSTAudioProcessor::MacroTarget>(
+        juce::jlimit(0,
+                     static_cast<int>(MlrVSTAudioProcessor::MacroTarget::GrainShape),
+                     comboId - 1));
+}
+
+juce::String macroTargetDisplayName(MlrVSTAudioProcessor::MacroTarget target)
+{
+    switch (target)
+    {
+        case MlrVSTAudioProcessor::MacroTarget::Cutoff: return "Cutoff";
+        case MlrVSTAudioProcessor::MacroTarget::Resonance: return "Resonance";
+        case MlrVSTAudioProcessor::MacroTarget::FilterMorph: return "Filter Morph";
+        case MlrVSTAudioProcessor::MacroTarget::Pitch: return "Pitch";
+        case MlrVSTAudioProcessor::MacroTarget::Volume: return "Volume";
+        case MlrVSTAudioProcessor::MacroTarget::Pan: return "Pan";
+        case MlrVSTAudioProcessor::MacroTarget::FilterEnable: return "Filter Enable";
+        case MlrVSTAudioProcessor::MacroTarget::Speed: return "Speed";
+        case MlrVSTAudioProcessor::MacroTarget::SliceLength: return "Slice Length";
+        case MlrVSTAudioProcessor::MacroTarget::Scratch: return "Scratch";
+        case MlrVSTAudioProcessor::MacroTarget::GrainSize: return "Grain Size";
+        case MlrVSTAudioProcessor::MacroTarget::GrainDensity: return "Grain Density";
+        case MlrVSTAudioProcessor::MacroTarget::GrainPitch: return "Grain Pitch";
+        case MlrVSTAudioProcessor::MacroTarget::GrainPitchJitter: return "Grain Pitch Jitter";
+        case MlrVSTAudioProcessor::MacroTarget::GrainSpread: return "Grain Spread";
+        case MlrVSTAudioProcessor::MacroTarget::GrainJitter: return "Grain Jitter";
+        case MlrVSTAudioProcessor::MacroTarget::GrainPositionJitter: return "Grain Pos Jitter";
+        case MlrVSTAudioProcessor::MacroTarget::GrainRandom: return "Grain Random";
+        case MlrVSTAudioProcessor::MacroTarget::GrainArp: return "Grain Arp";
+        case MlrVSTAudioProcessor::MacroTarget::GrainCloud: return "Grain Cloud";
+        case MlrVSTAudioProcessor::MacroTarget::GrainEmitter: return "Grain Emitter";
+        case MlrVSTAudioProcessor::MacroTarget::GrainEnvelope: return "Grain Envelope";
+        case MlrVSTAudioProcessor::MacroTarget::GrainShape: return "Grain Shape";
+        case MlrVSTAudioProcessor::MacroTarget::None:
+        default: return "None";
+    }
+}
+
+void populateMacroTargetBox(juce::ComboBox& box)
+{
+    using MacroTarget = MlrVSTAudioProcessor::MacroTarget;
+    box.addItem(macroTargetDisplayName(MacroTarget::None), macroTargetToComboId(MacroTarget::None));
+    box.addItem(macroTargetDisplayName(MacroTarget::Cutoff), macroTargetToComboId(MacroTarget::Cutoff));
+    box.addItem(macroTargetDisplayName(MacroTarget::Resonance), macroTargetToComboId(MacroTarget::Resonance));
+    box.addItem(macroTargetDisplayName(MacroTarget::FilterMorph), macroTargetToComboId(MacroTarget::FilterMorph));
+    box.addItem(macroTargetDisplayName(MacroTarget::Pitch), macroTargetToComboId(MacroTarget::Pitch));
+    box.addItem(macroTargetDisplayName(MacroTarget::Volume), macroTargetToComboId(MacroTarget::Volume));
+    box.addItem(macroTargetDisplayName(MacroTarget::Pan), macroTargetToComboId(MacroTarget::Pan));
+    box.addItem(macroTargetDisplayName(MacroTarget::FilterEnable), macroTargetToComboId(MacroTarget::FilterEnable));
+    box.addItem(macroTargetDisplayName(MacroTarget::Speed), macroTargetToComboId(MacroTarget::Speed));
+    box.addItem(macroTargetDisplayName(MacroTarget::SliceLength), macroTargetToComboId(MacroTarget::SliceLength));
+    box.addItem(macroTargetDisplayName(MacroTarget::Scratch), macroTargetToComboId(MacroTarget::Scratch));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainSize), macroTargetToComboId(MacroTarget::GrainSize));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainDensity), macroTargetToComboId(MacroTarget::GrainDensity));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainPitch), macroTargetToComboId(MacroTarget::GrainPitch));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainPitchJitter), macroTargetToComboId(MacroTarget::GrainPitchJitter));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainSpread), macroTargetToComboId(MacroTarget::GrainSpread));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainJitter), macroTargetToComboId(MacroTarget::GrainJitter));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainPositionJitter), macroTargetToComboId(MacroTarget::GrainPositionJitter));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainRandom), macroTargetToComboId(MacroTarget::GrainRandom));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainArp), macroTargetToComboId(MacroTarget::GrainArp));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainCloud), macroTargetToComboId(MacroTarget::GrainCloud));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainEmitter), macroTargetToComboId(MacroTarget::GrainEmitter));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainEnvelope), macroTargetToComboId(MacroTarget::GrainEnvelope));
+    box.addItem(macroTargetDisplayName(MacroTarget::GrainShape), macroTargetToComboId(MacroTarget::GrainShape));
+}
+
+juce::String macroCcLabelText(int ccNumber)
+{
+    return ccNumber >= 0 ? ("CC" + juce::String(ccNumber)) : "CC--";
+}
+
+juce::String macroValueText(MlrVSTAudioProcessor::MacroTarget target, float normalized)
+{
+    const float clamped = juce::jlimit(0.0f, 1.0f, normalized);
+
+    switch (target)
+    {
+        case MlrVSTAudioProcessor::MacroTarget::Cutoff:
+            return macroCutoffText(clamped);
+        case MlrVSTAudioProcessor::MacroTarget::Resonance:
+            return macroResonanceText(clamped);
+        case MlrVSTAudioProcessor::MacroTarget::FilterMorph:
+            return macroMorphText(clamped);
+        case MlrVSTAudioProcessor::MacroTarget::Pitch:
+            return macroPitchText(clamped);
+        case MlrVSTAudioProcessor::MacroTarget::Volume:
+            return juce::String(static_cast<int>(std::round(clamped * 100.0f))) + "%";
+        case MlrVSTAudioProcessor::MacroTarget::Pan:
+        {
+            const float pan = juce::jmap(clamped, 0.0f, 1.0f, -1.0f, 1.0f);
+            if (std::abs(pan) < 0.01f)
+                return "C";
+            return juce::String(pan < 0.0f ? "L" : "R")
+                + juce::String(static_cast<int>(std::round(std::abs(pan) * 100.0f)));
+        }
+        case MlrVSTAudioProcessor::MacroTarget::FilterEnable:
+            return clamped >= 0.5f ? "On" : "Off";
+        case MlrVSTAudioProcessor::MacroTarget::Speed:
+            return getPlayheadSpeedLabel(juce::jmap(clamped, 0.0f, 1.0f, 0.125f, 4.0f));
+        case MlrVSTAudioProcessor::MacroTarget::SliceLength:
+            return juce::String(static_cast<int>(std::round(clamped * 100.0f))) + "%";
+        case MlrVSTAudioProcessor::MacroTarget::Scratch:
+            return juce::String(static_cast<int>(std::round(clamped * 100.0f))) + "%";
+        case MlrVSTAudioProcessor::MacroTarget::GrainSize:
+            return juce::String(juce::jmap(clamped, 0.0f, 1.0f, 5.0f, 2400.0f), 1) + " ms";
+        case MlrVSTAudioProcessor::MacroTarget::GrainDensity:
+            return juce::String(static_cast<int>(std::round(juce::jmap(clamped, 0.0f, 1.0f, 0.05f, 0.9f) * 100.0f))) + "%";
+        case MlrVSTAudioProcessor::MacroTarget::GrainPitch:
+            return juce::String(juce::jmap(clamped, 0.0f, 1.0f, -48.0f, 48.0f), 1) + " st";
+        case MlrVSTAudioProcessor::MacroTarget::GrainPitchJitter:
+            return juce::String(juce::jmap(clamped, 0.0f, 1.0f, 0.0f, 48.0f), 1) + " st";
+        case MlrVSTAudioProcessor::MacroTarget::GrainSpread:
+        case MlrVSTAudioProcessor::MacroTarget::GrainJitter:
+        case MlrVSTAudioProcessor::MacroTarget::GrainPositionJitter:
+        case MlrVSTAudioProcessor::MacroTarget::GrainRandom:
+        case MlrVSTAudioProcessor::MacroTarget::GrainArp:
+        case MlrVSTAudioProcessor::MacroTarget::GrainCloud:
+        case MlrVSTAudioProcessor::MacroTarget::GrainEmitter:
+        case MlrVSTAudioProcessor::MacroTarget::GrainEnvelope:
+            return juce::String(static_cast<int>(std::round(clamped * 100.0f))) + "%";
+        case MlrVSTAudioProcessor::MacroTarget::GrainShape:
+            return juce::String(juce::jmap(clamped, 0.0f, 1.0f, -1.0f, 1.0f) * 100.0f, 0) + "%";
+        case MlrVSTAudioProcessor::MacroTarget::None:
+        default:
+            return "Unassigned";
+    }
+}
+
 int modTargetToComboId(ModernAudioEngine::ModTarget target)
 {
     switch (target)
@@ -168,7 +408,10 @@ int modTargetToComboId(ModernAudioEngine::ModTarget target)
         case ModernAudioEngine::ModTarget::GrainCloud: return 16;
         case ModernAudioEngine::ModTarget::GrainEmitter: return 17;
         case ModernAudioEngine::ModTarget::GrainEnvelope: return 18;
-        case ModernAudioEngine::ModTarget::Retrigger: return 19;
+        case ModernAudioEngine::ModTarget::GrainPositionJitter: return 19;
+        case ModernAudioEngine::ModTarget::GrainShape: return 20;
+        case ModernAudioEngine::ModTarget::FilterMorph: return 21;
+        case ModernAudioEngine::ModTarget::Retrigger: return 22;
         case ModernAudioEngine::ModTarget::None:
         default: return 1;
     }
@@ -195,7 +438,10 @@ ModernAudioEngine::ModTarget comboIdToModTarget(int id)
         case 16: return ModernAudioEngine::ModTarget::GrainCloud;
         case 17: return ModernAudioEngine::ModTarget::GrainEmitter;
         case 18: return ModernAudioEngine::ModTarget::GrainEnvelope;
-        case 19: return ModernAudioEngine::ModTarget::Retrigger;
+        case 19: return ModernAudioEngine::ModTarget::GrainPositionJitter;
+        case 20: return ModernAudioEngine::ModTarget::GrainShape;
+        case 21: return ModernAudioEngine::ModTarget::FilterMorph;
+        case 22: return ModernAudioEngine::ModTarget::Retrigger;
         case 1:
         default: return ModernAudioEngine::ModTarget::None;
     }
@@ -204,6 +450,55 @@ ModernAudioEngine::ModTarget comboIdToModTarget(int id)
 bool modTargetAllowsBipolar(ModernAudioEngine::ModTarget target)
 {
     return ModernAudioEngine::modTargetSupportsBipolar(target);
+}
+
+juce::String retriggerDivisionLabel(float amount01)
+{
+    const float v = juce::jlimit(0.0f, 1.0f, amount01);
+    if (v <= 1.0e-4f) return "Off";
+    if (v < 0.125f) return "1/2";
+    if (v < 0.250f) return "1/4";
+    if (v < 0.375f) return "1/8";
+    if (v < 0.500f) return "1/16";
+    if (v < 0.750f) return "1/32";
+    return "1/64";
+}
+
+juce::String makeRetriggerHintText(float rawStepValue01, float depth01)
+{
+    const float amount = juce::jlimit(0.0f, 1.0f, rawStepValue01 * depth01);
+    return "Retrig now " + retriggerDivisionLabel(amount)
+        + "  |  low = slower, high = faster";
+}
+
+juce::String modTargetDisplayName(ModernAudioEngine::ModTarget target)
+{
+    switch (target)
+    {
+        case ModernAudioEngine::ModTarget::Volume: return "Volume";
+        case ModernAudioEngine::ModTarget::Pan: return "Pan";
+        case ModernAudioEngine::ModTarget::Pitch: return "Pitch";
+        case ModernAudioEngine::ModTarget::Speed: return "Speed";
+        case ModernAudioEngine::ModTarget::Cutoff: return "Cutoff";
+        case ModernAudioEngine::ModTarget::Resonance: return "Resonance";
+        case ModernAudioEngine::ModTarget::GrainSize: return "Grain Size";
+        case ModernAudioEngine::ModTarget::GrainDensity: return "Grain Density";
+        case ModernAudioEngine::ModTarget::GrainPitch: return "Grain Pitch";
+        case ModernAudioEngine::ModTarget::GrainPitchJitter: return "Grain Pitch Jitter";
+        case ModernAudioEngine::ModTarget::GrainSpread: return "Grain Spread";
+        case ModernAudioEngine::ModTarget::GrainJitter: return "Grain Jitter";
+        case ModernAudioEngine::ModTarget::GrainRandom: return "Grain Random";
+        case ModernAudioEngine::ModTarget::GrainArp: return "Grain Arp";
+        case ModernAudioEngine::ModTarget::GrainCloud: return "Grain Cloud";
+        case ModernAudioEngine::ModTarget::GrainEmitter: return "Grain Emitter";
+        case ModernAudioEngine::ModTarget::GrainEnvelope: return "Grain Envelope";
+        case ModernAudioEngine::ModTarget::Retrigger: return "Stutter";
+        case ModernAudioEngine::ModTarget::GrainPositionJitter: return "Grain Pos Jitter";
+        case ModernAudioEngine::ModTarget::GrainShape: return "Grain Shape";
+        case ModernAudioEngine::ModTarget::FilterMorph: return "Filter Morph";
+        case ModernAudioEngine::ModTarget::None:
+        default: return "None";
+    }
 }
 
 enum class StepCellModifierGesture
@@ -1614,7 +1909,10 @@ void StripControl::setupComponents()
     modTargetBox.addItem("G.Cloud", 16);
     modTargetBox.addItem("G.Emit", 17);
     modTargetBox.addItem("G.Env", 18);
-    modTargetBox.addItem("Retrig", 19);
+    modTargetBox.addItem("G.PosJ", 19);
+    modTargetBox.addItem("G.Shape", 20);
+    modTargetBox.addItem("F.Morph", 21);
+    modTargetBox.addItem("Retrig", 22);
     modTargetBox.setSelectedId(1, juce::dontSendNotification);
     modTargetBox.onChange = [this]()
     {
@@ -1623,14 +1921,22 @@ void StripControl::setupComponents()
             engine->setModTarget(stripIndex, comboIdToModTarget(modTargetBox.getSelectedId()));
             modBipolarToggle.setToggleState(engine->isModBipolar(stripIndex), juce::dontSendNotification);
         }
+        resized();
+        repaint();
     };
     addAndMakeVisible(modTargetBox);
 
     modBipolarToggle.setButtonText("BIP");
+    modBipolarToggle.setTooltip("Click: convert existing steps so neutral is preserved. Option-click: reinterpret stored values without remapping.");
     modBipolarToggle.onClick = [this]()
     {
         if (auto* engine = processor.getAudioEngine())
-            engine->setModBipolar(stripIndex, modBipolarToggle.getToggleState());
+        {
+            const auto mode = juce::ModifierKeys::getCurrentModifiersRealtime().isAltDown()
+                ? ModernAudioEngine::ModBipolarToggleMode::Reinterpret
+                : ModernAudioEngine::ModBipolarToggleMode::ConvertPreserveNeutral;
+            engine->setModBipolar(stripIndex, modBipolarToggle.getToggleState(), mode);
+        }
     };
     addAndMakeVisible(modBipolarToggle);
 
@@ -1702,7 +2008,9 @@ void StripControl::setupComponents()
     {
         auto& tab = modSequencerTabs[static_cast<size_t>(slot)];
         tab.setButtonText("S" + juce::String(slot + 1));
-        tab.setTooltip("Switch to modulation sequencer " + juce::String(slot + 1) + ".");
+        tab.setTooltip("Switch to modulation sequencer " + juce::String(slot + 1)
+            + ". Default target: "
+            + modTargetDisplayName(ModernAudioEngine::defaultModTargetForSlot(slot)) + ".");
         tab.onClick = [this, slot]()
         {
             if (auto* engine = processor.getAudioEngine())
@@ -1734,6 +2042,12 @@ void StripControl::setupComponents()
             engine->setModPitchScale(stripIndex, comboIdToPitchScale(modPitchScaleBox.getSelectedId()));
     };
     addAndMakeVisible(modPitchScaleBox);
+
+    modTargetHintLabel.setColour(juce::Label::textColourId, kTextMuted.brighter(0.15f));
+    modTargetHintLabel.setFont(juce::Font(juce::FontOptions(9.0f)));
+    modTargetHintLabel.setJustificationType(juce::Justification::centredLeft);
+    modTargetHintLabel.setVisible(false);
+    addAndMakeVisible(modTargetHintLabel);
 
     modShapeLabel.setText("SHAPE", juce::dontSendNotification);
     modShapeLabel.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
@@ -2543,6 +2857,9 @@ void StripControl::resized()
     
     if (modulationLaneView)
     {
+        const auto currentModTarget = comboIdToModTarget(modTargetBox.getSelectedId());
+        const bool showPitchQuantControls = (currentModTarget == ModernAudioEngine::ModTarget::Pitch);
+        const bool showRetriggerHint = (currentModTarget == ModernAudioEngine::ModTarget::Retrigger);
         waveform.setVisible(false);
         stepDisplay.setVisible(false);
         hideAllPrimaryControls();
@@ -2561,8 +2878,9 @@ void StripControl::resized()
         modLengthBox.setVisible(true);
         for (auto& tab : modSequencerTabs)
             tab.setVisible(true);
-        modPitchQuantToggle.setVisible(true);
-        modPitchScaleBox.setVisible(true);
+        modPitchQuantToggle.setVisible(showPitchQuantControls);
+        modPitchScaleBox.setVisible(showPitchQuantControls);
+        modTargetHintLabel.setVisible(showRetriggerHint);
         modShapeLabel.setVisible(true);
         modShapeBox.setVisible(true);
         modCurveTypeLabel.setVisible(true);
@@ -2618,11 +2936,30 @@ void StripControl::resized()
         modCurveBendLabel.setBounds(cols2.second.removeFromLeft(30));
         modCurveBendSlider.setBounds(cols2.second);
 
-        controlsArea.removeFromTop(compactGap);
-        auto row3 = controlsArea.removeFromTop(compactRowHeight);
-        auto cols3 = splitRow(row3, gap);
-        modPitchQuantToggle.setBounds(cols3.first);
-        modPitchScaleBox.setBounds(cols3.second);
+        if (showPitchQuantControls || showRetriggerHint)
+        {
+            controlsArea.removeFromTop(compactGap);
+            auto row3 = controlsArea.removeFromTop(compactRowHeight);
+            if (showPitchQuantControls)
+            {
+                auto cols3 = splitRow(row3, gap);
+                modPitchQuantToggle.setBounds(cols3.first);
+                modPitchScaleBox.setBounds(cols3.second);
+                modTargetHintLabel.setBounds({});
+            }
+            else
+            {
+                modPitchQuantToggle.setBounds({});
+                modPitchScaleBox.setBounds({});
+                modTargetHintLabel.setBounds(row3);
+            }
+        }
+        else
+        {
+            modPitchQuantToggle.setBounds({});
+            modPitchScaleBox.setBounds({});
+            modTargetHintLabel.setBounds({});
+        }
 
         controlsArea.removeFromTop(compactGap);
         auto row4 = controlsArea.removeFromTop(compactRowHeight);
@@ -2654,6 +2991,7 @@ void StripControl::resized()
         tab.setVisible(false);
     modPitchQuantToggle.setVisible(false);
     modPitchScaleBox.setVisible(false);
+    modTargetHintLabel.setVisible(false);
     modShapeLabel.setVisible(false);
     modShapeBox.setVisible(false);
     modCurveTypeLabel.setVisible(false);
@@ -3029,6 +3367,11 @@ void StripControl::updateFromEngine()
     if (modulationLaneView)
     {
         const auto mod = processor.getAudioEngine()->getModSequencerState(stripIndex);
+        const bool showPitchQuantControls = (mod.target == ModernAudioEngine::ModTarget::Pitch);
+        const bool showRetriggerHint = (mod.target == ModernAudioEngine::ModTarget::Retrigger);
+        const bool targetUiChanged = (modPitchQuantToggle.isVisible() != showPitchQuantControls)
+            || (modPitchScaleBox.isVisible() != showPitchQuantControls)
+            || (modTargetHintLabel.isVisible() != showRetriggerHint);
         modTargetBox.setSelectedId(modTargetToComboId(mod.target), juce::dontSendNotification);
         modBipolarToggle.setToggleState(mod.bipolar, juce::dontSendNotification);
         modBipolarToggle.setEnabled(modTargetAllowsBipolar(mod.target));
@@ -3038,12 +3381,27 @@ void StripControl::updateFromEngine()
         modLengthBox.setSelectedId(mod.lengthBars, juce::dontSendNotification);
         modPitchQuantToggle.setToggleState(mod.pitchScaleQuantize, juce::dontSendNotification);
         modPitchScaleBox.setSelectedId(pitchScaleToComboId(static_cast<ModernAudioEngine::PitchScale>(mod.pitchScale)), juce::dontSendNotification);
-        modPitchScaleBox.setEnabled(mod.pitchScaleQuantize);
+        modPitchScaleBox.setEnabled(showPitchQuantControls && mod.pitchScaleQuantize);
+        modPitchQuantToggle.setVisible(showPitchQuantControls);
+        modPitchScaleBox.setVisible(showPitchQuantControls);
+        modTargetHintLabel.setVisible(showRetriggerHint);
+        if (showRetriggerHint)
+        {
+            const int activeStep = juce::jlimit(
+                0,
+                ModernAudioEngine::ModTotalSteps - 1,
+                processor.getAudioEngine()->getModCurrentGlobalStep(stripIndex));
+            const float activeRaw = juce::jlimit(0.0f, 1.0f,
+                processor.getAudioEngine()->getModStepValueAbsolute(stripIndex, activeStep));
+            modTargetHintLabel.setText(makeRetriggerHintText(activeRaw, mod.depth), juce::dontSendNotification);
+        }
         modShapeBox.setSelectedId(mod.curveMode ? 1 : 2, juce::dontSendNotification);
         modCurveTypeBox.setSelectedId(curveShapeToComboId(static_cast<ModernAudioEngine::ModCurveShape>(mod.curveShape)),
                                       juce::dontSendNotification);
         modCurveBendSlider.setEnabled(mod.curveMode);
         modCurveTypeBox.setEnabled(mod.curveMode);
+        if (targetUiChanged)
+            resized();
         updateModSequencerTabButtons();
         repaint();
         return;
@@ -3267,7 +3625,7 @@ void StripControl::updateFromEngine()
         grainSpreadSlider.setValue(strip->getGrainSpread(), juce::dontSendNotification);
     if (!modulates(ModernAudioEngine::ModTarget::GrainJitter))
         grainJitterSlider.setValue(strip->getGrainJitter(), juce::dontSendNotification);
-    if (!grainPositionJitterSlider.isMouseButtonDown())
+    if (!grainPositionJitterSlider.isMouseButtonDown() && !modulates(ModernAudioEngine::ModTarget::GrainPositionJitter))
         grainPositionJitterSlider.setValue(strip->getGrainPositionJitter(), juce::dontSendNotification);
     if (!modulates(ModernAudioEngine::ModTarget::GrainRandom))
         grainRandomSlider.setValue(strip->getGrainRandomDepth(), juce::dontSendNotification);
@@ -3279,7 +3637,8 @@ void StripControl::updateFromEngine()
         grainEmitterSlider.setValue(strip->getGrainEmitterDepth(), juce::dontSendNotification);
     if (!modulates(ModernAudioEngine::ModTarget::GrainEnvelope))
         grainEnvelopeSlider.setValue(strip->getGrainEnvelope(), juce::dontSendNotification);
-    grainShapeSlider.setValue(strip->getGrainShape(), juce::dontSendNotification);
+    if (!grainShapeSlider.isMouseButtonDown() && !modulates(ModernAudioEngine::ModTarget::GrainShape))
+        grainShapeSlider.setValue(strip->getGrainShape(), juce::dontSendNotification);
     const bool grainSyncEnabled = strip->isGrainTempoSyncEnabled();
     grainSizeSyncToggle.setToggleState(grainSyncEnabled, juce::dontSendNotification);
     grainSizeDivLabel.setText(grainSyncEnabled ? "SYNC" : "FREE", juce::dontSendNotification);
@@ -3428,6 +3787,9 @@ void StripControl::updateFromEngine()
                     case ModernAudioEngine::ModTarget::GrainCloud: return &grainCloudSlider;
                     case ModernAudioEngine::ModTarget::GrainEmitter: return &grainEmitterSlider;
                     case ModernAudioEngine::ModTarget::GrainEnvelope: return &grainEnvelopeSlider;
+                    case ModernAudioEngine::ModTarget::GrainPositionJitter: return &grainPositionJitterSlider;
+                    case ModernAudioEngine::ModTarget::GrainShape: return &grainShapeSlider;
+                    case ModernAudioEngine::ModTarget::FilterMorph: return nullptr;
                     case ModernAudioEngine::ModTarget::Retrigger: return nullptr;
                     default: return nullptr;
                 }
@@ -3751,6 +4113,7 @@ void FXStripControl::updateFromEngine()
 
     setBaseSliderTint(filterFreqSlider, base);
     setBaseSliderTint(filterResSlider, base);
+    setBaseSliderTint(filterMorphSlider, base);
 
     const auto algo = strip->getFilterAlgorithm();
     int algoId = 1;
@@ -3765,7 +4128,8 @@ void FXStripControl::updateFromEngine()
     {
         const auto mod = engine->getModSequencerState(stripIndex);
         const bool active = (mod.target == ModernAudioEngine::ModTarget::Cutoff
-                          || mod.target == ModernAudioEngine::ModTarget::Resonance);
+                          || mod.target == ModernAudioEngine::ModTarget::Resonance
+                          || mod.target == ModernAudioEngine::ModTarget::FilterMorph);
         if (active)
         {
             const float depth = juce::jlimit(0.0f, 1.0f, mod.depth);
@@ -3783,8 +4147,10 @@ void FXStripControl::updateFromEngine()
             const auto modColour = pickVisibleModColour(base).withAlpha(0.82f + (0.18f * pulse));
             if (mod.target == ModernAudioEngine::ModTarget::Cutoff)
                 setBaseSliderTint(filterFreqSlider, modColour);
-            else
+            else if (mod.target == ModernAudioEngine::ModTarget::Resonance)
                 setBaseSliderTint(filterResSlider, modColour);
+            else
+                setBaseSliderTint(filterMorphSlider, modColour);
         }
     }
 }
@@ -4141,34 +4507,55 @@ MonomeControlPanel::MonomeControlPanel(MlrVSTAudioProcessor& p)
     titleLabel.setFont(juce::Font(juce::FontOptions(12.0f, juce::Font::bold)));  // Smaller
     titleLabel.setColour(juce::Label::textColourId, kTextMuted);
     addAndMakeVisible(titleLabel);
-    
-    // Device selector
-    deviceSelector.setTextWhenNoChoicesAvailable("No devices found");
-    deviceSelector.setTextWhenNothingSelected("Select device...");
-    addAndMakeVisible(deviceSelector);
-    
-    // Refresh button
+
     refreshButton.setButtonText("Refresh");
-    refreshButton.onClick = [this]() { updateDeviceList(); };
+    refreshButton.onClick = [this]()
+    {
+        processor.getMonomeConnection().refreshDeviceList();
+    };
     addAndMakeVisible(refreshButton);
-    
-    // Connect button
-    connectButton.setButtonText("Connect");
-    connectButton.onClick = [this]() { connectToDevice(); };
-    addAndMakeVisible(connectButton);
-    
-    // Status label
-    statusLabel.setText("Not connected", juce::dontSendNotification);
-    statusLabel.setFont(juce::Font(juce::FontOptions(11.0f)));  // Slightly smaller
-    statusLabel.setColour(juce::Label::textColourId, kAccent);
-    addAndMakeVisible(statusLabel);
-    
-    // Rotation selector
-    rotationLabel.setText("Rotation", juce::dontSendNotification);  // Shorter text
-    rotationLabel.setFont(juce::Font(juce::FontOptions(11.0f)));  // Slightly smaller, consistent
+
+    gridLabel.setText("Grid", juce::dontSendNotification);
+    gridLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
+    gridLabel.setColour(juce::Label::textColourId, kTextPrimary);
+    addAndMakeVisible(gridLabel);
+
+    gridDeviceSelector.setTextWhenNoChoicesAvailable("No grids found");
+    gridDeviceSelector.setTextWhenNothingSelected("Select grid...");
+    addAndMakeVisible(gridDeviceSelector);
+
+    gridConnectButton.setButtonText("Use");
+    gridConnectButton.onClick = [this]() { connectToGridDevice(); };
+    addAndMakeVisible(gridConnectButton);
+
+    gridStatusLabel.setText("Grid: not connected", juce::dontSendNotification);
+    gridStatusLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
+    gridStatusLabel.setColour(juce::Label::textColourId, kAccent);
+    addAndMakeVisible(gridStatusLabel);
+
+    arcLabel.setText("Arc", juce::dontSendNotification);
+    arcLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
+    arcLabel.setColour(juce::Label::textColourId, kTextPrimary);
+    addAndMakeVisible(arcLabel);
+
+    arcDeviceSelector.setTextWhenNoChoicesAvailable("No arcs found");
+    arcDeviceSelector.setTextWhenNothingSelected("Select arc...");
+    addAndMakeVisible(arcDeviceSelector);
+
+    arcConnectButton.setButtonText("Use");
+    arcConnectButton.onClick = [this]() { connectToArcDevice(); };
+    addAndMakeVisible(arcConnectButton);
+
+    arcStatusLabel.setText("Arc: not connected", juce::dontSendNotification);
+    arcStatusLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
+    arcStatusLabel.setColour(juce::Label::textColourId, kAccent);
+    addAndMakeVisible(arcStatusLabel);
+
+    rotationLabel.setText("Rotation", juce::dontSendNotification);
+    rotationLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
     rotationLabel.setColour(juce::Label::textColourId, kTextPrimary);
     addAndMakeVisible(rotationLabel);
-    
+
     rotationSelector.addItem("0°", 1);
     rotationSelector.addItem("90°", 2);
     rotationSelector.addItem("180°", 3);
@@ -4181,8 +4568,24 @@ MonomeControlPanel::MonomeControlPanel(MlrVSTAudioProcessor& p)
     };
     addAndMakeVisible(rotationSelector);
     
+    auto safeThis = juce::Component::SafePointer<MonomeControlPanel>(this);
+    processor.getMonomeConnection().onDeviceListUpdated = [safeThis](const std::vector<MonomeConnection::DeviceInfo>&)
+    {
+        juce::MessageManager::callAsync([safeThis]()
+        {
+            if (safeThis != nullptr)
+                safeThis->updateDeviceList();
+        });
+    };
+
     updateDeviceList();
+    processor.getMonomeConnection().refreshDeviceList();
     startTimer(1000); // Update status every second
+}
+
+MonomeControlPanel::~MonomeControlPanel()
+{
+    processor.getMonomeConnection().onDeviceListUpdated = nullptr;
 }
 
 void MonomeControlPanel::paint(juce::Graphics& g)
@@ -4193,34 +4596,43 @@ void MonomeControlPanel::paint(juce::Graphics& g)
 void MonomeControlPanel::resized()
 {
     auto bounds = getLocalBounds().reduced(8);
-    
-    // Compact title
-    auto titleRow = bounds.removeFromTop(20);  // Smaller (was 24)
+
+    auto titleRow = bounds.removeFromTop(20);
+    refreshButton.setBounds(titleRow.removeFromRight(72));
     titleLabel.setBounds(titleRow);
-    
-    bounds.removeFromTop(6);  // Less gap (was 8)
-    
-    // Device selector row
-    auto deviceRow = bounds.removeFromTop(22);  // Smaller (was 24)
-    deviceSelector.setBounds(deviceRow.removeFromLeft(200));
-    deviceRow.removeFromLeft(4);
-    refreshButton.setBounds(deviceRow.removeFromLeft(70));
-    deviceRow.removeFromLeft(4);
-    connectButton.setBounds(deviceRow.removeFromLeft(70));
-    
-    bounds.removeFromTop(6);  // Less gap (was 8)
-    
-    // Status row
-    auto statusRow = bounds.removeFromTop(18);  // Smaller (was 20)
-    statusLabel.setBounds(statusRow);
-    
-    bounds.removeFromTop(6);  // Less gap (was 8)
-    
-    // Rotation row - ensure it's visible!
-    auto rotationRow = bounds.removeFromTop(22);  // Match other controls
+
+    bounds.removeFromTop(6);
+
+    auto gridRow = bounds.removeFromTop(22);
+    gridLabel.setBounds(gridRow.removeFromLeft(34));
+    gridRow.removeFromLeft(4);
+    gridConnectButton.setBounds(gridRow.removeFromRight(52));
+    gridRow.removeFromRight(4);
+    gridDeviceSelector.setBounds(gridRow);
+
+    bounds.removeFromTop(4);
+    auto gridStatusRow = bounds.removeFromTop(18);
+    gridStatusLabel.setBounds(gridStatusRow);
+
+    bounds.removeFromTop(6);
+
+    auto arcRow = bounds.removeFromTop(22);
+    arcLabel.setBounds(arcRow.removeFromLeft(34));
+    arcRow.removeFromLeft(4);
+    arcConnectButton.setBounds(arcRow.removeFromRight(52));
+    arcRow.removeFromRight(4);
+    arcDeviceSelector.setBounds(arcRow);
+
+    bounds.removeFromTop(4);
+    auto arcStatusRow = bounds.removeFromTop(18);
+    arcStatusLabel.setBounds(arcStatusRow);
+
+    bounds.removeFromTop(6);
+
+    auto rotationRow = bounds.removeFromTop(22);
     rotationLabel.setBounds(rotationRow.removeFromLeft(70));
     rotationRow.removeFromLeft(4);
-    rotationSelector.setBounds(rotationRow.removeFromLeft(100));  // Wider (was 80)
+    rotationSelector.setBounds(rotationRow.removeFromLeft(100));
 }
 
 void MonomeControlPanel::timerCallback()
@@ -4233,39 +4645,82 @@ void MonomeControlPanel::timerCallback()
 
 void MonomeControlPanel::updateDeviceList()
 {
-    deviceSelector.clear();
-    processor.getMonomeConnection().refreshDeviceList();
-    
+    gridDeviceIndices.clear();
+    arcDeviceIndices.clear();
+    gridDeviceSelector.clear();
+    arcDeviceSelector.clear();
+
     auto devices = processor.getMonomeConnection().getDiscoveredDevices();
+    const auto currentGrid = processor.getMonomeConnection().getCurrentGridDevice();
+    const auto currentArc = processor.getMonomeConnection().getCurrentArcDevice();
+    int selectedGridId = 0;
+    int selectedArcId = 0;
+
     for (size_t i = 0; i < devices.size(); ++i)
     {
         auto& device = devices[i];
         juce::String itemText = device.id + " (" + device.type + ") - " +
                                 juce::String(device.sizeX) + "x" + juce::String(device.sizeY);
-        deviceSelector.addItem(itemText, static_cast<int>(i + 1));
+
+        if (device.type.containsIgnoreCase("arc"))
+        {
+            arcDeviceIndices.push_back(static_cast<int>(i));
+            const int itemId = static_cast<int>(arcDeviceIndices.size());
+            arcDeviceSelector.addItem(itemText, itemId);
+            if (currentArc.id.isNotEmpty() && currentArc.id == device.id)
+                selectedArcId = itemId;
+        }
+        else
+        {
+            gridDeviceIndices.push_back(static_cast<int>(i));
+            const int itemId = static_cast<int>(gridDeviceIndices.size());
+            gridDeviceSelector.addItem(itemText, itemId);
+            if (currentGrid.id.isNotEmpty() && currentGrid.id == device.id)
+                selectedGridId = itemId;
+        }
     }
-    
-    if (devices.size() > 0)
-        deviceSelector.setSelectedId(1);
+
+    if (gridDeviceSelector.getNumItems() > 0)
+        gridDeviceSelector.setSelectedId(selectedGridId > 0 ? selectedGridId : 1, juce::dontSendNotification);
+    else
+        gridDeviceSelector.setSelectedId(0, juce::dontSendNotification);
+
+    if (arcDeviceSelector.getNumItems() > 0)
+        arcDeviceSelector.setSelectedId(selectedArcId > 0 ? selectedArcId : 1, juce::dontSendNotification);
+    else
+        arcDeviceSelector.setSelectedId(0, juce::dontSendNotification);
 }
 
-void MonomeControlPanel::connectToDevice()
+void MonomeControlPanel::connectToGridDevice()
 {
-    int selectedIndex = deviceSelector.getSelectedId() - 1;
-    if (selectedIndex >= 0)
-    {
-        processor.getMonomeConnection().selectDevice(selectedIndex);
-    }
+    const int selectedId = gridDeviceSelector.getSelectedId();
+    if (selectedId <= 0 || selectedId > static_cast<int>(gridDeviceIndices.size()))
+        return;
+
+    processor.getMonomeConnection().selectGridDevice(gridDeviceIndices[static_cast<size_t>(selectedId - 1)]);
+}
+
+void MonomeControlPanel::connectToArcDevice()
+{
+    const int selectedId = arcDeviceSelector.getSelectedId();
+    if (selectedId <= 0 || selectedId > static_cast<int>(arcDeviceIndices.size()))
+        return;
+
+    processor.getMonomeConnection().selectArcDevice(arcDeviceIndices[static_cast<size_t>(selectedId - 1)]);
 }
 
 void MonomeControlPanel::updateStatus()
 {
-    auto status = processor.getMonomeConnection().getConnectionStatus();
-    statusLabel.setText(status, juce::dontSendNotification);
-    
-    bool connected = processor.getMonomeConnection().isConnected();
-    statusLabel.setColour(juce::Label::textColourId,
-                          connected ? juce::Colour(0xff76be7e) : kAccent);
+    auto& monome = processor.getMonomeConnection();
+    const auto gridStatus = monome.getGridConnectionStatus();
+    const auto arcStatus = monome.getArcConnectionStatus();
+    gridStatusLabel.setText(gridStatus, juce::dontSendNotification);
+    arcStatusLabel.setText(arcStatus, juce::dontSendNotification);
+
+    gridStatusLabel.setColour(juce::Label::textColourId,
+                              monome.supportsGrid() ? juce::Colour(0xff76be7e) : kAccent);
+    arcStatusLabel.setColour(juce::Label::textColourId,
+                             monome.supportsArc() ? juce::Colour(0xff76be7e) : kAccent);
 }
 
 
@@ -4723,7 +5178,6 @@ void PresetControlPanel::mouseUp(const juce::MouseEvent& e)
 
 void PresetControlPanel::savePresetClicked(int index, juce::String typedName)
 {
-    processor.savePreset(index);
     const auto trimmed = (typedName.isNotEmpty() ? typedName : presetNameEditor.getText()).trim();
     if (trimmed.isNotEmpty())
     {
@@ -4731,6 +5185,8 @@ void PresetControlPanel::savePresetClicked(int index, juce::String typedName)
         presetNameDraft = trimmed;
         presetNameEditor.setText(trimmed, juce::dontSendNotification);
     }
+
+    processor.savePreset(index);
     selectedPresetIndex = index;
     updatePresetButtons();
 }
@@ -4815,30 +5271,13 @@ void PresetControlPanel::updatePresetButtons()
 {
     const int loadedPreset = processor.getLoadedPresetIndex();
     deleteButton.setEnabled(processor.presetExists(selectedPresetIndex));
-    auto shortPresetLabel = [](const juce::String& name, int fallbackIndex) -> juce::String
-    {
-        auto n = name.trim();
-        if (n.isEmpty())
-            return juce::String(fallbackIndex + 1);
-        juce::String compact;
-        for (auto c : n)
-        {
-            if (!juce::CharacterFunctions::isWhitespace(c))
-                compact << juce::String::charToString(c);
-            if (compact.length() >= 4)
-                break;
-        }
-        if (compact.isEmpty())
-            compact = juce::String(fallbackIndex + 1);
-        return compact.toUpperCase();
-    };
 
     for (int i = 0; i < MlrVSTAudioProcessor::MaxPresetSlots; ++i)
     {
         bool exists = processor.presetExists(i);
         auto& button = presetButtons[static_cast<size_t>(i)];
         const juce::String presetName = exists ? processor.getPresetName(i) : juce::String();
-        button.setButtonText(shortPresetLabel(presetName, i));
+        button.setButtonText(makePresetBubbleLabel(presetName, i));
         juce::String tip = "Preset " + juce::String(i + 1);
         if (exists)
             tip << " - " << presetName;
@@ -5211,6 +5650,214 @@ void GlobalControlPanel::refreshFromProcessor()
 }
 
 //==============================================================================
+// MacroControlPanel Implementation
+//==============================================================================
+
+MacroControlPanel::MacroControlPanel(MlrVSTAudioProcessor& p)
+    : processor(p)
+{
+    knobLookAndFeel.setKnobColor(kAccent);
+
+    titleLabel.setText("MACROS", juce::dontSendNotification);
+    titleLabel.setFont(juce::Font(juce::FontOptions(12.0f, juce::Font::bold)));
+    titleLabel.setColour(juce::Label::textColourId, kTextPrimary);
+    addAndMakeVisible(titleLabel);
+
+    targetStripLabel.setText("Target S1", juce::dontSendNotification);
+    targetStripLabel.setJustificationType(juce::Justification::centredRight);
+    targetStripLabel.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+    targetStripLabel.setColour(juce::Label::textColourId, getStripColor(0));
+    targetStripLabel.setTooltip("Follows the last strip row pressed on the monome.");
+    addAndMakeVisible(targetStripLabel);
+
+    for (int i = 0; i < MlrVSTAudioProcessor::MacroCount; ++i)
+    {
+        auto& macro = macros[static_cast<size_t>(i)];
+        macro.label.setText("M" + juce::String(i + 1), juce::dontSendNotification);
+        macro.label.setJustificationType(juce::Justification::centred);
+        macro.label.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+        macro.label.setColour(juce::Label::textColourId, kTextPrimary);
+        addAndMakeVisible(macro.label);
+
+        macro.ccButton.setButtonText(macroCcLabelText(processor.getMacroMidiCc(i)));
+        macro.ccButton.setTooltip("Click to arm MIDI learn for this macro. Shift-click to reset to the default MPK mini CC.");
+        macro.ccButton.setMouseCursor(juce::MouseCursor::PointingHandCursor);
+        macro.ccButton.setTriggeredOnMouseDown(true);
+        styleUiButton(macro.ccButton);
+        macro.ccButton.onClick = [this, i]()
+        {
+            if (juce::ModifierKeys::getCurrentModifiersRealtime().isShiftDown())
+            {
+                processor.resetMacroMidiCcToDefault(i);
+            }
+            else if (processor.getMacroMidiLearnIndex() == i)
+            {
+                processor.cancelMacroMidiLearn();
+            }
+            else
+            {
+                processor.beginMacroMidiLearn(i);
+            }
+
+            refreshFromProcessor();
+            repaint();
+        };
+        addAndMakeVisible(macro.ccButton);
+
+        populateMacroTargetBox(macro.targetBox);
+        styleUiCombo(macro.targetBox);
+        macro.targetBox.setTooltip("Select which strip parameter this macro knob controls.");
+        macro.targetBox.onChange = [this, i]()
+        {
+            processor.setMacroTarget(i, comboIdToMacroTargetSelection(macros[static_cast<size_t>(i)].targetBox.getSelectedId()));
+            refreshFromProcessor();
+            repaint();
+        };
+        addAndMakeVisible(macro.targetBox);
+
+        macro.slider.setLookAndFeel(&knobLookAndFeel);
+        macro.slider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+        macro.slider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+        macro.slider.setRange(0.0, 1.0, 0.001);
+        macro.slider.setValue(MlrVSTAudioProcessor::getDefaultMacroNormalizedValue(processor.getMacroTarget(i)), juce::dontSendNotification);
+        enableAltClickReset(macro.slider, MlrVSTAudioProcessor::getDefaultMacroNormalizedValue(processor.getMacroTarget(i)));
+        macro.slider.setPopupDisplayEnabled(true, false, this);
+        macro.slider.textFromValueFunction = [this, i](double value)
+        {
+            return macroValueText(processor.getMacroTarget(i), static_cast<float>(value));
+        };
+        macro.slider.onValueChange = [this, i]()
+        {
+            if (isRefreshing)
+                return;
+            processor.setSelectedStripMacroValue(i, static_cast<float>(macros[static_cast<size_t>(i)].slider.getValue()));
+        };
+        macro.slider.interceptMouseDown = [this, i](const juce::MouseEvent& e)
+        {
+            if (!e.mods.isPopupMenu())
+                return false;
+
+            juce::PopupMenu menu;
+            const bool isLearning = (processor.getMacroMidiLearnIndex() == i);
+            menu.addItem(1, isLearning ? "Cancel MIDI Learn" : "Learn MIDI CC");
+            menu.addItem(2, "Reset to Default CC");
+
+            const int result = menu.showAt(&macros[static_cast<size_t>(i)].slider);
+            if (result == 1)
+            {
+                if (isLearning)
+                    processor.cancelMacroMidiLearn();
+                else
+                    processor.beginMacroMidiLearn(i);
+            }
+            else if (result == 2)
+            {
+                processor.resetMacroMidiCcToDefault(i);
+            }
+
+            if (result != 0)
+            {
+                refreshFromProcessor();
+                repaint();
+            }
+
+            return true;
+        };
+        macro.slider.setTooltip("Drag to control the selected strip. Right-click for MIDI learn options.");
+        addAndMakeVisible(macro.slider);
+    }
+
+    refreshFromProcessor();
+}
+
+void MacroControlPanel::paint(juce::Graphics& g)
+{
+    drawPanel(g, getLocalBounds().toFloat(), kAccent, 8.0f);
+}
+
+void MacroControlPanel::resized()
+{
+    auto bounds = getLocalBounds().reduced(10);
+
+    auto header = bounds.removeFromTop(22);
+    targetStripLabel.setBounds(header.removeFromRight(160));
+    titleLabel.setBounds(header);
+
+    bounds.removeFromTop(6);
+    const int columns = 4;
+    const int rows = 2;
+    const int gap = 10;
+    const int cellWidth = (bounds.getWidth() - (gap * (columns - 1))) / columns;
+    const int cellHeight = (bounds.getHeight() - (gap * (rows - 1))) / rows;
+
+    for (int i = 0; i < MlrVSTAudioProcessor::MacroCount; ++i)
+    {
+        const int row = i / columns;
+        const int columnIndex = i % columns;
+        auto column = juce::Rectangle<int>(
+            bounds.getX() + columnIndex * (cellWidth + gap),
+            bounds.getY() + row * (cellHeight + gap),
+            cellWidth,
+            cellHeight);
+        auto& macro = macros[static_cast<size_t>(i)];
+        macro.label.setBounds(column.removeFromTop(16));
+        auto assignmentRow = column.removeFromTop(24);
+        macro.ccButton.setBounds(assignmentRow.removeFromLeft(64));
+        assignmentRow.removeFromLeft(6);
+        macro.targetBox.setBounds(assignmentRow);
+        column.removeFromTop(4);
+        macro.slider.setBounds(column);
+    }
+}
+
+void MacroControlPanel::refreshFromProcessor()
+{
+    const auto state = processor.getMacroState();
+    const auto targetColour = state.hasTargetStrip ? getStripColor(state.stripIndex) : kTextMuted;
+    knobLookAndFeel.setKnobColor(targetColour);
+    targetStripLabel.setText(state.hasTargetStrip
+                                 ? ("Target S" + juce::String(state.stripIndex + 1))
+                                 : "Target --",
+                             juce::dontSendNotification);
+    targetStripLabel.setColour(juce::Label::textColourId, targetColour);
+
+    for (int i = 0; i < MlrVSTAudioProcessor::MacroCount; ++i)
+    {
+        auto& macro = macros[static_cast<size_t>(i)];
+        const bool isLearning = (processor.getMacroMidiLearnIndex() == i);
+        const auto target = processor.getMacroTarget(i);
+        const bool hasTarget = target != MlrVSTAudioProcessor::MacroTarget::None;
+        const auto knobColour = targetColour.withMultipliedSaturation(1.0f);
+        macro.label.setColour(juce::Label::textColourId, hasTarget ? targetColour : kTextMuted);
+        macro.targetBox.setSelectedId(macroTargetToComboId(target), juce::dontSendNotification);
+        macro.slider.setEnabled(state.hasTargetStrip && hasTarget);
+        macro.slider.setColour(juce::Slider::rotarySliderFillColourId, knobColour.withAlpha(0.88f));
+        macro.slider.setColour(juce::Slider::rotarySliderOutlineColourId, juce::Colour(0xff232323));
+        macro.slider.setColour(juce::Slider::thumbColourId, knobColour.brighter(0.18f));
+        macro.slider.setColour(juce::Slider::textBoxTextColourId, kTextPrimary);
+        macro.slider.setColour(juce::Slider::textBoxOutlineColourId, juce::Colour(0xff4a4d50));
+        macro.slider.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour(0xff2c3034));
+        macro.slider.setDoubleClickReturnValue(true, MlrVSTAudioProcessor::getDefaultMacroNormalizedValue(target));
+        macro.ccButton.setButtonText(isLearning
+                                         ? "LEARN..."
+                                         : macroCcLabelText(processor.getMacroMidiCc(i)));
+        macro.ccButton.setColour(juce::TextButton::buttonColourId,
+                                 isLearning ? targetColour.withAlpha(0.92f) : juce::Colour(0xff2d3135));
+        macro.ccButton.setColour(juce::TextButton::buttonOnColourId,
+                                 isLearning ? targetColour.withAlpha(0.98f) : juce::Colour(0xff3b4148));
+        macro.ccButton.setColour(juce::TextButton::textColourOffId,
+                                 isLearning ? juce::Colour(0xff101214) : kTextMuted);
+        macro.ccButton.setColour(juce::TextButton::textColourOnId,
+                                 isLearning ? juce::Colour(0xff101214) : kTextPrimary);
+    }
+
+    isRefreshing = true;
+    for (int i = 0; i < MlrVSTAudioProcessor::MacroCount; ++i)
+        macros[static_cast<size_t>(i)].slider.setValue(state.values[static_cast<size_t>(i)], juce::dontSendNotification);
+    isRefreshing = false;
+}
+
+//==============================================================================
 // MonomePagesPanel Implementation
 //==============================================================================
 
@@ -5377,6 +6024,12 @@ void MonomePagesPanel::updatePresetButtons()
     {
         const bool exists = processor.presetExists(i);
         auto& button = presetButtons[static_cast<size_t>(i)];
+        const juce::String presetName = exists ? processor.getPresetName(i) : juce::String();
+        button.setButtonText(makePresetBubbleLabel(presetName, i));
+        juce::String tip = "Preset " + juce::String(i + 1);
+        if (exists)
+            tip << " - " << presetName;
+        button.setTooltip(tip);
         if (i == loadedPreset && exists)
         {
             button.setColour(juce::TextButton::buttonColourId, juce::Colour(0xffb8d478));
@@ -5470,8 +6123,9 @@ PatternControlPanel::PatternControlPanel(MlrVSTAudioProcessor& p)
     for (int i = 0; i < 4; ++i)
     {
         auto& pattern = patterns[i];
+        const juce::String groupTag = "G" + juce::String(i + 1);
 
-        pattern.nameLabel.setText("PATTERN " + juce::String(i + 1), juce::dontSendNotification);
+        pattern.nameLabel.setText("PATTERN " + juce::String(i + 1) + "  " + groupTag, juce::dontSendNotification);
         pattern.nameLabel.setFont(juce::Font(juce::FontOptions(12.0f, juce::Font::bold)));
         pattern.nameLabel.setColour(juce::Label::textColourId, getStripColor(i));
         pattern.nameLabel.setJustificationType(juce::Justification::centredLeft);
@@ -5479,7 +6133,7 @@ PatternControlPanel::PatternControlPanel(MlrVSTAudioProcessor& p)
         
         pattern.recordButton.setButtonText("Rec");
         pattern.recordButton.setToggleable(true);
-        pattern.recordButton.setTooltip("Record pattern events.");
+        pattern.recordButton.setTooltip("Record triggers from strips assigned to " + groupTag + ".");
         pattern.recordButton.onClick = [this, i]()
         {
             if (patterns[i].recordButton.getToggleState())
@@ -5496,7 +6150,7 @@ PatternControlPanel::PatternControlPanel(MlrVSTAudioProcessor& p)
         
         pattern.playButton.setButtonText("Play");
         pattern.playButton.setToggleable(true);
-        pattern.playButton.setTooltip("Play/loop this pattern.");
+        pattern.playButton.setTooltip("Play/loop triggers for " + groupTag + ".");
         pattern.playButton.onClick = [this, i]()
         {
             if (patterns[i].playButton.getToggleState())
@@ -5518,7 +6172,7 @@ PatternControlPanel::PatternControlPanel(MlrVSTAudioProcessor& p)
         styleUiButton(pattern.stopButton);
         
         pattern.clearButton.setButtonText("Clear");
-        pattern.clearButton.setTooltip("Erase all events in this pattern.");
+        pattern.clearButton.setTooltip("Erase all events recorded for " + groupTag + ".");
         pattern.clearButton.onClick = [this, i]()
         {
             processor.getAudioEngine()->clearPattern(i);
@@ -5531,7 +6185,7 @@ PatternControlPanel::PatternControlPanel(MlrVSTAudioProcessor& p)
         pattern.statusLabel.setJustificationType(juce::Justification::centredRight);
         addAndMakeVisible(pattern.statusLabel);
 
-        pattern.detailLabel.setText("No events recorded", juce::dontSendNotification);
+        pattern.detailLabel.setText("Records triggers from " + groupTag + " strips", juce::dontSendNotification);
         pattern.detailLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
         pattern.detailLabel.setColour(juce::Label::textColourId, kTextSecondary);
         pattern.detailLabel.setJustificationType(juce::Justification::centredLeft);
@@ -5895,7 +6549,10 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
     targetBox.addItem("Grain Cloud", 16);
     targetBox.addItem("Grain Emitter", 17);
     targetBox.addItem("Grain Envelope", 18);
-    targetBox.addItem("Retrigger", 19);
+    targetBox.addItem("Grain Pos Jitter", 19);
+    targetBox.addItem("Grain Shape", 20);
+    targetBox.addItem("Filter Morph", 21);
+    targetBox.addItem("Retrigger", 22);
     targetBox.onChange = [this]()
     {
         if (auto* engine = processor.getAudioEngine())
@@ -5903,14 +6560,21 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
             engine->setModTarget(selectedStrip, comboIdToModTarget(targetBox.getSelectedId()));
             bipolarToggle.setToggleState(engine->isModBipolar(selectedStrip), juce::dontSendNotification);
         }
+        refreshFromEngine();
     };
     addAndMakeVisible(targetBox);
 
     bipolarToggle.setButtonText("Bipolar");
+    bipolarToggle.setTooltip("Click: convert existing steps so neutral is preserved. Option-click: reinterpret stored values without remapping.");
     bipolarToggle.onClick = [this]()
     {
         if (auto* engine = processor.getAudioEngine())
-            engine->setModBipolar(selectedStrip, bipolarToggle.getToggleState());
+        {
+            const auto mode = juce::ModifierKeys::getCurrentModifiersRealtime().isAltDown()
+                ? ModernAudioEngine::ModBipolarToggleMode::Reinterpret
+                : ModernAudioEngine::ModBipolarToggleMode::ConvertPreserveNeutral;
+            engine->setModBipolar(selectedStrip, bipolarToggle.getToggleState(), mode);
+        }
     };
     addAndMakeVisible(bipolarToggle);
 
@@ -6009,6 +6673,12 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
     };
     addAndMakeVisible(pitchScaleBox);
 
+    targetHintLabel.setColour(juce::Label::textColourId, kTextMuted.brighter(0.15f));
+    targetHintLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
+    targetHintLabel.setJustificationType(juce::Justification::centredLeft);
+    targetHintLabel.setVisible(false);
+    addAndMakeVisible(targetHintLabel);
+
     gestureHintLabel.setText("Cell mods (same as Step): Cmd=Divide  Ctrl=Ramp+  Opt=Ramp-", juce::dontSendNotification);
     gestureHintLabel.setColour(juce::Label::textColourId, kTextMuted);
     gestureHintLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
@@ -6050,6 +6720,8 @@ void ModulationControlPanel::paint(juce::Graphics& g)
 void ModulationControlPanel::resized()
 {
     auto bounds = getLocalBounds().reduced(10);
+    const bool showPitchControls = pitchScaleToggle.isVisible();
+    const bool showRetriggerHint = targetHintLabel.isVisible();
     titleLabel.setBounds(bounds.removeFromTop(22));
     stripLabel.setBounds(bounds.removeFromTop(18));
     bounds.removeFromTop(4);
@@ -6071,18 +6743,39 @@ void ModulationControlPanel::resized()
     depthRow.removeFromLeft(4);
     bipolarToggle.setBounds(depthRow.removeFromLeft(70));
     depthRow.removeFromLeft(4);
-    pitchScaleToggle.setBounds(depthRow);
+    if (showPitchControls)
+        pitchScaleToggle.setBounds(depthRow);
+    else
+        pitchScaleToggle.setBounds({});
 
     bounds.removeFromTop(3);
     auto smoothRow = bounds.removeFromTop(22);
     smoothLabel.setBounds(smoothRow.removeFromLeft(44));
     smoothSlider.setBounds(smoothRow.removeFromLeft(120));
 
-    bounds.removeFromTop(3);
-    auto scaleRow = bounds.removeFromTop(22);
-    pitchScaleLabel.setBounds(scaleRow.removeFromLeft(44));
-    pitchScaleBox.setBounds(scaleRow.removeFromLeft(112));
-    scaleRow.removeFromLeft(4);
+    if (showPitchControls || showRetriggerHint)
+    {
+        bounds.removeFromTop(3);
+        auto scaleRow = bounds.removeFromTop(22);
+        if (showPitchControls)
+        {
+            pitchScaleLabel.setBounds(scaleRow.removeFromLeft(44));
+            pitchScaleBox.setBounds(scaleRow.removeFromLeft(112));
+            targetHintLabel.setBounds({});
+        }
+        else
+        {
+            pitchScaleLabel.setBounds({});
+            pitchScaleBox.setBounds({});
+            targetHintLabel.setBounds(scaleRow);
+        }
+    }
+    else
+    {
+        pitchScaleLabel.setBounds({});
+        pitchScaleBox.setBounds({});
+        targetHintLabel.setBounds({});
+    }
 
     bounds.removeFromTop(4);
     gestureHintLabel.setBounds(bounds.removeFromTop(16));
@@ -6238,10 +6931,23 @@ void ModulationControlPanel::refreshFromEngine()
     smoothSlider.setValue(state.smoothingMs, juce::dontSendNotification);
     pitchScaleToggle.setToggleState(state.pitchScaleQuantize, juce::dontSendNotification);
     pitchScaleBox.setSelectedId(pitchScaleToComboId(static_cast<ModernAudioEngine::PitchScale>(state.pitchScale)), juce::dontSendNotification);
-    pitchScaleLabel.setEnabled(state.pitchScaleQuantize);
-    pitchScaleBox.setEnabled(state.pitchScaleQuantize);
+    const bool showPitchControls = (state.target == ModernAudioEngine::ModTarget::Pitch);
+    const bool showRetriggerHint = (state.target == ModernAudioEngine::ModTarget::Retrigger);
+    const bool targetUiChanged = (pitchScaleToggle.isVisible() != showPitchControls)
+        || (pitchScaleLabel.isVisible() != showPitchControls)
+        || (pitchScaleBox.isVisible() != showPitchControls)
+        || (targetHintLabel.isVisible() != showRetriggerHint);
+    pitchScaleToggle.setVisible(showPitchControls);
+    pitchScaleLabel.setVisible(showPitchControls);
+    pitchScaleBox.setVisible(showPitchControls);
+    targetHintLabel.setVisible(showRetriggerHint);
+    pitchScaleLabel.setEnabled(showPitchControls && state.pitchScaleQuantize);
+    pitchScaleBox.setEnabled(showPitchControls && state.pitchScaleQuantize);
 
     const int activeGlobalStep = engine->getModCurrentGlobalStep(selectedStrip);
+    const float activeRaw = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(selectedStrip, activeGlobalStep));
+    if (showRetriggerHint)
+        targetHintLabel.setText(makeRetriggerHintText(activeRaw, state.depth), juce::dontSendNotification);
     const int playbackPage = juce::jlimit(
         0,
         ModernAudioEngine::MaxModBars - 1,
@@ -6272,6 +6978,8 @@ void ModulationControlPanel::refreshFromEngine()
                      + "  end " + juce::String(static_cast<int>(std::round(endValue * 100.0f))) + "%\n"
                      + "Click: toggle step. Cmd+drag: divide. Ctrl+drag: ramp up. Opt+drag: ramp down.");
     }
+    if (targetUiChanged)
+        resized();
 }
 
 
@@ -6312,6 +7020,7 @@ MlrVSTAudioProcessorEditor::MlrVSTAudioProcessorEditor(MlrVSTAudioProcessor& p)
     // Start UI update timer
     startTimer(50);
     lastPresetRefreshToken = audioProcessor.getPresetRefreshToken();
+    lastTopTabIndex = topTabs ? topTabs->getCurrentTabIndex() : -1;
 }
 
 int MlrVSTAudioProcessorEditor::getDetectedGuiStripCount() const
@@ -6364,6 +7073,7 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     {
         setTooltipsEnabled(enabled);
     };
+    macroControl = std::make_unique<MacroControlPanel>(audioProcessor);
     monomePagesControl = std::make_unique<MonomePagesPanel>(audioProcessor);
     presetControl = std::make_unique<PresetControlPanel>(audioProcessor);
     pathsControl = std::make_unique<PathsControlPanel>(audioProcessor);
@@ -6371,6 +7081,7 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     // Create TABBED top controls to save space
     topTabs = std::make_unique<juce::TabbedComponent>(juce::TabbedButtonBar::TabsAtTop);
     topTabs->addTab("Global Controls", juce::Colour(0xff2c2c2c), globalControl.get(), false);
+    topTabs->addTab("Macros", juce::Colour(0xff2c2c2c), macroControl.get(), false);
     topTabs->addTab("Presets", juce::Colour(0xff2c2c2c), presetControl.get(), false);
     topTabs->addTab("Monome Device", juce::Colour(0xff2c2c2c), monomeControl.get(), false);
     topTabs->addTab("Paths", juce::Colour(0xff2c2c2c), pathsControl.get(), false);
@@ -6588,7 +7299,10 @@ void MlrVSTAudioProcessorEditor::resized()
     bounds.reduce(margin, margin);
     
     // Top section: TABBED controls (Global/Presets/Monome)
-    auto topBar = bounds.removeFromTop(124);
+    const int selectedTopTab = topTabs->getCurrentTabIndex();
+    const int requestedTopBarHeight = (selectedTopTab == 1) ? 300 : 124;
+    const int maxTopBarHeight = juce::jmax(124, bounds.getHeight() - 180);
+    auto topBar = bounds.removeFromTop(juce::jmin(requestedTopBarHeight, maxTopBarHeight));
     topTabs->setBounds(topBar);
     
     bounds.removeFromTop(margin);
@@ -6606,6 +7320,16 @@ void MlrVSTAudioProcessorEditor::timerCallback()
 {
     if (!audioProcessor.getAudioEngine())
         return;
+
+    if (topTabs)
+    {
+        const int currentTopTabIndex = topTabs->getCurrentTabIndex();
+        if (currentTopTabIndex != lastTopTabIndex)
+        {
+            lastTopTabIndex = currentTopTabIndex;
+            resized();
+        }
+    }
     
     // Update input meters
     if (globalControl)
@@ -6615,6 +7339,9 @@ void MlrVSTAudioProcessorEditor::timerCallback()
         globalControl->updateMeters(levelL, levelR);
         globalControl->refreshFromProcessor();
     }
+
+    if (macroControl)
+        macroControl->refreshFromProcessor();
 
     if (presetControl)
         presetControl->refreshVisualState();

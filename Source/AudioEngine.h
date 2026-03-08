@@ -461,6 +461,7 @@ public:
     // Step sequencer control
     void startStepSequencer();  // Start step sequencer playback (auto-runs with clock)
     void retriggerStepVoice();  // Retrigger currently active step voice without editing gates
+    void retriggerStepVoiceAtColumn(int column, bool forceColumn = false); // Retrigger and lock visible step playhead to a given grid column
     void setStepPatternLengthSteps(int steps);
     int getStepPatternLengthSteps() const { return juce::jlimit(1, 64, stepPatternLengthSteps.load(std::memory_order_acquire)); }
     void setStepPatternBars(int bars);
@@ -1188,7 +1189,7 @@ public:
     static constexpr int MaxColumns = 16;
     static constexpr int MaxGroups = 4;
     static constexpr int MaxPatterns = 4;
-    static constexpr int NumModSequencers = 3;
+    static constexpr int NumModSequencers = 6;
     static constexpr int ModSteps = 16;
     static constexpr int MaxModBars = 8;
     static constexpr int ModTotalSteps = ModSteps * MaxModBars;
@@ -1215,7 +1216,16 @@ public:
         GrainEmitter,
         GrainEnvelope,
         Retrigger,
+        GrainPositionJitter,
+        GrainShape,
+        FilterMorph,
         FilterFrequency = Cutoff
+    };
+
+    enum class ModBipolarToggleMode
+    {
+        ConvertPreserveNeutral = 0,
+        Reinterpret
     };
 
     struct ModSequencerState
@@ -1281,6 +1291,7 @@ public:
     void setMomentaryStutterActive(bool enabled);
     void setMomentaryStutterDivision(double beats);
     void setMomentaryStutterStartPpq(double ppq);
+    void setMomentaryStutterReleasePpq(double ppq);
     void setMomentaryStutterRetriggerFadeMs(float fadeMs);
     void setMomentaryStutterStrip(int stripIndex, int column, double offsetRatio, bool enabled);
     void clearMomentaryStutterStrips();
@@ -1295,15 +1306,22 @@ public:
     void clearPattern(int patternIndex);
     void stopPattern(int patternIndex);
     PatternRecorder* getPattern(int index);
+    static int groupIndexForPattern(int patternIndex);
+    bool patternRecorderMatchesStrip(int patternIndex, int stripIndex) const;
 
     // Per-strip modulation sequencers.
     void setModSequencerSlot(int stripIndex, int slot);
     int getModSequencerSlot(int stripIndex) const;
     ModSequencerState getModSequencerState(int stripIndex) const;
+    void resetModSequencerSlotToDefaults(int stripIndex, int slot);
+    static ModTarget defaultModTargetForSlot(int slot);
+    static float defaultModStepValueForTarget(ModTarget target);
     static bool modTargetSupportsBipolar(ModTarget target);
     void setModTarget(int stripIndex, ModTarget target);
     ModTarget getModTarget(int stripIndex) const;
-    void setModBipolar(int stripIndex, bool bipolar);
+    void setModBipolar(int stripIndex,
+                       bool bipolar,
+                       ModBipolarToggleMode mode = ModBipolarToggleMode::ConvertPreserveNeutral);
     bool isModBipolar(int stripIndex) const;
     void setModDepth(int stripIndex, float depth);
     float getModDepth(int stripIndex) const;
@@ -1427,6 +1445,7 @@ private:
     std::atomic<int> momentaryStutterActive{0};
     std::atomic<double> momentaryStutterDivisionBeats{0.5}; // quarter-note units
     std::atomic<double> momentaryStutterStartPpq{0.0};
+    std::atomic<double> momentaryStutterReleasePpq{-1.0};
     std::array<std::atomic<int>, MaxStrips> momentaryStutterStripEnabled{};
     std::array<std::atomic<int>, MaxStrips> momentaryStutterColumns{};
     std::array<std::atomic<double>, MaxStrips> momentaryStutterOffsetRatios{};
