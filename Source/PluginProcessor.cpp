@@ -18,6 +18,9 @@
 namespace
 {
 constexpr bool kEnableTriggerDebugLogging = false;
+constexpr const char* kEmbeddedFlipSampleAttr = "embeddedSampleWavBase64";
+constexpr size_t kMaxEmbeddedFlipWavBytes = 48 * 1024 * 1024;
+constexpr int kMaxEmbeddedFlipBase64Chars = 64 * 1024 * 1024;
 
 struct BarSelection
 {
@@ -200,6 +203,79 @@ MacroTarget sanitizeMacroTarget(int rawTarget)
 constexpr std::array<int, MlrVSTAudioProcessor::MacroCount> kAkaiMpkMiniMacroCcs {
     70, 71, 72, 73, -1, -1, -1, -1
 };
+
+bool encodeBufferAsWavBase64(const juce::AudioBuffer<float>& buffer,
+                             double sampleRate,
+                             juce::String& outBase64)
+{
+    outBase64.clear();
+
+    if (buffer.getNumSamples() <= 0
+        || buffer.getNumChannels() <= 0
+        || !std::isfinite(sampleRate)
+        || sampleRate <= 1000.0)
+    {
+        return false;
+    }
+
+    auto wavBytes = std::make_unique<juce::MemoryOutputStream>();
+    auto* wavBytesRaw = wavBytes.get();
+    juce::WavAudioFormat wavFormat;
+    auto writerStream = std::unique_ptr<juce::OutputStream>(wavBytes.release());
+    const auto writerOptions = juce::AudioFormatWriter::Options{}
+        .withSampleRate(sampleRate)
+        .withNumChannels(buffer.getNumChannels())
+        .withBitsPerSample(24)
+        .withQualityOptionIndex(0);
+    std::unique_ptr<juce::AudioFormatWriter> writer(
+        wavFormat.createWriterFor(writerStream, writerOptions));
+
+    if (!writer || !writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples()))
+        return false;
+
+    writer->flush();
+    const auto data = wavBytesRaw->getMemoryBlock();
+    outBase64 = data.toBase64Encoding();
+    writer.reset();
+    return outBase64.isNotEmpty();
+}
+
+bool decodeWavBase64ToBuffer(const juce::String& base64Data,
+                             juce::AudioBuffer<float>& bufferOut,
+                             double& sampleRateOut)
+{
+    bufferOut.setSize(0, 0);
+    sampleRateOut = 0.0;
+
+    if (base64Data.isEmpty() || base64Data.length() > kMaxEmbeddedFlipBase64Chars)
+        return false;
+
+    juce::MemoryBlock wavBytes;
+    if (!wavBytes.fromBase64Encoding(base64Data) || wavBytes.getSize() == 0 || wavBytes.getSize() > kMaxEmbeddedFlipWavBytes)
+        return false;
+
+    juce::WavAudioFormat wavFormat;
+    std::unique_ptr<juce::AudioFormatReader> reader(
+        wavFormat.createReaderFor(new juce::MemoryInputStream(wavBytes.getData(), wavBytes.getSize(), false), true));
+    if (!reader)
+        return false;
+
+    const int64_t totalSamples64 = reader->lengthInSamples;
+    if (totalSamples64 <= 0 || totalSamples64 > static_cast<int64_t>(std::numeric_limits<int>::max()))
+        return false;
+
+    const int totalSamples = static_cast<int>(totalSamples64);
+    const int channelCount = juce::jlimit(1, 2, static_cast<int>(reader->numChannels));
+    bufferOut.setSize(channelCount, totalSamples, false, false, true);
+    if (!reader->read(&bufferOut, 0, totalSamples, 0, true, true))
+    {
+        bufferOut.setSize(0, 0);
+        return false;
+    }
+
+    sampleRateOut = reader->sampleRate;
+    return true;
+}
 
 std::unique_ptr<juce::XmlElement> loadGlobalSettingsXml()
 {
@@ -2490,6 +2566,7 @@ void MlrVSTAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
         stripPersistentGlobalControlsFromState(state);
         appendDefaultPathsToState(state);
         appendControlPagesToState(state);
+        appendFlipStatesToState(state);
         
         if (!state.isValid())
             return;
@@ -2521,6 +2598,7 @@ void MlrVSTAudioProcessor::setStateInformation(const void* data, int sizeInBytes
             parameters.replaceState(state);
             loadDefaultPathsFromState(state);
             loadControlPagesFromState(state);
+            loadFlipStatesFromState(state);
             loadPersistentGlobalControls();
             persistentGlobalControlsApplied = true;
             pendingPersistentGlobalControlsRestore.store(1, std::memory_order_release);
@@ -2610,6 +2688,63 @@ bool MlrVSTAudioProcessor::hasSampleModeAudio(int stripIndex) const
     return engine != nullptr && engine->hasSample();
 }
 
+juce::String MlrVSTAudioProcessor::createEmbeddedFlipSampleData(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return {};
+
+    const auto storedPath = currentStripFiles[static_cast<size_t>(stripIndex)].getFullPathName().trim();
+    if (storedPath.isNotEmpty() && juce::File(storedPath).existsAsFile())
+        return {};
+
+    auto* engine = const_cast<MlrVSTAudioProcessor*>(this)->getSampleModeEngine(stripIndex, false);
+    if (engine == nullptr)
+        return {};
+
+    const auto sample = engine->getLoadedSample();
+    if (sample == nullptr || sample->audioBuffer.getNumSamples() <= 0)
+        return {};
+    if (sample->sourcePath.isNotEmpty() && juce::File(sample->sourcePath).existsAsFile())
+        return {};
+
+    juce::String embeddedSample;
+    if (!encodeBufferAsWavBase64(sample->audioBuffer, sample->sourceSampleRate, embeddedSample))
+        return {};
+
+    return embeddedSample;
+}
+
+bool MlrVSTAudioProcessor::loadEmbeddedFlipSampleData(int stripIndex,
+                                                      const juce::String& base64Data,
+                                                      const SampleModePersistentState* persistentState)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || base64Data.isEmpty())
+        return false;
+
+    juce::AudioBuffer<float> buffer;
+    double sampleRate = 0.0;
+    if (!decodeWavBase64ToBuffer(base64Data, buffer, sampleRate))
+        return false;
+
+    auto* engine = getSampleModeEngine(stripIndex, true);
+    if (engine == nullptr)
+        return false;
+
+    juce::String displayName = "Embedded Flip Sample";
+    if (persistentState != nullptr && persistentState->samplePath.isNotEmpty())
+        displayName = juce::File(persistentState->samplePath).getFileNameWithoutExtension();
+
+    const bool loaded = engine->loadSampleFromBuffer(buffer, sampleRate, {}, displayName);
+    if (!loaded)
+        return false;
+
+    if (persistentState != nullptr)
+        engine->applyPersistentState(*persistentState);
+
+    currentStripFiles[static_cast<size_t>(stripIndex)] = juce::File();
+    return true;
+}
+
 void MlrVSTAudioProcessor::renderSampleModeStrip(int stripIndex,
                                                  juce::AudioBuffer<float>& output,
                                                  int startSample,
@@ -2640,14 +2775,26 @@ void MlrVSTAudioProcessor::renderSampleModeStrip(int stripIndex,
         playbackRate = juce::jlimit(0.03125f, 8.0f, playbackRate);
 
     const int fadeSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.003));
-    const bool rendered = engine->renderToBuffer(scratch,
-                                                 0,
-                                                 numSamples,
-                                                 playbackRate,
-                                                 fadeSamples);
-    if (rendered)
+    const bool soundTouchEnabled = soundTouchEnabledParam != nullptr
+        && soundTouchEnabledParam->load(std::memory_order_acquire) > 0.5f;
+    const bool preferHighQualityKeyLock = !strip->isResamplePitchEnabled()
+        && soundTouchEnabled
+        && std::abs(strip->getPitchShift()) > 0.01f;
+    const auto renderResult = engine->renderToBuffer(scratch,
+                                                     0,
+                                                     numSamples,
+                                                     playbackRate,
+                                                     fadeSamples,
+                                                     strip->getPitchShift(),
+                                                     preferHighQualityKeyLock);
+    if (renderResult.renderedAnything)
     {
-        strip->processExternalOutputBuffer(scratch, 0, numSamples, positionInfo, tempo);
+        strip->processExternalOutputBuffer(scratch,
+                                           0,
+                                           numSamples,
+                                           positionInfo,
+                                           tempo,
+                                           !renderResult.usedInternalPitch);
         output.addFrom(0, startSample, scratch, 0, 0, numSamples);
         output.addFrom(1, startSample, scratch, 1, 0, numSamples);
     }
@@ -4627,6 +4774,124 @@ void MlrVSTAudioProcessor::appendControlPagesToState(juce::ValueTree& state) con
     controlPages.setProperty("swingDivision", swingDivisionSelection.load(std::memory_order_acquire), nullptr);
 }
 
+void MlrVSTAudioProcessor::appendFlipStatesToState(juce::ValueTree& state) const
+{
+    auto flipStates = state.getOrCreateChildWithName("FlipStates", nullptr);
+    while (flipStates.getNumChildren() > 0)
+        flipStates.removeChild(0, nullptr);
+
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        auto* strip = audioEngine != nullptr ? audioEngine->getStrip(i) : nullptr;
+        if (strip == nullptr)
+            continue;
+
+        const bool isFlipMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample);
+        if (!isFlipMode && !hasSampleModeAudio(i))
+            continue;
+
+        auto* engine = const_cast<MlrVSTAudioProcessor*>(this)->getSampleModeEngine(i, isFlipMode);
+        if (engine == nullptr)
+            continue;
+
+        auto flipState = engine->capturePersistentState().createValueTree("FlipStrip");
+        flipState.setProperty("index", i, nullptr);
+        flipState.setProperty("enabled", isFlipMode, nullptr);
+        const auto embeddedSample = createEmbeddedFlipSampleData(i);
+        if (embeddedSample.isNotEmpty())
+            flipState.setProperty(kEmbeddedFlipSampleAttr, embeddedSample, nullptr);
+        flipStates.addChild(flipState, -1, nullptr);
+    }
+}
+
+void MlrVSTAudioProcessor::loadFlipStatesFromState(const juce::ValueTree& state)
+{
+    auto flipStates = state.getChildWithName("FlipStates");
+    if (!flipStates.isValid() || audioEngine == nullptr)
+        return;
+
+    for (auto flipState : flipStates)
+    {
+        if (!flipState.hasType("FlipStrip"))
+            continue;
+
+        const int stripIndex = static_cast<int>(flipState.getProperty("index", -1));
+        if (stripIndex < 0 || stripIndex >= MaxStrips)
+            continue;
+
+        if (auto* strip = audioEngine->getStrip(stripIndex))
+        {
+            const bool enabled = static_cast<bool>(flipState.getProperty("enabled", false));
+            if (!enabled)
+                continue;
+
+            strip->setPlayMode(EnhancedAudioStrip::PlayMode::Sample);
+            if (auto* engine = getSampleModeEngine(stripIndex, true))
+            {
+                const auto persistentState = SampleModePersistentState::fromValueTree(flipState);
+                const auto embeddedSample = flipState.getProperty(kEmbeddedFlipSampleAttr).toString();
+                const juce::File sampleFile(persistentState.samplePath);
+                if (sampleFile.existsAsFile())
+                {
+                    engine->applyPersistentState(persistentState);
+                    loadSampleToSampleModeStrip(stripIndex, sampleFile);
+                    currentStripFiles[static_cast<size_t>(stripIndex)] = sampleFile;
+                }
+                else if (embeddedSample.isNotEmpty())
+                {
+                    loadEmbeddedFlipSampleData(stripIndex, embeddedSample, &persistentState);
+                }
+                else
+                {
+                    engine->applyPersistentState(persistentState);
+                }
+            }
+        }
+    }
+}
+
+std::unique_ptr<juce::XmlElement> MlrVSTAudioProcessor::createFlipPresetStateXml(int stripIndex) const
+{
+    auto* strip = audioEngine != nullptr ? audioEngine->getStrip(stripIndex) : nullptr;
+    if (strip == nullptr || strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample)
+        return {};
+
+    auto* engine = const_cast<MlrVSTAudioProcessor*>(this)->getSampleModeEngine(stripIndex, false);
+    if (engine == nullptr)
+        return {};
+
+    auto xml = engine->capturePersistentState().createXml("FlipState");
+    const auto embeddedSample = createEmbeddedFlipSampleData(stripIndex);
+    if (embeddedSample.isNotEmpty())
+        xml->setAttribute(kEmbeddedFlipSampleAttr, embeddedSample);
+    return xml;
+}
+
+void MlrVSTAudioProcessor::applyFlipPresetStateXml(int stripIndex, const juce::XmlElement* flipStateXml)
+{
+    if (flipStateXml == nullptr || audioEngine == nullptr || stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    auto* strip = audioEngine->getStrip(stripIndex);
+    if (strip == nullptr)
+        return;
+
+    strip->setPlayMode(EnhancedAudioStrip::PlayMode::Sample);
+    if (auto* engine = getSampleModeEngine(stripIndex, true))
+    {
+        const auto persistentState = SampleModePersistentState::fromXml(*flipStateXml);
+        const auto embeddedSample = flipStateXml->getStringAttribute(kEmbeddedFlipSampleAttr);
+        if (embeddedSample.isNotEmpty())
+        {
+            loadEmbeddedFlipSampleData(stripIndex, embeddedSample, &persistentState);
+        }
+        else
+        {
+            engine->applyPersistentState(persistentState);
+        }
+    }
+}
+
 void MlrVSTAudioProcessor::loadDefaultPathsFromState(const juce::ValueTree& state)
 {
     auto paths = state.getChildWithName("DefaultPaths");
@@ -5306,6 +5571,32 @@ void MlrVSTAudioProcessor::timerCallback()
         }
     }
 
+    if (audioEngine != nullptr)
+    {
+        const bool soundTouchEnabled = soundTouchEnabledParam != nullptr
+            && soundTouchEnabledParam->load(std::memory_order_acquire) > 0.5f;
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+        {
+            auto* strip = audioEngine->getStrip(stripIndex);
+            auto* engine = getSampleModeEngine(stripIndex, false);
+            if (strip == nullptr || engine == nullptr)
+                continue;
+
+            const bool keyLockEnabled = strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample
+                && !strip->isResamplePitchEnabled()
+                && soundTouchEnabled
+                && std::abs(strip->getPitchShift()) > 0.01f;
+            float playbackRate = juce::jmax(0.03125f, strip->getPlayheadSpeedRatio())
+                               * juce::jmax(0.03125f, strip->getPlaybackSpeed());
+            if (strip->isResamplePitchEnabled())
+                playbackRate = juce::jlimit(0.03125f, 8.0f, playbackRate * strip->getResamplePitchRatio());
+            else
+                playbackRate = juce::jlimit(0.03125f, 8.0f, playbackRate);
+
+            engine->requestKeyLockRenderCache(playbackRate, strip->getPitchShift(), keyLockEnabled);
+        }
+    }
+
     // Update monome LEDs regularly for smooth playhead
     if (monomeConnection.isConnected() && audioEngine)
     {
@@ -5678,6 +5969,10 @@ void MlrVSTAudioProcessor::performPresetLoad(int presetIndex, double hostPpqSnap
         {
             return loadSampleToStrip(stripIndex, sampleFile);
         },
+        [this](int stripIndex, const juce::XmlElement* flipStateXml)
+        {
+            applyFlipPresetStateXml(stripIndex, flipStateXml);
+        },
         hostPpqSnapshot,
         hostTempoSnapshot);
 
@@ -5704,7 +5999,11 @@ bool MlrVSTAudioProcessor::runPresetSaveRequest(const PresetSaveRequest& request
                                        MaxStrips,
                                        audioEngine.get(),
                                        parameters,
-                                       request.stripFiles.data());
+                                       request.stripFiles.data(),
+                                       [this](int stripIndex)
+                                       {
+                                           return createFlipPresetStateXml(stripIndex);
+                                       });
     }
     catch (const std::exception& e)
     {

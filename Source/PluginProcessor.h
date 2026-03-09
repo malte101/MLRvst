@@ -596,6 +596,14 @@ private:
     bool saveBrowserFavoriteDirectoryFromStrip(int stripIndex, int slot);
     bool recallBrowserFavoriteDirectoryForStrip(int stripIndex, int slot);
     bool isAudioFileSupported(const juce::File& file) const;
+    juce::String createEmbeddedFlipSampleData(int stripIndex) const;
+    bool loadEmbeddedFlipSampleData(int stripIndex,
+                                    const juce::String& base64Data,
+                                    const SampleModePersistentState* persistentState = nullptr);
+    void loadFlipStatesFromState(const juce::ValueTree& state);
+    void appendFlipStatesToState(juce::ValueTree& state) const;
+    std::unique_ptr<juce::XmlElement> createFlipPresetStateXml(int stripIndex) const;
+    void applyFlipPresetStateXml(int stripIndex, const juce::XmlElement* flipStateXml);
     void loadDefaultPathsFromState(const juce::ValueTree& state);
     void appendDefaultPathsToState(juce::ValueTree& state) const;
     void loadControlPagesFromState(const juce::ValueTree& state);

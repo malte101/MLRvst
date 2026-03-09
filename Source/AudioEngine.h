@@ -443,7 +443,8 @@ public:
                                      int startSample,
                                      int numSamples,
                                      const juce::AudioPlayHead::PositionInfo& positionInfo,
-                                     double tempo);
+                                     double tempo,
+                                     bool applyPitchShift = true);
     
     // Playback control
     void trigger(int column, double tempo, bool quantized = false);

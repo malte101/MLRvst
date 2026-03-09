@@ -548,7 +548,8 @@ bool savePreset(int presetIndex,
                 int maxStrips,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,
-                const juce::File* currentStripFiles)
+                const juce::File* currentStripFiles,
+                const std::function<std::unique_ptr<juce::XmlElement>(int)>& createFlipStateXml)
 {
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots || audioEngine == nullptr || currentStripFiles == nullptr)
         return false;
@@ -604,6 +605,12 @@ bool savePreset(int presetIndex,
                     DBG("Preset save strip " << i << ": skipped embedded sample (invalid path or embed too large)");
                 }
             }
+        }
+
+        if (playMode == EnhancedAudioStrip::PlayMode::Sample && createFlipStateXml)
+        {
+            if (auto flipStateXml = createFlipStateXml(i))
+                stripXml->addChildElement(flipStateXml.release());
         }
 
         stripXml->setAttribute("volume", strip->getVolume());
@@ -803,6 +810,7 @@ bool loadPreset(int presetIndex,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,
                 const std::function<bool(int, const juce::File&)>& loadSampleToStrip,
+                const std::function<void(int, const juce::XmlElement*)>& applyFlipStateXml,
                 double hostPpqSnapshot,
                 double hostTempoSnapshot)
 {
@@ -896,6 +904,9 @@ bool loadPreset(int presetIndex,
         const auto restoredPlayMode = static_cast<EnhancedAudioStrip::PlayMode>(
             juce::jlimit(0, 5, stripXml->getIntAttribute("playMode", 1)));
         strip->setPlayMode(restoredPlayMode);
+
+        if (restoredPlayMode == EnhancedAudioStrip::PlayMode::Sample && applyFlipStateXml)
+            applyFlipStateXml(stripIndex, stripXml->getChildByName("FlipState"));
 
         const juce::String samplePath = stripXml->getStringAttribute("samplePath").trim();
         bool loadedStripAudio = false;

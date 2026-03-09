@@ -6009,7 +6009,8 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
                                                      int startSample,
                                                      int numSamples,
                                                      const juce::AudioPlayHead::PositionInfo& positionInfo,
-                                                     double tempo)
+                                                     double tempo,
+                                                     bool applyPitchShift)
 {
     juce::ScopedLock lock(bufferLock);
 
@@ -6039,7 +6040,7 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
         leftSample *= std::cos(panAngle);
         rightSample *= std::sin(panAngle);
 
-        if (!isResamplePitchEnabled())
+        if (applyPitchShift && !isResamplePitchEnabled())
         {
             const float semitonesNow = smoothedPitchShift.getNextValue();
             processPitchShift(leftSample, rightSample, semitonesNow);
