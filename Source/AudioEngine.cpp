@@ -13,14 +13,8 @@
 #ifndef MLRVST_ENABLE_HUOVILAINEN
 #define MLRVST_ENABLE_HUOVILAINEN 0
 #endif
-#ifndef MLRVST_ENABLE_SOUNDTOUCH
-#define MLRVST_ENABLE_SOUNDTOUCH 0
-#endif
 #if MLRVST_ENABLE_HUOVILAINEN
 #include "HuovilainenModel.h"
-#endif
-#if MLRVST_ENABLE_SOUNDTOUCH
-#include <soundtouch/SoundTouch.h>
 #endif
 #include <random>
 #include <map>
@@ -119,6 +113,94 @@ float shapeGrainEnvelopeWindow(float baseWindow, float curve)
     return std::pow(clampedWindow, clampedCurve);
 }
 
+double meanAbsoluteLevelInRange(const std::vector<double>& absolutePrefixSum, int startSample, int endSample)
+{
+    const int clampedStart = juce::jmax(0, startSample);
+    const int clampedEnd = juce::jmax(clampedStart, juce::jmin(static_cast<int>(absolutePrefixSum.size()) - 1, endSample));
+    const int sampleCount = juce::jmax(1, clampedEnd - clampedStart);
+    return (absolutePrefixSum[static_cast<size_t>(clampedEnd)] - absolutePrefixSum[static_cast<size_t>(clampedStart)])
+        / static_cast<double>(sampleCount);
+}
+
+std::vector<int> refineOnsetSamplesToLeadingEdges(const std::vector<float>& monoSamples,
+                                                  const std::vector<int>& onsetSamples,
+                                                  int frameSize,
+                                                  int hopSize)
+{
+    std::vector<int> refined;
+    const int totalSamples = static_cast<int>(monoSamples.size());
+    if (totalSamples <= 2 || onsetSamples.empty())
+        return refined;
+
+    std::vector<double> absolutePrefixSum(static_cast<size_t>(totalSamples) + 1u, 0.0);
+    for (int i = 0; i < totalSamples; ++i)
+        absolutePrefixSum[static_cast<size_t>(i) + 1u] = absolutePrefixSum[static_cast<size_t>(i)] + std::abs(monoSamples[static_cast<size_t>(i)]);
+
+    const int searchBehind = juce::jlimit(24, juce::jmax(24, totalSamples / 256), frameSize / 2);
+    const int searchAhead = juce::jlimit(8, juce::jmax(8, totalSamples / 1024), juce::jmax(8, hopSize / 3));
+    const int lookBehind = juce::jlimit(3, juce::jmax(3, totalSamples / 4096), juce::jmax(4, hopSize / 8));
+    const int lookAhead = juce::jlimit(6, juce::jmax(6, totalSamples / 2048), juce::jmax(6, hopSize / 5));
+
+    refined.reserve(onsetSamples.size());
+    for (const auto onsetSample : onsetSamples)
+    {
+        const int center = juce::jlimit(1, totalSamples - 2, onsetSample);
+        const int searchStart = juce::jmax(1, center - searchBehind);
+        const int searchEnd = juce::jmin(totalSamples - 2, center + searchAhead);
+        if (searchEnd <= searchStart)
+        {
+            refined.push_back(center);
+            continue;
+        }
+
+        std::vector<double> scores(static_cast<size_t>(searchEnd - searchStart + 1), 0.0);
+        int bestIndex = center;
+        double bestScore = -std::numeric_limits<double>::infinity();
+
+        for (int sampleIndex = searchStart; sampleIndex <= searchEnd; ++sampleIndex)
+        {
+            const double levelBefore = meanAbsoluteLevelInRange(absolutePrefixSum, sampleIndex - lookBehind, sampleIndex);
+            const double levelAfter = meanAbsoluteLevelInRange(absolutePrefixSum, sampleIndex, sampleIndex + lookAhead);
+            const double levelRise = juce::jmax(0.0, levelAfter - levelBefore);
+            const double attackStep = std::abs(monoSamples[static_cast<size_t>(sampleIndex)] - monoSamples[static_cast<size_t>(sampleIndex - 1)])
+                + (0.5 * std::abs(monoSamples[static_cast<size_t>(sampleIndex + 1)] - monoSamples[static_cast<size_t>(sampleIndex)]));
+            const int delta = sampleIndex - center;
+            const double proximityPenalty = delta > 0
+                ? 0.0030 * static_cast<double>(delta)
+                : 0.00045 * static_cast<double>(-delta);
+            const double score = (levelRise * 8.0) + (attackStep * 2.0) - proximityPenalty;
+            scores[static_cast<size_t>(sampleIndex - searchStart)] = score;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestIndex = sampleIndex;
+            }
+        }
+
+        int refinedIndex = bestIndex;
+        if (bestScore > 0.0)
+        {
+            const double threshold = bestScore * 0.58;
+            for (int sampleIndex = searchStart; sampleIndex <= bestIndex; ++sampleIndex)
+            {
+                const double score = scores[static_cast<size_t>(sampleIndex - searchStart)];
+                if (score >= threshold)
+                {
+                    refinedIndex = sampleIndex;
+                    break;
+                }
+            }
+        }
+
+        refined.push_back(refinedIndex);
+    }
+
+    std::sort(refined.begin(), refined.end());
+    refined.erase(std::unique(refined.begin(), refined.end()), refined.end());
+    return refined;
+}
+
 float smoothingCoeffFromMs(float ms, double sampleRate)
 {
     const double safeMs = juce::jmax(0.001, static_cast<double>(ms));
@@ -143,7 +225,7 @@ float computeDuckGainFromEnvelope(float envelope,
     return juce::Decibels::decibelsToGain(reductionDb);
 }
 
-#if MLRVST_ENABLE_SOUNDTOUCH
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
 double swingUnitBeatsFromDivision(EnhancedAudioStrip::SwingDivision division)
 {
     switch (division)
@@ -881,7 +963,12 @@ bool PatternRecorder::updateRecording(double currentBeat)
     return false;
 }
 
-void PatternRecorder::recordEvent(int strip, int column, bool noteOn, double currentBeat)
+void PatternRecorder::recordEvent(int strip,
+                                  int column,
+                                  bool noteOn,
+                                  double currentBeat,
+                                  int sampleSliceId,
+                                  int64_t sampleStartSample)
 {
     if (!recording.load(std::memory_order_acquire))
         return;
@@ -898,13 +985,19 @@ void PatternRecorder::recordEvent(int strip, int column, bool noteOn, double cur
     Event event;
     event.stripIndex = strip;
     event.column = column;
+    event.sampleSliceId = sampleSliceId;
+    event.sampleStartSample = sampleStartSample;
     // Time is relative to pattern start (0 to lengthInBeats)
     event.time = currentBeat - startBeat;
     event.isNoteOn = noteOn;
     
     events.push_back(event);
     
-    DBG("Event recorded: strip=" << strip << ", col=" << column << ", beat=" << event.time);
+    DBG("Event recorded: strip=" << strip
+        << ", col=" << column
+        << ", sliceId=" << sampleSliceId
+        << ", start=" << sampleStartSample
+        << ", beat=" << event.time);
 }
 
 // Template implementation must be in header or here
@@ -1496,7 +1589,7 @@ void EnhancedAudioStrip::loadSample(const juce::AudioBuffer<float>& buffer, doub
         transientSliceMapDirty = true;
 
     rebuildSampleAnalysisCacheLocked();
-#if MLRVST_ENABLE_SOUNDTOUCH
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     invalidateSoundTouchSwingCache();
 #endif
 }
@@ -1511,7 +1604,7 @@ void EnhancedAudioStrip::setTransientSliceMode(bool enabled)
         if (transientSliceMapDirty && sampleBuffer.getNumSamples() > 0)
             rebuildTransientSliceMap();
     }
-#if MLRVST_ENABLE_SOUNDTOUCH
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     invalidateSoundTouchSwingCache();
 #endif
 }
@@ -1632,6 +1725,15 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
     std::vector<float> prevMag(static_cast<size_t>(halfBins), 0.0f);
     std::vector<float> spectralFlux(static_cast<size_t>(frames), 0.0f);
     std::vector<float> frameEnergy(static_cast<size_t>(frames), 0.0f);
+    std::vector<float> monoSamples(static_cast<size_t>(totalSamples), 0.0f);
+
+    for (int sampleIndex = 0; sampleIndex < totalSamples; ++sampleIndex)
+    {
+        float mono = 0.0f;
+        for (int ch = 0; ch < channels; ++ch)
+            mono += sampleBuffer.getSample(ch, sampleIndex);
+        monoSamples[static_cast<size_t>(sampleIndex)] = mono / static_cast<float>(channels);
+    }
 
     for (int frame = 0; frame < frames; ++frame)
     {
@@ -1641,10 +1743,7 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
         for (int n = 0; n < frameSize; ++n)
         {
             const int sampleIndex = juce::jlimit(0, totalSamples - 1, start + n);
-            float mono = 0.0f;
-            for (int ch = 0; ch < channels; ++ch)
-                mono += sampleBuffer.getSample(ch, sampleIndex);
-            mono /= static_cast<float>(channels);
+            const float mono = monoSamples[static_cast<size_t>(sampleIndex)];
             fftData[static_cast<size_t>(n)] = mono;
             energy += static_cast<double>(mono * mono);
         }
@@ -1770,6 +1869,11 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
 
     std::sort(onsetSamples.begin(), onsetSamples.end());
     onsetSamples.erase(std::unique(onsetSamples.begin(), onsetSamples.end()), onsetSamples.end());
+    if (const auto refined = refineOnsetSamplesToLeadingEdges(monoSamples, onsetSamples, frameSize, hop);
+        !refined.empty())
+    {
+        onsetSamples = refined;
+    }
     if (onsetSamples.empty())
     {
         fillUniform();
@@ -3591,7 +3695,7 @@ bool EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
         grainCenterSmoother.setCurrentAndTargetValue(playbackPosition.load());
         resetGrainState();
         resetPitchShifter();
-#if MLRVST_ENABLE_SOUNDTOUCH
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
         invalidateSoundTouchSwingCache();
 #endif
         return true;
@@ -3653,7 +3757,7 @@ void EnhancedAudioStrip::clearSample()
     stepSubdivisionGateOpen = true;
     stepTraversalRatioAtLastTick = -1.0;
     stepTraversalPhaseOffsetTicks = 0.0;
-#if MLRVST_ENABLE_SOUNDTOUCH
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     invalidateSoundTouchSwingCache();
 #endif
     resetGrainState();
@@ -3661,7 +3765,7 @@ void EnhancedAudioStrip::clearSample()
     resetScratchComboState();
 }
 
-#if MLRVST_ENABLE_SOUNDTOUCH
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
 void EnhancedAudioStrip::invalidateSoundTouchSwingCache()
 {
     soundTouchSwingCacheValid = false;
@@ -3715,6 +3819,7 @@ bool EnhancedAudioStrip::rebuildSoundTouchSwingCache(double loopStartSamples,
     }
 
     const float swing = juce::jlimit(0.0f, 1.0f, swingAmount.load(std::memory_order_acquire));
+    const auto stretchBackend = getStretchBackend();
     const int divisionRaw = swingDivision.load(std::memory_order_acquire);
     const int divisionClamped = juce::jlimit(
         0, static_cast<int>(SwingDivision::SixteenthTriplet), divisionRaw);
@@ -3824,7 +3929,6 @@ bool EnhancedAudioStrip::rebuildSoundTouchSwingCache(double loopStartSamples,
     mergedTargetBoundaries.push_back(loopSamples);
 
     std::vector<float> segmentIn;
-    std::vector<float> segmentOut;
     const int sampleRateInt = juce::jmax(8000, static_cast<int>(std::lround(currentSampleRate)));
     const int segmentCount = juce::jmax(1, static_cast<int>(mergedSourceBoundaries.size()) - 1);
     auto writeSegmentSample = [&](int writeIndex, int segmentOffset, int blendSamples, float left, float right)
@@ -3922,79 +4026,74 @@ bool EnhancedAudioStrip::rebuildSoundTouchSwingCache(double loopStartSamples,
             continue;
         }
 
-        soundtouch::SoundTouch stretcher;
-        stretcher.setSampleRate(static_cast<uint>(sampleRateInt));
-        stretcher.setChannels(2);
-        stretcher.setRate(1.0);
-        stretcher.setPitch(1.0);
-        stretcher.setTempo(stretchTempo);
-        stretcher.setSetting(SETTING_USE_AA_FILTER, 1);
-        stretcher.setSetting(SETTING_AA_FILTER_LENGTH, 64);
-        stretcher.setSetting(SETTING_USE_QUICKSEEK, 0);
-        const int segmentMs = juce::jmax(8, static_cast<int>(std::lround((1000.0 * inputLen) / static_cast<double>(sampleRateInt))));
-        const bool wideStretch = (stretchTempo < 0.75 || stretchTempo > 1.33);
-        const double sequenceScale = wideStretch ? 1.15 : 0.95;
-        const int sequenceMs = juce::jlimit(28, 120, static_cast<int>(std::lround(segmentMs * sequenceScale)));
-        const int seekWindowMs = juce::jlimit(12, 64, sequenceMs / 2);
-        const int overlapMs = juce::jlimit(8, 24, sequenceMs / 4);
-        stretcher.setSetting(SETTING_SEQUENCE_MS, sequenceMs);
-        stretcher.setSetting(SETTING_SEEKWINDOW_MS, seekWindowMs);
-        stretcher.setSetting(SETTING_OVERLAP_MS, overlapMs);
-        stretcher.putSamples(segmentIn.data(), static_cast<uint>(inputLen));
-        stretcher.flush();
-
-        const int outCapacity = juce::jmax(targetLen + 1024, inputLen + 1024);
-        segmentOut.assign(static_cast<size_t>(outCapacity * 2), 0.0f);
-
-        uint receivedTotal = 0;
-        while (receivedTotal < static_cast<uint>(outCapacity))
+        juce::AudioBuffer<float> sourceSegment(2, inputLen);
+        for (int n = 0; n < inputLen; ++n)
         {
-            const uint got = stretcher.receiveSamples(
-                segmentOut.data() + (receivedTotal * 2),
-                static_cast<uint>(outCapacity) - receivedTotal);
-            if (got == 0)
-                break;
-            receivedTotal += got;
+            sourceSegment.setSample(0, n, segmentIn[static_cast<size_t>(2 * n)]);
+            sourceSegment.setSample(1, n, segmentIn[static_cast<size_t>((2 * n) + 1)]);
         }
 
-        if (receivedTotal == 0)
+        juce::AudioBuffer<float> stretchedSegment;
+        if (!renderTimeStretchedBuffer(sourceSegment,
+                                       static_cast<double>(sampleRateInt),
+                                       targetLen,
+                                       0.0f,
+                                       stretchBackend,
+                                       stretchedSegment))
         {
-            receivedTotal = static_cast<uint>(inputLen);
-            segmentOut.assign(segmentIn.begin(), segmentIn.end());
-        }
-
-        const int receivedInt = static_cast<int>(receivedTotal);
-        if (receivedInt <= 1)
-        {
-            const float left = (receivedInt > 0) ? segmentOut[0] : 0.0f;
-            const float right = (receivedInt > 0) ? segmentOut[1] : 0.0f;
-            for (int n = 0; n < targetLen; ++n)
-                writeSegmentSample(targetStart + n, n, boundaryBlendSamples, left, right);
-        }
-        else if (receivedInt == targetLen)
-        {
-            for (int n = 0; n < targetLen; ++n)
+            if (inputLen <= 1)
             {
-                const float left = segmentOut[static_cast<size_t>(2 * n)];
-                const float right = segmentOut[static_cast<size_t>((2 * n) + 1)];
-                writeSegmentSample(targetStart + n, n, boundaryBlendSamples, left, right);
+                const float left = segmentIn[0];
+                const float right = segmentIn[1];
+                for (int n = 0; n < targetLen; ++n)
+                    writeSegmentSample(targetStart + n, n, boundaryBlendSamples, left, right);
+            }
+            else
+            {
+                for (int n = 0; n < targetLen; ++n)
+                {
+                    const double srcOutPos = (targetLen > 1)
+                        ? (static_cast<double>(n) * static_cast<double>(inputLen - 1)
+                           / static_cast<double>(targetLen - 1))
+                        : 0.0;
+                    const int s0 = juce::jlimit(0, inputLen - 1, static_cast<int>(std::floor(srcOutPos)));
+                    const int s1 = juce::jlimit(0, inputLen - 1, s0 + 1);
+                    const float frac = static_cast<float>(srcOutPos - static_cast<double>(s0));
+                    const float l0 = segmentIn[static_cast<size_t>(2 * s0)];
+                    const float l1 = segmentIn[static_cast<size_t>(2 * s1)];
+                    const float r0 = segmentIn[static_cast<size_t>((2 * s0) + 1)];
+                    const float r1 = segmentIn[static_cast<size_t>((2 * s1) + 1)];
+                    writeSegmentSample(targetStart + n, n, boundaryBlendSamples,
+                                       l0 + ((l1 - l0) * frac),
+                                       r0 + ((r1 - r0) * frac));
+                }
             }
         }
         else
         {
+            const int receivedInt = stretchedSegment.getNumSamples();
+            if (receivedInt <= 1)
+            {
+                const float left = (receivedInt > 0) ? stretchedSegment.getSample(0, 0) : 0.0f;
+                const float right = (receivedInt > 0) ? stretchedSegment.getSample(1, 0) : 0.0f;
+                for (int n = 0; n < targetLen; ++n)
+                    writeSegmentSample(targetStart + n, n, boundaryBlendSamples, left, right);
+                continue;
+            }
+
             for (int n = 0; n < targetLen; ++n)
             {
-                const double srcOutPos = (targetLen > 1)
+                const double srcOutPos = (targetLen > 1 && receivedInt != targetLen)
                     ? (static_cast<double>(n) * static_cast<double>(receivedInt - 1)
                        / static_cast<double>(targetLen - 1))
-                    : 0.0;
+                    : static_cast<double>(juce::jlimit(0, receivedInt - 1, n));
                 const int s0 = juce::jlimit(0, receivedInt - 1, static_cast<int>(std::floor(srcOutPos)));
                 const int s1 = juce::jlimit(0, receivedInt - 1, s0 + 1);
                 const float frac = static_cast<float>(srcOutPos - static_cast<double>(s0));
-                const float l0 = segmentOut[static_cast<size_t>(2 * s0)];
-                const float l1 = segmentOut[static_cast<size_t>(2 * s1)];
-                const float r0 = segmentOut[static_cast<size_t>((2 * s0) + 1)];
-                const float r1 = segmentOut[static_cast<size_t>((2 * s1) + 1)];
+                const float l0 = stretchedSegment.getSample(0, s0);
+                const float l1 = stretchedSegment.getSample(0, s1);
+                const float r0 = stretchedSegment.getSample(1, s0);
+                const float r1 = stretchedSegment.getSample(1, s1);
                 writeSegmentSample(targetStart + n, n, boundaryBlendSamples,
                                    l0 + ((l1 - l0) * frac),
                                    r0 + ((r1 - r0) * frac));
@@ -4064,7 +4163,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         lastObservedTempo = tempo;
     }
 
-    if (playMode == PlayMode::Sample)
+    if (playMode == PlayMode::Sample && !isSampleModeLegacyLoopEngineEnabled())
     {
         playing = false;
         wasPlayingBeforeStop = false;
@@ -4558,7 +4657,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     const juce::AudioBuffer<float>* playbackSourceBuffer = &sampleBuffer;
     double playbackSourceLoopStartSamples = loopStartSamples;
     double playbackSourceSampleLength = sampleLength;
-#if MLRVST_ENABLE_SOUNDTOUCH
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     if (shouldUseSoundTouchSwingCache(loopLength, beatsForLoop, loopCols, isScratching, playheadTraversalRatio)
         && rebuildSoundTouchSwingCache(loopStartSamples, loopLength, beatsForLoop, loopCols))
     {
@@ -7622,15 +7721,21 @@ void EnhancedAudioStrip::setPitchShift(float semitones)
     smoothedPitchShift.setTargetValue(clamped);
 }
 
-void EnhancedAudioStrip::setSoundTouchEnabled(bool enabled)
+void EnhancedAudioStrip::setStretchBackend(TimeStretchBackend backend)
 {
-    const int newValue = enabled ? 1 : 0;
+    const int newValue = static_cast<int>(sanitizeTimeStretchBackend(static_cast<int>(backend)));
     const int oldValue = soundTouchEnabled.exchange(newValue, std::memory_order_acq_rel);
     if (oldValue == newValue)
         return;
-#if MLRVST_ENABLE_SOUNDTOUCH
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     invalidateSoundTouchSwingCache();
 #endif
+}
+
+void EnhancedAudioStrip::setSoundTouchEnabled(bool enabled)
+{
+    setStretchBackend(enabled ? TimeStretchBackend::SoundTouch
+                              : TimeStretchBackend::Resample);
 }
 
 void EnhancedAudioStrip::setPitchSmoothingTime(float seconds)
@@ -8760,7 +8865,7 @@ ModernAudioEngine::ModernAudioEngine()
     // Initialize strips
     for (int i = 0; i < MaxStrips; ++i)
         strips[static_cast<size_t>(i)] = std::make_unique<EnhancedAudioStrip>(i);
-    setGlobalSoundTouchEnabled(soundTouchEnabled.load(std::memory_order_acquire) != 0);
+    setGlobalStretchBackend(sanitizeTimeStretchBackend(soundTouchEnabled.load(std::memory_order_acquire)));
     
     // Initialize groups
     for (int i = 0; i < MaxGroups; ++i)
@@ -8875,7 +8980,7 @@ void ModernAudioEngine::prepareToPlay(double sampleRate, int maxBlockSize)
     
     for (auto& strip : strips)
         strip->prepareToPlay(sampleRate, maxBlockSize);
-    setGlobalSoundTouchEnabled(soundTouchEnabled.load(std::memory_order_acquire) != 0);
+    setGlobalStretchBackend(sanitizeTimeStretchBackend(soundTouchEnabled.load(std::memory_order_acquire)));
     
     liveRecorder->prepareToPlay(sampleRate, maxBlockSize);
     setCrossfadeLengthMs(crossfadeLengthMs.load(std::memory_order_acquire));
@@ -9782,6 +9887,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     const int64_t triggerSample = blockStart + eventOffset;
                     sampleModeTriggerCallback(event.stripIndex,
                                               event.column,
+                                              -1,
+                                              -1,
                                               triggerSample,
                                               triggerPosInfo,
                                               event.isMomentaryStutter);
@@ -10302,7 +10409,11 @@ void ModernAudioEngine::scheduleQuantizedTrigger(int stripIndex, int column, dou
     quantizeClock.scheduleTrigger(stripIndex, column, ppq, strip);
 }
 
-void ModernAudioEngine::triggerStripWithQuantization(int stripIndex, int column, bool useQuantize)
+void ModernAudioEngine::triggerStripWithQuantization(int stripIndex,
+                                                     int column,
+                                                     bool useQuantize,
+                                                     int sampleSliceId,
+                                                     int64_t sampleStartSample)
 {
     if (stripIndex >= 0 && stripIndex < MaxStrips
         && momentaryStutterActive.load(std::memory_order_acquire) != 0
@@ -10334,6 +10445,8 @@ void ModernAudioEngine::triggerStripWithQuantization(int stripIndex, int column,
         {
             sampleModeTriggerCallback(stripIndex,
                                       column,
+                                      sampleSliceId,
+                                      sampleStartSample,
                                       globalSampleCount.load(),
                                       immediatePosInfo,
                                       false);
@@ -10437,9 +10550,9 @@ EnhancedAudioStrip::SwingDivision ModernAudioEngine::getGlobalSwingDivision() co
     return EnhancedAudioStrip::SwingDivision::Eighth;
 }
 
-void ModernAudioEngine::setGlobalSoundTouchEnabled(bool enabled)
+void ModernAudioEngine::setGlobalStretchBackend(TimeStretchBackend backend)
 {
-    const int newValue = enabled ? 1 : 0;
+    const int newValue = static_cast<int>(sanitizeTimeStretchBackend(static_cast<int>(backend)));
     if (soundTouchEnabled.load(std::memory_order_acquire) == newValue)
         return;
 
@@ -10447,8 +10560,14 @@ void ModernAudioEngine::setGlobalSoundTouchEnabled(bool enabled)
     for (auto& strip : strips)
     {
         if (strip)
-            strip->setSoundTouchEnabled(enabled);
+            strip->setStretchBackend(backend);
     }
+}
+
+void ModernAudioEngine::setGlobalSoundTouchEnabled(bool enabled)
+{
+    setGlobalStretchBackend(enabled ? TimeStretchBackend::SoundTouch
+                                    : TimeStretchBackend::Resample);
 }
 
 void ModernAudioEngine::updateTempo(const juce::AudioPlayHead::PositionInfo& positionInfo)
@@ -10551,7 +10670,11 @@ void ModernAudioEngine::processPatterns()
                         {
                             // Use the same trigger path as live grid presses so pattern playback
                             // stays on the PPQ/sample timeline and respects group behavior.
-                            triggerStripWithQuantization(event.stripIndex, event.column, false);
+                            triggerStripWithQuantization(event.stripIndex,
+                                                         event.column,
+                                                         false,
+                                                         event.sampleSliceId,
+                                                         event.sampleStartSample);
                         }
                         else if (auto* strip = getStrip(event.stripIndex))
                         {

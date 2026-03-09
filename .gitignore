@@ -69,3 +69,7 @@ compile_commands.json
 # Backup files
 *backup*
 *.bak
+
+# Persistent local native dependency prefixes (generated, not tracked)
+third_party/_native/*
+!third_party/_native/README.md

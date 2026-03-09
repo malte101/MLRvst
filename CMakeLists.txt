@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 
 # Set C and C++ compilers (JUCE needs both)
-project(mlrVST VERSION 2.0.0 LANGUAGES C CXX)
+project(mlrVST VERSION 2.0.1 LANGUAGES C CXX)
 
 # C++ Standard
 set(CMAKE_CXX_STANDARD 17)
@@ -12,6 +12,72 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # OFF by default so release binaries do not accidentally include Huovilainen code.
 option(MLRVST_ENABLE_HUOVILAINEN "Enable Huovilainen Moog model (LGPL-derived upstream)" OFF)
 option(MLRVST_ENABLE_SOUNDTOUCH "Enable SoundTouch-based swing time-stretch path" ON)
+option(MLRVST_ENABLE_BUNGEE "Enable Bungee-based stretch backend" ON)
+set(MLRVST_NATIVE_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/_native" CACHE PATH
+    "Path to persistent repo-local native dependency prefixes")
+set(MLRVST_DEFAULT_ESSENTIA_PREFIX "${MLRVST_NATIVE_DEPS_DIR}/essentia-prefix")
+set(MLRVST_DEFAULT_BUNGEE_PREFIX "${MLRVST_NATIVE_DEPS_DIR}/bungee-prefix")
+set(MLRVST_ESSENTIA_PREFIX "${MLRVST_DEFAULT_ESSENTIA_PREFIX}" CACHE PATH
+    "Path to a native Essentia install prefix")
+set(MLRVST_BUNGEE_PREFIX "${MLRVST_DEFAULT_BUNGEE_PREFIX}" CACHE PATH
+    "Path to a persistent Bungee install prefix")
+set(MLRVST_BUNGEE_SOURCE_DIR "${MLRVST_NATIVE_DEPS_DIR}/_bungee-source" CACHE PATH
+    "Path to a Bungee source checkout")
+set(MLRVST_BUNGEE_BUILD_DIR "${MLRVST_NATIVE_DEPS_DIR}/_bungee-build" CACHE PATH
+    "Path to a built Bungee tree")
+
+if(EXISTS "${MLRVST_DEFAULT_ESSENTIA_PREFIX}/include/essentia/algorithmfactory.h"
+   AND ((NOT EXISTS "${MLRVST_ESSENTIA_PREFIX}/include/essentia/algorithmfactory.h")
+        OR "${MLRVST_ESSENTIA_PREFIX}" MATCHES "^/tmp($|/)"))
+    set(MLRVST_ESSENTIA_PREFIX "${MLRVST_DEFAULT_ESSENTIA_PREFIX}" CACHE PATH
+        "Path to a native Essentia install prefix" FORCE)
+    unset(MLRVST_ESSENTIA_INCLUDE_DIR CACHE)
+    unset(MLRVST_ESSENTIA_LIBRARY CACHE)
+endif()
+
+if(EXISTS "${MLRVST_ESSENTIA_PREFIX}/include/essentia/algorithmfactory.h"
+   AND EXISTS "${MLRVST_ESSENTIA_PREFIX}/lib/libessentia.a")
+    set(MLRVST_ESSENTIA_INCLUDE_DIR "${MLRVST_ESSENTIA_PREFIX}/include" CACHE PATH
+        "Resolved native Essentia include directory" FORCE)
+    set(MLRVST_ESSENTIA_LIBRARY "${MLRVST_ESSENTIA_PREFIX}/lib/libessentia.a" CACHE FILEPATH
+        "Resolved native Essentia library" FORCE)
+endif()
+
+if(EXISTS "${MLRVST_DEFAULT_BUNGEE_PREFIX}/include/bungee/Bungee.h"
+   AND EXISTS "${MLRVST_DEFAULT_BUNGEE_PREFIX}/lib/libbungee.a"
+   AND ((NOT EXISTS "${MLRVST_BUNGEE_PREFIX}/include/bungee/Bungee.h")
+        OR "${MLRVST_BUNGEE_PREFIX}" MATCHES "^/tmp($|/)"))
+    set(MLRVST_BUNGEE_PREFIX "${MLRVST_DEFAULT_BUNGEE_PREFIX}" CACHE PATH
+        "Path to a persistent Bungee install prefix" FORCE)
+    unset(MLRVST_BUNGEE_INCLUDE_DIR CACHE)
+    unset(MLRVST_BUNGEE_LIBRARY CACHE)
+    unset(MLRVST_BUNGEE_PFFFT_LIBRARY CACHE)
+endif()
+
+if(EXISTS "${MLRVST_BUNGEE_PREFIX}/include/bungee/Bungee.h"
+   AND EXISTS "${MLRVST_BUNGEE_PREFIX}/lib/libbungee.a"
+   AND EXISTS "${MLRVST_BUNGEE_PREFIX}/lib/libpffft.a")
+    set(MLRVST_BUNGEE_INCLUDE_DIR "${MLRVST_BUNGEE_PREFIX}/include" CACHE PATH
+        "Resolved native Bungee include directory" FORCE)
+    set(MLRVST_BUNGEE_LIBRARY "${MLRVST_BUNGEE_PREFIX}/lib/libbungee.a" CACHE FILEPATH
+        "Resolved native Bungee library" FORCE)
+    set(MLRVST_BUNGEE_PFFFT_LIBRARY "${MLRVST_BUNGEE_PREFIX}/lib/libpffft.a" CACHE FILEPATH
+        "Resolved native PFFFT library for Bungee" FORCE)
+endif()
+
+if("${MLRVST_ESSENTIA_INCLUDE_DIR}" MATCHES "^/tmp($|/)"
+   OR "${MLRVST_ESSENTIA_LIBRARY}" MATCHES "^/tmp($|/)")
+    unset(MLRVST_ESSENTIA_INCLUDE_DIR CACHE)
+    unset(MLRVST_ESSENTIA_LIBRARY CACHE)
+endif()
+
+if("${MLRVST_BUNGEE_INCLUDE_DIR}" MATCHES "^/tmp($|/)"
+   OR "${MLRVST_BUNGEE_LIBRARY}" MATCHES "^/tmp($|/)"
+   OR "${MLRVST_BUNGEE_PFFFT_LIBRARY}" MATCHES "^/tmp($|/)")
+    unset(MLRVST_BUNGEE_INCLUDE_DIR CACHE)
+    unset(MLRVST_BUNGEE_LIBRARY CACHE)
+    unset(MLRVST_BUNGEE_PFFFT_LIBRARY CACHE)
+endif()
 
 # Export compile commands for IDE support
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -45,6 +111,23 @@ endif()
 # Add JUCE
 add_subdirectory("${MLRVST_JUCE_PATH}" "${CMAKE_CURRENT_BINARY_DIR}/JUCE")
 
+set(MLRVST_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(MLRVST_BUILD_INFO_HEADER "${MLRVST_GENERATED_DIR}/mlrvst_build_info.h")
+file(MAKE_DIRECTORY "${MLRVST_GENERATED_DIR}")
+file(WRITE "${MLRVST_BUILD_INFO_HEADER}"
+    "#pragma once\n"
+    "#define MLRVST_BUILD_VERSION \"${PROJECT_VERSION}\"\n"
+    "#define MLRVST_BUILD_STAMP \"configure\"\n"
+    "#define MLRVST_BUILD_STAMP_COMPACT \"configure\"\n")
+
+add_custom_target(mlrVST_build_info ALL
+    COMMAND "${CMAKE_COMMAND}"
+        -DOUTPUT_FILE=${MLRVST_BUILD_INFO_HEADER}
+        -DMLRVST_PROJECT_VERSION=${PROJECT_VERSION}
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateBuildInfo.cmake"
+    COMMENT "Generate mlrVST build metadata"
+    VERBATIM)
+
 # Plugin formats by platform
 set(MLRVST_PLUGIN_FORMATS VST3)
 set(MLRVST_AU_MAIN_TYPE_ARGS)
@@ -56,6 +139,8 @@ endif()
 # Plugin configuration
 juce_add_plugin(mlrVST
     COMPANY_NAME "mlrVST"
+    VERSION ${PROJECT_VERSION}
+    BUILD_VERSION ${PROJECT_VERSION}
     IS_SYNTH FALSE
     NEEDS_MIDI_INPUT TRUE
     NEEDS_MIDI_OUTPUT FALSE
@@ -97,6 +182,8 @@ target_sources(mlrVST
         Source/AudioEngine.h
         Source/PresetStore.cpp
         Source/PresetStore.h
+        Source/TimeStretchBackend.cpp
+        Source/TimeStretchBackend.h
         Source/SampleMode.cpp
         Source/SampleMode.h
         Source/MonomeController.cpp
@@ -148,6 +235,75 @@ if(MLRVST_ENABLE_SOUNDTOUCH)
     endif()
 else()
     target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_SOUNDTOUCH=0)
+endif()
+
+set(MLRVST_BUNGEE_ENABLED FALSE)
+if(MLRVST_ENABLE_BUNGEE)
+    find_path(MLRVST_BUNGEE_INCLUDE_DIR
+        NAMES bungee/Bungee.h
+        PATHS
+            "${MLRVST_BUNGEE_PREFIX}/include"
+            "${MLRVST_BUNGEE_SOURCE_DIR}"
+            /opt/homebrew/include
+            /usr/local/include)
+    find_library(MLRVST_BUNGEE_LIBRARY
+        NAMES bungee libbungee
+        PATHS
+            "${MLRVST_BUNGEE_PREFIX}/lib"
+            "${MLRVST_BUNGEE_BUILD_DIR}"
+            "${MLRVST_BUNGEE_BUILD_DIR}/Release"
+            /opt/homebrew/lib
+            /usr/local/lib)
+    find_library(MLRVST_BUNGEE_PFFFT_LIBRARY
+        NAMES pffft libpffft
+        PATHS
+            "${MLRVST_BUNGEE_PREFIX}/lib"
+            "${MLRVST_BUNGEE_BUILD_DIR}"
+            "${MLRVST_BUNGEE_BUILD_DIR}/Release")
+
+    if(MLRVST_BUNGEE_INCLUDE_DIR AND MLRVST_BUNGEE_LIBRARY AND MLRVST_BUNGEE_PFFFT_LIBRARY)
+        target_include_directories(mlrVST SYSTEM PRIVATE "${MLRVST_BUNGEE_INCLUDE_DIR}")
+        target_link_libraries(mlrVST PRIVATE "${MLRVST_BUNGEE_LIBRARY}" "${MLRVST_BUNGEE_PFFFT_LIBRARY}")
+        target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_BUNGEE=1)
+        set(MLRVST_BUNGEE_ENABLED TRUE)
+    else()
+        message(WARNING "Bungee requested but not found; Bungee stretch backend will be unavailable.")
+        target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_BUNGEE=0)
+    endif()
+else()
+    target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_BUNGEE=0)
+endif()
+
+set(MLRVST_ESSENTIA_ENABLED FALSE)
+find_path(MLRVST_ESSENTIA_INCLUDE_DIR
+    NAMES essentia/essentia.h
+    PATHS
+        "${MLRVST_ESSENTIA_PREFIX}/include"
+        /opt/homebrew/include
+        /usr/local/include)
+find_library(MLRVST_ESSENTIA_LIBRARY
+    NAMES essentia libessentia
+    PATHS
+        "${MLRVST_ESSENTIA_PREFIX}/lib"
+        /opt/homebrew/lib
+        /usr/local/lib)
+
+if(MLRVST_ESSENTIA_INCLUDE_DIR AND MLRVST_ESSENTIA_LIBRARY)
+    target_include_directories(mlrVST SYSTEM PRIVATE
+        "${MLRVST_ESSENTIA_INCLUDE_DIR}"
+        /opt/homebrew/Cellar/eigen/5.0.1/include/eigen3)
+    target_link_libraries(mlrVST PRIVATE "${MLRVST_ESSENTIA_LIBRARY}")
+    if(APPLE)
+        find_library(ACCELERATE_FRAMEWORK Accelerate)
+        if(ACCELERATE_FRAMEWORK)
+            target_link_libraries(mlrVST PRIVATE "${ACCELERATE_FRAMEWORK}")
+        endif()
+    endif()
+    target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_ESSENTIA_NATIVE=1)
+    set(MLRVST_ESSENTIA_ENABLED TRUE)
+else()
+    message(WARNING "Native Essentia not found; building with internal Flip analysis only.")
+    target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_ESSENTIA_NATIVE=0)
 endif()
 
 # Link libraries
@@ -232,7 +388,10 @@ endif()
 target_include_directories(mlrVST
     PRIVATE
         Source
+        "${MLRVST_GENERATED_DIR}"
 )
+
+add_dependencies(mlrVST mlrVST_build_info)
 
 # Third-party headers are treated as system includes to avoid surfacing
 # vendor warnings as project warnings.
@@ -272,6 +431,7 @@ message(STATUS "  C++ Standard: C++${CMAKE_CXX_STANDARD}")
 message(STATUS "  System: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "  Huovilainen model: ${MLRVST_ENABLE_HUOVILAINEN}")
 message(STATUS "  SoundTouch swing path: ${MLRVST_SOUNDTOUCH_ENABLED}")
+message(STATUS "  Bungee backend: ${MLRVST_BUNGEE_ENABLED}")
 message(STATUS "")
 message(STATUS "Plugin Formats:")
 message(STATUS "  ✓ VST3")

@@ -31,10 +31,14 @@
 #include <vector>
 
 #include "StepSampler.h"
+#include "TimeStretchBackend.h"
 #include "LadderFilterBase.h"
 
 #ifndef MLRVST_ENABLE_SOUNDTOUCH
 #define MLRVST_ENABLE_SOUNDTOUCH 0
+#endif
+#ifndef MLRVST_ENABLE_BUNGEE
+#define MLRVST_ENABLE_BUNGEE 0
 #endif
 
 //==============================================================================
@@ -162,6 +166,8 @@ public:
     {
         int stripIndex;
         int column;
+        int sampleSliceId = -1;
+        int64_t sampleStartSample = -1;
         double time; // in beats (relative to pattern start)
         bool isNoteOn;
         
@@ -178,7 +184,12 @@ public:
     void stopPlayback();
     void clear();
     
-    void recordEvent(int strip, int column, bool noteOn, double currentBeat);
+    void recordEvent(int strip,
+                     int column,
+                     bool noteOn,
+                     double currentBeat,
+                     int sampleSliceId = -1,
+                     int64_t sampleStartSample = -1);
     
     // Check if recording should auto-stop (returns true if stopped)
     bool updateRecording(double currentBeat);
@@ -423,6 +434,7 @@ public:
     std::atomic<float> gateSpeed{4.0f};     // cycles per beat (default 1/16)
     std::atomic<float> gateEnvelope{0.5f};  // 0..1 smoothing
     std::atomic<float> gateShape{0.5f};     // 0..1 pulse/curve shape
+    std::atomic<int> sampleModeLegacyLoopEngineEnabled{0};
     
     // Public methods
     EnhancedAudioStrip(int stripIndex);
@@ -553,14 +565,27 @@ public:
     {
         return juce::jlimit(0.125f, 8.0f, resamplePitchRatio.load(std::memory_order_acquire));
     }
+    void setStretchBackend(TimeStretchBackend backend);
+    TimeStretchBackend getStretchBackend() const
+    {
+        return sanitizeTimeStretchBackend(soundTouchEnabled.load(std::memory_order_acquire));
+    }
     void setSoundTouchEnabled(bool enabled);
-    bool isSoundTouchEnabled() const { return soundTouchEnabled.load(std::memory_order_acquire) != 0; }
+    bool isSoundTouchEnabled() const { return getStretchBackend() != TimeStretchBackend::Resample; }
     void setScratchAmount(float amount) { scratchAmount = juce::jlimit(0.0f, 100.0f, amount); }
     float getScratchAmount() const { return scratchAmount.load(); }
     void setReverse(bool shouldReverse);
     bool isReversed() const { return reverse; }
     void setTransientSliceMode(bool enabled);
     bool isTransientSliceMode() const { return transientSliceMode.load(std::memory_order_acquire); }
+    void setSampleModeLegacyLoopEngineEnabled(bool enabled)
+    {
+        sampleModeLegacyLoopEngineEnabled.store(enabled ? 1 : 0, std::memory_order_release);
+    }
+    bool isSampleModeLegacyLoopEngineEnabled() const
+    {
+        return sampleModeLegacyLoopEngineEnabled.load(std::memory_order_acquire) != 0;
+    }
     void setLoopSliceLength(float amount) { loopSliceLength.store(juce::jlimit(0.02f, 1.0f, amount), std::memory_order_release); }
     float getLoopSliceLength() const { return loopSliceLength.load(std::memory_order_acquire); }
     std::array<int, 16> getSliceStartSamples(bool transientMode) const;
@@ -900,7 +925,7 @@ private:
     };
 
     juce::AudioBuffer<float> sampleBuffer;
-#if MLRVST_ENABLE_SOUNDTOUCH
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     juce::AudioBuffer<float> soundTouchSwingCacheBuffer;
     bool soundTouchSwingCacheValid = false;
     double soundTouchSwingCacheLoopStart = -1.0;
@@ -1195,7 +1220,7 @@ public:
     float getPanGain(int channel) const; // 0=left, 1=right
     void rebuildTransientSliceMap();
     void rebuildSampleAnalysisCacheLocked();
-#if MLRVST_ENABLE_SOUNDTOUCH
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     bool shouldUseSoundTouchSwingCache(double loopLength, double beatsForLoop, int loopCols,
                                        bool isScratching, double playheadTraversalRatio) const;
     bool rebuildSoundTouchSwingCache(double loopStartSamples, double loopLength, double beatsForLoop, int loopCols);
@@ -1338,6 +1363,8 @@ public:
                                                         double quantizeBeats)>;
     using SampleModeTriggerCallback = std::function<void(int stripIndex,
                                                          int column,
+                                                         int sampleSliceId,
+                                                         int64_t sampleStartSample,
                                                          int64_t triggerSample,
                                                          const juce::AudioPlayHead::PositionInfo& positionInfo,
                                                          bool isMomentaryStutter)>;
@@ -1363,7 +1390,11 @@ public:
     // Quantization
     void setQuantization(int division);
     void scheduleQuantizedTrigger(int stripIndex, int column, double currentPPQ);
-    void triggerStripWithQuantization(int stripIndex, int column, bool useQuantize);
+    void triggerStripWithQuantization(int stripIndex,
+                                      int column,
+                                      bool useQuantize,
+                                      int sampleSliceId = -1,
+                                      int64_t sampleStartSample = -1);
     bool hasPendingTrigger(int stripIndex) const { return quantizeClock.hasPendingTrigger(stripIndex); }
     void setMomentaryStutterActive(bool enabled);
     void setMomentaryStutterDivision(double beats);
@@ -1472,8 +1503,13 @@ public:
     float getTriggerFadeInMs() const { return triggerFadeInMs.load(std::memory_order_acquire); }
     void setGlobalSwingDivision(EnhancedAudioStrip::SwingDivision division);
     EnhancedAudioStrip::SwingDivision getGlobalSwingDivision() const;
+    void setGlobalStretchBackend(TimeStretchBackend backend);
+    TimeStretchBackend getGlobalStretchBackend() const
+    {
+        return sanitizeTimeStretchBackend(soundTouchEnabled.load(std::memory_order_acquire));
+    }
     void setGlobalSoundTouchEnabled(bool enabled);
-    bool isGlobalSoundTouchEnabled() const { return soundTouchEnabled.load(std::memory_order_acquire) != 0; }
+    bool isGlobalSoundTouchEnabled() const { return getGlobalStretchBackend() != TimeStretchBackend::Resample; }
     
     // Input metering
     float getInputLevelL() const { return inputLevelL.load(); }

@@ -19,6 +19,7 @@ bool loadPreset(int presetIndex,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,
                 const std::function<bool(int, const juce::File&)>& loadSampleToStrip,
+                const std::function<void(int, const juce::File&)>& restoreStripSamplePath,
                 const std::function<void(int, const juce::XmlElement*)>& applyFlipStateXml,
                 double hostPpqSnapshot,
                 double hostTempoSnapshot);

@@ -6,6 +6,8 @@
 #include <juce_events/juce_events.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 
+#include "TimeStretchBackend.h"
+
 #include <array>
 #include <atomic>
 #include <functional>
@@ -32,8 +34,9 @@ struct SampleAnalysisSummary
     double estimatedTempoBpm = 0.0;
     double estimatedPitchHz = 0.0;
     int estimatedPitchMidi = -1;
-    bool audioFluxUsed = false;
+    bool essentiaUsed = false;
     juce::String analysisSource;
+    std::vector<int64_t> beatTickSamples;
     std::vector<int64_t> transientSamples;
 };
 
@@ -60,7 +63,7 @@ struct SampleSlice
 
 struct LoadedSampleData
 {
-    static constexpr int PreviewPointCount = 2048;
+    static constexpr int PreviewPointCount = 8192;
 
     juce::AudioBuffer<float> audioBuffer;
     juce::String sourcePath;
@@ -91,6 +94,8 @@ struct SampleModePersistentState
     int visibleSliceBankIndex = 0;
     SampleSliceMode sliceMode = SampleSliceMode::Uniform;
     SampleTriggerMode triggerMode = SampleTriggerMode::OneShot;
+    bool useLegacyLoopEngine = false;
+    int legacyLoopBarSelection = 0;
     int beatDivision = 1;
     float viewZoom = 1.0f;
     float viewScroll = 0.0f;
@@ -98,8 +103,10 @@ struct SampleModePersistentState
     double analyzedTempoBpm = 0.0;
     double analyzedPitchHz = 0.0;
     int analyzedPitchMidi = -1;
+    bool essentiaUsed = false;
     juce::String analysisSource;
     std::vector<SampleCuePoint> cuePoints;
+    std::vector<int64_t> transientEditSamples;
     std::vector<SampleSlice> storedSlices;
 
     juce::ValueTree createValueTree(const juce::Identifier& type = "FlipState") const;
@@ -129,7 +136,8 @@ public:
                                                        int totalSliceCount = VisibleSliceCount);
     static std::vector<SampleSlice> buildBeatSlices(const LoadedSampleData& sampleData,
                                                     double tempoBpm,
-                                                    int beatDivision);
+                                                    int beatDivision,
+                                                    const std::vector<int64_t>& beatTickSamples = {});
     static std::vector<SampleSlice> buildTransientSlices(const LoadedSampleData& sampleData,
                                                          const std::vector<int64_t>& transientSamples);
     static std::vector<SampleSlice> buildManualSlices(const LoadedSampleData& sampleData,
@@ -143,7 +151,15 @@ private:
 class SampleAnalysisEngine
 {
 public:
-    void enrichAnalysisForFile(const juce::File& file, LoadedSampleData& sampleData) const;
+    using ProgressCallback = std::function<void(float progress, const juce::String& statusText)>;
+
+    SampleAnalysisSummary analyzeLoadedSample(const juce::File& file,
+                                             const juce::AudioBuffer<float>& audioBuffer,
+                                             double sourceSampleRate,
+                                             ProgressCallback progressCallback = {}) const;
+    void enrichAnalysisForFile(const juce::File& file,
+                               LoadedSampleData& sampleData,
+                               ProgressCallback progressCallback = {}) const;
     std::vector<SampleSlice> buildSlicesForState(const LoadedSampleData& sampleData,
                                                  const SampleModePersistentState& state) const;
 };
@@ -161,17 +177,20 @@ public:
     };
 
     using LoadCallback = std::function<void(LoadResult)>;
+    using ProgressCallback = std::function<void(int requestId, float progress, juce::String statusText)>;
 
     SampleFileManager();
     ~SampleFileManager();
 
-    int loadFileAsync(const juce::File& file, LoadCallback callback);
+    int loadFileAsync(const juce::File& file, LoadCallback callback, ProgressCallback progressCallback = {});
     void cancelPendingLoads();
 
 private:
     class LoadJob;
 
-    LoadResult decodeFile(const juce::File& file, int requestId);
+    LoadResult decodeFile(const juce::File& file,
+                          int requestId,
+                          const std::function<void(float progress, const juce::String& statusText)>& progressCallback);
 
     juce::AudioFormatManager formatManager;
     juce::ThreadPool threadPool { 1 };
@@ -221,6 +240,21 @@ private:
 class SampleModeEngine : public juce::ChangeBroadcaster
 {
 public:
+    static constexpr int MaxPlaybackVoices = 2;
+
+    struct LegacyLoopSyncInfo
+    {
+        std::shared_ptr<const LoadedSampleData> loadedSample;
+        std::array<SampleSlice, SliceModel::VisibleSliceCount> visibleSlices {};
+        int visibleBankIndex = 0;
+        int triggerVisibleSlot = -1;
+        float visibleBankBeats = 0.0f;
+        double analyzedTempoBpm = 0.0;
+        int legacyLoopBarSelection = 0;
+        SampleSliceMode sliceMode = SampleSliceMode::Uniform;
+        std::vector<int64_t> markerSamples;
+    };
+
     struct RenderResult
     {
         bool renderedAnything = false;
@@ -231,6 +265,7 @@ public:
     {
         bool hasSample = false;
         bool isLoading = false;
+        float analysisProgress = 0.0f;
         juce::String statusText { "No sample loaded" };
         juce::String samplePath;
         juce::String displayName;
@@ -246,6 +281,8 @@ public:
         float playbackProgress = -1.0f;
         SampleSliceMode sliceMode = SampleSliceMode::Uniform;
         SampleTriggerMode triggerMode = SampleTriggerMode::OneShot;
+        bool useLegacyLoopEngine = false;
+        int legacyLoopBarSelection = 0;
         int beatDivision = 1;
         float viewZoom = 1.0f;
         float viewScroll = 0.0f;
@@ -253,8 +290,10 @@ public:
         double estimatedTempoBpm = 0.0;
         double estimatedPitchHz = 0.0;
         int estimatedPitchMidi = -1;
+        bool essentiaUsed = false;
         juce::String analysisSource;
         std::vector<SampleCuePoint> cuePoints;
+        std::vector<int64_t> transientMarkers;
         std::array<SampleSlice, SliceModel::VisibleSliceCount> visibleSlices {};
     };
 
@@ -278,12 +317,27 @@ public:
     bool canNavigateVisibleBankLeft() const;
     bool canNavigateVisibleBankRight() const;
     void stepVisibleBank(int delta);
+    void randomizeVisibleBank();
     bool hasVisibleSlice(int visibleSlot) const;
+    bool getVisibleSliceInfo(int visibleSlot, SampleSlice& sliceOut) const;
+    bool getLegacyLoopSyncInfo(LegacyLoopSyncInfo& syncInfo) const;
+    bool resolveLegacyLoopTriggerSyncInfo(int preferredVisibleSlot,
+                                          int sliceId,
+                                          int64_t sliceStartSample,
+                                          LegacyLoopSyncInfo& syncInfo) const;
     int getActiveVisibleSliceSlot() const noexcept;
     int getPendingVisibleSliceSlot() const noexcept;
     void setPendingVisibleSlice(int visibleSlot);
     void clearPendingVisibleSlice();
     bool triggerVisibleSlice(int visibleSlot, bool forceLoop = false);
+    bool triggerRecordedSlice(int preferredVisibleSlot,
+                              int sliceId,
+                              int64_t sliceStartSample,
+                              bool forceLoop = false);
+    void updateLegacyLoopMonitorState(bool isPlaying,
+                                      int visibleSlot,
+                                      float playbackProgressNormalized);
+    void clearLegacyLoopMonitorState();
     RenderResult renderToBuffer(juce::AudioBuffer<float>& output,
                                 int startSample,
                                 int numSamples,
@@ -293,7 +347,8 @@ public:
                                 bool preferHighQualityKeyLock);
     void requestKeyLockRenderCache(float playbackRate,
                                    float pitchSemitones,
-                                   bool enabled);
+                                   bool enabled,
+                                   TimeStretchBackend backend);
 
     SampleModePersistentState capturePersistentState() const;
     void applyPersistentState(const SampleModePersistentState& state);
@@ -302,6 +357,13 @@ public:
     SampleSliceMode getSliceMode() const;
     void setTriggerMode(SampleTriggerMode mode);
     SampleTriggerMode getTriggerMode() const;
+    void setLegacyLoopEngineEnabled(bool enabled);
+    bool isLegacyLoopEngineEnabled() const;
+    void setLegacyLoopBarSelection(int selection);
+    int getLegacyLoopBarSelection() const;
+    bool nudgeLegacyLoopWindowByAnchorDelta(int delta);
+    void scaleAnalyzedTempo(double factor);
+    double getAnalyzedTempoBpm() const;
     void setBeatDivision(int division);
     int getBeatDivision() const;
     void setViewWindow(float scroll, float zoom);
@@ -310,21 +372,46 @@ public:
     void selectCuePoint(int cueIndex);
     int getSelectedCuePoint() const;
     int createCuePointAtNormalizedPosition(float normalizedPosition);
-    bool moveCuePoint(int cueIndex, float normalizedPosition);
+    int moveCuePoint(int cueIndex, float normalizedPosition);
     bool deleteCuePoint(int cueIndex);
+    int createTransientMarkerAtNormalizedPosition(float normalizedPosition);
+    int moveTransientMarker(int markerIndex, float normalizedPosition);
+    int moveTransientMarkerToNearestDetectedTransient(int markerIndex, float normalizedPosition);
+    bool moveVisibleSliceToPosition(int visibleSlot, float normalizedPosition);
+    bool moveVisibleSliceToNearestTransient(int visibleSlot, float normalizedPosition);
+    bool deleteTransientMarker(int markerIndex);
 
     using LoadStatusCallback = std::function<void(const SampleFileManager::LoadResult&)>;
+    using LoadProgressCallback = std::function<void(int requestId, float progress, juce::String statusText)>;
     void setLoadStatusCallback(LoadStatusCallback callback);
 
 private:
     bool resolveVisibleSlice(int visibleSlot, SampleSlice& sliceOut) const;
+    std::array<SampleSlice, SliceModel::VisibleSliceCount> getCurrentVisibleSlicesLocked() const;
+    bool computeLegacyLoopWindowRangeLocked(int64_t& rangeStartSample, int64_t& rangeEndSample) const;
+    int findTransientMarkerIndexForVisibleSlotLocked(int visibleSlot);
+    std::array<SampleSlice, SliceModel::VisibleSliceCount> buildLegacyLoopWindowVisibleSlicesLocked(int64_t rangeStartSample,
+                                                                                                     int64_t rangeEndSample) const;
+    int64_t getDefaultLegacyLoopWindowStartSampleLocked() const;
+    std::vector<int64_t> buildLegacyLoopAnchorCandidatesLocked() const;
+    void fitViewToLegacyLoopWindowLocked();
+    void clearRandomVisibleSliceOverrideLocked();
+    void resetSampleSpecificStateLocked();
+    bool buildLegacyLoopSyncInfoForSliceIndexLocked(int sliceIndex, LegacyLoopSyncInfo& syncInfo) const;
     void handleLoadResult(SampleFileManager::LoadResult result);
+    void handleLoadProgress(int requestId, float progress, const juce::String& statusText);
     void handleKeyLockCacheReady(uint64_t generation,
                                  std::vector<std::shared_ptr<const StretchedSliceBuffer>> caches,
                                  float playbackRate,
                                  float pitchSemitones,
                                  int visibleBankIndex);
+    void materializeTransientMarkersLocked();
     void rebuildSlicesLocked();
+    bool triggerResolvedSlice(const SampleSlice& slice, int resolvedVisibleSlot, SampleTriggerMode triggerMode);
+    bool resolveRecordedSlice(int sliceId,
+                              int64_t sliceStartSample,
+                              SampleSlice& sliceOut,
+                              int& resolvedVisibleSlot) const;
     std::shared_ptr<const StretchedSliceBuffer> findKeyLockCacheForSlice(const SampleSlice& slice,
                                                                          float playbackRate,
                                                                          float pitchSemitones) const;
@@ -340,26 +427,35 @@ private:
     SampleAnalysisEngine analysisEngine;
     SliceModel sliceModel;
     SampleModePersistentState persistentState;
-    std::array<SamplePlaybackVoice, 4> playbackVoices;
+    std::array<SamplePlaybackVoice, MaxPlaybackVoices> playbackVoices;
     std::shared_ptr<const LoadedSampleData> loadedSample;
     LoadStatusCallback loadStatusCallback;
     bool isLoading = false;
+    float analysisProgress = 0.0f;
     juce::String statusText { "No sample loaded" };
     int activeRequestId = 0;
     bool pendingTriggerSliceValid = false;
     SampleSlice pendingTriggerSlice;
+    bool randomVisibleSliceOverrideActive = false;
+    std::array<SampleSlice, SliceModel::VisibleSliceCount> randomVisibleSlices {};
+    int64_t legacyLoopWindowStartSample = -1;
+    bool legacyLoopWindowManualAnchor = false;
     std::atomic<double> preparedSampleRate { 44100.0 };
     std::atomic<int> preparedMaxBlockSize { 512 };
     std::atomic<int> activeVisibleSliceSlot { -1 };
     std::atomic<int> pendingVisibleSliceSlot { -1 };
     std::atomic<float> playbackProgress { -1.0f };
     std::atomic<int> playingAtomic { 0 };
+    std::atomic<int> legacyLoopActiveVisibleSliceSlot { -1 };
+    std::atomic<float> legacyLoopPlaybackProgress { -1.0f };
+    std::atomic<int> legacyLoopPlayingAtomic { 0 };
     uint64_t nextVoiceId = 1;
     bool keyLockCacheEnabled = false;
     bool keyLockCacheBuildInFlight = false;
     uint64_t keyLockCacheGeneration = 0;
     float keyLockCachePlaybackRate = 1.0f;
     float keyLockCachePitchSemitones = 0.0f;
+    TimeStretchBackend keyLockCacheBackend = TimeStretchBackend::SoundTouch;
     int keyLockCacheVisibleBankIndex = -1;
     std::vector<std::shared_ptr<const StretchedSliceBuffer>> keyLockCaches;
 
@@ -375,6 +471,7 @@ public:
     ~SampleModeComponent() override;
 
     void setEngine(SampleModeEngine* engineToUse);
+    void setWaveformColour(juce::Colour colour);
 
     void paint(juce::Graphics& g) override;
     void resized() override;
@@ -387,27 +484,52 @@ public:
 
     std::function<void(int visibleSlot)> onTriggerVisibleSlice;
     std::function<void(int delta)> onNavigateVisibleBank;
+    std::function<void()> onRequestLoad;
+    std::function<void()> onCopyToLoop;
+    std::function<void()> onCopyToGrain;
+    std::function<void()> onRequestLegacyLoopBarsMenu;
 
 private:
     void refreshFromEngine();
     int hitTestVisibleSlice(const juce::Point<int>& point) const;
+    int hitTestVisibleSliceMarker(const juce::Point<int>& point) const;
     int hitTestCuePoint(const juce::Point<int>& point) const;
+    int findCuePointForVisibleSlice(int visibleSlot) const;
+    int findTransientMarkerForVisibleSlice(int visibleSlot) const;
     float normalizedPositionFromPoint(const juce::Point<int>& point) const;
     juce::Range<float> getVisibleRange() const;
     juce::Rectangle<int> getSliceModeButtonBounds(SampleSliceMode mode) const;
     juce::Rectangle<int> getTriggerModeButtonBounds(SampleTriggerMode mode) const;
+    juce::Rectangle<int> getLegacyLoopButtonBounds() const;
+    juce::Rectangle<int> getLegacyLoopBarsButtonBounds() const;
+    juce::Rectangle<int> getVisibleLegacyLoopRangeBounds() const;
     void timerCallback() override;
 
     SampleModeEngine* engine = nullptr;
     SampleModeEngine::StateSnapshot stateSnapshot;
     std::shared_ptr<const LoadedSampleData> loadedSample;
     juce::Rectangle<int> waveformBounds;
-    juce::Rectangle<int> leftNavBounds;
-    juce::Rectangle<int> rightNavBounds;
+    juce::Rectangle<int> prev16Bounds;
+    juce::Rectangle<int> next16Bounds;
+    juce::Rectangle<int> random16Bounds;
+    juce::Rectangle<int> tempoHalfBounds;
+    juce::Rectangle<int> tempoDoubleBounds;
+    juce::Rectangle<int> copyLoopBounds;
+    juce::Rectangle<int> copyGrainBounds;
+    juce::Rectangle<int> legacyLoopBarsBounds;
     juce::Rectangle<int> sliceModeArea;
     juce::Rectangle<int> triggerModeArea;
+    juce::Rectangle<int> legacyLoopArea;
+    bool draggingLegacyLoopWindow = false;
+    int legacyLoopDragStartX = 0;
+    int legacyLoopDragStepOffset = 0;
+    int draggingVisibleSliceSlot = -1;
     int draggingCueIndex = -1;
+    int draggingTransientIndex = -1;
     bool createdCueOnMouseDown = false;
+    juce::Colour waveformColour { juce::Colour(0xff6ca7ff) };
+
+    int hitTestTransientMarker(const juce::Point<int>& point) const;
 };
 
 class MonomeSamplePage

@@ -10,6 +10,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "PlayheadSpeedQuantizer.h"
+#include "mlrvst_build_info.h"
 #include <cmath>
 #include <juce_audio_formats/juce_audio_formats.h>
 
@@ -101,6 +102,16 @@ juce::String getPlayheadSpeedLabel(float ratio)
 float getPlayheadSpeedRatioForStrip(const EnhancedAudioStrip& strip)
 {
     return PlayheadSpeedQuantizer::quantizeRatio(strip.getPlayheadSpeedRatio());
+}
+
+juce::String getCompactNoteName(int midiNote)
+{
+    static constexpr const char* names[] = { "C", "C#", "D", "D#", "E", "F",
+                                             "F#", "G", "G#", "A", "A#", "B" };
+    if (midiNote < 0)
+        return "?";
+    const int clamped = juce::jlimit(0, 127, midiNote);
+    return juce::String(names[clamped % 12]) + juce::String((clamped / 12) - 1);
 }
 
 juce::String getMonomePageDisplayName(MlrVSTAudioProcessor::ControlMode mode)
@@ -1187,6 +1198,7 @@ void StripControl::setupComponents()
     addAndMakeVisible(waveform);
 
     sampleModeComponent.setEngine(nullptr);
+    sampleModeComponent.setWaveformColour(stripColor);
     sampleModeComponent.onTriggerVisibleSlice = [this](int visibleSlot)
     {
         processor.triggerStrip(stripIndex, visibleSlot);
@@ -1195,6 +1207,92 @@ void StripControl::setupComponents()
     {
         if (auto* engine = processor.getSampleModeEngine(stripIndex, false))
             engine->stepVisibleBank(delta);
+    };
+    sampleModeComponent.onRequestLoad = [this]()
+    {
+        loadSample();
+    };
+    sampleModeComponent.onCopyToLoop = [this]()
+    {
+        juce::PopupMenu menu;
+        for (int targetStrip = 0; targetStrip < MlrVSTAudioProcessor::MaxStrips; ++targetStrip)
+        {
+            const bool sameStrip = (targetStrip == stripIndex);
+            menu.addItem(targetStrip + 1,
+                         sameStrip
+                             ? ("S" + juce::String(targetStrip + 1) + " (This)")
+                             : ("S" + juce::String(targetStrip + 1)));
+        }
+
+        juce::Component::SafePointer<StripControl> safeThis(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&sampleModeComponent),
+                           [safeThis](int result)
+                           {
+                               if (safeThis == nullptr || result <= 0)
+                                   return;
+
+                               const int targetStrip = result - 1;
+                               if (safeThis->processor.copyFlipCurrentSlicesToMode(safeThis->stripIndex,
+                                                                                   targetStrip,
+                                                                                   EnhancedAudioStrip::PlayMode::Loop)
+                                   && targetStrip == safeThis->stripIndex)
+                               {
+                                   safeThis->playModeBox.setSelectedId(static_cast<int>(EnhancedAudioStrip::PlayMode::Loop) + 1,
+                                                                       juce::sendNotification);
+                               }
+                           });
+    };
+    sampleModeComponent.onCopyToGrain = [this]()
+    {
+        if (processor.copyFlipCurrentSlicesToMode(stripIndex, EnhancedAudioStrip::PlayMode::Grain))
+            playModeBox.setSelectedId(static_cast<int>(EnhancedAudioStrip::PlayMode::Grain) + 1, juce::sendNotification);
+    };
+    sampleModeComponent.onRequestLegacyLoopBarsMenu = [this]()
+    {
+        auto* sampleEngine = processor.getSampleModeEngine(stripIndex, false);
+        if (sampleEngine == nullptr)
+            return;
+
+        juce::PopupMenu menu;
+        const int currentSelection = sampleEngine->getLegacyLoopBarSelection();
+        const struct Item { int id; const char* label; int selection; } items[] = {
+            { 1, "Auto", 0 },
+            { 2, "1/4 Bar", 25 },
+            { 3, "1/2 Bar", 50 },
+            { 4, "1 Bar", 100 },
+            { 5, "2 Bars", 200 },
+            { 6, "4 Bars", 400 },
+            { 7, "8 Bars", 800 }
+        };
+
+        for (const auto& item : items)
+            menu.addItem(item.id, item.label, true, currentSelection == item.selection);
+
+        juce::Component::SafePointer<StripControl> safeThis(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&sampleModeComponent),
+                           [safeThis](int result)
+                           {
+                               if (safeThis == nullptr || result <= 0)
+                                   return;
+
+                               auto* engine = safeThis->processor.getSampleModeEngine(safeThis->stripIndex, false);
+                               if (engine == nullptr)
+                                   return;
+
+                               switch (result)
+                               {
+                                   case 2: engine->setLegacyLoopBarSelection(25); break;
+                                   case 3: engine->setLegacyLoopBarSelection(50); break;
+                                   case 4: engine->setLegacyLoopBarSelection(100); break;
+                                   case 5: engine->setLegacyLoopBarSelection(200); break;
+                                   case 6: engine->setLegacyLoopBarSelection(400); break;
+                                   case 7: engine->setLegacyLoopBarSelection(800); break;
+                                   case 1:
+                                   default:
+                                       engine->setLegacyLoopBarSelection(0);
+                                       break;
+                               }
+                           });
     };
     addChildComponent(sampleModeComponent);
     
@@ -1243,6 +1341,18 @@ void StripControl::setupComponents()
     loadButton.onClick = [this]() { loadSample(); };
     loadButton.setTooltip("Load sample into this strip.");
     addAndMakeVisible(loadButton);
+
+    pitchMasterButton.setButtonText("PM");
+    pitchMasterButton.onClick = [this]() { processor.requestLoopStripPitchMaster(stripIndex); };
+    pitchMasterButton.setTooltip("Analyze this strip asynchronously and set the detected note as the global root note.");
+    styleUiButton(pitchMasterButton);
+    addAndMakeVisible(pitchMasterButton);
+
+    pitchSyncButton.setButtonText("PS");
+    pitchSyncButton.onClick = [this]() { processor.requestLoopStripPitchSync(stripIndex); };
+    pitchSyncButton.setTooltip("Analyze this strip asynchronously and repitch it to the current global root note.");
+    styleUiButton(pitchSyncButton);
+    addAndMakeVisible(pitchSyncButton);
 
     transientSliceButton.setButtonText("TIME");
     transientSliceButton.setClickingTogglesState(true);
@@ -2786,7 +2896,7 @@ void StripControl::mouseUp(const juce::MouseEvent&)
 void StripControl::hideAllPrimaryControls()
 {
     auto hide = [](juce::Component& c){ c.setVisible(false); };
-    hide(loadButton); hide(transientSliceButton); hide(playModeBox); hide(directionModeBox); hide(groupSelector);
+    hide(loadButton); hide(pitchMasterButton); hide(pitchSyncButton); hide(transientSliceButton); hide(playModeBox); hide(directionModeBox); hide(groupSelector);
     hide(volumeSlider); hide(panSlider); hide(pitchSlider); hide(speedSlider); hide(scratchSlider); hide(sliceLengthSlider); hide(patternLengthBox); hide(stepLengthReadoutBox);
     hide(stepAttackSlider); hide(stepDecaySlider); hide(stepReleaseSlider);
     hide(tempoLabel); hide(recordBarsBox); hide(recordButton); hide(recordBarsLabel);
@@ -2888,7 +2998,7 @@ void StripControl::resized()
     const bool isSampleMode = showingSampleMode;
     
     // Main area splits: waveform left, controls right
-    auto controlsArea = bounds.removeFromRight(isSampleMode ? 184 : 228);
+    auto controlsArea = bounds.removeFromRight(228);
     
     // Waveform OR step display gets all remaining space
     waveform.setBounds(bounds);
@@ -3014,6 +3124,9 @@ void StripControl::resized()
     }
 
     loadButton.setVisible(true);
+    const bool showLoopPitchButtons = !isSampleMode && !showingStepDisplay && !grainOverlayVisible;
+    pitchMasterButton.setVisible(showLoopPitchButtons);
+    pitchSyncButton.setVisible(showLoopPitchButtons);
     transientSliceButton.setVisible(!isSampleMode);
     playModeBox.setVisible(true);
     directionModeBox.setVisible(!isSampleMode);
@@ -3056,15 +3169,35 @@ void StripControl::resized()
     if (isSampleMode)
     {
         loadButton.setBounds(topRow.reduced(0, 0));
+        pitchMasterButton.setBounds({});
+        pitchSyncButton.setBounds({});
         transientSliceButton.setBounds({});
     }
     else
     {
-        const int half = topRow.getWidth() / 2;
-        auto loadArea = topRow.removeFromLeft(half);
-        loadButton.setBounds(loadArea.reduced(0, 0));
-        topRow.removeFromLeft(2);
-        transientSliceButton.setBounds(topRow);
+        if (showLoopPitchButtons)
+        {
+            auto loadArea = topRow.removeFromLeft(juce::jmax(36, topRow.getWidth() * 2 / 5));
+            loadButton.setBounds(loadArea.reduced(0, 0));
+            topRow.removeFromLeft(2);
+            auto transientArea = topRow.removeFromLeft(juce::jmax(32, topRow.getWidth() / 2));
+            transientSliceButton.setBounds(transientArea);
+            topRow.removeFromLeft(2);
+            auto pitchMasterArea = topRow.removeFromLeft(juce::jmax(24, topRow.getWidth() / 2));
+            pitchMasterButton.setBounds(pitchMasterArea);
+            topRow.removeFromLeft(2);
+            pitchSyncButton.setBounds(topRow);
+        }
+        else
+        {
+            const int half = topRow.getWidth() / 2;
+            auto loadArea = topRow.removeFromLeft(half);
+            loadButton.setBounds(loadArea.reduced(0, 0));
+            pitchMasterButton.setBounds({});
+            pitchSyncButton.setBounds({});
+            topRow.removeFromLeft(2);
+            transientSliceButton.setBounds(topRow);
+        }
     }
     controlsArea.removeFromTop(rowGap);
     
@@ -3683,6 +3816,18 @@ void StripControl::updateFromEngine()
     const bool transientMode = strip->isTransientSliceMode();
     transientSliceButton.setToggleState(transientMode, juce::dontSendNotification);
     transientSliceButton.setButtonText(transientMode ? "TRANS" : "TIME");
+    const bool pitchAnalysisBusy = processor.isLoopStripPitchAnalysisInFlight(stripIndex);
+    const int detectedPitchMidi = processor.getLoopStripDetectedPitchMidi(stripIndex);
+    const int rootNoteMidi = processor.getGlobalRootNoteMidi();
+    pitchMasterButton.setEnabled(!pitchAnalysisBusy);
+    pitchSyncButton.setEnabled(!pitchAnalysisBusy);
+    pitchMasterButton.setButtonText(pitchAnalysisBusy ? "..." : "PM");
+    pitchSyncButton.setButtonText(pitchAnalysisBusy ? "..." : "PS");
+    pitchMasterButton.setTooltip("Analyze this strip asynchronously and set the detected note as the global root note. Current root: "
+                                 + getCompactNoteName(rootNoteMidi)
+                                 + (detectedPitchMidi >= 0 ? (" | last detect: " + getCompactNoteName(detectedPitchMidi)) : juce::String()));
+    pitchSyncButton.setTooltip("Analyze this strip asynchronously and repitch it to the current global root note ("
+                               + getCompactNoteName(rootNoteMidi) + ").");
     updateGrainOverlayVisibility();
     if (!modulates(ModernAudioEngine::ModTarget::GrainSize))
         grainSizeSlider.setValue(strip->getGrainSizeMs(), juce::dontSendNotification);
@@ -4662,14 +4807,43 @@ void MonomeGridDisplay::updateFromEngine()
                 if (auto* sampleEngine = processor.getSampleModeEngine(stripIndex, false))
                 {
                     const auto snapshot = sampleEngine->getStateSnapshot();
+                    const bool legacyLoopFeedback = snapshot.useLegacyLoopEngine
+                        || strip->isSampleModeLegacyLoopEngineEnabled();
+                    const bool loopTriggerMode = snapshot.triggerMode == SampleTriggerMode::Loop;
+                    const int heldSlot = processor.getSampleModeHeldVisibleSliceSlot(stripIndex);
+                    int playbackSlot = -1;
+                    if (!legacyLoopFeedback && snapshot.playbackProgress >= 0.0f)
+                    {
+                        for (int x = 0; x < gridWidth && x < 16; ++x)
+                        {
+                            const auto& slice = snapshot.visibleSlices[static_cast<size_t>(x)];
+                            if (slice.id < 0)
+                                continue;
+                            const bool isLastSlice = (x == 15);
+                            if (snapshot.playbackProgress >= slice.normalizedStart
+                                && (snapshot.playbackProgress < slice.normalizedEnd
+                                    || (isLastSlice && snapshot.playbackProgress <= slice.normalizedEnd)))
+                            {
+                                playbackSlot = x;
+                                break;
+                            }
+                        }
+                    }
                     for (int x = 0; x < gridWidth && x < 16; ++x)
                     {
                         int brightness = 0;
                         if (snapshot.visibleSlices[static_cast<size_t>(x)].id >= 0)
-                            brightness = snapshot.isPlaying ? 4 : 2;
+                            brightness = legacyLoopFeedback
+                                ? (strip->isPlaying() ? 4 : 2)
+                                : (snapshot.isPlaying ? (loopTriggerMode ? 8 : 6)
+                                                      : (loopTriggerMode ? 5 : 3));
                         if (snapshot.pendingVisibleSliceSlot == x)
-                            brightness = juce::jmax(brightness, 9);
-                        if (snapshot.activeVisibleSliceSlot == x)
+                            brightness = juce::jmax(brightness, loopTriggerMode ? 12 : 10);
+                        if (!legacyLoopFeedback && heldSlot == x)
+                            brightness = juce::jmax(brightness, loopTriggerMode ? 11 : 9);
+                        if ((legacyLoopFeedback && snapshot.activeVisibleSliceSlot == x) || playbackSlot == x)
+                            brightness = 15;
+                        else if (!legacyLoopFeedback && snapshot.activeVisibleSliceSlot == x)
                             brightness = 15;
                         ledState[x][monomeRow] = brightness;
                     }
@@ -4987,11 +5161,11 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(titleLabel);
     titleLabel.setTooltip("Master timing, quality, monitoring, and UI help settings.");
 
-    versionLabel.setText("v" + juce::String(JucePlugin_VersionString), juce::dontSendNotification);
+    versionLabel.setText("v" + juce::String(MLRVST_BUILD_VERSION), juce::dontSendNotification);
     versionLabel.setJustificationType(juce::Justification::centredRight);
     versionLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
     versionLabel.setColour(juce::Label::textColourId, kTextMuted);
-    versionLabel.setTooltip("Plugin version.");
+    versionLabel.setTooltip("Plugin version. Build " + juce::String(MLRVST_BUILD_STAMP) + ".");
     addAndMakeVisible(versionLabel);
     
     // Master volume
@@ -5240,14 +5414,15 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(momentaryToggle);
     styleUiButton(momentaryToggle);
 
-    soundTouchToggle.setButtonText("SoundTouch");
-    soundTouchToggle.setClickingTogglesState(true);
-    soundTouchToggle.setTooltip("Enable SoundTouch swing warp in Loop/Gate playback.");
-    addAndMakeVisible(soundTouchToggle);
-    styleUiButton(soundTouchToggle);
-    soundTouchEnabledAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
-        processor.parameters, "soundTouchEnabled", soundTouchToggle);
-    soundTouchToggle.onClick = [this]()
+    stretchBackendBox.addItem("Resample", 1);
+    stretchBackendBox.addItem("SoundTouch", 2);
+    stretchBackendBox.addItem("Bungee", 3);
+    stretchBackendBox.setTooltip("Select the tempo/pitch backend for Loop/Gate swing and Flip host-tempo matching.");
+    styleUiCombo(stretchBackendBox);
+    addAndMakeVisible(stretchBackendBox);
+    stretchBackendAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "stretchBackend", stretchBackendBox);
+    stretchBackendBox.onChange = [this]()
     {
         if (globalUiReady)
             processor.markPersistentGlobalUserChange();
@@ -5803,8 +5978,12 @@ void PathsControlPanel::clearDirectory(int stripIndex, MlrVSTAudioProcessor::Sam
 
 juce::String PathsControlPanel::pathToDisplay(const juce::File& file)
 {
-    if (!file.exists() || !file.isDirectory())
+    if (file == juce::File() || file.getFullPathName().trim().isEmpty())
         return "(not set)";
+
+    if (!file.exists() || !file.isDirectory())
+        return file.getFullPathName() + " (missing)";
+
     return file.getFullPathName();
 }
 
@@ -5820,7 +5999,7 @@ void GlobalControlPanel::resized()
     auto titleRow = bounds.removeFromTop(20);  // Smaller title (was 24)
     tooltipsToggle.setBounds(titleRow.removeFromRight(86));
     titleRow.removeFromRight(6);
-    soundTouchToggle.setBounds(titleRow.removeFromRight(102));
+    stretchBackendBox.setBounds(titleRow.removeFromRight(118));
     titleRow.removeFromRight(6);
     momentaryToggle.setBounds(titleRow.removeFromRight(92));
     titleRow.removeFromRight(6);
@@ -7583,8 +7762,8 @@ void MlrVSTAudioProcessorEditor::paint(juce::Graphics& g)
 
     g.setColour(kTextMuted);
     g.setFont(juce::Font(juce::FontOptions(10.0f)));
-    const juce::String buildInfo = "v" + juce::String(JucePlugin_VersionString)
-        + " | build " + juce::String(__DATE__) + " " + juce::String(__TIME__);
+    const juce::String buildInfo = "v" + juce::String(MLRVST_BUILD_VERSION)
+        + " | build " + juce::String(MLRVST_BUILD_STAMP);
     g.drawText(buildInfo, getWidth() - 440, 11, 424, 18, juce::Justification::centredRight);
 }
 

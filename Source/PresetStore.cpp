@@ -760,6 +760,8 @@ bool savePreset(int presetIndex,
                 auto* eventXml = patternXml->createNewChildElement("Event");
                 eventXml->setAttribute("strip", e.stripIndex);
                 eventXml->setAttribute("column", e.column);
+                eventXml->setAttribute("sampleSliceId", e.sampleSliceId);
+                eventXml->setAttribute("sampleStartSample", juce::String(e.sampleStartSample));
                 eventXml->setAttribute("time", e.time);
                 eventXml->setAttribute("noteOn", e.isNoteOn);
             }
@@ -810,6 +812,7 @@ bool loadPreset(int presetIndex,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,
                 const std::function<bool(int, const juce::File&)>& loadSampleToStrip,
+                const std::function<void(int, const juce::File&)>& restoreStripSamplePath,
                 const std::function<void(int, const juce::XmlElement*)>& applyFlipStateXml,
                 double hostPpqSnapshot,
                 double hostTempoSnapshot)
@@ -913,6 +916,8 @@ bool loadPreset(int presetIndex,
         if (samplePath.isNotEmpty() && isValidStoredSamplePath(samplePath))
         {
             juce::File sampleFile(samplePath);
+            if (restoreStripSamplePath)
+                restoreStripSamplePath(stripIndex, sampleFile);
             if (sampleFile.existsAsFile())
             {
                 loadedStripAudio = loadSampleToStrip(stripIndex, sampleFile);
@@ -1313,6 +1318,8 @@ bool loadPreset(int presetIndex,
                 PatternRecorder::Event e{};
                 e.stripIndex = eventXml->getIntAttribute("strip", 0);
                 e.column = eventXml->getIntAttribute("column", 0);
+                e.sampleSliceId = eventXml->getIntAttribute("sampleSliceId", -1);
+                e.sampleStartSample = eventXml->getStringAttribute("sampleStartSample", "-1").getLargeIntValue();
                 e.time = eventXml->getDoubleAttribute("time", 0.0);
                 e.isNoteOn = eventXml->getBoolAttribute("noteOn", true);
                 events.push_back(e);

@@ -25,6 +25,13 @@ For full platform setup and troubleshooting, see `Docs/BUILD.md`.
 - C++17 compiler
 - JUCE source at `./JUCE`
 - serialosc (for monome hardware use)
+- Native Essentia and Bungee dependencies bootstrapped into `third_party/_native`
+
+Bootstrap native dependencies once:
+
+```bash
+./scripts/bootstrap_native_deps.sh
+```
 
 ## Build Commands
 
@@ -46,6 +53,8 @@ Direct CMake build:
 cmake -B Build -DCMAKE_BUILD_TYPE=Release
 cmake --build Build --config Release
 ```
+
+The build prefers persistent repo-local native prefixes in `third_party/_native` over temporary `/tmp/...` paths.
 
 ## Release Packaging
 
@@ -69,8 +78,9 @@ Artifacts are written to `release/`.
 
 ## Licensing
 
-- Project code in this repository is MIT-licensed: `LICENSE`
+- Project code in this repository is licensed under the GNU Affero General Public License v3.0: `LICENSE`
 - Third-party terms and redistribution notes: `THIRD_PARTY_NOTICES.md`
+- Native dependency layout and rebuild instructions: `third_party/_native/README.md`
 
 If you redistribute binaries, include the relevant notice files.
 

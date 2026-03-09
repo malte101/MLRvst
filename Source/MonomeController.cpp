@@ -826,6 +826,27 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 updateMonomeLEDs();
                 return;
             }
+            else if ((!controlModeActive || currentControlMode == ControlMode::Normal)
+                     && x >= 13 && x <= 15)
+            {
+                const int selectedStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
+                auto* strip = audioEngine->getStrip(selectedStripIndex);
+                auto* sampleEngine = getSampleModeEngine(selectedStripIndex, false);
+                if (strip != nullptr
+                    && sampleEngine != nullptr
+                    && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
+                {
+                    if (x == 13)
+                        sampleEngine->setTriggerMode(SampleTriggerMode::OneShot);
+                    else if (x == 14)
+                        sampleEngine->setTriggerMode(SampleTriggerMode::Loop);
+                    else
+                        sampleEngine->setLegacyLoopEngineEnabled(!sampleEngine->isLegacyLoopEngineEnabled());
+
+                    updateMonomeLEDs();
+                    return;
+                }
+            }
             else if (x == 15)
             {
                 return;  // Don't process as strip trigger!
@@ -1224,6 +1245,10 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                             int64_t globalSample = audioEngine->getGlobalSampleCount();
                             strip->onButtonPress(x, globalSample);
                         }
+                        else
+                        {
+                            setSampleModeHeldVisibleSliceSlot(stripIndex, x);
+                        }
                         
                         // Trigger the strip (quantized or immediate)
                         triggerStrip(stripIndex, x);
@@ -1340,6 +1365,10 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     {
                         int64_t globalSample = audioEngine->getGlobalSampleCount();
                         strip->onButtonRelease(x, globalSample);
+                    }
+                    else
+                    {
+                        clearSampleModeHeldVisibleSliceSlot(stripIndex, x);
                     }
                 }
             }
@@ -2142,17 +2171,63 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                 if (auto* sampleEngine = getSampleModeEngine(stripIndex, false))
                 {
                     const auto snapshot = sampleEngine->getStateSnapshot();
+                    const bool legacyLoopFeedback = snapshot.useLegacyLoopEngine
+                        || strip->isSampleModeLegacyLoopEngineEnabled();
+                    const bool loopTriggerMode = snapshot.triggerMode == SampleTriggerMode::Loop;
+                    const int heldSlot = getSampleModeHeldVisibleSliceSlot(stripIndex);
+                    int playbackSlot = -1;
+                    if (!legacyLoopFeedback && snapshot.playbackProgress >= 0.0f)
+                    {
+                        for (int x = 0; x < 16; ++x)
+                        {
+                            const auto& slice = snapshot.visibleSlices[static_cast<size_t>(x)];
+                            if (slice.id < 0)
+                                continue;
+
+                            const bool isLastSlice = (x == 15);
+                            if (snapshot.playbackProgress >= slice.normalizedStart
+                                && (snapshot.playbackProgress < slice.normalizedEnd
+                                    || (isLastSlice && snapshot.playbackProgress <= slice.normalizedEnd)))
+                            {
+                                playbackSlot = x;
+                                break;
+                            }
+                        }
+                    }
                     for (int x = 0; x < 16; ++x)
                     {
                         const auto& slice = snapshot.visibleSlices[static_cast<size_t>(x)];
                         if (slice.id >= 0)
-                            newLedState[x][y] = snapshot.isPlaying ? 4 : 2;
+                            newLedState[x][y] = legacyLoopFeedback
+                                ? (strip->isPlaying() ? 4 : 2)
+                                : (snapshot.isPlaying ? (loopTriggerMode ? 8 : 6)
+                                                      : (loopTriggerMode ? 5 : 3));
                     }
 
                     if (snapshot.pendingVisibleSliceSlot >= 0 && snapshot.pendingVisibleSliceSlot < 16)
-                        newLedState[snapshot.pendingVisibleSliceSlot][y] = juce::jmax(newLedState[snapshot.pendingVisibleSliceSlot][y], 9);
+                        newLedState[snapshot.pendingVisibleSliceSlot][y] = juce::jmax(newLedState[snapshot.pendingVisibleSliceSlot][y],
+                                                                                      loopTriggerMode ? 12 : 10);
+                    if (!legacyLoopFeedback && heldSlot >= 0 && heldSlot < 16)
+                        newLedState[heldSlot][y] = juce::jmax(newLedState[heldSlot][y], loopTriggerMode ? 11 : 9);
 
-                    if (!isGroupMuted
+                    if (legacyLoopFeedback)
+                    {
+                        const int currentCol = strip->getCurrentColumn();
+                        if (!isGroupMuted
+                            && strip->isPlaying()
+                            && currentCol >= 0
+                            && currentCol < 16)
+                        {
+                            newLedState[currentCol][y] = 15;
+                        }
+                    }
+                    else if (!isGroupMuted
+                        && playbackSlot >= 0
+                        && playbackSlot < 16)
+                    {
+                        newLedState[playbackSlot][y] = 15;
+                    }
+                    else if (!isGroupMuted
                         && snapshot.activeVisibleSliceSlot >= 0
                         && snapshot.activeVisibleSliceSlot < 16)
                     {
@@ -2289,13 +2364,48 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         newLedState[13][CONTROL_ROW] = firstBankActive ? 15 : 4;
         newLedState[14][CONTROL_ROW] = secondBankActive ? 15 : 4;
     }
+    else if (!controlModeActive || currentControlMode == ControlMode::Normal)
+    {
+        const int selectedStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
+        if (auto* selectedStrip = audioEngine->getStrip(selectedStripIndex))
+        {
+            if (selectedStrip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
+            {
+                if (auto* sampleEngine = getSampleModeEngine(selectedStripIndex, false))
+                {
+                    const auto triggerMode = sampleEngine->getTriggerMode();
+                    newLedState[13][CONTROL_ROW] = (triggerMode == SampleTriggerMode::OneShot) ? 15 : 4;
+                    newLedState[14][CONTROL_ROW] = (triggerMode == SampleTriggerMode::Loop) ? 15 : 4;
+                    newLedState[15][CONTROL_ROW] = sampleEngine->isLegacyLoopEngineEnabled() ? 15 : 4;
+                }
+            }
+        }
+    }
 
     // Metronome pulse on control-row quantize button (row 7, col 15):
     // beat pulses dim, bar "1" pulses bright.
-    if (metroPulseOn)
-        newLedState[15][CONTROL_ROW] = metroDownbeat ? 15 : 7;
+    if ((!controlModeActive || currentControlMode == ControlMode::Normal)
+        && clampVisibleStrip(getLastMonomePressedStripRow()) >= 0)
+    {
+        const int selectedStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
+        if (auto* selectedStrip = audioEngine->getStrip(selectedStripIndex))
+        {
+            if (selectedStrip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample)
+            {
+                if (metroPulseOn)
+                    newLedState[15][CONTROL_ROW] = metroDownbeat ? 15 : 7;
+                else
+                    newLedState[15][CONTROL_ROW] = 5;
+            }
+        }
+    }
     else
-        newLedState[15][CONTROL_ROW] = 5;
+    {
+        if (metroPulseOn)
+            newLedState[15][CONTROL_ROW] = metroDownbeat ? 15 : 7;
+        else
+            newLedState[15][CONTROL_ROW] = 5;
+    }
     
     // Differential update
     for (int y = 0; y < gridHeight; ++y)

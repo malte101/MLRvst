@@ -1,12 +1,12 @@
 # Third-Party Notices
 
-This repository contains project code under MIT (`/LICENSE`) and references/includes third-party components with their own licenses.
+This repository contains project code under AGPLv3 (`/LICENSE`) and references/includes third-party components with their own licenses.
 
 This document is an engineering notice, not legal advice.
 
 ## Project License
 
-- `mlrVST` project code in this repository: MIT (`/LICENSE`)
+- `mlrVST` project code in this repository: GNU Affero General Public License v3.0 (`/LICENSE`)
 
 ## Third-Party Components
 
@@ -14,10 +14,32 @@ This document is an engineering notice, not legal advice.
 
 - Upstream: https://github.com/juce-framework/JUCE
 - Role: framework used to build plugin binaries.
-- License model: JUCE is distributed under GPLv3 or a commercial JUCE license (depending on how you license your use).
+- License model: JUCE 8 is dual-licensed under AGPLv3 or a commercial JUCE license.
 - Notes:
-  - If you distribute binaries built with JUCE, you must comply with the JUCE terms for your chosen license path.
+  - This repository now takes the AGPLv3 path for JUCE-based distribution.
   - JUCE is not committed in this repository by default, but is required for builds.
+
+### Essentia
+
+- Upstream: https://github.com/MTG/essentia
+- Role: offline Flip/loop pitch and tempo analysis.
+- License model: AGPLv3.
+- Notes:
+  - Current integration links against a native Essentia build when available.
+  - The build now prefers a persistent repo-local native prefix at `/third_party/_native/essentia-prefix`.
+  - The helper script `/scripts/bootstrap_native_deps.sh` rebuilds a lightweight static Essentia into that prefix.
+  - Generated third-party binaries in `/third_party/_native` are local build assets and are ignored by Git by default.
+
+### Bungee
+
+- Upstream: https://github.com/bungee-audio-stretch/bungee
+- Role: optional tempo/pitch stretch backend for Loop/Gate swing and Flip tempo matching.
+- License model: MPL-2.0.
+- Notes:
+  - The build now prefers a persistent repo-local native prefix at `/third_party/_native/bungee-prefix`.
+  - The helper script `/scripts/bootstrap_native_deps.sh` rebuilds Bungee static libraries and headers into that prefix.
+  - The project also still supports SoundTouch as an alternative backend.
+  - Mozilla's MPL 2.0 text defines AGPLv3 as a `Secondary License`, and Mozilla's FAQ describes MPL code being combined with GPL-family code in a Larger Work. Review the upstream notice terms before redistribution; this file is not legal advice.
 
 ### MoogLadders (vendored source tree)
 

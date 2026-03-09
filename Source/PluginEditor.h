@@ -554,6 +554,8 @@ private:
     };
     GrainSubPage grainSubPage = GrainSubPage::Pitch;
     juce::TextButton loadButton;    // Small
+    juce::TextButton pitchMasterButton;
+    juce::TextButton pitchSyncButton;
     juce::ComboBox groupSelector;   // Compact
     juce::Label stripLabel;         // Small
     
@@ -758,7 +760,7 @@ private:
     juce::Slider triggerFadeInSlider;
     juce::Label triggerFadeInLabel;
     juce::ToggleButton momentaryToggle;
-    juce::ToggleButton soundTouchToggle;
+    juce::ComboBox stretchBackendBox;
     juce::ToggleButton tooltipsToggle;
     
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterVolumeAttachment;
@@ -771,7 +773,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> triggerFadeInAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> outputRoutingAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> pitchControlModeAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> soundTouchEnabledAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> stretchBackendAttachment;
     bool globalUiReady = false;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GlobalControlPanel)
