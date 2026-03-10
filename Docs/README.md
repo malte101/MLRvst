@@ -14,8 +14,6 @@ For the GitHub project overview, start with the root README:
   - Platform build steps
   - Build options
   - Release packaging
-- `CLION_SETUP.md`
-  - CLion project setup and troubleshooting
 - `AUDIO_ENGINE_DOCS.md`
   - Audio engine architecture and behavior
 - `SERIALOSC_REFERENCE.md`
@@ -31,6 +29,11 @@ For the GitHub project overview, start with the root README:
 - Audio strips: 6
 - Build system: CMake with Makefile helpers
 - Release packaging script: `../scripts/package_release_macos.sh`
+
+## Archive
+
+- `archive/README.md`
+  - Index for archived build guides and historical versioned notes
 
 ## Licensing
 

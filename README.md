@@ -73,9 +73,9 @@ Artifacts are written to `release/`.
 
 - Quick start: `QUICKSTART.md`
 - Build guide: `Docs/BUILD.md`
-- CLion setup: `Docs/CLION_SETUP.md`
 - Audio engine notes: `Docs/AUDIO_ENGINE_DOCS.md`
 - SerialOSC reference: `Docs/SERIALOSC_REFERENCE.md`
+- Archived notes and legacy guides: `Docs/archive/`
 
 ## Licensing
 
