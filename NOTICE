@@ -1,0 +1,18 @@
+mlrVST (Modern)
+Copyright (C) 2024-2026 mlrVST Contributors
+
+This repository preserves attribution to the original mlrVST project by
+Ewan Hemingway ("hemmer").
+
+Original upstream repository:
+https://github.com/hemmer/mlrVST
+
+Original mlrVST attribution to Ewan Hemingway and original mlr attribution
+to Brian Crabtree / monome must be preserved in source and binary
+redistributions.
+
+The preserved upstream MIT notice is included in:
+- third_party/licenses/hemmer-mlrVST-MIT-LICENSE.txt
+- UPSTREAM_PROVENANCE.md
+
+This notice is informational and does not replace the license files.

@@ -8,6 +8,21 @@ This document is an engineering notice, not legal advice.
 
 - `mlrVST` project code in this repository: GNU Affero General Public License v3.0 (`/LICENSE`)
 
+## Upstream Provenance
+
+### Original mlrVST (Ewan Hemingway / hemmer)
+
+- Upstream: https://github.com/hemmer/mlrVST
+- Role: original project this repository modernizes and continues.
+- Upstream license status observed locally on 2026-03-10:
+  - upstream commit `1b81a371c777620ebdab48374c99ffc2b57cefca` added a top-level MIT license on 2026-02-24.
+- Preserved local notice files:
+  - `/NOTICE`
+  - `/UPSTREAM_PROVENANCE.md`
+  - `/third_party/licenses/hemmer-mlrVST-MIT-LICENSE.txt`
+- Redistribution note:
+  - Do not remove the original mlrVST attribution to Ewan Hemingway (`hemmer`) or the original mlr attribution to Brian Crabtree / monome from source or packaged binaries.
+
 ## Third-Party Components
 
 ### JUCE Framework
@@ -29,6 +44,7 @@ This document is an engineering notice, not legal advice.
   - The build now prefers a persistent repo-local native prefix at `/third_party/_native/essentia-prefix`.
   - The helper script `/scripts/bootstrap_native_deps.sh` rebuilds a lightweight static Essentia into that prefix.
   - Generated third-party binaries in `/third_party/_native` are local build assets and are ignored by Git by default.
+  - Preserve `/third_party/licenses/ESSENTIA-NOTICE.md` together with `/LICENSE` when native Essentia code is included in redistributed binaries.
 
 ### Bungee
 
@@ -39,7 +55,39 @@ This document is an engineering notice, not legal advice.
   - The build now prefers a persistent repo-local native prefix at `/third_party/_native/bungee-prefix`.
   - The helper script `/scripts/bootstrap_native_deps.sh` rebuilds Bungee static libraries and headers into that prefix.
   - The project also still supports SoundTouch as an alternative backend.
+  - Preserve `/third_party/licenses/BUNGEE-NOTICE.md` and `/third_party/licenses/BUNGEE-LICENSE.txt` with redistributions that include the Bungee backend.
   - Mozilla's MPL 2.0 text defines AGPLv3 as a `Secondary License`, and Mozilla's FAQ describes MPL code being combined with GPL-family code in a Larger Work. Review the upstream notice terms before redistribution; this file is not legal advice.
+
+### PFFFT (via Bungee build)
+
+- Upstream: https://bitbucket.org/jpommier/pffft.git
+- Role: Fourier helper static library linked as `libpffft.a` by the Bungee build.
+- License/notice model: upstream header notice with FFTPACK/NCAR redistribution terms.
+- Preserved local notice file:
+  - `/third_party/licenses/PFFFT-NOTICE.txt`
+
+### SoundTouch
+
+- Upstream: https://www.surina.net/soundtouch
+- Role: optional dynamic stretch backend when linked.
+- License model: LGPL-2.1.
+- Notes:
+  - Current macOS builds on this machine link Homebrew's `libSoundTouch` when available.
+  - Preserve `/third_party/licenses/SOUNDTOUCH-NOTICE.md` and the copied `SoundTouch-COPYING.TXT` notice in redistributed archives that link SoundTouch.
+
+### LibPyin
+
+- Upstream: https://github.com/xstreck1/LibPyin
+- Path: `/third_party/LibPyin`
+- Role: offline monophonic pitch detection for Loop-mode `PM` / `PS` analysis.
+- License model: GPL-3.0-or-later for LibPyin wrapper/source tree, with bundled upstream notices for pYIN and Vamp components.
+- Notes:
+  - This repository vendors the LibPyin source tree directly under `/third_party/LibPyin`.
+  - Release archives should include:
+    - `/third_party/LibPyin/LICENSE`
+    - `/third_party/LibPyin/source/LICENSE_PYIN`
+    - `/third_party/LibPyin/source/LICENSE_VAMP`
+  - LibPyin is only used in the existing async offline analysis job for loop strips. It is not run on the audio thread and does not add host-reported plug-in latency.
 
 ### MoogLadders (vendored source tree)
 
@@ -72,7 +120,21 @@ Some files in `/third_party/MoogLadders-main/src` and `/third_party/MoogLadders-
 Release archives should include:
 
 1. `/LICENSE`
-2. `/THIRD_PARTY_NOTICES.md`
-3. Relevant upstream license texts for bundled vendor code (at minimum `/third_party/MoogLadders-main/LICENSE`)
+2. `/NOTICE`
+3. `/UPSTREAM_PROVENANCE.md`
+4. `/THIRD_PARTY_NOTICES.md`
+5. Relevant upstream license texts and notice files for bundled or linked code:
+   - `/third_party/licenses/hemmer-mlrVST-MIT-LICENSE.txt`
+   - `/third_party/MoogLadders-main/LICENSE`
+   - `/third_party/LibPyin/LICENSE`
+   - `/third_party/LibPyin/source/LICENSE_PYIN`
+   - `/third_party/LibPyin/source/LICENSE_VAMP`
+   - `/JUCE/LICENSE.md`
+   - `/third_party/licenses/BUNGEE-LICENSE.txt`
+   - `/third_party/licenses/BUNGEE-NOTICE.md`
+   - `/third_party/licenses/ESSENTIA-NOTICE.md`
+   - `/third_party/licenses/PFFFT-NOTICE.txt`
+   - `/third_party/licenses/SOUNDTOUCH-NOTICE.md`
+   - `SoundTouch-COPYING.TXT` when a packaged binary links `libSoundTouch`
 
-The script `/scripts/package_release_macos.sh` follows this policy.
+The script `/scripts/package_release_macos.sh` follows this policy and preserves the original `hemmer/mlrVST` attribution in packaged releases.

@@ -304,7 +304,8 @@ If you have the original mlrVST code:
 
 ## License
 
-- Project source in this repository is MIT-licensed: see [../LICENSE](../LICENSE).
+- Project source in this repository is AGPLv3-licensed: see [../LICENSE](../LICENSE).
+- Original upstream attribution and provenance are preserved in [../NOTICE](../NOTICE) and [../UPSTREAM_PROVENANCE.md](../UPSTREAM_PROVENANCE.md).
 - Third-party components included/used by the build have additional terms.
 - See [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) before distributing binaries.
 

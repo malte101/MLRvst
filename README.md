@@ -26,6 +26,7 @@ For full platform setup and troubleshooting, see `Docs/BUILD.md`.
 - JUCE source at `./JUCE`
 - serialosc (for monome hardware use)
 - Native Essentia and Bungee dependencies bootstrapped into `third_party/_native`
+- Vendored LibPyin source tree in `third_party/LibPyin` for loop-mode monophonic pitch analysis
 
 Bootstrap native dependencies once:
 
@@ -79,10 +80,13 @@ Artifacts are written to `release/`.
 ## Licensing
 
 - Project code in this repository is licensed under the GNU Affero General Public License v3.0: `LICENSE`
+- Original upstream attribution and provenance are preserved in: `NOTICE`, `UPSTREAM_PROVENANCE.md`
+- Preserved upstream MIT notice for the original `hemmer/mlrVST` project: `third_party/licenses/hemmer-mlrVST-MIT-LICENSE.txt`
 - Third-party terms and redistribution notes: `THIRD_PARTY_NOTICES.md`
 - Native dependency layout and rebuild instructions: `third_party/_native/README.md`
+- Vendored LibPyin licenses: `third_party/LibPyin/LICENSE`, `third_party/LibPyin/source/LICENSE_PYIN`, `third_party/LibPyin/source/LICENSE_VAMP`
 
-If you redistribute binaries, include the relevant notice files.
+If you redistribute binaries, include the relevant notice files and do not remove the preserved upstream attribution notices.
 
 ## Credits
 
