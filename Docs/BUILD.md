@@ -1,31 +1,43 @@
-# Build Instructions
+# Build Guide
 
-Complete guide to building mlrVST Modern Edition on all platforms.
+This is the canonical build guide for the current `mlrVST` repo.
 
-## Table of Contents
+The project builds with CMake. The `Makefile` is a convenience wrapper for macOS and Linux, but the CMake flow below is the source of truth because it matches the active targets, helper scripts, and packaging steps.
 
-- [Prerequisites](#prerequisites)
-- [Getting JUCE](#getting-juce)
-- [Building on macOS](#building-on-macos)
-- [Building on Linux](#building-on-linux)
-- [Building on Windows](#building-on-windows)
-- [Build Options](#build-options)
-- [Troubleshooting](#troubleshooting)
+## Supported Outputs
+
+- macOS: `VST3` and `AU`
+- Linux: `VST3`
+- Windows: `VST3`
+
+Notes:
+
+- Windows builds must use `MSVC` or `clang-cl` with the Windows SDK.
+- `MinGW` and `MSYS2` are not supported by the current `JUCE 8` build path.
+- Plugin bundles are written to `Build/mlrVST_artefacts/<Config>/...`.
+- Copying into system or user plugin folders is a separate explicit step.
 
 ## Prerequisites
 
-### All Platforms
+### All platforms
 
-- **CMake** 3.22 or later
-- **Git** (for cloning repositories)
-- **C++17 compatible compiler**
+- `CMake 3.22+`
+- `Git`
+- A `C++17` compiler
+- A local `JUCE 8` checkout
+
+The project looks for JUCE in `./JUCE` by default. If your checkout lives somewhere else, pass:
+
+```bash
+-DMLRVST_JUCE_PATH=/path/to/JUCE
+```
 
 ### macOS
 
-- Xcode 13 or later
+- `Xcode 13+`
 - Command Line Tools: `xcode-select --install`
 
-### Linux (Ubuntu/Debian)
+### Linux (Debian/Ubuntu)
 
 ```bash
 sudo apt-get update
@@ -67,406 +79,278 @@ sudo dnf install -y \
 
 ### Windows
 
-- **Visual Studio 2019 or later** with C++ Desktop Development
-- **CMake** (download from cmake.org)
-- **Git for Windows**
-- **PowerShell 5+** (for packaging helper scripts)
+- `Visual Studio 2019+` with Desktop C++ tools
+- `PowerShell 5+` if you want to use the release packager
 
-## Getting JUCE
+## JUCE Setup
 
-### Option 1: Git Clone (Recommended)
+If you keep JUCE inside the repo:
 
 ```bash
-cd <repo-root>
 git clone https://github.com/juce-framework/JUCE.git
 ```
 
-### Option 2: Download Release
-
-1. Visit https://github.com/juce-framework/JUCE/releases
-2. Download JUCE 8.0.4 or later
-3. Extract to `<repo-root>/JUCE/`
-
-### Option 3: Git Submodule
+If you keep JUCE elsewhere, configure with `MLRVST_JUCE_PATH`:
 
 ```bash
-git submodule add https://github.com/juce-framework/JUCE.git
-git submodule update --init --recursive
+cmake -S . -B Build -DMLRVST_JUCE_PATH=/path/to/JUCE
 ```
 
-## Building on macOS
+The `Makefile` only checks for `./JUCE`, so the direct CMake flow is the flexible option when JUCE is external.
 
-### Quick Build (Makefile)
+## Optional Native Dependencies
+
+The project can build without all optional analysis and stretch backends.
+
+- `SoundTouch`: enabled only if headers and libraries are found
+- `Bungee`: enabled only if headers and libraries are found
+- `LibPyin`: enabled only if `third_party/LibPyin` is present
+- Native `Essentia`: enabled only if the configured prefix contains the library
+- `Huovilainen`: disabled by default and opt-in only
+
+If the optional native dependencies are missing, the build still succeeds with reduced backend coverage.
+
+Repo-local native prefixes live under `third_party/_native/`. On macOS, you can populate them with:
 
 ```bash
-# From repository root
-make
+./scripts/bootstrap_native_deps.sh
+```
 
-# Build specific targets
-make vst3        # VST3 only
-make au          # Audio Unit only
+That bootstrap script is macOS-oriented. On other platforms, point CMake at existing installs instead:
 
-# Install to system
+```bash
+-DMLRVST_ESSENTIA_PREFIX=/path/to/essentia/prefix
+-DMLRVST_BUNGEE_PREFIX=/path/to/bungee/prefix
+```
+
+## Canonical Build Flow
+
+From the repo root:
+
+```bash
+cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release
+cmake --build Build --config Release
+```
+
+Common outputs:
+
+- macOS VST3: `Build/mlrVST_artefacts/Release/VST3/mlrVST.vst3`
+- macOS AU: `Build/mlrVST_artefacts/Release/AU/mlrVST.component`
+- Linux VST3: `Build/mlrVST_artefacts/Release/VST3/mlrVST.vst3`
+- Windows VST3: `Build/mlrVST_artefacts/Release/VST3/mlrVST.vst3`
+
+On single-config generators, add parallelism as needed:
+
+```bash
+cmake --build Build --parallel
+```
+
+## Platform Notes
+
+### macOS
+
+Build:
+
+```bash
+cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release
+cmake --build Build --config Release
+```
+
+Optional Xcode project:
+
+```bash
+cmake -S . -B Build -G Xcode
+open Build/mlrVST.xcodeproj
+```
+
+Install plugin bundles:
+
+```bash
+cmake --build Build --target install_plugins_user
+cmake --build Build --target install_plugins_system
+```
+
+Or use the helper script directly:
+
+```bash
+./scripts/install_macos_plugins.sh --user --build-dir Build
+./scripts/install_macos_plugins.sh --system --build-dir Build
+```
+
+Install paths:
+
+- User scope: `~/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/Components`
+- System scope: `/Library/Audio/Plug-Ins/VST3` and `/Library/Audio/Plug-Ins/Components`
+
+Important:
+
+- `make install` installs to the macOS system folders under `/Library`, not the user folders.
+- `cmake --install Build` is not the normal plugin-install step for this repo.
+
+Package release zips:
+
+```bash
+./scripts/package_release_macos.sh --build-dir Build --config Release
+```
+
+If both `Build` and `cmake-build-release` exist, the packager requires `--build-dir` explicitly.
+
+### Linux
+
+Build:
+
+```bash
+cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release
+cmake --build Build --parallel
+```
+
+Install the plugin bundle for local DAW discovery:
+
+```bash
+mkdir -p ~/.vst3
+cp -R Build/mlrVST_artefacts/Release/VST3/mlrVST.vst3 ~/.vst3/
+```
+
+If you keep JUCE at `./JUCE`, the Makefile wrapper does the same copy for you:
+
+```bash
 make install
+```
 
-# Create release zips (includes license notices)
+That wrapper exists for convenience, but it is not required.
+
+`cmake --install Build` only performs the generic CMake install rules. It does not replace the plugin-folder copy step above.
+
+### Windows
+
+Configure and build from a Visual Studio developer shell:
+
+```powershell
+cmake -S . -B Build -G "Visual Studio 17 2022" -A x64
+cmake --build Build --config Release
+```
+
+Manual install:
+
+- Copy `Build\mlrVST_artefacts\Release\VST3\mlrVST.vst3`
+- Into `%CommonProgramFiles%\VST3\`
+
+Package a distributable zip:
+
+```powershell
+.\scripts\package_release_windows.ps1 -BuildDir Build -Config Release -OutDir release\windows
+```
+
+Important:
+
+- `MinGW` and `MSYS2` are not supported.
+- There is no repo-specific Windows plugin install target; copy the built `.vst3` bundle manually.
+
+## Makefile Shortcuts
+
+The `Makefile` is useful on macOS and Linux when `JUCE` lives at `./JUCE`.
+
+```bash
+make
+make vst3
+make au
+make install
 make package-release
 ```
 
-### Manual Build (CMake)
+Notes:
+
+- `make au` is macOS-only
+- `make install` is system-scope on macOS and user-scope on Linux
+- `make package-release` currently wraps the macOS packager only
+
+## Useful CMake Options
 
 ```bash
-mkdir Build && cd Build
-
-# Configure
-cmake .. -DCMAKE_BUILD_TYPE=Release
-
-# Build
-cmake --build . --config Release -j8
-
-# Install
-sudo cmake --install .
+-DMLRVST_JUCE_PATH=/path/to/JUCE
+-DMLRVST_ENABLE_HUOVILAINEN=OFF
+-DMLRVST_ENABLE_SOUNDTOUCH=ON
+-DMLRVST_ENABLE_BUNGEE=ON
+-DMLRVST_ENABLE_LIBPYIN=ON
+-DMLRVST_NATIVE_DEPS_DIR=/path/to/third_party/_native
+-DMLRVST_ESSENTIA_PREFIX=/path/to/essentia/prefix
+-DMLRVST_BUNGEE_PREFIX=/path/to/bungee/prefix
 ```
 
-### Xcode Project
+Defaults:
+
+- `MLRVST_ENABLE_HUOVILAINEN=OFF`
+- `MLRVST_ENABLE_SOUNDTOUCH=ON`
+- `MLRVST_ENABLE_BUNGEE=ON`
+- `MLRVST_ENABLE_LIBPYIN=ON`
+
+Even when the default is `ON`, the backend is only compiled if the dependency is actually available.
+
+## Verification
+
+Check that the expected bundles exist:
 
 ```bash
-mkdir Build && cd Build
-cmake .. -G "Xcode"
-open mlrVST.xcodeproj
+ls Build/mlrVST_artefacts/Release
 ```
 
-### Installation Locations
-
-After `make install`:
-- **VST3**: `~/Library/Audio/Plug-Ins/VST3/mlrVST.vst3`
-- **AU**: `~/Library/Audio/Plug-Ins/Components/mlrVST.component`
-
-## Building on Linux
-
-### Quick Build (Makefile)
+macOS AU validation:
 
 ```bash
-# From repository root
-make
-
-# Install to system
-make install
+auval -v aufx Mlrv Mlrx
 ```
 
-### Manual Build (CMake)
+macOS dependency check:
 
 ```bash
-mkdir Build && cd Build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j$(nproc)
-
-# Install (may need sudo)
-sudo cmake --install .
+otool -L Build/mlrVST_artefacts/Release/VST3/mlrVST.vst3/Contents/MacOS/mlrVST
 ```
 
-### Installation Locations
-
-After `make install`:
-- **VST3**: `~/.vst3/mlrVST.vst3`
-
-## Building on Windows
-
-### Visual Studio (Recommended)
-
-```cmd
-REM Open "Developer Command Prompt for VS 2022"
-cd <repo-root>
-mkdir Build
-cd Build
-
-REM Configure
-cmake .. -G "Visual Studio 17 2022" -A x64
-
-REM Build
-cmake --build . --config Release
-
-REM Install (run as Administrator)
-cmake --install .
-```
-
-### Release Packaging (Windows)
-
-```powershell
-cd <repo-root>
-.\scripts\package_release_windows.ps1 -BuildDir build -Config Release -OutDir release\windows
-```
-
-This writes a distributable VST3 zip to `release/windows/`.
-
-### Important
-
-- MinGW/MSYS2 is not supported for this project with JUCE 8.
-- Use MSVC (Visual Studio generator) for Windows builds.
-
-### Installation Locations
-
-- **VST3**: `C:\Program Files\Common Files\VST3\mlrVST.vst3`
-
-## Build Options
-
-### Configuration Types
+Linux dependency check:
 
 ```bash
-# Debug build (with symbols)
-make CONFIG=Debug
-
-# Release build (optimized)
-make CONFIG=Release
-```
-
-### Verbose Output
-
-```bash
-# Show full compile commands
-make VERBOSE=1
-```
-
-### Parallel Builds
-
-```bash
-# Auto-detect cores
-make
-
-# Specific number of cores
-cmake --build Build -j4
-```
-
-### Build Specific Formats
-
-```bash
-# CMake targets
-cmake --build Build --target mlrVST_VST3
-cmake --build Build --target mlrVST_AU
-
-# Makefile targets
-make vst3
-make au
-```
-
-### Custom JUCE Location
-
-If JUCE is in a different location:
-
-```bash
-cmake .. -DJUCE_DIR=/path/to/JUCE
-```
-
-### Optional Huovilainen Model
-
-`MLRVST_ENABLE_HUOVILAINEN` is `OFF` by default.
-
-```bash
-# Enable only if you have reviewed licensing obligations
-cmake .. -DMLRVST_ENABLE_HUOVILAINEN=ON
-```
-
-### Code Signing (macOS)
-
-Edit `CMakeLists.txt`:
-
-```cmake
-set_target_properties(mlrVST_VST3 PROPERTIES
-    XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "Developer ID Application"
-    XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "YOUR_TEAM_ID"
-)
+ldd Build/mlrVST_artefacts/Release/VST3/mlrVST.vst3/Contents/x86_64-linux/mlrVST.so
 ```
 
 ## Troubleshooting
 
-### CMake Can't Find JUCE
+### JUCE not found
 
-**Problem**: `CMake Error: Could not find JUCE`
-
-**Solution**:
-```bash
-# Ensure JUCE is in correct location
-ls JUCE/modules/juce_core  # Should exist
-
-# Or specify path
-cmake .. -DJUCE_DIR=/path/to/JUCE
-```
-
-### Compiler Not Found
-
-**Problem**: `CMake Error: CMAKE_CXX_COMPILER not found`
-
-**macOS**:
-```bash
-xcode-select --install
-```
-
-**Linux**:
-```bash
-sudo apt-get install build-essential
-```
-
-**Windows**:
-- Install Visual Studio with C++ Desktop Development
-- Use the Visual Studio generator (`-G "Visual Studio 17 2022" -A x64`)
-
-### Missing Dependencies (Linux)
-
-**Problem**: Build fails with missing X11 or ALSA headers
-
-**Solution**:
-```bash
-# Ubuntu/Debian
-sudo apt-get install libasound2-dev libx11-dev libfreetype6-dev
-
-# Fedora
-sudo dnf install alsa-lib-devel libX11-devel freetype-devel
-```
-
-### VST3 SDK Not Found
-
-**Problem**: `Could not find VST3 SDK`
-
-**Solution**: This should be included with JUCE 8.x automatically. If not:
-```bash
-cd JUCE
-git pull origin master  # Update to latest
-```
-
-### Out of Memory During Build
-
-**Problem**: Build fails with memory error
-
-**Solution**:
-```bash
-# Reduce parallel jobs
-cmake --build Build -j2
-
-# Or use Makefile
-make NPROC=2
-```
-
-### Permission Denied (Install)
-
-**Problem**: `Permission denied` during install
-
-**macOS/Linux**:
-```bash
-sudo make install
-# Or
-sudo cmake --install Build
-```
-
-**Windows**:
-- Run Command Prompt as Administrator
-
-### Build Artifacts Not Found
-
-**Problem**: Can't find built plugins
-
-**Solution**:
-```bash
-# Check build directory
-ls -la Build/mlrVST_artefacts/Release/
-
-# Ensure build completed
-make 2>&1 | tee build.log
-```
-
-### Linker Errors
-
-**Problem**: Undefined symbols during linking
-
-**Solution**:
-```bash
-# Clean and rebuild
-make distclean
-make
-
-# Check compiler version
-gcc --version  # Should be 9+
-clang --version  # Should be 10+
-```
-
-## Advanced Build Options
-
-### Static vs Shared Linking
-
-```cmake
-# In CMakeLists.txt, add:
-set(JUCE_BUILD_SHARED_CODE ON)  # Shared linking
-```
-
-### Custom Optimization Flags
+Use the correct cache variable:
 
 ```bash
-# Release with debug symbols
-cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
-
-# Profile-guided optimization
-cmake .. -DCMAKE_CXX_FLAGS="-fprofile-generate"
-# ... run and profile ...
-cmake .. -DCMAKE_CXX_FLAGS="-fprofile-use"
+cmake -S . -B Build -DMLRVST_JUCE_PATH=/path/to/JUCE
 ```
 
-### Cross-Compilation
+`JUCE_DIR` is not the project variable used by this repo.
+
+### Windows build fails with MinGW
+
+That toolchain is intentionally blocked by the current `JUCE 8` setup. Use a Visual Studio generator or `clang-cl`.
+
+### Optional backends are missing after configure
+
+This usually means the dependency was not found. Build still works, but those backends are disabled.
+
+To restore the repo-local native prefixes on macOS:
 
 ```bash
-# Example: Build for ARM on x86
-cmake .. -DCMAKE_TOOLCHAIN_FILE=arm-toolchain.cmake
+./scripts/bootstrap_native_deps.sh
 ```
 
-## Build Verification
+Or point CMake at known-good prefixes with `MLRVST_ESSENTIA_PREFIX` and `MLRVST_BUNGEE_PREFIX`.
 
-After building, verify:
+### macOS install landed in the wrong scope
+
+Use:
+
+- `install_plugins_user` or `scripts/install_macos_plugins.sh --user` for `~/Library`
+- `install_plugins_system` or `make install` for `/Library`
+
+### macOS packaging refuses to auto-detect the build dir
+
+Pass the build dir explicitly:
 
 ```bash
-# Check plugin loads in DAW
-# macOS: auval for AU validation
-auval -v aufx Mlrv Mlrx
-
-# Check symbols
-nm Build/mlrVST_artefacts/Release/VST3/mlrVST.vst3/Contents/MacOS/mlrVST
-
-# Check dependencies (macOS)
-otool -L Build/mlrVST_artefacts/Release/VST3/mlrVST.vst3/Contents/MacOS/mlrVST
-
-# Check dependencies (Linux)
-ldd Build/mlrVST_artefacts/Release/VST3/mlrVST.vst3/Contents/x86_64-linux/mlrVST.so
+./scripts/package_release_macos.sh --build-dir Build --config Release
 ```
-
-## Clean Build
-
-```bash
-# Clean build directory
-make clean
-
-# Remove all artifacts
-make distclean
-
-# Complete fresh build
-make distclean && make
-```
-
-## Getting Help
-
-If you encounter issues:
-
-1. Check the [Troubleshooting](#troubleshooting) section above
-2. Review build log: `make 2>&1 | tee build.log`
-3. Check JUCE version: Should be 8.0.4+
-4. Verify CMake version: Should be 3.22+
-5. Open an issue on GitHub with:
-   - OS and version
-   - Compiler and version
-   - Full build log
-   - CMake output
-
-## Next Steps
-
-After successful build:
-
-1. Read [README.md](../README.md) for usage instructions
-2. Check [AUDIO_ENGINE_DOCS.md](AUDIO_ENGINE_DOCS.md) for audio features
-3. Review [SERIALOSC_REFERENCE.md](SERIALOSC_REFERENCE.md) for monome setup
-4. Install serialosc from [monome.org](https://monome.org/docs/serialosc/setup/)

@@ -16,16 +16,22 @@ git clone https://github.com/juce-framework/JUCE.git
 ## 3. Build And Install
 
 ```bash
-make
-make install
+cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release
+cmake --build Build --config Release
 ```
 
-Plugin install locations:
+Install notes:
 
-- macOS VST3: `~/Library/Audio/Plug-Ins/VST3/mlrVST.vst3`
-- macOS AU: `~/Library/Audio/Plug-Ins/Components/mlrVST.component`
-- Linux VST3: `~/.vst3/mlrVST.vst3`
-- Windows VST3: `C:\Program Files\Common Files\VST3\mlrVST.vst3`
+- macOS user install: `cmake --build Build --target install_plugins_user`
+- macOS system install: `cmake --build Build --target install_plugins_system`
+- Linux local install: `mkdir -p ~/.vst3 && cp -R Build/mlrVST_artefacts/Release/VST3/mlrVST.vst3 ~/.vst3/`
+- Windows: copy `Build\mlrVST_artefacts\Release\VST3\mlrVST.vst3` to `%CommonProgramFiles%\VST3\`
+
+If you want the optional native Essentia and Bungee backends on macOS:
+
+```bash
+./scripts/bootstrap_native_deps.sh
+```
 
 ## 4. Install serialosc
 
@@ -43,7 +49,9 @@ Build fails:
 
 ```bash
 xcode-select --install  # macOS
-make distclean && make
+rm -rf Build
+cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release
+cmake --build Build --config Release
 ```
 
 monome not detected:

@@ -13,22 +13,22 @@ Modern JUCE-based mlrVST for monome grid performance workflows.
 git clone https://github.com/malte101/MLRvst.git
 cd MLRvst
 git clone https://github.com/juce-framework/JUCE.git
-make
-make install
+cmake -S . -B Build -DCMAKE_BUILD_TYPE=Release
+cmake --build Build --config Release
 ```
 
-For full platform setup and troubleshooting, see `Docs/BUILD.md`.
+For install steps, packaging, and platform-specific notes, see `Docs/BUILD.md`.
 
 ## Requirements
 
 - CMake 3.22+
 - C++17 compiler
-- JUCE source at `./JUCE`
-- serialosc (for monome hardware use)
-- Native Essentia and Bungee dependencies bootstrapped into `third_party/_native`
-- Vendored LibPyin source tree in `third_party/LibPyin` for loop-mode monophonic pitch analysis
+- JUCE source at `./JUCE`, or pass `-DMLRVST_JUCE_PATH=/path/to/JUCE`
+- serialosc (optional, for monome hardware use)
+- Native Essentia and Bungee installs are optional and can live under `third_party/_native`
+- Vendored LibPyin in `third_party/LibPyin` is optional and only needed for that analysis path
 
-Bootstrap native dependencies once:
+Bootstrap the repo-local native dependencies on macOS if you want those backends available:
 
 ```bash
 ./scripts/bootstrap_native_deps.sh
@@ -37,25 +37,23 @@ Bootstrap native dependencies once:
 ## Build Commands
 
 ```bash
-# Default build
-make
-
-# Format-specific
-make vst3
-make au
-
-# Install plugin bundles to local plugin folders
-make install
-```
-
-Direct CMake build:
-
-```bash
+# Canonical build
 cmake -B Build -DCMAKE_BUILD_TYPE=Release
 cmake --build Build --config Release
 ```
 
-The build prefers persistent repo-local native prefixes in `third_party/_native` over temporary `/tmp/...` paths.
+Optional Makefile shortcuts on macOS/Linux:
+
+```bash
+make
+make vst3
+make au
+make install
+```
+
+`make install` installs to `/Library/Audio/Plug-Ins/*` on macOS and `~/.vst3/` on Linux.
+
+The build prefers persistent repo-local native prefixes in `third_party/_native` over temporary `/tmp/...` paths when those dependencies are present.
 
 ## Release Packaging
 
@@ -64,7 +62,7 @@ Create release zips that include binaries and notices:
 ```bash
 make package-release
 # or
-./scripts/package_release_macos.sh --config Release
+./scripts/package_release_macos.sh --build-dir Build --config Release
 ```
 
 Artifacts are written to `release/`.
