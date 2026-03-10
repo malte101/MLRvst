@@ -54,6 +54,8 @@ This document is an engineering notice, not legal advice.
 - Notes:
   - The build now prefers a persistent repo-local native prefix at `/third_party/_native/bungee-prefix`.
   - The helper script `/scripts/bootstrap_native_deps.sh` rebuilds Bungee static libraries and headers into that prefix.
+  - The Bungee library itself compiles Eigen headers and links PFFFT.
+  - The upstream `cxxopts` dependency is only used by Bungee's sample command-line executable, not by the `mlrVST` plugin build.
   - The project also still supports SoundTouch as an alternative backend.
   - Preserve `/third_party/licenses/BUNGEE-NOTICE.md` and `/third_party/licenses/BUNGEE-LICENSE.txt` with redistributions that include the Bungee backend.
   - Mozilla's MPL 2.0 text defines AGPLv3 as a `Secondary License`, and Mozilla's FAQ describes MPL code being combined with GPL-family code in a Larger Work. Review the upstream notice terms before redistribution; this file is not legal advice.
@@ -65,6 +67,15 @@ This document is an engineering notice, not legal advice.
 - License/notice model: upstream header notice with FFTPACK/NCAR redistribution terms.
 - Preserved local notice file:
   - `/third_party/licenses/PFFFT-NOTICE.txt`
+
+### Eigen (via Bungee and native Essentia)
+
+- Upstream: https://eigen.tuxfamily.org/
+- Role: header-only linear algebra and tensor code compiled into the Bungee and native Essentia static payloads used by this project.
+- License model: MPL-2.0.
+- Notes:
+  - Built plugin symbols on this machine show Eigen code present through both the Bungee and Essentia paths.
+  - Preserve `/third_party/licenses/EIGEN-NOTICE.md` together with `/third_party/licenses/BUNGEE-LICENSE.txt` (the full MPL 2.0 text) in redistributions that include native Bungee and/or native Essentia code.
 
 ### SoundTouch
 
@@ -133,6 +144,7 @@ Release archives should include:
    - `/third_party/licenses/BUNGEE-LICENSE.txt`
    - `/third_party/licenses/BUNGEE-NOTICE.md`
    - `/third_party/licenses/ESSENTIA-NOTICE.md`
+   - `/third_party/licenses/EIGEN-NOTICE.md`
    - `/third_party/licenses/PFFFT-NOTICE.txt`
    - `/third_party/licenses/SOUNDTOUCH-NOTICE.md`
    - `SoundTouch-COPYING.TXT` when a packaged binary links `libSoundTouch`

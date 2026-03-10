@@ -46,9 +46,24 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 if [[ -z "${BUILD_DIR}" ]]; then
+    have_cmake_build_release=0
+    have_build_dir=0
+
     if [[ -d "${REPO_ROOT}/cmake-build-release/mlrVST_artefacts/${CONFIG}" ]]; then
+        have_cmake_build_release=1
+    fi
+
+    if [[ -d "${REPO_ROOT}/Build/mlrVST_artefacts/${CONFIG}" ]]; then
+        have_build_dir=1
+    fi
+
+    if [[ "${have_cmake_build_release}" -eq 1 && "${have_build_dir}" -eq 1 ]]; then
+        echo "Multiple build dirs detected (cmake-build-release and Build)." >&2
+        echo "Pass --build-dir explicitly so packaging matches the binary you reviewed." >&2
+        exit 1
+    elif [[ "${have_cmake_build_release}" -eq 1 ]]; then
         BUILD_DIR="cmake-build-release"
-    elif [[ -d "${REPO_ROOT}/Build/mlrVST_artefacts/${CONFIG}" ]]; then
+    elif [[ "${have_build_dir}" -eq 1 ]]; then
         BUILD_DIR="Build"
     else
         echo "Could not auto-detect build dir. Pass --build-dir explicitly." >&2
@@ -74,6 +89,7 @@ for required in \
     "${REPO_ROOT}/third_party/licenses/BUNGEE-LICENSE.txt" \
     "${REPO_ROOT}/third_party/licenses/BUNGEE-NOTICE.md" \
     "${REPO_ROOT}/third_party/licenses/ESSENTIA-NOTICE.md" \
+    "${REPO_ROOT}/third_party/licenses/EIGEN-NOTICE.md" \
     "${REPO_ROOT}/third_party/licenses/PFFFT-NOTICE.txt" \
     "${REPO_ROOT}/third_party/licenses/SOUNDTOUCH-NOTICE.md" \
     "${REPO_ROOT}/third_party/MoogLadders-main/LICENSE" \
@@ -122,6 +138,8 @@ copy_common_notices() {
        "${target_dir}/LICENSES/BUNGEE-NOTICE.md"
     cp "${REPO_ROOT}/third_party/licenses/ESSENTIA-NOTICE.md" \
        "${target_dir}/LICENSES/ESSENTIA-NOTICE.md"
+    cp "${REPO_ROOT}/third_party/licenses/EIGEN-NOTICE.md" \
+       "${target_dir}/LICENSES/EIGEN-NOTICE.md"
     cp "${REPO_ROOT}/third_party/licenses/PFFFT-NOTICE.txt" \
        "${target_dir}/LICENSES/PFFFT-NOTICE.txt"
     cp "${REPO_ROOT}/third_party/licenses/SOUNDTOUCH-NOTICE.md" \
