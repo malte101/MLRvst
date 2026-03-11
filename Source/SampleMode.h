@@ -29,11 +29,20 @@ enum class SampleTriggerMode
     Loop
 };
 
+enum class SamplePitchAnalysisProfile
+{
+    Polyphonic = 0,
+    Monophonic
+};
+
 struct SampleAnalysisSummary
 {
     double estimatedTempoBpm = 0.0;
     double estimatedPitchHz = 0.0;
     int estimatedPitchMidi = -1;
+    float estimatedPitchConfidence = 0.0f;
+    int estimatedScaleIndex = -1;
+    float estimatedScaleConfidence = 0.0f;
     bool essentiaUsed = false;
     juce::String analysisSource;
     std::vector<int64_t> beatTickSamples;
@@ -156,9 +165,11 @@ public:
     SampleAnalysisSummary analyzeLoadedSample(const juce::File& file,
                                              const juce::AudioBuffer<float>& audioBuffer,
                                              double sourceSampleRate,
+                                             SamplePitchAnalysisProfile pitchProfile = SamplePitchAnalysisProfile::Polyphonic,
                                              ProgressCallback progressCallback = {}) const;
     void enrichAnalysisForFile(const juce::File& file,
                                LoadedSampleData& sampleData,
+                               SamplePitchAnalysisProfile pitchProfile = SamplePitchAnalysisProfile::Polyphonic,
                                ProgressCallback progressCallback = {}) const;
     std::vector<SampleSlice> buildSlicesForState(const LoadedSampleData& sampleData,
                                                  const SampleModePersistentState& state) const;

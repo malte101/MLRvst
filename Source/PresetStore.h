@@ -13,14 +13,20 @@ bool savePreset(int presetIndex,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,
                 const juce::File* currentStripFiles,
-                const std::function<std::unique_ptr<juce::XmlElement>(int)>& createFlipStateXml);
+                const juce::File* recentLoopDirectories,
+                const juce::File* recentStepDirectories,
+                const juce::File* recentFlipDirectories,
+                const std::function<std::unique_ptr<juce::XmlElement>(int)>& createFlipStateXml,
+                const std::function<std::unique_ptr<juce::XmlElement>(int)>& createLoopPitchStateXml);
 bool loadPreset(int presetIndex,
                 int maxStrips,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,
                 const std::function<bool(int, const juce::File&)>& loadSampleToStrip,
                 const std::function<void(int, const juce::File&)>& restoreStripSamplePath,
+                const std::function<void(int, const juce::File&, const juce::File&, const juce::File&)>& restoreStripRecentDirectories,
                 const std::function<void(int, const juce::XmlElement*)>& applyFlipStateXml,
+                const std::function<void(int, const juce::XmlElement*)>& applyLoopPitchStateXml,
                 double hostPpqSnapshot,
                 double hostTempoSnapshot);
 juce::String getPresetName(int presetIndex);

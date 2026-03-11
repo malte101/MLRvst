@@ -49,6 +49,7 @@ public:
                          const std::array<int, 16>& transientSlices,
                          int totalSamples,
                          bool transientModeActive);
+    void setLoopPitchOverlay(bool enabled, const juce::String& lineA, const juce::String& lineB);
     void setWaveformColor(juce::Colour color);
     bool hasLoadedAudio() const noexcept { return hasAudio; }
     void clear();
@@ -78,6 +79,9 @@ private:
     float grainHudPitchSemitones = 0.0f;
     float grainHudArpDepth = 0.0f;
     float grainHudPitchJitterSemitones = 0.0f;
+    bool loopPitchOverlayEnabled = false;
+    juce::String loopPitchOverlayLineA;
+    juce::String loopPitchOverlayLineB;
     
     void generateThumbnail(const juce::AudioBuffer<float>& buffer);
     
@@ -463,8 +467,12 @@ private:
     bool preModulationStepVisible = false;
     bool preModulationSampleVisible = false;
     juce::Rectangle<int> modulationLaneBounds;
+    juce::Rectangle<int> loopPitchProgressBounds;
     int modulationLastDrawStep = -1;
     float modulationLastDrawValue = 0.0f;
+    float loopPitchAnalysisProgress = 0.0f;
+    bool loopPitchAnalysisActive = false;
+    juce::String loopPitchAnalysisStatus;
     
     // Compact controls on the right
     juce::Slider volumeSlider;      // Compact rotary
@@ -556,8 +564,16 @@ private:
     juce::TextButton loadButton;    // Small
     juce::TextButton pitchMasterButton;
     juce::TextButton pitchSyncButton;
+    juce::ComboBox pitchNoteBox;
+    juce::TextButton identityModeButton;
+    juce::TextButton identityGroupButton;
+    juce::TextButton identityRoleButton;
+    juce::TextButton identityNoteButton;
+    juce::TextButton identityTargetButton;
+    juce::TextButton identityTimingButton;
     juce::ComboBox groupSelector;   // Compact
     juce::Label stripLabel;         // Small
+    juce::Label stripSampleNameLabel;
     
     // Attachments
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> volumeAttachment;
@@ -571,6 +587,7 @@ private:
     void loadSampleFromFile(const juce::File& file);
     static bool isSupportedAudioFile(const juce::File& file);
     void paintLEDOverlay(juce::Graphics& g);  // Draw LED blocks over waveform
+    void paintLoopPitchAnalysisProgress(juce::Graphics& g);
     void paintModulationLane(juce::Graphics& g);
     juce::Rectangle<int> getModulationLaneBounds() const;
     void applyModulationPoint(juce::Point<int> p);
@@ -746,6 +763,10 @@ private:
     juce::Label outputRoutingLabel;
     juce::ComboBox pitchControlModeBox;
     juce::Label pitchControlModeLabel;
+    juce::ComboBox rootNoteBox;
+    juce::Label rootNoteLabel;
+    juce::ComboBox globalScaleBox;
+    juce::Label globalScaleLabel;
     
     // Input monitoring controls
     juce::Slider inputMonitorSlider;
@@ -1030,6 +1051,7 @@ private:
     juce::Label titleLabel;
     juce::Label instructionsLabel;
     juce::TextEditor presetNameEditor;
+    juce::TextButton initButton;
     juce::TextButton saveButton;
     juce::TextButton deleteButton;
     juce::TextButton exportWavButton;

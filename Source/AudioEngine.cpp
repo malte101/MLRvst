@@ -309,6 +309,35 @@ float quantizePitchDeltaToScale(float semitoneDelta, ModernAudioEngine::PitchSca
     }
 }
 
+template <size_t N>
+int quantizeMidiToScaleImpl(int midiNote, int rootMidi, const std::array<int, N>& scale)
+{
+    const int clampedMidi = juce::jlimit(0, 127, midiNote);
+    const int clampedRoot = juce::jlimit(0, 127, rootMidi);
+    int bestMidi = clampedMidi;
+    int bestDist = std::numeric_limits<int>::max();
+
+    for (int oct = -10; oct <= 10; ++oct)
+    {
+        const int octaveBase = (12 * oct) + clampedRoot;
+        for (int degree : scale)
+        {
+            const int candidate = octaveBase + degree;
+            if (candidate < 0 || candidate > 127)
+                continue;
+
+            const int dist = std::abs(candidate - clampedMidi);
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestMidi = candidate;
+            }
+        }
+    }
+
+    return bestMidi;
+}
+
 float quantizeSpeedRatioMusical(float unit)
 {
     // Share one musical ratio palette between Mod Speed and Playhead Speed controls.
@@ -422,6 +451,40 @@ inline float filterLimiter0dB(float sample, float resonanceDrive)
     return std::copysign(limited, sample);
 }
 
+}
+
+float ModernAudioEngine::quantizePitchSemitonesToScale(float semitoneDelta, PitchScale scale)
+{
+    return quantizePitchDeltaToScale(semitoneDelta, scale);
+}
+
+float ModernAudioEngine::quantizePitchSemitonesToScale(float semitoneDelta, int rootMidi, PitchScale scale)
+{
+    if (scale == PitchScale::Chromatic)
+        return juce::jlimit(-48.0f, 48.0f, semitoneDelta);
+
+    const int referenceRoot = juce::jlimit(0, 127, rootMidi);
+    const int targetMidi = juce::jlimit(0, 127, static_cast<int>(std::round(static_cast<float>(referenceRoot) + semitoneDelta)));
+    const int quantizedMidi = quantizeMidiNoteToScale(targetMidi, referenceRoot, scale);
+    return juce::jlimit(-48.0f, 48.0f, static_cast<float>(quantizedMidi - referenceRoot));
+}
+
+int ModernAudioEngine::quantizeMidiNoteToScale(int midiNote, int rootMidi, PitchScale scale)
+{
+    switch (scale)
+    {
+        case PitchScale::Major:
+            return quantizeMidiToScaleImpl(midiNote, rootMidi, kScaleMajor);
+        case PitchScale::Minor:
+            return quantizeMidiToScaleImpl(midiNote, rootMidi, kScaleMinor);
+        case PitchScale::Dorian:
+            return quantizeMidiToScaleImpl(midiNote, rootMidi, kScaleDorian);
+        case PitchScale::PentatonicMinor:
+            return quantizeMidiToScaleImpl(midiNote, rootMidi, kScalePentMinor);
+        case PitchScale::Chromatic:
+        default:
+            return juce::jlimit(0, 127, midiNote);
+    }
 }
 
 //==============================================================================
@@ -2638,6 +2701,7 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
     const bool arpActive = (arpDepth > 0.001f);
     const int arpMode = arpActive ? juce::jlimit(0, 5, grainArpModeAtomic.load(std::memory_order_acquire)) : 0;
     const float arpRangeSemis = juce::jlimit(0.0f, 48.0f, std::abs(pitchBase));
+    const int rootMidi = globalPitchRootMidi.load(std::memory_order_acquire);
     auto quantizeToScale = [](float semi, const std::array<int, 7>& scale, int rootMidi)
     {
         const int midi = static_cast<int>(std::round(semi + static_cast<float>(rootMidi)));
@@ -2664,11 +2728,11 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
         static constexpr std::array<int, 7> minorScale { 0, 2, 3, 5, 7, 8, 11 };
         static constexpr std::array<int, 7> pentaScale { 0, 2, 4, 7, 9, 12, 14 };
         if (arpMode == 3)
-            return quantizeToScale(semi, majorScale, 60);
+            return quantizeToScale(semi, majorScale, rootMidi);
         if (arpMode == 4)
-            return quantizeToScale(semi, minorScale, 57);
+            return quantizeToScale(semi, minorScale, rootMidi);
         if (arpMode == 5)
-            return quantizeToScale(semi, pentaScale, 62);
+            return quantizeToScale(semi, pentaScale, rootMidi);
         if (arpMode == 0)
             return 12.0f * std::round(semi / 12.0f);
         if (arpMode == 1)
@@ -7721,6 +7785,18 @@ void EnhancedAudioStrip::setPitchShift(float semitones)
     smoothedPitchShift.setTargetValue(clamped);
 }
 
+void EnhancedAudioStrip::setGlobalPitchContext(int rootMidi, int scaleIndex)
+{
+    const int clampedRoot = juce::jlimit(0, 127, rootMidi);
+    const int clampedScale = juce::jlimit(
+        0, static_cast<int>(ModernAudioEngine::PitchScale::PentatonicMinor), scaleIndex);
+    const int previousScale = globalPitchScale.exchange(clampedScale, std::memory_order_acq_rel);
+    globalPitchRootMidi.store(clampedRoot, std::memory_order_release);
+    stepSampler.setRootMidi(clampedRoot);
+    if (previousScale != clampedScale)
+        setGrainPitch(grainPitchAtomic.load(std::memory_order_acquire));
+}
+
 void EnhancedAudioStrip::setStretchBackend(TimeStretchBackend backend)
 {
     const int newValue = static_cast<int>(sanitizeTimeStretchBackend(static_cast<int>(backend)));
@@ -8622,7 +8698,15 @@ void EnhancedAudioStrip::setGrainDensity(float value)
 void EnhancedAudioStrip::setGrainPitch(float semitones)
 {
     juce::ScopedLock lock(bufferLock);
-    grainParams.pitchSemitones = juce::jlimit(-48.0f, 48.0f, semitones);
+    const int rootMidi = globalPitchRootMidi.load(std::memory_order_acquire);
+    const auto scale = static_cast<ModernAudioEngine::PitchScale>(juce::jlimit(
+        0,
+        static_cast<int>(ModernAudioEngine::PitchScale::PentatonicMinor),
+        globalPitchScale.load(std::memory_order_acquire)));
+    grainParams.pitchSemitones = juce::jlimit(
+        -48.0f,
+        48.0f,
+        ModernAudioEngine::quantizePitchSemitonesToScale(semitones, rootMidi, scale));
     grainPitchAtomic.store(grainParams.pitchSemitones, std::memory_order_release);
     grainPitchSmoother.setTargetValue(grainParams.pitchSemitones);
     if (!grainArpWasActive)
@@ -9368,7 +9452,10 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                         {
                             const auto scale = static_cast<PitchScale>(juce::jlimit(
                                 0, static_cast<int>(PitchScale::PentatonicMinor), seq.pitchScale.load(std::memory_order_acquire)));
-                            targetPitch = quantizePitchDeltaToScale(targetPitch, scale);
+                            targetPitch = ModernAudioEngine::quantizePitchSemitonesToScale(
+                                targetPitch,
+                                strip->getGlobalPitchRootMidi(),
+                                scale);
                         }
                         targetPitch = juce::jlimit(-24.0f, 24.0f, targetPitch);
                         strip->setPitchShift(targetPitch);
@@ -10186,28 +10273,15 @@ bool ModernAudioEngine::loadSampleToStrip(int stripIndex, const juce::File& file
             << " barsExact=" << estimatedBars
             << " barsDetected=" << detectedBars);
 
-        // Strict PPQ safety:
-        // - If not playing, apply detected mapping immediately.
-        // - If playing, only apply when PPQ-anchor remap is provably safe.
-        if (!strip->isPlaying())
-        {
-            strip->setRecordingBars(detectedBars);
-            strip->setBeatsPerLoop(static_cast<float>(detectedBars * 4));
-        }
+        strip->setRecordingBars(detectedBars);
+        // Keep detected dropdown value and active beat mapping in lock-step on load.
+        // If timeline anchor + PPQ are available, remap at current PPQ; otherwise
+        // still set manual beats so speed is correct on first playback.
+        const double hostPpqNow = getTimelineBeat();
+        if (strip->isPpqTimelineAnchored() && std::isfinite(hostPpqNow))
+            strip->setBeatsPerLoopAtPpq(static_cast<float>(detectedBars * 4), hostPpqNow);
         else
-        {
-            const double hostPpqNow = getTimelineBeat();
-            if (strip->isPpqTimelineAnchored() && std::isfinite(hostPpqNow))
-            {
-                strip->setRecordingBars(detectedBars);
-                strip->setBeatsPerLoopAtPpq(static_cast<float>(detectedBars * 4), hostPpqNow);
-            }
-            else
-            {
-                DBG("Skipped live detected bar remap on strip " << stripIndex
-                    << " because PPQ anchor is not stable; retry when timeline is anchored.");
-            }
-        }
+            strip->setBeatsPerLoop(static_cast<float>(detectedBars * 4));
 
         return true;
     }

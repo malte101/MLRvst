@@ -555,6 +555,8 @@ public:
     float getDisplaySpeed() const { return displaySpeedAtomic.load(std::memory_order_acquire); }
     void setPitchShift(float semitones);
     float getPitchShift() const { return pitchShiftSemitones.load(); }
+    void setGlobalPitchContext(int rootMidi, int scaleIndex);
+    int getGlobalPitchRootMidi() const { return globalPitchRootMidi.load(std::memory_order_acquire); }
     void setResamplePitchEnabled(bool enabled) { resamplePitchEnabled.store(enabled ? 1 : 0, std::memory_order_release); }
     bool isResamplePitchEnabled() const { return resamplePitchEnabled.load(std::memory_order_acquire) != 0; }
     void setResamplePitchRatio(float ratio)
@@ -1127,6 +1129,8 @@ private:
     std::atomic<float> grainSizeModulatedMsAtomic{-1.0f}; // < 0 => modulation inactive
     std::atomic<float> grainDensityAtomic{0.05f};
     std::atomic<float> grainPitchAtomic{0.0f};
+    std::atomic<int> globalPitchRootMidi{60};
+    std::atomic<int> globalPitchScale{0};
     std::atomic<float> grainPitchJitterAtomic{0.0f};
     std::atomic<float> grainSpreadAtomic{0.0f};
     std::atomic<float> grainJitterAtomic{0.0f};
@@ -1343,6 +1347,10 @@ public:
         Dorian,
         PentatonicMinor
     };
+
+    static float quantizePitchSemitonesToScale(float semitoneDelta, PitchScale scale);
+    static float quantizePitchSemitonesToScale(float semitoneDelta, int rootMidi, PitchScale scale);
+    static int quantizeMidiNoteToScale(int midiNote, int rootMidi, PitchScale scale);
 
     enum class ModCurveShape
     {

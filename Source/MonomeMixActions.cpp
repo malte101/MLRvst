@@ -151,10 +151,7 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
     else if (mode == pitchMode)
     {
         const int semitones = musicalPitchSemitones[static_cast<size_t>(juce::jlimit(0, 15, x))];
-        processor.applyPitchControlToStrip(strip, static_cast<float>(semitones));
-
-        if (auto* param = processor.parameters.getParameter("stripPitch" + juce::String(stripIndex)))
-            param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(semitones)));
+        processor.applyUserPitchControlToStrip(stripIndex, static_cast<float>(semitones));
     }
     else if (mode == panMode)
     {

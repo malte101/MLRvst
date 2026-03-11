@@ -814,13 +814,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     const float currentSemitones = getPitchSemitonesForDisplay(*strip);
                     const float delta = (x == 13) ? -1.0f : 1.0f;
                     const float nextSemitones = juce::jlimit(-24.0f, 24.0f, currentSemitones + delta);
-                    applyPitchControlToStrip(*strip, nextSemitones);
-
-                    if (auto* param = parameters.getParameter("stripPitch" + juce::String(selectedStripIndex)))
-                    {
-                        const float normalized = juce::jlimit(0.0f, 1.0f, param->convertTo0to1(nextSemitones));
-                        param->setValueNotifyingHost(normalized);
-                    }
+                    applyUserPitchControlToStrip(selectedStripIndex, nextSemitones);
                 }
 
                 updateMonomeLEDs();
@@ -921,13 +915,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 if (stepEditTool == StepEditTool::Release)
                 {
                     const float pitchSemitones = juce::jmap(columnNorm, -24.0f, 24.0f);
-                    applyPitchControlToStrip(*targetStrip, pitchSemitones);
-
-                    if (auto* param = parameters.getParameter("stripPitch" + juce::String(selectedStripIndex)))
-                    {
-                        const float normalized = juce::jlimit(0.0f, 1.0f, param->convertTo0to1(pitchSemitones));
-                        param->setValueNotifyingHost(normalized);
-                    }
+                    applyUserPitchControlToStrip(selectedStripIndex, pitchSemitones);
 
                     updateMonomeLEDs();
                     return;

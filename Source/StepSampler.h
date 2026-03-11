@@ -233,7 +233,7 @@ public:
         synth.allNotesOff(0, true);
         
         // Trigger new note with pitch offset
-        int midiNote = 60 + pitchOffset;  // C4 + offset
+        int midiNote = rootMidi + pitchOffset;
         midiNote = juce::jlimit(0, 127, midiNote);
         
         synth.noteOn(1,      // MIDI channel
@@ -283,6 +283,11 @@ public:
             pitchOffset = static_cast<int>(std::round(semitones));
             pitchOffset = juce::jlimit(-36, 36, pitchOffset);  // ±3 octaves
         }
+    }
+
+    void setRootMidi(int midiNote)
+    {
+        rootMidi = juce::jlimit(0, 127, midiNote);
     }
 
     void setAmpAttackMs(float ms)
@@ -336,6 +341,7 @@ public:
     float getPan() const { return pan; }
     float getSpeed() const { return static_cast<float>(std::pow(2.0, static_cast<double>(pitchOffset) / 12.0)); }
     int getPitchOffset() const { return pitchOffset; }
+    int getRootMidi() const { return rootMidi; }
     bool isFilterEnabled() const { return filterEnabled; }
     float getFilterFrequency() const { return filterFrequency; }
     float getFilterResonance() const { return filterResonance; }
@@ -415,6 +421,7 @@ private:
     // Volume and pan (connected to strip controls)
     float volume = 1.0f;
     float pan = 0.0f;
+    int rootMidi = 60;
     int pitchOffset = 0;  // Semitone offset for speed/pitch control
     
     // Filter state

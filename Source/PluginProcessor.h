@@ -217,6 +217,7 @@ public:
     MonomeConnection& getMonomeConnection() { return monomeConnection; }
     
     bool loadSampleToStrip(int stripIndex, const juce::File& file);
+    bool loadSampleToStripPreservingPlaybackState(int stripIndex, const juce::File& file);
     bool loadSampleToSampleModeStrip(int stripIndex, const juce::File& file);
     SampleModeEngine* getSampleModeEngine(int stripIndex, bool createIfMissing = true);
     bool hasSampleModeAudio(int stripIndex) const;
@@ -243,7 +244,10 @@ public:
     static constexpr int BrowserFavoriteSlots = 6;
     juce::File getDefaultSampleDirectory(int stripIndex, SamplePathMode mode) const;
     void setDefaultSampleDirectory(int stripIndex, SamplePathMode mode, const juce::File& directory);
+    void setCurrentBrowserDirectoryForStrip(int stripIndex, SamplePathMode mode, const juce::File& directory);
     juce::File getCurrentBrowserDirectoryForStrip(int stripIndex) const;
+    juce::File getCurrentBrowserDirectoryForStrip(int stripIndex, SamplePathMode mode) const;
+    juce::String getStripDisplaySampleName(int stripIndex);
     juce::File getBrowserFavoriteDirectory(int stripIndex, int slot) const;
     bool isBrowserFavoritePadHeld(int stripIndex, int slot) const;
     bool isBrowserFavoriteSaveBurstActive(int slot, uint32_t nowMs) const;
@@ -261,12 +265,50 @@ public:
     bool usesTimeStretchBackend() const { return getStretchBackend() != TimeStretchBackend::Resample; }
     bool isPitchControlResampleMode() const { return getPitchControlMode() == PitchControlMode::Resample; }
     void applyPitchControlToStrip(EnhancedAudioStrip& strip, float semitones);
+    void applyPitchControlToStrip(int stripIndex, EnhancedAudioStrip& strip, float semitones);
+    void applyUserPitchControlToStrip(int stripIndex, float semitones);
     float getPitchSemitonesForDisplay(const EnhancedAudioStrip& strip) const;
+    float quantizePitchSemitonesForStripControl(int stripIndex, float semitones) const;
     bool requestLoopStripPitchMaster(int stripIndex);
     bool requestLoopStripPitchSync(int stripIndex);
     bool isLoopStripPitchAnalysisInFlight(int stripIndex) const;
+    float getLoopStripPitchAnalysisProgress(int stripIndex) const;
+    juce::String getLoopStripPitchAnalysisStatusText(int stripIndex) const;
     int getLoopStripDetectedPitchMidi(int stripIndex) const;
+    float getLoopStripDetectedPitchHz(int stripIndex) const;
+    int getLoopStripDetectedScaleIndex(int stripIndex) const;
+    float getLoopStripDetectedPitchConfidence(int stripIndex) const;
+    float getLoopStripDetectedScaleConfidence(int stripIndex) const;
+    bool isLoopStripAssignedPitchManual(int stripIndex) const;
+    bool didLoopStripPitchUseEssentia(int stripIndex) const;
+    enum class LoopPitchRole
+    {
+        None = 0,
+        Master,
+        Sync
+    };
+    enum class LoopPitchSyncTiming
+    {
+        Immediate = 0,
+        NextTrigger,
+        NextLoop,
+        NextBar
+    };
+    LoopPitchRole getLoopPitchRole(int stripIndex) const;
+    void setLoopPitchRole(int stripIndex, LoopPitchRole role);
+    LoopPitchSyncTiming getLoopPitchSyncTiming(int stripIndex) const;
+    void setLoopPitchSyncTiming(int stripIndex, LoopPitchSyncTiming timing);
+    int getLoopStripAssignedPitchMidi(int stripIndex) const;
+    float getLoopStripPitchSyncCorrectionSemitones(int stripIndex) const;
+    void setLoopStripAssignedPitchMidi(int stripIndex, int midiNote, bool manualOverride = true);
+    void updateGlobalRootFromLoopPitchMaster(int stripIndex, bool markPersistent = true);
     int getGlobalRootNoteMidi() const { return globalRootNoteMidi.load(std::memory_order_acquire); }
+    int getGlobalRootNotePitchClass() const;
+    void setGlobalRootNoteMidi(int midiNote, bool markPersistent = true);
+    void setGlobalRootNotePitchClass(int pitchClass);
+    ModernAudioEngine::PitchScale getGlobalPitchScale() const;
+    void setGlobalPitchScale(ModernAudioEngine::PitchScale scale);
+    float quantizePitchSemitonesToGlobalScale(float semitones) const;
     struct LoopPitchAnalysisResult
     {
         int stripIndex = -1;
@@ -275,6 +317,9 @@ public:
         bool success = false;
         int detectedMidi = -1;
         double detectedHz = 0.0;
+        float detectedPitchConfidence = 0.0f;
+        int detectedScaleIndex = -1;
+        float detectedScaleConfidence = 0.0f;
         bool essentiaUsed = false;
         juce::String analysisSource;
     };
@@ -348,6 +393,7 @@ public:
     void savePreset(int presetIndex);
     void loadPreset(int presetIndex);
     bool deletePreset(int presetIndex);
+    void initRuntimeStateToDefaults();
     int getLoadedPresetIndex() const { return loadedPresetIndex; }
     juce::String getPresetName(int presetIndex) const;
     bool setPresetName(int presetIndex, const juce::String& name);
@@ -550,6 +596,9 @@ private:
     std::array<juce::File, MaxStrips> defaultLoopDirectories;
     std::array<juce::File, MaxStrips> defaultStepDirectories;
     std::array<juce::File, MaxStrips> defaultFlipDirectories;
+    std::array<juce::File, MaxStrips> recentLoopDirectories;
+    std::array<juce::File, MaxStrips> recentStepDirectories;
+    std::array<juce::File, MaxStrips> recentFlipDirectories;
     std::array<juce::File, BrowserFavoriteSlots> browserFavoriteDirectories;
     std::array<juce::File, BrowserFavoriteSlots> browserFlipFavoriteDirectories;
     std::atomic<int> persistentGlobalControlsDirty{0};
@@ -588,12 +637,27 @@ private:
     std::array<std::atomic<int>, MaxStrips> sampleModeHeldVisibleSliceSlots{};
     std::array<std::atomic<int>, MaxStrips> loopPitchAnalysisRequestIds{};
     std::array<std::atomic<int>, MaxStrips> loopPitchAnalysisInFlight{};
+    std::array<std::atomic<int>, MaxStrips> loopPitchAnalysisProgressPermille{};
     std::array<std::atomic<int>, MaxStrips> loopPitchDetectedMidi{};
+    std::array<std::atomic<float>, MaxStrips> loopPitchDetectedHz{};
+    std::array<std::atomic<float>, MaxStrips> loopPitchDetectedPitchConfidence{};
+    std::array<std::atomic<int>, MaxStrips> loopPitchDetectedScaleIndices{};
+    std::array<std::atomic<float>, MaxStrips> loopPitchDetectedScaleConfidence{};
     std::array<std::atomic<int>, MaxStrips> loopPitchEssentiaUsed{};
+    std::array<std::atomic<int>, MaxStrips> loopPitchRoles{};
+    std::array<std::atomic<int>, MaxStrips> loopPitchSyncTimings{};
+    std::array<std::atomic<int>, MaxStrips> loopPitchAssignedMidi{};
+    std::array<std::atomic<int>, MaxStrips> loopPitchAssignedManual{};
+    std::array<std::atomic<int>, MaxStrips> loopPitchPendingRetune{};
     std::atomic<int> globalRootNoteMidi{60};
+    std::atomic<int> globalPitchScale{static_cast<int>(ModernAudioEngine::PitchScale::Chromatic)};
     juce::ThreadPool loopPitchAnalysisThreadPool{1};
+    mutable juce::CriticalSection loopPitchAnalysisStatusLock;
+    std::array<juce::String, MaxStrips> loopPitchAnalysisStatusTexts;
     juce::CriticalSection loopPitchAnalysisResultLock;
     std::vector<LoopPitchAnalysisResult> loopPitchAnalysisResults;
+    std::array<int, MaxStrips> loopPitchLastObservedColumns{};
+    int loopPitchLastObservedHostBar = -1;
     struct FlipLegacyLoopSyncCache
     {
         const void* loadedSampleToken = nullptr;
@@ -633,7 +697,21 @@ private:
     void queueLoopPitchAnalysisResult(LoopPitchAnalysisResult result);
     void applyCompletedLoopPitchAnalyses();
     bool beginLoopStripPitchAnalysis(int stripIndex, bool setDetectedAsRoot);
+    void updateLoopPitchAnalysisProgress(int stripIndex, int requestId, float progress, const juce::String& statusText);
+    void resetLoopPitchAnalysisProgress(int stripIndex);
     void applyLoopStripPitchSemitones(int stripIndex, float semitones);
+    void normalizeLoopPitchMasterRoles();
+    int getEffectiveLoopPitchMasterRootMidi(int stripIndex) const;
+    void applyLoopPitchRoleStateToStrip(int stripIndex);
+    void applyLoopPitchSyncToAllStrips();
+    int getPitchQuantizeReferenceRootMidiForStrip(int stripIndex) const;
+    void requestLoopPitchRoleStateUpdate(int stripIndex);
+    void applyPendingLoopPitchRetunes();
+    bool applyPendingLoopPitchRetuneOnTrigger(int stripIndex);
+    void appendLoopPitchStateToState(juce::ValueTree& state) const;
+    void loadLoopPitchStateFromState(const juce::ValueTree& state);
+    std::unique_ptr<juce::XmlElement> createLoopPitchPresetStateXml(int stripIndex) const;
+    void applyLoopPitchPresetStateXml(int stripIndex, const juce::XmlElement* stateXml);
     void invalidateFlipLegacyLoopSync(int stripIndex);
     void stopSampleModeStrip(int stripIndex, bool immediateStop);
     void timerCallback() override;
@@ -650,6 +728,8 @@ private:
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     void cacheParameterPointers();
     SamplePathMode getSamplePathModeForStrip(int stripIndex) const;
+    juce::File getRecentSampleDirectory(int stripIndex, SamplePathMode mode) const;
+    void setRecentSampleDirectory(int stripIndex, SamplePathMode mode, const juce::File& directory, bool persist = true);
     void rememberLoadedSamplePathForStrip(int stripIndex, const juce::File& file, bool persist = true);
     void rememberLoadedSamplePathForStripMode(int stripIndex, const juce::File& file, SamplePathMode mode, bool persist = true);
     bool saveBrowserFavoriteDirectoryFromStrip(int stripIndex, int slot);
@@ -670,12 +750,14 @@ private:
     void stripPersistentGlobalControlsFromState(juce::ValueTree& state) const;
     void loadPersistentDefaultPaths();
     void savePersistentDefaultPaths() const;
+    void resetCurrentBrowserDirectoriesToDefaultPaths(bool persist);
     void loadPersistentControlPages();
     void savePersistentControlPages() const;
     void loadPersistentGlobalControls();
     int getQuantizeDivision() const;
     float getInnerLoopLengthFactor() const;
     void queueLoopChange(int stripIndex, bool clearLoop, int startColumn, int endColumn, bool reverseDirection, int markerColumn = -1);
+    void recoverDeferredPpqAnchors(const juce::AudioPlayHead::PositionInfo& posInfo);
     void applyPendingLoopChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
     void applyPendingBarChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
     void applyPendingStutterStart(const juce::AudioPlayHead::PositionInfo& posInfo);
@@ -695,6 +777,9 @@ private:
     {
         int presetIndex = -1;
         std::array<juce::File, MaxStrips> stripFiles;
+        std::array<juce::File, MaxStrips> recentLoopDirectories;
+        std::array<juce::File, MaxStrips> recentStepDirectories;
+        std::array<juce::File, MaxStrips> recentFlipDirectories;
     };
     struct PresetSaveResult
     {

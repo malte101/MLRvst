@@ -14,6 +14,9 @@
  #include <essentia/essentia.h>
  #include <essentia/essentiamath.h>
 #endif
+#if MLRVST_ENABLE_LIBPYIN
+ #include "../third_party/LibPyin/source/libpyincpp.h"
+#endif
 
 namespace
 {
@@ -246,6 +249,8 @@ const EssentiaPythonConfig& getEssentiaPythonConfig()
 juce::String buildSliceLabel(int index);
 float safeNormalizedPosition(int64_t samplePosition, int64_t totalSamples);
 void fillSliceMetadata(SampleSlice& slice, int sliceIndex, int64_t totalSamples);
+juce::AudioBuffer<float> buildMonoBuffer(const LoadedSampleData& sampleData);
+int pitchHzToMidi(double pitchHz);
 
 std::array<SampleSlice, SliceModel::VisibleSliceCount> buildDistributedRandomSliceSelection(
     const std::vector<SampleSlice>& allSlices,
@@ -409,6 +414,298 @@ juce::String noteNameForMidi(int midiNote)
     return juce::String(names[pitchClass]) + juce::String(octave);
 }
 
+int pitchClassFromKeyName(const juce::String& keyName)
+{
+    const auto normalized = keyName.trim().toUpperCase();
+    if (normalized.isEmpty())
+        return -1;
+
+    if (normalized == "C")  return 0;
+    if (normalized == "B#" ) return 0;
+    if (normalized == "C#" || normalized == "DB") return 1;
+    if (normalized == "D")  return 2;
+    if (normalized == "D#" || normalized == "EB") return 3;
+    if (normalized == "E" || normalized == "FB") return 4;
+    if (normalized == "F" || normalized == "E#") return 5;
+    if (normalized == "F#" || normalized == "GB") return 6;
+    if (normalized == "G")  return 7;
+    if (normalized == "G#" || normalized == "AB") return 8;
+    if (normalized == "A")  return 9;
+    if (normalized == "A#" || normalized == "BB") return 10;
+    if (normalized == "B" || normalized == "CB") return 11;
+    return -1;
+}
+
+int pitchScaleIndexFromEssentiaName(const juce::String& scaleName)
+{
+    const auto normalized = scaleName.trim().toLowerCase();
+    if (normalized == "major")
+        return 1;
+    if (normalized == "minor")
+        return 2;
+    return -1;
+}
+
+double midiToPitchHz(int midiNote)
+{
+    return 440.0 * std::pow(2.0, (static_cast<double>(midiNote) - 69.0) / 12.0);
+}
+
+#if MLRVST_ENABLE_LIBPYIN
+struct LibPyinPitchEstimate
+{
+    double frequency = 0.0;
+    int midi = -1;
+    float confidence = 0.0f;
+};
+
+std::optional<LibPyinPitchEstimate> runLibPyinMonophonicPitch(const LoadedSampleData& sampleData)
+{
+    const auto monoBuffer = buildMonoBuffer(sampleData);
+    const int totalSamples = monoBuffer.getNumSamples();
+    if (totalSamples <= 0 || sampleData.sourceSampleRate <= 0.0)
+        return std::nullopt;
+
+    int blockSize = 4096;
+    while (blockSize > totalSamples && blockSize > 1024)
+        blockSize /= 2;
+    const int stepSize = juce::jmax(64, blockSize / 16);
+    if (blockSize < 1024 || stepSize <= 0)
+        return std::nullopt;
+
+    std::vector<float> monoSamples(static_cast<size_t>(totalSamples));
+    const auto* mono = monoBuffer.getReadPointer(0);
+    float peak = 0.0f;
+    for (int i = 0; i < totalSamples; ++i)
+        peak = juce::jmax(peak, std::abs(mono[i]));
+    if (peak < 1.0e-5f)
+        return std::nullopt;
+
+    const float normalizeGain = 1.0f / peak;
+    for (int i = 0; i < totalSamples; ++i)
+        monoSamples[static_cast<size_t>(i)] = mono[i] * normalizeGain;
+
+    PyinCpp pyin(static_cast<int>(std::lround(sampleData.sourceSampleRate)), blockSize, stepSize);
+    pyin.setCutOff(0.0f);
+    pyin.reserve(totalSamples);
+    pyin.feed(monoSamples);
+
+    const auto& candidateFrames = pyin.getPitchCandidates();
+    if (candidateFrames.empty())
+        return std::nullopt;
+
+    struct FrameEstimate
+    {
+        double frequency = 0.0;
+        double probability = 0.0;
+        double rms = 0.0;
+        int midi = -1;
+        bool valid = false;
+    };
+
+    std::vector<FrameEstimate> frames(candidateFrames.size());
+    std::vector<double> rmsValues;
+    rmsValues.reserve(candidateFrames.size());
+    std::array<double, 128> midiWeights {};
+
+    for (size_t frameIndex = 0; frameIndex < candidateFrames.size(); ++frameIndex)
+    {
+        const int startSample = static_cast<int>(frameIndex) * stepSize;
+        const int endSample = juce::jmin(totalSamples, startSample + blockSize);
+        double sumSquares = 0.0;
+        for (int sample = startSample; sample < endSample; ++sample)
+            sumSquares += static_cast<double>(monoSamples[static_cast<size_t>(sample)])
+                * static_cast<double>(monoSamples[static_cast<size_t>(sample)]);
+
+        const int frameLength = juce::jmax(1, endSample - startSample);
+        FrameEstimate estimate;
+        estimate.rms = std::sqrt(sumSquares / static_cast<double>(frameLength));
+        rmsValues.push_back(estimate.rms);
+
+        double bestProbability = 0.0;
+        double bestFrequency = 0.0;
+        int bestMidi = -1;
+        for (const auto& candidate : candidateFrames[frameIndex])
+        {
+            const double frequency = static_cast<double>(candidate.first);
+            const double probability = static_cast<double>(candidate.second);
+            const int midi = pitchHzToMidi(frequency);
+            if (!(frequency > 20.0) || midi < 0 || midi > 127 || probability < 0.08)
+                continue;
+            if (probability > bestProbability)
+            {
+                bestProbability = probability;
+                bestFrequency = frequency;
+                bestMidi = midi;
+            }
+        }
+
+        if (bestMidi >= 0)
+        {
+            estimate.frequency = bestFrequency;
+            estimate.probability = juce::jlimit(0.0, 1.0, bestProbability);
+            estimate.midi = bestMidi;
+            estimate.valid = true;
+        }
+
+        frames[frameIndex] = estimate;
+    }
+
+    if (rmsValues.empty())
+        return std::nullopt;
+
+    auto sortedRms = rmsValues;
+    std::sort(sortedRms.begin(), sortedRms.end());
+    const double rmsMedian = sortedRms[sortedRms.size() / 2];
+    const double rmsHigh = sortedRms[static_cast<size_t>(juce::jlimit<int>(0,
+                                                                           static_cast<int>(sortedRms.size() - 1),
+                                                                           static_cast<int>(std::floor(sortedRms.size() * 0.85))))];
+    const double rmsFloor = juce::jmax(0.0025, juce::jmax(rmsMedian * 0.45, rmsHigh * 0.18));
+
+    for (const auto& frame : frames)
+    {
+        if (!frame.valid || frame.rms < rmsFloor)
+            continue;
+        const double weight = frame.probability * (0.35 + juce::jlimit(0.0, 1.0, frame.rms / juce::jmax(1.0e-6, rmsHigh)));
+        midiWeights[static_cast<size_t>(frame.midi)] += weight;
+    }
+
+    const auto bestMidiIt = std::max_element(midiWeights.begin(), midiWeights.end());
+    if (bestMidiIt == midiWeights.end() || *bestMidiIt <= 0.0)
+        return std::nullopt;
+
+    const int bestMidi = static_cast<int>(std::distance(midiWeights.begin(), bestMidiIt));
+
+    struct Segment
+    {
+        size_t start = 0;
+        size_t end = 0;
+        double score = 0.0;
+    };
+
+    auto frameMatchesBestNote = [&](const FrameEstimate& frame) -> bool
+    {
+        if (!frame.valid || frame.rms < rmsFloor || frame.probability < 0.12)
+            return false;
+        return std::abs(frame.midi - bestMidi) <= 1;
+    };
+
+    Segment bestSegment {};
+    bool haveSegment = false;
+    size_t segmentStart = 0;
+    size_t segmentEnd = 0;
+    int gapFrames = 0;
+    double lastFrequency = 0.0;
+    double segmentWeightSum = 0.0;
+    double segmentScoreAccum = 0.0;
+
+    auto finishSegment = [&](size_t endExclusive)
+    {
+        if (segmentEnd < segmentStart)
+            return;
+        const size_t length = segmentEnd - segmentStart + 1;
+        if (length < 2 || segmentWeightSum <= 0.0)
+            return;
+        const double stabilityScore = segmentScoreAccum / segmentWeightSum;
+        const double score = static_cast<double>(length) * stabilityScore;
+        if (!haveSegment || score > bestSegment.score)
+        {
+            bestSegment = { segmentStart, endExclusive, score };
+            haveSegment = true;
+        }
+    };
+
+    for (size_t frameIndex = 0; frameIndex < frames.size(); ++frameIndex)
+    {
+        const auto& frame = frames[frameIndex];
+        if (!frameMatchesBestNote(frame))
+        {
+            ++gapFrames;
+            if (gapFrames > 1 && segmentEnd >= segmentStart)
+            {
+                finishSegment(segmentEnd + 1);
+                segmentStart = frameIndex + 1;
+                segmentEnd = frameIndex;
+                gapFrames = 0;
+                lastFrequency = 0.0;
+                segmentWeightSum = 0.0;
+                segmentScoreAccum = 0.0;
+            }
+            continue;
+        }
+
+        const double weight = frame.probability
+            * (0.35 + juce::jlimit(0.0, 1.0, frame.rms / juce::jmax(1.0e-6, rmsHigh)));
+        const double jumpSemitones = (lastFrequency > 0.0 && frame.frequency > 0.0)
+            ? std::abs(12.0 * std::log2(frame.frequency / lastFrequency))
+            : 0.0;
+
+        if (segmentEnd >= segmentStart && jumpSemitones > 0.85)
+        {
+            finishSegment(segmentEnd + 1);
+            segmentStart = frameIndex;
+            segmentEnd = frameIndex - 1;
+            gapFrames = 0;
+            lastFrequency = 0.0;
+            segmentWeightSum = 0.0;
+            segmentScoreAccum = 0.0;
+        }
+
+        if (segmentEnd < segmentStart)
+            segmentStart = frameIndex;
+
+        segmentEnd = frameIndex;
+        gapFrames = 0;
+        lastFrequency = frame.frequency;
+        segmentWeightSum += weight;
+        segmentScoreAccum += weight / (1.0 + (jumpSemitones * 0.75));
+    }
+
+    finishSegment(segmentEnd + 1);
+
+    double weightedLogPitch = 0.0;
+    double totalWeight = 0.0;
+    auto accumulateFrame = [&](const FrameEstimate& frame)
+    {
+        if (!frameMatchesBestNote(frame))
+            return;
+        const double weight = frame.probability
+            * (0.35 + juce::jlimit(0.0, 1.0, frame.rms / juce::jmax(1.0e-6, rmsHigh)));
+        weightedLogPitch += std::log(frame.frequency) * weight;
+        totalWeight += weight;
+    };
+
+    if (haveSegment)
+    {
+        for (size_t frameIndex = bestSegment.start; frameIndex < bestSegment.end && frameIndex < frames.size(); ++frameIndex)
+            accumulateFrame(frames[frameIndex]);
+    }
+
+    if (totalWeight <= 0.0)
+    {
+        for (const auto& frame : frames)
+            accumulateFrame(frame);
+    }
+
+    if (totalWeight <= 0.0)
+        return std::nullopt;
+
+    const double frequency = std::exp(weightedLogPitch / totalWeight);
+    const double dominantWeight = *bestMidiIt;
+    double totalMidiWeight = 0.0;
+    for (const auto weight : midiWeights)
+        totalMidiWeight += weight;
+    const double dominance = (totalMidiWeight > 0.0) ? (dominantWeight / totalMidiWeight) : 0.0;
+    const double segmentConfidence = haveSegment
+        ? juce::jlimit(0.0, 1.0, bestSegment.score / juce::jmax(1.0, static_cast<double>(bestSegment.end - bestSegment.start)))
+        : 0.0;
+    const float confidence = juce::jlimit(0.0f,
+                                          1.0f,
+                                          static_cast<float>((dominance * 0.65) + (segmentConfidence * 0.35)));
+    return LibPyinPitchEstimate { frequency, pitchHzToMidi(frequency), confidence };
+}
+#endif
+
 juce::String analysisBackendDisplayText(bool essentiaUsed, const juce::String& analysisSource)
 {
     const auto source = analysisSource.trim();
@@ -457,7 +754,9 @@ juce::String compactLoadStatusText(const juce::String& statusText)
         return "Waveform...";
     if (source.containsIgnoreCase("Analyzing transients"))
         return "Transients...";
-    if (source.containsIgnoreCase("Essentia tempo / pitch"))
+    if (source.containsIgnoreCase("Essentia tempo / pitch")
+        || source.containsIgnoreCase("Essentia key")
+        || source.containsIgnoreCase("Essentia pitch"))
         return "Essentia...";
     if (source.containsIgnoreCase("Snapping loop-style transients"))
         return "Snapping...";
@@ -1207,8 +1506,10 @@ std::optional<juce::File> createEssentiaAnalysisWaveFile(const LoadedSampleData&
 }
 
 std::optional<SampleAnalysisSummary> runEssentiaAnalysis(const juce::File& sourceFile,
+                                                         SamplePitchAnalysisProfile pitchProfile,
                                                          juce::String* failureReason = nullptr)
 {
+    juce::ignoreUnused(pitchProfile);
     if (!sourceFile.existsAsFile())
     {
         if (failureReason != nullptr)
@@ -1345,6 +1646,7 @@ EssentiaNativeRuntime& getEssentiaNativeRuntime()
 }
 
 std::optional<SampleAnalysisSummary> runEssentiaAnalysis(const LoadedSampleData& sampleData,
+                                                         SamplePitchAnalysisProfile pitchProfile,
                                                          juce::String* failureReason = nullptr)
 {
     if (sampleData.audioBuffer.getNumSamples() <= 0 || sampleData.sourceSampleRate <= 0.0)
@@ -1409,67 +1711,158 @@ std::optional<SampleAnalysisSummary> runEssentiaAnalysis(const LoadedSampleData&
                 break;
         }
 
-        int frameSize = 2048;
-        while (frameSize > totalSamples && frameSize > 256)
-            frameSize /= 2;
-        const int hopSize = juce::jmax(64, frameSize / 8);
-
-        std::unique_ptr<essentia::standard::Algorithm> frameCutter(
-            factory.create("FrameCutter",
-                           "frameSize", frameSize,
-                           "hopSize", hopSize,
-                           "startFromZero", false));
-        std::unique_ptr<essentia::standard::Algorithm> window(
-            factory.create("Windowing", "type", "hann", "zeroPadding", 0));
-        std::unique_ptr<essentia::standard::Algorithm> spectrum(
-            factory.create("Spectrum", "size", frameSize));
-        std::unique_ptr<essentia::standard::Algorithm> pitchDetect(
-            factory.create("PitchYinFFT",
-                           "frameSize", frameSize,
-                           "sampleRate", sampleData.sourceSampleRate));
-
-        std::vector<essentia::Real> frame;
-        std::vector<essentia::Real> windowedFrame;
-        std::vector<essentia::Real> magnitudeSpectrum;
-        essentia::Real pitchHz = 0.0f;
-        essentia::Real pitchConfidence = 0.0f;
-        frameCutter->input("signal").set(signal);
-        frameCutter->output("frame").set(frame);
-        window->input("frame").set(frame);
-        window->output("frame").set(windowedFrame);
-        spectrum->input("frame").set(windowedFrame);
-        spectrum->output("spectrum").set(magnitudeSpectrum);
-        pitchDetect->input("spectrum").set(magnitudeSpectrum);
-        pitchDetect->output("pitch").set(pitchHz);
-        pitchDetect->output("pitchConfidence").set(pitchConfidence);
-
-        std::vector<double> detectedPitchesHz;
-        while (true)
         {
-            frameCutter->compute();
-            if (frame.empty())
-                break;
+            std::unique_ptr<essentia::standard::Algorithm> keyExtractor(
+                factory.create("KeyExtractor",
+                               "sampleRate", sampleData.sourceSampleRate,
+                               "frameSize", 4096,
+                               "hopSize", 2048,
+                               "hpcpSize", 36,
+                               "minFrequency", 40.0,
+                               "maxFrequency", 5000.0,
+                               "maximumSpectralPeaks", 120,
+                               "profileType", "edma",
+                               "pcpThreshold", 0.2,
+                               "averageDetuningCorrection", true,
+                               "weightType", "cosine"));
 
-            float peak = 0.0f;
-            for (const auto sample : frame)
-                peak = juce::jmax(peak, std::abs(sample));
-            if (peak < 1.0e-4f)
-                continue;
+            std::string detectedKey;
+            std::string detectedScale;
+            essentia::Real keyStrength = 0.0f;
+            keyExtractor->input("audio").set(signal);
+            keyExtractor->output("key").set(detectedKey);
+            keyExtractor->output("scale").set(detectedScale);
+	            keyExtractor->output("strength").set(keyStrength);
+	            keyExtractor->compute();
 
-            window->compute();
-            spectrum->compute();
-            pitchDetect->compute();
+	            summary.estimatedScaleIndex = pitchScaleIndexFromEssentiaName(juce::String(detectedScale));
+	            summary.estimatedScaleConfidence = juce::jlimit(0.0f, 1.0f, static_cast<float>(keyStrength));
 
-            if (std::isfinite(pitchHz) && pitchHz > 20.0f && pitchConfidence >= 0.45f)
-                detectedPitchesHz.push_back(static_cast<double>(pitchHz));
+	            if (pitchProfile == SamplePitchAnalysisProfile::Polyphonic)
+	            {
+	                const int pitchClass = pitchClassFromKeyName(juce::String(detectedKey));
+	                if (pitchClass >= 0 && std::isfinite(keyStrength) && keyStrength >= 0.08f)
+	                {
+	                    summary.estimatedPitchMidi = 60 + pitchClass;
+	                    summary.estimatedPitchHz = midiToPitchHz(summary.estimatedPitchMidi);
+	                    summary.estimatedPitchConfidence = juce::jlimit(0.0f, 1.0f, static_cast<float>(keyStrength));
+	                }
+	            }
         }
 
-        if (!detectedPitchesHz.empty())
+        if (pitchProfile == SamplePitchAnalysisProfile::Polyphonic)
         {
-            std::sort(detectedPitchesHz.begin(), detectedPitchesHz.end());
-            const size_t medianIndex = detectedPitchesHz.size() / 2;
-            summary.estimatedPitchHz = detectedPitchesHz[medianIndex];
-            summary.estimatedPitchMidi = pitchHzToMidi(summary.estimatedPitchHz);
+            juce::ignoreUnused(summary.estimatedScaleIndex);
+        }
+        else
+        {
+           #if MLRVST_ENABLE_LIBPYIN
+	            if (const auto pyinPitch = runLibPyinMonophonicPitch(sampleData))
+	            {
+	                summary.estimatedPitchHz = pyinPitch->frequency;
+	                summary.estimatedPitchMidi = pyinPitch->midi;
+	                summary.estimatedPitchConfidence = pyinPitch->confidence;
+	            }
+	            #endif
+
+            if (summary.estimatedPitchMidi < 0)
+            {
+                int frameSize = 4096;
+                while (frameSize > totalSamples && frameSize > 512)
+                    frameSize /= 2;
+                const int hopSize = juce::jmax(128, frameSize / 8);
+
+                std::unique_ptr<essentia::standard::Algorithm> frameCutter(
+                    factory.create("FrameCutter",
+                                   "frameSize", frameSize,
+                                   "hopSize", hopSize,
+                                   "startFromZero", false));
+                std::unique_ptr<essentia::standard::Algorithm> window(
+                    factory.create("Windowing", "type", "hann", "zeroPadding", 0));
+                std::unique_ptr<essentia::standard::Algorithm> spectrum(
+                    factory.create("Spectrum", "size", frameSize));
+                std::unique_ptr<essentia::standard::Algorithm> pitchDetect(
+                    factory.create("PitchYinFFT",
+                                   "frameSize", frameSize,
+                                   "sampleRate", sampleData.sourceSampleRate));
+
+                std::vector<essentia::Real> frame;
+                std::vector<essentia::Real> windowedFrame;
+                std::vector<essentia::Real> magnitudeSpectrum;
+                essentia::Real pitchHz = 0.0f;
+                essentia::Real pitchConfidence = 0.0f;
+                frameCutter->input("signal").set(signal);
+                frameCutter->output("frame").set(frame);
+                window->input("frame").set(frame);
+                window->output("frame").set(windowedFrame);
+                spectrum->input("frame").set(windowedFrame);
+                spectrum->output("spectrum").set(magnitudeSpectrum);
+                pitchDetect->input("spectrum").set(magnitudeSpectrum);
+                pitchDetect->output("pitch").set(pitchHz);
+                pitchDetect->output("pitchConfidence").set(pitchConfidence);
+
+                struct MonophonicPitchFrame
+                {
+                    double hz = 0.0;
+                    double confidence = 0.0;
+                    int midi = -1;
+                };
+                std::vector<MonophonicPitchFrame> detectedPitches;
+                while (true)
+                {
+                    frameCutter->compute();
+                    if (frame.empty())
+                        break;
+
+                    float peak = 0.0f;
+                    for (const auto sample : frame)
+                        peak = juce::jmax(peak, std::abs(sample));
+                    if (peak < 2.0e-4f)
+                        continue;
+
+                    window->compute();
+                    spectrum->compute();
+                    pitchDetect->compute();
+
+                    const int midi = pitchHzToMidi(static_cast<double>(pitchHz));
+                    if (std::isfinite(pitchHz)
+                        && pitchHz > 20.0f
+                        && pitchConfidence >= 0.55f
+                        && midi >= 0)
+                    {
+                        detectedPitches.push_back({ static_cast<double>(pitchHz),
+                                                    static_cast<double>(pitchConfidence),
+                                                    midi });
+                    }
+                }
+
+                if (!detectedPitches.empty())
+                {
+                    std::array<double, 128> midiWeights {};
+                    for (const auto& framePitch : detectedPitches)
+                        midiWeights[static_cast<size_t>(juce::jlimit(0, 127, framePitch.midi))] += framePitch.confidence;
+
+                    const auto bestMidiIt = std::max_element(midiWeights.begin(), midiWeights.end());
+                    const int bestMidi = static_cast<int>(std::distance(midiWeights.begin(), bestMidiIt));
+                    std::vector<double> filteredHz;
+                    filteredHz.reserve(detectedPitches.size());
+                    for (const auto& framePitch : detectedPitches)
+                    {
+                        if (std::abs(framePitch.midi - bestMidi) <= 1)
+                            filteredHz.push_back(framePitch.hz);
+                    }
+
+                    if (filteredHz.empty())
+                    {
+                        for (const auto& framePitch : detectedPitches)
+                            filteredHz.push_back(framePitch.hz);
+                    }
+
+                    std::sort(filteredHz.begin(), filteredHz.end());
+                    summary.estimatedPitchHz = filteredHz[filteredHz.size() / 2];
+                    summary.estimatedPitchMidi = pitchHzToMidi(summary.estimatedPitchHz);
+                }
+            }
         }
 
         const bool hasTempo = summary.estimatedTempoBpm > 0.0 || !summary.beatTickSamples.empty();
@@ -1483,7 +1876,15 @@ std::optional<SampleAnalysisSummary> runEssentiaAnalysis(const LoadedSampleData&
 
         summary.essentiaUsed = true;
         summary.analysisSource = hasPitch
-            ? "essentia native tempo/pitch/ticks"
+            ? (pitchProfile == SamplePitchAnalysisProfile::Polyphonic
+                ? "essentia native tempo/poly-key/ticks"
+                :
+               #if MLRVST_ENABLE_LIBPYIN
+                    "essentia native tempo/libpyin mono-pitch/ticks"
+               #else
+                    "essentia native tempo/mono-pitch/ticks"
+               #endif
+                  )
             : "essentia native tempo/ticks";
         return summary;
     }
@@ -1757,6 +2158,44 @@ int64_t computeMedianBeatTickInterval(const std::vector<int64_t>& beatTicks)
     return intervals[intervals.size() / 2];
 }
 
+int64_t computeMedianBeatTickIntervalWindow(const std::vector<int64_t>& beatTicks,
+                                            int startIntervalIndex,
+                                            int endIntervalIndexExclusive)
+{
+    if (beatTicks.size() < 2)
+        return 0;
+
+    const int intervalCount = static_cast<int>(beatTicks.size()) - 1;
+    const int clampedStart = juce::jlimit(0, intervalCount, startIntervalIndex);
+    const int clampedEnd = juce::jlimit(clampedStart + 1, intervalCount, endIntervalIndexExclusive);
+
+    std::vector<int64_t> intervals;
+    intervals.reserve(static_cast<size_t>(juce::jmax(0, clampedEnd - clampedStart)));
+    for (int i = clampedStart; i < clampedEnd; ++i)
+    {
+        const int64_t interval = beatTicks[static_cast<size_t>(i + 1)] - beatTicks[static_cast<size_t>(i)];
+        if (interval > 0)
+            intervals.push_back(interval);
+    }
+
+    if (intervals.empty())
+        return 0;
+
+    std::sort(intervals.begin(), intervals.end());
+    return intervals[intervals.size() / 2];
+}
+
+int64_t computeEdgeBeatTickInterval(const std::vector<int64_t>& beatTicks, bool useEndEdge)
+{
+    if (beatTicks.size() < 2)
+        return 0;
+
+    const int intervalCount = static_cast<int>(beatTicks.size()) - 1;
+    const int windowSize = juce::jmin(4, intervalCount);
+    const int startInterval = useEndEdge ? (intervalCount - windowSize) : 0;
+    return computeMedianBeatTickIntervalWindow(beatTicks, startInterval, startInterval + windowSize);
+}
+
 double computeMedianDouble(std::vector<double> values)
 {
     if (values.empty())
@@ -1781,59 +2220,118 @@ std::vector<int64_t> buildWholeFileDriftCorrectedBeatTicks(const std::vector<int
     if (medianInterval <= 0)
         return corrected;
 
-    std::vector<double> interceptCandidates;
-    interceptCandidates.reserve(corrected.size());
-    for (size_t i = 0; i < corrected.size(); ++i)
-        interceptCandidates.push_back(static_cast<double>(corrected[i])
-                                      - (static_cast<double>(i) * static_cast<double>(medianInterval)));
-
-    const double intercept = computeMedianDouble(std::move(interceptCandidates));
     const auto snappedTransients = sanitizeBeatTickSamples(transientSamples, totalSamples);
+    if (snappedTransients.empty())
+        return corrected;
+
     const int64_t maxSnapDistance = juce::jmax<int64_t>(1, static_cast<int64_t>(std::llround(static_cast<double>(medianInterval) * 0.18)));
+    const int64_t strictSnapDistance = juce::jmax<int64_t>(1, maxSnapDistance / 2);
+
+    std::vector<int64_t> snappedTargets(corrected.size(), 0);
+    std::vector<bool> hasSnappedTarget(corrected.size(), false);
+    std::vector<double> snappedOffsets(corrected.size(), 0.0);
+
+    auto findNearestTransient = [&](int64_t targetSample) -> std::pair<int64_t, int64_t>
+    {
+        auto it = std::lower_bound(snappedTransients.begin(), snappedTransients.end(), targetSample);
+        int64_t bestCandidate = targetSample;
+        int64_t bestDistance = std::numeric_limits<int64_t>::max();
+
+        if (it != snappedTransients.end())
+        {
+            const int64_t distance = std::abs(*it - targetSample);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                bestCandidate = *it;
+            }
+        }
+        if (it != snappedTransients.begin())
+        {
+            const int64_t candidate = *std::prev(it);
+            const int64_t distance = std::abs(candidate - targetSample);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                bestCandidate = candidate;
+            }
+        }
+
+        return { bestCandidate, bestDistance };
+    };
+
+    for (size_t i = 0; i < corrected.size(); ++i)
+    {
+        const auto [candidate, distance] = findNearestTransient(corrected[i]);
+        if (distance <= maxSnapDistance)
+        {
+            snappedTargets[i] = candidate;
+            snappedOffsets[i] = static_cast<double>(candidate - corrected[i]);
+            hasSnappedTarget[i] = true;
+        }
+        else
+        {
+            snappedTargets[i] = corrected[i];
+        }
+    }
 
     std::vector<int64_t> stabilized;
     stabilized.reserve(corrected.size());
     int64_t previous = -1;
+    const int intervalCount = static_cast<int>(corrected.size()) - 1;
 
     for (size_t i = 0; i < corrected.size(); ++i)
     {
-        int64_t chosen = static_cast<int64_t>(std::llround(
-            intercept + (static_cast<double>(i) * static_cast<double>(medianInterval))));
-        chosen = juce::jlimit<int64_t>(0, juce::jmax<int64_t>(0, totalSamples - 1), chosen);
-
-        if (!snappedTransients.empty())
+        std::vector<double> offsetWindow;
+        offsetWindow.reserve(9);
+        const int index = static_cast<int>(i);
+        const int windowStart = juce::jmax(0, index - 4);
+        const int windowEnd = juce::jmin(static_cast<int>(corrected.size()) - 1, index + 4);
+        for (int j = windowStart; j <= windowEnd; ++j)
         {
-            auto it = std::lower_bound(snappedTransients.begin(), snappedTransients.end(), chosen);
-            int64_t bestCandidate = chosen;
-            int64_t bestDistance = std::numeric_limits<int64_t>::max();
-
-            if (it != snappedTransients.end())
-            {
-                const int64_t distance = std::abs(*it - chosen);
-                if (distance < bestDistance)
-                {
-                    bestDistance = distance;
-                    bestCandidate = *it;
-                }
-            }
-            if (it != snappedTransients.begin())
-            {
-                const int64_t candidate = *std::prev(it);
-                const int64_t distance = std::abs(candidate - chosen);
-                if (distance < bestDistance)
-                {
-                    bestDistance = distance;
-                    bestCandidate = candidate;
-                }
-            }
-
-            if (bestDistance <= maxSnapDistance)
-                chosen = bestCandidate;
+            if (hasSnappedTarget[static_cast<size_t>(j)])
+                offsetWindow.push_back(snappedOffsets[static_cast<size_t>(j)]);
         }
 
-        chosen = juce::jlimit<int64_t>(juce::jmax<int64_t>(0, previous + 1),
-                                       juce::jmax<int64_t>(0, totalSamples - 1),
-                                       chosen);
+        const double smoothedOffset = offsetWindow.empty()
+            ? 0.0
+            : computeMedianDouble(std::move(offsetWindow));
+        int64_t chosen = static_cast<int64_t>(std::llround(static_cast<double>(corrected[i]) + smoothedOffset));
+
+        if (hasSnappedTarget[i])
+        {
+            const int64_t snapped = snappedTargets[i];
+            if (std::abs(snapped - chosen) <= maxSnapDistance)
+                chosen = snapped;
+        }
+        else
+        {
+            const auto [candidate, distance] = findNearestTransient(chosen);
+            if (distance <= strictSnapDistance)
+                chosen = candidate;
+        }
+
+        if (previous >= 0)
+        {
+            const int64_t localInterval = juce::jmax<int64_t>(
+                1,
+                computeMedianBeatTickIntervalWindow(corrected,
+                                                    juce::jmax(0, index - 3),
+                                                    juce::jmin(intervalCount, index + 4)));
+            const int64_t minInterval = juce::jmax<int64_t>(1, static_cast<int64_t>(std::llround(static_cast<double>(localInterval) * 0.35)));
+            const int64_t maxInterval = juce::jmax<int64_t>(minInterval + 1,
+                                                            static_cast<int64_t>(std::llround(static_cast<double>(localInterval) * 2.25)));
+            const int64_t minChosen = juce::jmax<int64_t>(previous + 1, previous + minInterval);
+            const int64_t maxChosen = juce::jmin<int64_t>(totalSamples - 1, previous + maxInterval);
+            chosen = juce::jlimit<int64_t>(minChosen,
+                                           juce::jmax(minChosen, maxChosen),
+                                           chosen);
+        }
+        else
+        {
+            chosen = juce::jlimit<int64_t>(0, juce::jmax<int64_t>(0, totalSamples - 1), chosen);
+        }
+
         stabilized.push_back(chosen);
         previous = chosen;
     }
@@ -1876,8 +2374,8 @@ bool computeBeatTickAlignedWindowRange(const std::vector<int64_t>& beatTicks,
     if (startIndex < 0)
         return false;
 
-    const int64_t medianInterval = computeMedianBeatTickInterval(beatTicks);
-    if (medianInterval <= 0)
+    const int64_t endEdgeInterval = computeEdgeBeatTickInterval(beatTicks, true);
+    if (endEdgeInterval <= 0)
         return false;
 
     const int endIndex = startIndex + beatCount;
@@ -1890,7 +2388,7 @@ bool computeBeatTickAlignedWindowRange(const std::vector<int64_t>& beatTicks,
     else
     {
         const int extrapolatedBeats = endIndex - (static_cast<int>(beatTicks.size()) - 1);
-        rangeEndSample = beatTicks.back() + (static_cast<int64_t>(extrapolatedBeats) * medianInterval);
+        rangeEndSample = beatTicks.back() + (static_cast<int64_t>(extrapolatedBeats) * endEdgeInterval);
     }
 
     rangeStartSample = juce::jlimit<int64_t>(0, sourceLengthSamples - 1, rangeStartSample);
@@ -1906,18 +2404,19 @@ double computeBeatTickPosition(const std::vector<int64_t>& beatTicks,
     if (beatTicks.size() < 2)
         return 0.0;
 
-    const int64_t medianInterval = computeMedianBeatTickInterval(beatTicks);
-    if (medianInterval <= 0)
+    const int64_t startEdgeInterval = computeEdgeBeatTickInterval(beatTicks, false);
+    const int64_t endEdgeInterval = computeEdgeBeatTickInterval(beatTicks, true);
+    if (startEdgeInterval <= 0 || endEdgeInterval <= 0)
         return 0.0;
 
     auto it = std::lower_bound(beatTicks.begin(), beatTicks.end(), samplePosition);
     if (it == beatTicks.begin())
-        return static_cast<double>(samplePosition - beatTicks.front()) / static_cast<double>(medianInterval);
+        return static_cast<double>(samplePosition - beatTicks.front()) / static_cast<double>(startEdgeInterval);
 
     if (it == beatTicks.end())
     {
         const double beatsBeyondEnd = static_cast<double>(samplePosition - beatTicks.back())
-            / static_cast<double>(medianInterval);
+            / static_cast<double>(endEdgeInterval);
         return static_cast<double>(beatTicks.size() - 1) + beatsBeyondEnd;
     }
 
@@ -1937,14 +2436,15 @@ int64_t samplePositionFromBeatTickPosition(const std::vector<int64_t>& beatTicks
     if (beatTicks.empty() || sourceLengthSamples <= 0 || !std::isfinite(beatPosition))
         return 0;
 
-    const int64_t medianInterval = computeMedianBeatTickInterval(beatTicks);
-    if (medianInterval <= 0)
+    const int64_t startEdgeInterval = computeEdgeBeatTickInterval(beatTicks, false);
+    const int64_t endEdgeInterval = computeEdgeBeatTickInterval(beatTicks, true);
+    if (startEdgeInterval <= 0 || endEdgeInterval <= 0)
         return juce::jlimit<int64_t>(0, sourceLengthSamples - 1, beatTicks.front());
 
     if (beatPosition <= 0.0)
     {
         const double sample = static_cast<double>(beatTicks.front())
-            + (beatPosition * static_cast<double>(medianInterval));
+            + (beatPosition * static_cast<double>(startEdgeInterval));
         return juce::jlimit<int64_t>(0, sourceLengthSamples - 1, static_cast<int64_t>(std::llround(sample)));
     }
 
@@ -1952,7 +2452,7 @@ int64_t samplePositionFromBeatTickPosition(const std::vector<int64_t>& beatTicks
     if (beatPosition >= static_cast<double>(maxIndex))
     {
         const double sample = static_cast<double>(beatTicks.back())
-            + ((beatPosition - static_cast<double>(maxIndex)) * static_cast<double>(medianInterval));
+            + ((beatPosition - static_cast<double>(maxIndex)) * static_cast<double>(endEdgeInterval));
         return juce::jlimit<int64_t>(0, sourceLengthSamples - 1, static_cast<int64_t>(std::llround(sample)));
     }
 
@@ -2580,6 +3080,7 @@ std::vector<SampleSlice> SliceModel::buildManualSlices(const LoadedSampleData& s
 SampleAnalysisSummary SampleAnalysisEngine::analyzeLoadedSample(const juce::File& file,
                                                                const juce::AudioBuffer<float>& audioBuffer,
                                                                double sourceSampleRate,
+                                                               SamplePitchAnalysisProfile pitchProfile,
                                                                ProgressCallback progressCallback) const
 {
     LoadedSampleData sampleData;
@@ -2591,7 +3092,7 @@ SampleAnalysisSummary SampleAnalysisEngine::analyzeLoadedSample(const juce::File
         / juce::jmax(1.0, sampleData.sourceSampleRate);
 
     if (file.existsAsFile())
-        enrichAnalysisForFile(file, sampleData, std::move(progressCallback));
+        enrichAnalysisForFile(file, sampleData, pitchProfile, std::move(progressCallback));
     else
         sampleData.analysis = buildInternalAnalysis(sampleData);
 
@@ -2600,6 +3101,7 @@ SampleAnalysisSummary SampleAnalysisEngine::analyzeLoadedSample(const juce::File
 
 void SampleAnalysisEngine::enrichAnalysisForFile(const juce::File& file,
                                                  LoadedSampleData& sampleData,
+                                                 SamplePitchAnalysisProfile pitchProfile,
                                                  ProgressCallback progressCallback) const
 {
     juce::ignoreUnused(file);
@@ -2612,14 +3114,25 @@ void SampleAnalysisEngine::enrichAnalysisForFile(const juce::File& file,
         progressCallback(0.70f, "Preparing Essentia...");
 
     if (progressCallback)
-        progressCallback(0.76f, "Essentia tempo...");
+    {
+        progressCallback(0.76f,
+                         pitchProfile == SamplePitchAnalysisProfile::Polyphonic
+                             ? "Essentia key..."
+                             :
+#if MLRVST_ENABLE_LIBPYIN
+                               "pYIN pitch..."
+#else
+                               "Essentia pitch..."
+#endif
+                               );
+    }
 #if MLRVST_ENABLE_ESSENTIA_NATIVE
-    if (const auto essentiaSummary = runEssentiaAnalysis(sampleData, &essentiaFailureReason))
+    if (const auto essentiaSummary = runEssentiaAnalysis(sampleData, pitchProfile, &essentiaFailureReason))
 #else
     std::optional<juce::File> essentiaInputFile = createEssentiaAnalysisWaveFile(sampleData, &essentiaFailureReason);
     if (essentiaInputFile)
     {
-        if (const auto essentiaSummary = runEssentiaAnalysis(*essentiaInputFile, &essentiaFailureReason))
+        if (const auto essentiaSummary = runEssentiaAnalysis(*essentiaInputFile, pitchProfile, &essentiaFailureReason))
 #endif
     {
         sampleData.analysis = internalSummary;
@@ -2872,7 +3385,10 @@ SampleFileManager::LoadResult SampleFileManager::decodeFile(const juce::File& fi
     if (progressCallback)
         progressCallback(0.46f, "Building waveform...");
     buildWaveformPreview(*loadedSample);
-    SampleAnalysisEngine().enrichAnalysisForFile(file, *loadedSample, progressCallback);
+    SampleAnalysisEngine().enrichAnalysisForFile(file,
+                                                 *loadedSample,
+                                                 SamplePitchAnalysisProfile::Polyphonic,
+                                                 progressCallback);
     if (progressCallback)
         progressCallback(0.98f, "Finalizing analysis...");
 
@@ -5429,9 +5945,9 @@ void SampleModeComponent::paint(juce::Graphics& g)
     tempoDoubleBounds = {};
     if (stateSnapshot.estimatedTempoBpm > 0.0 && header.getWidth() >= 44)
     {
-        tempoHalfBounds = header.removeFromLeft(18);
+        tempoHalfBounds = header.removeFromLeft(20);
         header.removeFromLeft(4);
-        tempoDoubleBounds = header.removeFromLeft(18);
+        tempoDoubleBounds = header.removeFromLeft(20);
         header.removeFromLeft(6);
     }
     auto analysisHeader = header;
@@ -5457,9 +5973,9 @@ void SampleModeComponent::paint(juce::Graphics& g)
     drawHeaderButton(copyLoopBounds, "To Loop", stateSnapshot.hasSample);
     drawHeaderButton(copyGrainBounds, "To Grain", stateSnapshot.hasSample);
     if (!tempoHalfBounds.isEmpty())
-        drawHeaderButton(tempoHalfBounds, "-", stateSnapshot.estimatedTempoBpm > 20.5);
+        drawHeaderButton(tempoHalfBounds, "1/2", stateSnapshot.estimatedTempoBpm > 20.5);
     if (!tempoDoubleBounds.isEmpty())
-        drawHeaderButton(tempoDoubleBounds, "+", stateSnapshot.estimatedTempoBpm > 0.0 && stateSnapshot.estimatedTempoBpm < 399.5);
+        drawHeaderButton(tempoDoubleBounds, "2x", stateSnapshot.estimatedTempoBpm > 0.0 && stateSnapshot.estimatedTempoBpm < 399.5);
 
     if (analysisHeader.getWidth() > 48
         && (stateSnapshot.isLoading
@@ -5655,12 +6171,15 @@ void SampleModeComponent::paint(juce::Graphics& g)
                                static_cast<float>(waveformBounds.getY() + 5),
                                static_cast<float>(waveformBounds.getBottom() - 7));
 
-            juce::Path handle;
-            handle.startNewSubPath(static_cast<float>(markerX), static_cast<float>(waveformBounds.getY() + 2));
-            handle.lineTo(static_cast<float>(markerX - 4), static_cast<float>(waveformBounds.getY() + 8));
-            handle.lineTo(static_cast<float>(markerX + 4), static_cast<float>(waveformBounds.getY() + 8));
-            handle.closeSubPath();
-            g.fillPath(handle);
+            if (stateSnapshot.sliceMode != SampleSliceMode::Manual)
+            {
+                juce::Path handle;
+                handle.startNewSubPath(static_cast<float>(markerX), static_cast<float>(waveformBounds.getY() + 2));
+                handle.lineTo(static_cast<float>(markerX - 4), static_cast<float>(waveformBounds.getY() + 8));
+                handle.lineTo(static_cast<float>(markerX + 4), static_cast<float>(waveformBounds.getY() + 8));
+                handle.closeSubPath();
+                g.fillPath(handle);
+            }
         }
 
         for (size_t cueIndex = 0; cueIndex < stateSnapshot.cuePoints.size(); ++cueIndex)
@@ -5677,6 +6196,16 @@ void SampleModeComponent::paint(juce::Graphics& g)
             g.drawVerticalLine(x,
                                static_cast<float>(waveformBounds.getY() + 2),
                                static_cast<float>(waveformBounds.getBottom() - 2));
+
+            juce::Path handle;
+            const float handleTop = static_cast<float>(waveformBounds.getY() + 2);
+            const float handleBottom = static_cast<float>(waveformBounds.getY() + 9);
+            const float handleHalfWidth = selected ? 5.0f : 4.0f;
+            handle.startNewSubPath(static_cast<float>(x), handleTop);
+            handle.lineTo(static_cast<float>(x) - handleHalfWidth, handleBottom);
+            handle.lineTo(static_cast<float>(x) + handleHalfWidth, handleBottom);
+            handle.closeSubPath();
+            g.fillPath(handle);
         }
 
         if (stateSnapshot.sliceMode == SampleSliceMode::Transient)
@@ -5920,6 +6449,16 @@ void SampleModeComponent::mouseDown(const juce::MouseEvent& event)
     if (engine != nullptr && event.mods.isShiftDown() && waveformBounds.contains(point))
     {
         grabKeyboardFocus();
+        if (stateSnapshot.sliceMode == SampleSliceMode::Manual)
+        {
+            draggingCueIndex = hitTestCuePoint(point);
+            if (draggingCueIndex >= 0)
+            {
+                engine->selectCuePoint(draggingCueIndex);
+                return;
+            }
+        }
+
         int visibleSliceSlot = hitTestVisibleSliceMarker(point);
         if (visibleSliceSlot < 0)
             visibleSliceSlot = hitTestVisibleSlice(point);
@@ -5933,8 +6472,6 @@ void SampleModeComponent::mouseDown(const juce::MouseEvent& event)
             else if (stateSnapshot.sliceMode == SampleSliceMode::Manual)
             {
                 draggingCueIndex = findCuePointForVisibleSlice(visibleSliceSlot);
-                if (draggingCueIndex < 0)
-                    draggingCueIndex = hitTestCuePoint(point);
                 if (draggingCueIndex >= 0)
                 {
                     engine->selectCuePoint(draggingCueIndex);

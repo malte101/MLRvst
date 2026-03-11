@@ -549,9 +549,18 @@ bool savePreset(int presetIndex,
                 ModernAudioEngine* audioEngine,
                 juce::AudioProcessorValueTreeState& parameters,
                 const juce::File* currentStripFiles,
-                const std::function<std::unique_ptr<juce::XmlElement>(int)>& createFlipStateXml)
+                const juce::File* recentLoopDirectories,
+                const juce::File* recentStepDirectories,
+                const juce::File* recentFlipDirectories,
+                const std::function<std::unique_ptr<juce::XmlElement>(int)>& createFlipStateXml,
+                const std::function<std::unique_ptr<juce::XmlElement>(int)>& createLoopPitchStateXml)
 {
-    if (presetIndex < 0 || presetIndex >= kMaxPresetSlots || audioEngine == nullptr || currentStripFiles == nullptr)
+    if (presetIndex < 0 || presetIndex >= kMaxPresetSlots
+        || audioEngine == nullptr
+        || currentStripFiles == nullptr
+        || recentLoopDirectories == nullptr
+        || recentStepDirectories == nullptr
+        || recentFlipDirectories == nullptr)
         return false;
 
     try
@@ -613,6 +622,12 @@ bool savePreset(int presetIndex,
                 stripXml->addChildElement(flipStateXml.release());
         }
 
+        if (createLoopPitchStateXml)
+        {
+            if (auto loopPitchStateXml = createLoopPitchStateXml(i))
+                stripXml->addChildElement(loopPitchStateXml.release());
+        }
+
         stripXml->setAttribute("volume", strip->getVolume());
         stripXml->setAttribute("pan", strip->getPan());
         const float savedSpeedRatio = PlayheadSpeedQuantizer::quantizeRatio(strip->getPlayheadSpeedRatio());
@@ -631,6 +646,9 @@ bool savePreset(int presetIndex,
         stripXml->setAttribute("scratchAmount", strip->getScratchAmount());
         stripXml->setAttribute("transientSliceMode", strip->isTransientSliceMode());
         stripXml->setAttribute("loopSliceLength", strip->getLoopSliceLength());
+        stripXml->setAttribute("recentLoopDir", recentLoopDirectories[i].getFullPathName());
+        stripXml->setAttribute("recentStepDir", recentStepDirectories[i].getFullPathName());
+        stripXml->setAttribute("recentFlipDir", recentFlipDirectories[i].getFullPathName());
         if (strip->hasSampleAnalysisCache())
         {
             stripXml->setAttribute(kAnalysisSampleCountAttr, strip->getAnalysisSampleCount());
@@ -813,7 +831,9 @@ bool loadPreset(int presetIndex,
                 juce::AudioProcessorValueTreeState& parameters,
                 const std::function<bool(int, const juce::File&)>& loadSampleToStrip,
                 const std::function<void(int, const juce::File&)>& restoreStripSamplePath,
+                const std::function<void(int, const juce::File&, const juce::File&, const juce::File&)>& restoreStripRecentDirectories,
                 const std::function<void(int, const juce::XmlElement*)>& applyFlipStateXml,
+                const std::function<void(int, const juce::XmlElement*)>& applyLoopPitchStateXml,
                 double hostPpqSnapshot,
                 double hostTempoSnapshot)
 {
@@ -948,6 +968,13 @@ bool loadPreset(int presetIndex,
                 return fallback;
             return value;
         };
+        auto restoreStoredDirectory = [](const juce::String& rawPath) -> juce::File
+        {
+            const auto trimmedPath = rawPath.trim();
+            if (trimmedPath.isEmpty() || !juce::File::isAbsolutePath(trimmedPath))
+                return {};
+            return juce::File(trimmedPath);
+        };
 
         strip->setVolume(clampedFloat(stripXml->getDoubleAttribute("volume", 1.0), 1.0f, 0.0f, 1.0f));
         strip->setPan(clampedFloat(stripXml->getDoubleAttribute("pan", 0.0), 0.0f, -1.0f, 1.0f));
@@ -978,6 +1005,20 @@ bool loadPreset(int presetIndex,
         int groupId = stripXml->getIntAttribute("group", -1);
         audioEngine->assignStripToGroup(stripIndex, groupId);
 
+        const int savedRecordingBars = clampedInt(stripXml->getIntAttribute("recordingBars", 1), 1, 8, 1);
+        const float savedBeatsPerLoop = finiteFloat(stripXml->getDoubleAttribute("beatsPerLoop", -1.0), -1.0f);
+        strip->setRecordingBars(savedRecordingBars);
+        strip->setBeatsPerLoop(savedBeatsPerLoop);
+
+        if (restoreStripRecentDirectories)
+        {
+            restoreStripRecentDirectories(
+                stripIndex,
+                restoreStoredDirectory(stripXml->getStringAttribute("recentLoopDir")),
+                restoreStoredDirectory(stripXml->getStringAttribute("recentStepDir")),
+                restoreStoredDirectory(stripXml->getStringAttribute("recentFlipDir")));
+        }
+
         const bool restorePlayingRequested = stripXml->getBoolAttribute("isPlaying", false);
         const bool restorePlaying = canRecallPlayingState && restorePlayingRequested;
         const int restoreMarkerColumn = clampedInt(stripXml->getIntAttribute("playbackColumn", safeLoopStart),
@@ -1006,8 +1047,6 @@ bool loadPreset(int presetIndex,
             strip->stop(true);
         }
 
-        float beats = finiteFloat(stripXml->getDoubleAttribute("beatsPerLoop", -1.0), -1.0f);
-        strip->setBeatsPerLoop(beats);
         strip->setScratchAmount(clampedFloat(stripXml->getDoubleAttribute("scratchAmount", 0.0), 0.0f, 0.0f, 100.0f));
         const int analysisSampleCount = juce::jmax(0, stripXml->getIntAttribute(kAnalysisSampleCountAttr, 0));
         const juce::String analysisTransientCsv = stripXml->getStringAttribute(kAnalysisTransientAttr);
@@ -1030,7 +1069,8 @@ bool loadPreset(int presetIndex,
         strip->setTransientSliceMode(stripXml->getBoolAttribute("transientSliceMode", false));
         strip->setLoopSliceLength(clampedFloat(stripXml->getDoubleAttribute("loopSliceLength", 1.0), 1.0f, 0.0f, 1.0f));
         strip->setPitchShift(clampedFloat(stripXml->getDoubleAttribute("pitchShift", 0.0), 0.0f, -24.0f, 24.0f));
-        strip->setRecordingBars(clampedInt(stripXml->getIntAttribute("recordingBars", 1), 1, 8, 1));
+        if (applyLoopPitchStateXml)
+            applyLoopPitchStateXml(stripIndex, stripXml->getChildByName("LoopPitchState"));
         const bool restoreFilterEnabled = stripXml->getBoolAttribute("filterEnabled", false);
         strip->setFilterFrequency(clampedFloat(stripXml->getDoubleAttribute("filterFrequency", 20000.0), 20000.0f, 20.0f, 20000.0f));
         strip->setFilterResonance(clampedFloat(stripXml->getDoubleAttribute("filterResonance", 0.707), 0.707f, 0.1f, 10.0f));

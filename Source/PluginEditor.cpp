@@ -53,6 +53,63 @@ void drawPanel(juce::Graphics& g, juce::Rectangle<float> bounds, juce::Colour ac
     g.drawRoundedRectangle(bounds.reduced(2.0f), juce::jmax(2.0f, radius - 2.0f), 1.0f);
 }
 
+enum class StripHarmonyOverlayState
+{
+    None = 0,
+    ScaleLocked,
+    RootLocked
+};
+
+StripHarmonyOverlayState getStripHarmonyOverlayState(MlrVSTAudioProcessor& processor, int stripIndex)
+{
+    switch (processor.getLoopPitchRole(stripIndex))
+    {
+        case MlrVSTAudioProcessor::LoopPitchRole::Master:
+            return StripHarmonyOverlayState::ScaleLocked;
+        case MlrVSTAudioProcessor::LoopPitchRole::Sync:
+            return StripHarmonyOverlayState::RootLocked;
+        case MlrVSTAudioProcessor::LoopPitchRole::None:
+        default:
+            return StripHarmonyOverlayState::None;
+    }
+}
+
+void paintStripHarmonyOverlay(juce::Graphics& g,
+                              juce::Rectangle<float> bounds,
+                              StripHarmonyOverlayState state,
+                              juce::Colour stripColor)
+{
+    if (state == StripHarmonyOverlayState::None)
+        return;
+
+    const juce::Colour accent = state == StripHarmonyOverlayState::RootLocked
+        ? juce::Colour(0xff75c7ca)
+        : stripColor.interpolatedWith(kAccent, 0.48f).withMultipliedSaturation(0.72f);
+
+    auto inner = bounds.reduced(3.0f);
+    const float radius = 7.0f;
+
+    juce::ColourGradient topGlow(accent.withAlpha(0.085f),
+                                 inner.getX() + 12.0f, inner.getY() + 1.5f,
+                                 juce::Colours::transparentBlack,
+                                 inner.getX() + (inner.getWidth() * 0.48f), inner.getY() + 10.0f,
+                                 false);
+    g.setGradientFill(topGlow);
+    g.fillRoundedRectangle(inner, radius);
+
+    const float topW = juce::jlimit(34.0f, juce::jmax(34.0f, inner.getWidth() - 24.0f), inner.getWidth() * 0.2f);
+    const float sideH = juce::jlimit(18.0f, juce::jmax(18.0f, inner.getHeight() - 28.0f), inner.getHeight() * 0.12f);
+    auto topAccent = juce::Rectangle<float>(inner.getX() + 10.0f, inner.getY() + 2.0f, topW, 1.6f);
+    auto sideAccent = juce::Rectangle<float>(inner.getX() + 2.0f, inner.getY() + 11.0f, 1.6f, sideH);
+
+    g.setColour(accent.withAlpha(0.30f));
+    g.fillRoundedRectangle(topAccent, 1.0f);
+    g.fillRoundedRectangle(sideAccent, 1.0f);
+
+    g.setColour(accent.withAlpha(0.11f));
+    g.drawRoundedRectangle(inner, radius, 0.8f);
+}
+
 void enableAltClickReset(juce::Slider& slider, double defaultValue)
 {
     // JUCE supports modifier-click reset when a double-click return value is set.
@@ -112,6 +169,37 @@ juce::String getCompactNoteName(int midiNote)
         return "?";
     const int clamped = juce::jlimit(0, 127, midiNote);
     return juce::String(names[clamped % 12]) + juce::String((clamped / 12) - 1);
+}
+
+juce::String getPitchClassName(int pitchClass)
+{
+    static constexpr const char* names[] = { "C", "C#", "D", "D#", "E", "F",
+                                             "F#", "G", "G#", "A", "A#", "B" };
+    return juce::String(names[((pitchClass % 12) + 12) % 12]);
+}
+
+int getNearestMidiForPitchClass(int referenceMidi, int pitchClass)
+{
+    const int normalizedPitchClass = ((pitchClass % 12) + 12) % 12;
+    const int clampedReference = juce::jlimit(0, 127, referenceMidi);
+    int bestMidi = normalizedPitchClass;
+    int bestDistance = std::numeric_limits<int>::max();
+
+    for (int octave = -1; octave <= 10; ++octave)
+    {
+        const int midi = (octave * 12) + normalizedPitchClass;
+        if (midi < 0 || midi > 127)
+            continue;
+
+        const int distance = std::abs(midi - clampedReference);
+        if (distance < bestDistance)
+        {
+            bestDistance = distance;
+            bestMidi = midi;
+        }
+    }
+
+    return bestMidi;
 }
 
 juce::String getMonomePageDisplayName(MlrVSTAudioProcessor::ControlMode mode)
@@ -594,6 +682,77 @@ int pitchScaleToComboId(ModernAudioEngine::PitchScale scale)
     }
 }
 
+juce::String pitchScaleDisplayName(ModernAudioEngine::PitchScale scale, bool compact)
+{
+    switch (scale)
+    {
+        case ModernAudioEngine::PitchScale::Major: return compact ? "Maj" : "Major";
+        case ModernAudioEngine::PitchScale::Minor: return compact ? "Min" : "Minor";
+        case ModernAudioEngine::PitchScale::Dorian: return compact ? "Dor" : "Dorian";
+        case ModernAudioEngine::PitchScale::PentatonicMinor: return compact ? "Pent" : "Pentatonic";
+        case ModernAudioEngine::PitchScale::Chromatic:
+        default: return compact ? "Chr" : "Chromatic";
+    }
+}
+
+juce::String loopPitchSyncTimingDisplayName(MlrVSTAudioProcessor::LoopPitchSyncTiming timing, bool compact)
+{
+    switch (timing)
+    {
+        case MlrVSTAudioProcessor::LoopPitchSyncTiming::NextTrigger: return compact ? "Trig" : "Next Trigger";
+        case MlrVSTAudioProcessor::LoopPitchSyncTiming::NextLoop: return compact ? "Loop" : "Next Loop";
+        case MlrVSTAudioProcessor::LoopPitchSyncTiming::NextBar: return compact ? "Bar" : "Next Bar";
+        case MlrVSTAudioProcessor::LoopPitchSyncTiming::Immediate:
+        default: return compact ? "Imm" : "Immediate";
+    }
+}
+
+juce::String loopPitchRoleDisplayName(MlrVSTAudioProcessor::LoopPitchRole role, bool compact)
+{
+    switch (role)
+    {
+        case MlrVSTAudioProcessor::LoopPitchRole::Master: return compact ? "PM" : "Master";
+        case MlrVSTAudioProcessor::LoopPitchRole::Sync: return compact ? "PS" : "Sync";
+        case MlrVSTAudioProcessor::LoopPitchRole::None:
+        default: return compact ? "Free" : "Free";
+    }
+}
+
+juce::String playModeDisplayName(EnhancedAudioStrip::PlayMode mode, bool compact)
+{
+    switch (mode)
+    {
+        case EnhancedAudioStrip::PlayMode::OneShot: return compact ? "One" : "One-Shot";
+        case EnhancedAudioStrip::PlayMode::Loop: return "Loop";
+        case EnhancedAudioStrip::PlayMode::Gate: return "Gate";
+        case EnhancedAudioStrip::PlayMode::Step: return "Step";
+        case EnhancedAudioStrip::PlayMode::Grain: return compact ? "Grn" : "Grain";
+        case EnhancedAudioStrip::PlayMode::Sample: return "Flip";
+        default: return "Mode";
+    }
+}
+
+juce::String directionModeDisplayName(EnhancedAudioStrip::DirectionMode mode, bool compact)
+{
+    switch (mode)
+    {
+        case EnhancedAudioStrip::DirectionMode::Normal: return compact ? "Norm" : "Normal";
+        case EnhancedAudioStrip::DirectionMode::Reverse: return compact ? "Rev" : "Reverse";
+        case EnhancedAudioStrip::DirectionMode::PingPong: return compact ? "Ping" : "Ping-Pong";
+        case EnhancedAudioStrip::DirectionMode::Random: return compact ? "Rand" : "Random";
+        case EnhancedAudioStrip::DirectionMode::RandomWalk: return compact ? "Walk" : "Random Walk";
+        case EnhancedAudioStrip::DirectionMode::RandomSlice: return compact ? "Slice" : "Random Slice";
+        default: return compact ? "Norm" : "Normal";
+    }
+}
+
+juce::String confidencePercentText(float confidence)
+{
+    if (!(confidence > 0.0f))
+        return {};
+    return juce::String(static_cast<int>(std::round(juce::jlimit(0.0f, 1.0f, confidence) * 100.0f))) + "%";
+}
+
 ModernAudioEngine::PitchScale comboIdToPitchScale(int id)
 {
     switch (id)
@@ -937,6 +1096,49 @@ void WaveformDisplay::paint(juce::Graphics& g)
         drawHudBar(grainHudSpread, grainAccent.withMultipliedBrightness(1.05f));
         drawHudBar(grainHudEmitter, grainAccent.brighter(0.22f));
     }
+
+    if (loopPitchOverlayEnabled)
+    {
+        juce::Font lineAFont(juce::FontOptions(9.4f, juce::Font::bold));
+        juce::Font lineBFont(juce::FontOptions(7.8f));
+        const auto measureTextWidth = [](const juce::Font& font, const juce::String& text) -> int
+        {
+            if (text.isEmpty())
+                return 0;
+            juce::GlyphArrangement glyphs;
+            glyphs.addLineOfText(font, text, 0.0f, 0.0f);
+            return juce::roundToInt(glyphs.getBoundingBox(0, glyphs.getNumGlyphs(), true).getWidth());
+        };
+        const int lineAWidth = measureTextWidth(lineAFont, loopPitchOverlayLineA);
+        const int lineBWidth = measureTextWidth(lineBFont, loopPitchOverlayLineB);
+        const int contentWidth = juce::jmax(lineAWidth, lineBWidth);
+        const bool hasSecondLine = loopPitchOverlayLineB.isNotEmpty();
+        const float badgeWidth = juce::jlimit(20.0f, bounds.getWidth() - 12.0f, static_cast<float>(contentWidth + 10));
+        const float badgeHeight = hasSecondLine ? 20.0f : 12.0f;
+        auto hudRect = juce::Rectangle<float>(bounds.getRight() - badgeWidth - 6.0f,
+                                              bounds.getY() + 6.0f,
+                                              badgeWidth,
+                                              badgeHeight);
+        g.setColour(juce::Colour(0xff101010).withAlpha(0.78f));
+        g.fillRoundedRectangle(hudRect, 3.0f);
+        g.setColour(waveformColor.withAlpha(0.54f));
+        g.drawRoundedRectangle(hudRect, 3.0f, 0.9f);
+
+        auto text = hudRect.reduced(4.0f, 2.0f);
+        g.setColour(kTextSecondary.withAlpha(0.98f));
+        g.setFont(lineAFont);
+        if (hasSecondLine)
+        {
+            g.drawText(loopPitchOverlayLineA, text.removeFromTop(9), juce::Justification::centredRight, false);
+            g.setColour(kTextMuted.withAlpha(0.98f));
+            g.setFont(lineBFont);
+            g.drawText(loopPitchOverlayLineB, text, juce::Justification::centredRight, false);
+        }
+        else
+        {
+            g.drawText(loopPitchOverlayLineA, text, juce::Justification::centredRight, false);
+        }
+    }
 }
 
 void WaveformDisplay::resized()
@@ -1055,6 +1257,14 @@ void WaveformDisplay::setSliceMarkers(const std::array<int, 16>& normalSlices,
     repaint();
 }
 
+void WaveformDisplay::setLoopPitchOverlay(bool enabled, const juce::String& lineA, const juce::String& lineB)
+{
+    loopPitchOverlayEnabled = enabled && (lineA.isNotEmpty() || lineB.isNotEmpty());
+    loopPitchOverlayLineA = lineA;
+    loopPitchOverlayLineB = lineB;
+    repaint();
+}
+
 void WaveformDisplay::clear()
 {
     hasAudio = false;
@@ -1076,6 +1286,9 @@ void WaveformDisplay::clear()
     grainHudPitchSemitones = 0.0f;
     grainHudArpDepth = 0.0f;
     grainHudPitchJitterSemitones = 0.0f;
+    loopPitchOverlayEnabled = false;
+    loopPitchOverlayLineA.clear();
+    loopPitchOverlayLineB.clear();
     repaint();
 }
 
@@ -1192,6 +1405,13 @@ void StripControl::setupComponents()
     stripLabel.setJustificationType(juce::Justification::centredLeft);
     stripLabel.setColour(juce::Label::textColourId, stripColor);
     addAndMakeVisible(stripLabel);
+
+    stripSampleNameLabel.setFont(juce::Font(juce::FontOptions(8.4f)));
+    stripSampleNameLabel.setJustificationType(juce::Justification::centredLeft);
+    stripSampleNameLabel.setColour(juce::Label::textColourId, kTextMuted);
+    stripSampleNameLabel.setInterceptsMouseClicks(false, false);
+    stripSampleNameLabel.setTooltip("Click to load a sample.");
+    addAndMakeVisible(stripSampleNameLabel);
     
     // Waveform display with rainbow color
     waveform.setWaveformColor(stripColor.withMultipliedSaturation(1.35f).withMultipliedBrightness(1.25f));
@@ -1339,20 +1559,223 @@ void StripControl::setupComponents()
     // Load button - compact
     loadButton.setButtonText("Load");
     loadButton.onClick = [this]() { loadSample(); };
-    loadButton.setTooltip("Load sample into this strip.");
+    loadButton.setTooltip("Replace the strip source. Preserve timing safely. Rerun pitch analysis only when the current pitch role requires it.");
     addAndMakeVisible(loadButton);
 
     pitchMasterButton.setButtonText("PM");
-    pitchMasterButton.onClick = [this]() { processor.requestLoopStripPitchMaster(stripIndex); };
-    pitchMasterButton.setTooltip("Analyze this strip asynchronously and set the detected note as the global root note.");
+    pitchMasterButton.onClick = [this]()
+    {
+        const auto currentRole = processor.getLoopPitchRole(stripIndex);
+        processor.setLoopPitchRole(stripIndex,
+                                   currentRole == MlrVSTAudioProcessor::LoopPitchRole::Master
+                                       ? MlrVSTAudioProcessor::LoopPitchRole::None
+                                       : MlrVSTAudioProcessor::LoopPitchRole::Master);
+    };
+    pitchMasterButton.setTooltip("Toggle Pitch Master for this strip. When active, analysis sets the global root note.");
     styleUiButton(pitchMasterButton);
     addAndMakeVisible(pitchMasterButton);
 
     pitchSyncButton.setButtonText("PS");
-    pitchSyncButton.onClick = [this]() { processor.requestLoopStripPitchSync(stripIndex); };
-    pitchSyncButton.setTooltip("Analyze this strip asynchronously and repitch it to the current global root note.");
+    pitchSyncButton.onClick = [this]()
+    {
+        if (juce::ModifierKeys::getCurrentModifiersRealtime().isAltDown())
+        {
+            const auto currentTiming = processor.getLoopPitchSyncTiming(stripIndex);
+            const int nextTiming = (static_cast<int>(currentTiming) + 1)
+                % (static_cast<int>(MlrVSTAudioProcessor::LoopPitchSyncTiming::NextBar) + 1);
+            processor.setLoopPitchSyncTiming(stripIndex,
+                                             static_cast<MlrVSTAudioProcessor::LoopPitchSyncTiming>(nextTiming));
+            return;
+        }
+
+        const auto currentRole = processor.getLoopPitchRole(stripIndex);
+        processor.setLoopPitchRole(stripIndex,
+                                   currentRole == MlrVSTAudioProcessor::LoopPitchRole::Sync
+                                       ? MlrVSTAudioProcessor::LoopPitchRole::None
+                                       : MlrVSTAudioProcessor::LoopPitchRole::Sync);
+    };
+    pitchSyncButton.setTooltip("Toggle Pitch Sync for this strip. Option-click cycles retune timing.");
     styleUiButton(pitchSyncButton);
     addAndMakeVisible(pitchSyncButton);
+
+    pitchNoteBox.setJustificationType(juce::Justification::centredLeft);
+    pitchNoteBox.setTextWhenNothingSelected("Note");
+    for (int pitchClass = 0; pitchClass < 12; ++pitchClass)
+        pitchNoteBox.addItem(getPitchClassName(pitchClass), pitchClass + 1);
+    pitchNoteBox.onChange = [this]()
+    {
+        const int selectedPitchClass = pitchNoteBox.getSelectedId() - 1;
+        if (selectedPitchClass >= 0)
+        {
+            const int currentAssignedMidi = processor.getLoopStripAssignedPitchMidi(stripIndex);
+            const int referenceMidi = currentAssignedMidi >= 0
+                ? currentAssignedMidi
+                : processor.getGlobalRootNoteMidi();
+            const int selectedMidi = getNearestMidiForPitchClass(referenceMidi, selectedPitchClass);
+            processor.setLoopStripAssignedPitchMidi(stripIndex, selectedMidi);
+            if (processor.getLoopPitchRole(stripIndex) == MlrVSTAudioProcessor::LoopPitchRole::Master)
+                processor.updateGlobalRootFromLoopPitchMaster(stripIndex, true);
+        }
+    };
+    pitchNoteBox.setTooltip("Detected or manual source note for this strip. PM sets the global root note. PS retunes from this note to the global root.");
+    styleUiCombo(pitchNoteBox);
+    addAndMakeVisible(pitchNoteBox);
+
+    identityModeButton.onClick = [this]()
+    {
+        juce::PopupMenu menu;
+        menu.addItem(1, "One-Shot", true, playModeBox.getSelectedId() == 1);
+        menu.addItem(2, "Loop", true, playModeBox.getSelectedId() == 2);
+        menu.addItem(3, "Gate", true, playModeBox.getSelectedId() == 3);
+        menu.addItem(4, "Step", true, playModeBox.getSelectedId() == 4);
+        menu.addItem(5, "Grain", true, playModeBox.getSelectedId() == 5);
+        menu.addItem(6, "Flip", true, playModeBox.getSelectedId() == 6);
+
+        juce::Component::SafePointer<StripControl> safeThis(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&identityModeButton),
+                           [safeThis](int result)
+                           {
+                               if (safeThis == nullptr || result <= 0)
+                                   return;
+                               safeThis->playModeBox.setSelectedId(result, juce::sendNotification);
+                           });
+    };
+    identityModeButton.setTooltip("Playback mode for this strip.");
+    styleUiButton(identityModeButton);
+    addAndMakeVisible(identityModeButton);
+
+    identityGroupButton.onClick = [this]()
+    {
+        juce::PopupMenu menu;
+        const int currentGroupId = groupSelector.getSelectedId();
+        menu.addItem(1, "None", true, currentGroupId == 1);
+        menu.addItem(2, "G1", true, currentGroupId == 2);
+        menu.addItem(3, "G2", true, currentGroupId == 3);
+        menu.addItem(4, "G3", true, currentGroupId == 4);
+        menu.addItem(5, "G4", true, currentGroupId == 5);
+
+        juce::Component::SafePointer<StripControl> safeThis(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&identityGroupButton),
+                           [safeThis](int result)
+                           {
+                               if (safeThis == nullptr || result <= 0)
+                                   return;
+                               safeThis->groupSelector.setSelectedId(result, juce::sendNotification);
+                           });
+    };
+    identityGroupButton.setTooltip("Mute group assignment for this strip.");
+    styleUiButton(identityGroupButton);
+    addAndMakeVisible(identityGroupButton);
+
+    identityRoleButton.onClick = [this]()
+    {
+        juce::PopupMenu menu;
+        const auto currentRole = processor.getLoopPitchRole(stripIndex);
+        menu.addItem(1, "Free", true, currentRole == MlrVSTAudioProcessor::LoopPitchRole::None);
+        menu.addItem(2, "PM", true, currentRole == MlrVSTAudioProcessor::LoopPitchRole::Master);
+        menu.addItem(3, "PS", true, currentRole == MlrVSTAudioProcessor::LoopPitchRole::Sync);
+
+        juce::Component::SafePointer<StripControl> safeThis(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&identityRoleButton),
+                           [safeThis](int result)
+                           {
+                               if (safeThis == nullptr || result <= 0)
+                                   return;
+
+                               MlrVSTAudioProcessor::LoopPitchRole role = MlrVSTAudioProcessor::LoopPitchRole::None;
+                               if (result == 2)
+                                   role = MlrVSTAudioProcessor::LoopPitchRole::Master;
+                               else if (result == 3)
+                                   role = MlrVSTAudioProcessor::LoopPitchRole::Sync;
+                               safeThis->processor.setLoopPitchRole(safeThis->stripIndex, role);
+                           });
+    };
+    identityRoleButton.setTooltip("Pitch role for this strip. PM sets the global tonal center. PS follows the global tonal center. Free ignores it.");
+    styleUiButton(identityRoleButton);
+    addAndMakeVisible(identityRoleButton);
+
+    identityNoteButton.onClick = [this]()
+    {
+        juce::PopupMenu menu;
+        const int assignedPitchMidi = processor.getLoopStripAssignedPitchMidi(stripIndex);
+        const int assignedPitchClass = assignedPitchMidi >= 0 ? ((assignedPitchMidi % 12) + 12) % 12 : -1;
+        for (int pitchClass = 0; pitchClass < 12; ++pitchClass)
+            menu.addItem(100 + pitchClass, getPitchClassName(pitchClass), true, pitchClass == assignedPitchClass);
+
+        juce::Component::SafePointer<StripControl> safeThis(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&identityNoteButton),
+                           [safeThis](int result)
+                           {
+                               if (safeThis == nullptr || result < 100 || result >= 112)
+                                   return;
+
+                               const int selectedPitchClass = result - 100;
+                               const int currentAssignedMidi = safeThis->processor.getLoopStripAssignedPitchMidi(safeThis->stripIndex);
+                               const int referenceMidi = currentAssignedMidi >= 0
+                                   ? currentAssignedMidi
+                                   : safeThis->processor.getGlobalRootNoteMidi();
+                               const int selectedMidi = getNearestMidiForPitchClass(referenceMidi, selectedPitchClass);
+                               safeThis->processor.setLoopStripAssignedPitchMidi(safeThis->stripIndex, selectedMidi);
+                               if (safeThis->processor.getLoopPitchRole(safeThis->stripIndex) == MlrVSTAudioProcessor::LoopPitchRole::Master)
+                                   safeThis->processor.updateGlobalRootFromLoopPitchMaster(safeThis->stripIndex, true);
+                           });
+    };
+    identityNoteButton.setTooltip("Source note of this material. This is metadata for the strip source, not the global target root.");
+    styleUiButton(identityNoteButton);
+    addAndMakeVisible(identityNoteButton);
+
+    identityTargetButton.onClick = [this]()
+    {
+        juce::PopupMenu menu;
+        const int currentModeId = directionModeBox.getSelectedId();
+        menu.addItem(1, "Normal", true, currentModeId == 1);
+        menu.addItem(2, "Reverse", true, currentModeId == 2);
+        menu.addItem(3, "Ping-Pong", true, currentModeId == 3);
+        menu.addItem(4, "Random", true, currentModeId == 4);
+        menu.addItem(5, "Random Walk", true, currentModeId == 5);
+        menu.addItem(6, "Random Slice", true, currentModeId == 6);
+
+        juce::Component::SafePointer<StripControl> safeThis(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&identityTargetButton),
+                           [safeThis](int result)
+                           {
+                               if (safeThis == nullptr || result <= 0)
+                                   return;
+                               safeThis->directionModeBox.setSelectedId(result, juce::sendNotification);
+                           });
+    };
+    identityTargetButton.setTooltip("Playback direction behavior for this strip.");
+    styleUiButton(identityTargetButton);
+    addAndMakeVisible(identityTargetButton);
+
+    identityTimingButton.onClick = [this]()
+    {
+        juce::PopupMenu menu;
+        const auto currentTiming = processor.getLoopPitchSyncTiming(stripIndex);
+        for (int timing = 0; timing <= static_cast<int>(MlrVSTAudioProcessor::LoopPitchSyncTiming::NextBar); ++timing)
+        {
+            const auto value = static_cast<MlrVSTAudioProcessor::LoopPitchSyncTiming>(timing);
+            menu.addItem(100 + timing,
+                         loopPitchSyncTimingDisplayName(value, false),
+                         true,
+                         value == currentTiming);
+        }
+
+        juce::Component::SafePointer<StripControl> safeThis(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&identityTimingButton),
+                           [safeThis](int result)
+                           {
+                               if (safeThis == nullptr || result < 100)
+                                   return;
+
+                               safeThis->processor.setLoopPitchSyncTiming(
+                                   safeThis->stripIndex,
+                                   static_cast<MlrVSTAudioProcessor::LoopPitchSyncTiming>(result - 100));
+                           });
+    };
+    identityTimingButton.setTooltip("Pitch retune timing for PS strips.");
+    styleUiButton(identityTimingButton);
+    addAndMakeVisible(identityTimingButton);
 
     transientSliceButton.setButtonText("TIME");
     transientSliceButton.setClickingTogglesState(true);
@@ -1497,6 +1920,18 @@ void StripControl::setupComponents()
 
     pitchAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
         processor.parameters, "stripPitch" + juce::String(stripIndex), pitchSlider);
+    pitchSlider.onValueChange = [this]()
+    {
+        const float quantized = processor.quantizePitchSemitonesForStripControl(stripIndex,
+                                                                                static_cast<float>(pitchSlider.getValue()));
+        if (std::abs(quantized - static_cast<float>(pitchSlider.getValue())) > 1.0e-4f)
+        {
+            pitchSlider.setValue(quantized, juce::sendNotificationSync);
+            return;
+        }
+
+        processor.applyUserPitchControlToStrip(stripIndex, quantized);
+    };
 
     speedSlider.setLookAndFeel(&knobLookAndFeel);
     speedSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
@@ -1645,6 +2080,8 @@ void StripControl::setupComponents()
         slider.setSliderStyle(juce::Slider::LinearHorizontal);
         slider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     };
+    setupMini(grainSizeSlider);
+    setupMini(grainDensitySlider);
     setupMini(grainPitchSlider);
     setupMini(grainPitchJitterSlider);
     setupMini(grainSpreadSlider);
@@ -1743,6 +2180,15 @@ void StripControl::setupComponents()
                 if (std::abs(static_cast<float>(grainPitchSlider.getValue()) - value) > 1.0e-4f)
                     grainPitchSlider.setValue(value, juce::dontSendNotification);
             }
+            else
+            {
+                value = processor.quantizePitchSemitonesToGlobalScale(value);
+                if (std::abs(static_cast<float>(grainPitchSlider.getValue()) - value) > 1.0e-4f)
+                {
+                    grainPitchSlider.setValue(value, juce::sendNotificationSync);
+                    return;
+                }
+            }
             strip->setGrainPitch(value);
         }
     };
@@ -1828,6 +2274,7 @@ void StripControl::setupComponents()
     grainSizeDivLabel.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
     addAndMakeVisible(grainSizeDivLabel);
     grainSizeLabel.setJustificationType(juce::Justification::centredLeft);
+    grainDensityLabel.setJustificationType(juce::Justification::centredLeft);
 
     auto setupGrainTab = [this](juce::TextButton& button, const juce::String& text, GrainSubPage page)
     {
@@ -1845,7 +2292,7 @@ void StripControl::setupComponents()
         };
         addAndMakeVisible(button);
     };
-    setupGrainTab(grainTabPitchButton, "PITCH", GrainSubPage::Pitch);
+    setupGrainTab(grainTabPitchButton, "ENGINE", GrainSubPage::Pitch);
     setupGrainTab(grainTabSpaceButton, "SPACE", GrainSubPage::Space);
     setupGrainTab(grainTabShapeButton, "SHAPE", GrainSubPage::Shape);
     updateGrainTabButtons();
@@ -2233,16 +2680,13 @@ void StripControl::setupComponents()
 
 void StripControl::updateGrainOverlayVisibility()
 {
-    const bool isGrainMode = !showingStepDisplay
-                          && processor.getAudioEngine()
-                          && processor.getAudioEngine()->getStrip(stripIndex)
-                          && processor.getAudioEngine()->getStrip(stripIndex)->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain;
-    const bool isSampleMode = !showingStepDisplay
-                           && processor.getAudioEngine()
-                           && processor.getAudioEngine()->getStrip(stripIndex)
-                           && processor.getAudioEngine()->getStrip(stripIndex)->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample;
-    const bool isStepMode = showingStepDisplay;
+    auto* strip = processor.getAudioEngine() != nullptr ? processor.getAudioEngine()->getStrip(stripIndex) : nullptr;
+    const auto playMode = strip != nullptr ? strip->getPlayMode() : EnhancedAudioStrip::PlayMode::Loop;
+    const bool isStepMode = (playMode == EnhancedAudioStrip::PlayMode::Step);
+    const bool isSampleMode = (playMode == EnhancedAudioStrip::PlayMode::Sample);
+    const bool isGrainMode = (playMode == EnhancedAudioStrip::PlayMode::Grain);
     grainOverlayVisible = isGrainMode;
+    showingStepDisplay = isStepMode;
     showingSampleMode = isSampleMode;
     const bool showPitchPage = isGrainMode && grainSubPage == GrainSubPage::Pitch;
     const bool showSpacePage = isGrainMode && grainSubPage == GrainSubPage::Space;
@@ -2265,11 +2709,8 @@ void StripControl::updateGrainOverlayVisibility()
     const bool showLoopKnobs = !showingStepDisplay && !isGrainMode && !isSampleMode;
     const bool showSampleModeKnobs = isSampleMode;
     bool showSliceLength = false;
-    if (showLoopKnobs && processor.getAudioEngine())
-    {
-        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-            showSliceLength = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Loop);
-    }
+    if (showLoopKnobs && strip != nullptr)
+        showSliceLength = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Loop);
 
     pitchSlider.setVisible(showLoopKnobs || showSampleModeKnobs);
     speedSlider.setVisible(showLoopKnobs || showSampleModeKnobs);
@@ -2289,8 +2730,8 @@ void StripControl::updateGrainOverlayVisibility()
     stepReleaseLabel.setVisible(isStepMode && !isGrainMode);
     recordLengthLabel.setVisible(false);
 
-    grainSizeSlider.setVisible(isGrainMode);
-    grainDensitySlider.setVisible(isGrainMode);
+    grainSizeSlider.setVisible(showPitchPage);
+    grainDensitySlider.setVisible(showPitchPage);
     grainPitchSlider.setVisible(showPitchPage);
     grainPitchJitterSlider.setVisible(showPitchPage);
     grainSpreadSlider.setVisible(showSpacePage);
@@ -2305,10 +2746,10 @@ void StripControl::updateGrainOverlayVisibility()
     grainTabPitchButton.setVisible(isGrainMode);
     grainTabSpaceButton.setVisible(isGrainMode);
     grainTabShapeButton.setVisible(isGrainMode);
-    grainSizeSyncToggle.setVisible(isGrainMode);
-    grainSizeDivLabel.setVisible(isGrainMode);
-    grainSizeLabel.setVisible(isGrainMode);
-    grainDensityLabel.setVisible(isGrainMode);
+    grainSizeSyncToggle.setVisible(showPitchPage);
+    grainSizeDivLabel.setVisible(showPitchPage);
+    grainSizeLabel.setVisible(showPitchPage);
+    grainDensityLabel.setVisible(showPitchPage);
     grainPitchLabel.setVisible(showPitchPage);
     grainPitchJitterLabel.setVisible(showPitchPage);
     grainSpreadLabel.setVisible(showSpacePage);
@@ -2368,6 +2809,7 @@ void StripControl::paint(juce::Graphics& g)
     auto bounds = getLocalBounds().toFloat();
 
     drawPanel(g, bounds, stripColor, 10.0f);
+    paintStripHarmonyOverlay(g, bounds, getStripHarmonyOverlayState(processor, stripIndex), stripColor);
 
     if (modulationLaneView)
     {
@@ -2379,6 +2821,7 @@ void StripControl::paint(juce::Graphics& g)
         paintLEDOverlay(g);
     }
 
+    paintLoopPitchAnalysisProgress(g);
 }
 
 void StripControl::setModulationLaneView(bool shouldShow)
@@ -2661,6 +3104,34 @@ void StripControl::paintModulationLane(juce::Graphics& g)
     }
 }
 
+void StripControl::paintLoopPitchAnalysisProgress(juce::Graphics& g)
+{
+    if (!loopPitchAnalysisActive || loopPitchProgressBounds.isEmpty())
+        return;
+
+    auto bounds = loopPitchProgressBounds.toFloat().reduced(0.0f, 1.0f);
+    if (bounds.getWidth() <= 6.0f || bounds.getHeight() <= 2.0f)
+        return;
+
+    g.setColour(juce::Colour(0xff121212).withAlpha(0.92f));
+    g.fillRoundedRectangle(bounds, 3.0f);
+
+    const auto fillWidth = juce::jmax(2.0f, bounds.getWidth() * juce::jlimit(0.0f, 1.0f, loopPitchAnalysisProgress));
+    auto fillBounds = bounds.withWidth(fillWidth);
+    g.setColour(stripColor.withMultipliedBrightness(1.1f).withAlpha(0.92f));
+    g.fillRoundedRectangle(fillBounds, 3.0f);
+
+    g.setColour(stripColor.withAlpha(0.35f));
+    g.drawRoundedRectangle(bounds, 3.0f, 1.0f);
+
+    g.setColour(kTextPrimary.withAlpha(0.9f));
+    g.setFont(8.5f);
+    const auto text = loopPitchAnalysisStatus.isNotEmpty()
+        ? loopPitchAnalysisStatus
+        : "Pitch";
+    g.drawFittedText(text, loopPitchProgressBounds, juce::Justification::centred, 1);
+}
+
 void StripControl::applyModulationPoint(juce::Point<int> p)
 {
     auto* engine = processor.getAudioEngine();
@@ -2887,16 +3358,23 @@ void StripControl::mouseDrag(const juce::MouseEvent& e)
     }
 }
 
-void StripControl::mouseUp(const juce::MouseEvent&)
+void StripControl::mouseUp(const juce::MouseEvent& e)
 {
     modTransformMode = ModTransformMode::None;
     modTransformStep = -1;
+
+    if (!e.mods.isPopupMenu()
+        && e.getDistanceFromDragStart() < 4
+        && stripSampleNameLabel.getBounds().contains(e.getPosition()))
+    {
+        loadSample();
+    }
 }
 
 void StripControl::hideAllPrimaryControls()
 {
     auto hide = [](juce::Component& c){ c.setVisible(false); };
-    hide(loadButton); hide(pitchMasterButton); hide(pitchSyncButton); hide(transientSliceButton); hide(playModeBox); hide(directionModeBox); hide(groupSelector);
+    hide(loadButton); hide(pitchMasterButton); hide(pitchSyncButton); hide(pitchNoteBox); hide(transientSliceButton); hide(playModeBox); hide(directionModeBox); hide(groupSelector);
     hide(volumeSlider); hide(panSlider); hide(pitchSlider); hide(speedSlider); hide(scratchSlider); hide(sliceLengthSlider); hide(patternLengthBox); hide(stepLengthReadoutBox);
     hide(stepAttackSlider); hide(stepDecaySlider); hide(stepReleaseSlider);
     hide(tempoLabel); hide(recordBarsBox); hide(recordButton); hide(recordBarsLabel);
@@ -2991,11 +3469,64 @@ void StripControl::resized()
     if (bounds.getWidth() < 50 || bounds.getHeight() < 50)
         return;
     
-    // Label at very top
-    auto labelArea = bounds.removeFromTop(14);
-    stripLabel.setBounds(labelArea.removeFromLeft(30));
+    const int headerHeight = 19;
+    auto labelArea = bounds.removeFromTop(headerHeight);
+    auto headerRow = labelArea.reduced(0, 1);
+    stripLabel.setBounds(headerRow.removeFromLeft(30));
+    identityModeButton.setVisible(true);
 
-    const bool isSampleMode = showingSampleMode;
+    auto* strip = processor.getAudioEngine() != nullptr ? processor.getAudioEngine()->getStrip(stripIndex) : nullptr;
+    const auto playMode = strip != nullptr ? strip->getPlayMode() : EnhancedAudioStrip::PlayMode::Loop;
+    const bool isStepMode = (playMode == EnhancedAudioStrip::PlayMode::Step);
+    const bool isSampleMode = (playMode == EnhancedAudioStrip::PlayMode::Sample);
+    const bool isGrainMode = (playMode == EnhancedAudioStrip::PlayMode::Grain);
+    showingStepDisplay = isStepMode;
+    showingSampleMode = isSampleMode;
+    grainOverlayVisible = isGrainMode;
+
+    const bool showPitchIdentity = !isSampleMode && !isStepMode;
+    const bool showDirectionIdentity = !isSampleMode;
+    const bool showIdentityTiming = showPitchIdentity
+        && processor.getLoopPitchRole(stripIndex) == MlrVSTAudioProcessor::LoopPitchRole::Sync;
+
+    identityTargetButton.setVisible(showDirectionIdentity);
+    identityGroupButton.setVisible(true);
+    identityRoleButton.setVisible(showPitchIdentity);
+    identityNoteButton.setVisible(showPitchIdentity);
+    identityTimingButton.setVisible(showIdentityTiming);
+
+    const int chipGap = 4;
+    auto placeChip = [&](juce::Component& component, int width)
+    {
+        component.setBounds(headerRow.removeFromLeft(juce::jmin(width, headerRow.getWidth())));
+        if (headerRow.getWidth() > chipGap)
+            headerRow.removeFromLeft(chipGap);
+    };
+
+    placeChip(identityModeButton, 54);
+    if (showDirectionIdentity)
+        placeChip(identityTargetButton, 52);
+    else
+        identityTargetButton.setBounds({});
+    placeChip(identityGroupButton, 38);
+    if (showPitchIdentity)
+    {
+        placeChip(identityRoleButton, 44);
+        placeChip(identityNoteButton, 38);
+        if (showIdentityTiming)
+            placeChip(identityTimingButton, 44);
+        else
+            identityTimingButton.setBounds({});
+    }
+    else
+    {
+        identityRoleButton.setBounds({});
+        identityNoteButton.setBounds({});
+        identityTargetButton.setBounds({});
+        identityTimingButton.setBounds({});
+    }
+
+    stripSampleNameLabel.setBounds(headerRow.reduced(0, 1));
     
     // Main area splits: waveform left, controls right
     auto controlsArea = bounds.removeFromRight(228);
@@ -3124,13 +3655,12 @@ void StripControl::resized()
     }
 
     loadButton.setVisible(true);
-    const bool showLoopPitchButtons = !isSampleMode && !showingStepDisplay && !grainOverlayVisible;
-    pitchMasterButton.setVisible(showLoopPitchButtons);
-    pitchSyncButton.setVisible(showLoopPitchButtons);
+    pitchMasterButton.setVisible(false);
+    pitchSyncButton.setVisible(false);
     transientSliceButton.setVisible(!isSampleMode);
-    playModeBox.setVisible(true);
-    directionModeBox.setVisible(!isSampleMode);
-    groupSelector.setVisible(true);
+    playModeBox.setVisible(false);
+    directionModeBox.setVisible(false);
+    groupSelector.setVisible(false);
     modTargetLabel.setVisible(false);
     modTargetBox.setVisible(false);
     modBipolarToggle.setVisible(false);
@@ -3155,70 +3685,185 @@ void StripControl::resized()
     // Controls column on right
     controlsArea.reduce(4, 0);
     
-    const bool isGrainMode = grainOverlayVisible;
-    const bool isGrainSpacePage = isGrainMode && grainSubPage == GrainSubPage::Space;
-    const bool isStepMode = showingStepDisplay;
     patternLengthBox.setBounds({});
     stepLengthReadoutBox.setBounds({});
 
     const int rowGap = isGrainMode ? 0 : 1;
+    loopPitchProgressBounds = {};
 
     // Top row: Load + slice mode
-    const int topRowHeight = isGrainMode ? (isGrainSpacePage ? 12 : 14) : 18;
+    const int topRowHeight = isGrainMode ? 14 : 18;
     auto topRow = controlsArea.removeFromTop(topRowHeight);
     if (isSampleMode)
     {
         loadButton.setBounds(topRow.reduced(0, 0));
-        pitchMasterButton.setBounds({});
-        pitchSyncButton.setBounds({});
         transientSliceButton.setBounds({});
     }
     else
     {
-        if (showLoopPitchButtons)
+        auto loadArea = topRow.removeFromLeft(juce::jmax(42, (topRow.getWidth() * 3) / 5));
+        loadButton.setBounds(loadArea.reduced(0, 0));
+        topRow.removeFromLeft(2);
+        transientSliceButton.setBounds(topRow);
+    }
+    pitchMasterButton.setBounds({});
+    pitchSyncButton.setBounds({});
+    pitchNoteBox.setBounds({});
+    controlsArea.removeFromTop(rowGap);
+    loopPitchProgressBounds = {};
+    
+    // Playback mode, direction, and group are controlled in the header line.
+    playModeBox.setBounds({});
+    directionModeBox.setBounds({});
+    groupSelector.setBounds({});
+
+    if (isGrainMode)
+    {
+        tempoLabel.setVisible(false);
+        recordBarsBox.setVisible(false);
+        recordButton.setVisible(false);
+        recordBarsLabel.setVisible(false);
+        tempoLabel.setBounds({});
+        recordBarsBox.setBounds({});
+        recordButton.setBounds({});
+        recordBarsLabel.setBounds({});
+        patternLengthBox.setVisible(false);
+        stepLengthReadoutBox.setVisible(false);
+        stepAttackSlider.setVisible(false);
+        stepDecaySlider.setVisible(false);
+        stepReleaseSlider.setVisible(false);
+        stepAttackLabel.setVisible(false);
+        stepDecayLabel.setVisible(false);
+        stepReleaseLabel.setVisible(false);
+        patternLengthBox.setBounds({});
+        stepLengthReadoutBox.setBounds({});
+        stepAttackSlider.setBounds({});
+        stepDecaySlider.setBounds({});
+        stepReleaseSlider.setBounds({});
+        stepAttackLabel.setBounds({});
+        stepDecayLabel.setBounds({});
+        stepReleaseLabel.setBounds({});
+        pitchNoteBox.setVisible(false);
+        pitchNoteBox.setBounds({});
+        recordLengthLabel.setVisible(false);
+        recordLengthLabel.setBounds({});
+
+        const int grainTabRowHeight = 14;
+        const int grainTabGap = 4;
+        const int preferredGrainTabWidth = 60;
+        auto tabRow = controlsArea.removeFromTop(grainTabRowHeight);
+        const int minClusterWidth = (3 * preferredGrainTabWidth) + (2 * grainTabGap);
+        const int grainTabWidth = tabRow.getWidth() >= minClusterWidth
+            ? preferredGrainTabWidth
+            : juce::jmax(1, (tabRow.getWidth() - (2 * grainTabGap)) / 3);
+        const int tabClusterWidth = (3 * grainTabWidth) + (2 * grainTabGap);
+        if (tabRow.getWidth() > tabClusterWidth)
+            tabRow.removeFromLeft((tabRow.getWidth() - tabClusterWidth) / 2);
+        grainTabPitchButton.setBounds(tabRow.removeFromLeft(grainTabWidth));
+        tabRow.removeFromLeft(grainTabGap);
+        grainTabSpaceButton.setBounds(tabRow.removeFromLeft(grainTabWidth));
+        tabRow.removeFromLeft(grainTabGap);
+        grainTabShapeButton.setBounds(tabRow.removeFromLeft(grainTabWidth));
+
+        const int grainSectionGap = 3;
+        if (controlsArea.getHeight() > grainSectionGap)
+            controlsArea.removeFromTop(grainSectionGap);
+
+        const bool showEnginePage = grainSubPage == GrainSubPage::Pitch;
+        if (showEnginePage)
         {
-            auto loadArea = topRow.removeFromLeft(juce::jmax(36, topRow.getWidth() * 2 / 5));
-            loadButton.setBounds(loadArea.reduced(0, 0));
-            topRow.removeFromLeft(2);
-            auto transientArea = topRow.removeFromLeft(juce::jmax(32, topRow.getWidth() / 2));
-            transientSliceButton.setBounds(transientArea);
-            topRow.removeFromLeft(2);
-            auto pitchMasterArea = topRow.removeFromLeft(juce::jmax(24, topRow.getWidth() / 2));
-            pitchMasterButton.setBounds(pitchMasterArea);
-            topRow.removeFromLeft(2);
-            pitchSyncButton.setBounds(topRow);
+            const int engineRowHeight = 15;
+            const int engineRowGap = 2;
+            const int engineLabelW = 34;
+            const int syncToggleW = 14;
+            const int syncModeW = 30;
+
+            auto sizeRow = controlsArea.removeFromTop(engineRowHeight);
+            grainSizeLabel.setBounds(sizeRow.removeFromLeft(engineLabelW));
+            if (sizeRow.getWidth() > 4)
+                sizeRow.removeFromLeft(4);
+            const int sliderW = juce::jmax(8, sizeRow.getWidth() - syncToggleW - syncModeW - 4);
+            grainSizeSlider.setBounds(sizeRow.removeFromLeft(sliderW));
+            if (sizeRow.getWidth() > 2)
+                sizeRow.removeFromLeft(2);
+            grainSizeSyncToggle.setBounds(sizeRow.removeFromLeft(syncToggleW));
+            if (sizeRow.getWidth() > 2)
+                sizeRow.removeFromLeft(2);
+            grainSizeDivLabel.setBounds(sizeRow);
+
+            if (controlsArea.getHeight() > engineRowGap)
+                controlsArea.removeFromTop(engineRowGap);
+
+            auto densityRow = controlsArea.removeFromTop(engineRowHeight);
+            grainDensityLabel.setBounds(densityRow.removeFromLeft(engineLabelW));
+            if (densityRow.getWidth() > 4)
+                densityRow.removeFromLeft(4);
+            grainDensitySlider.setBounds(densityRow);
+
+            if (controlsArea.getHeight() > 2)
+                controlsArea.removeFromTop(2);
         }
         else
         {
-            const int half = topRow.getWidth() / 2;
-            auto loadArea = topRow.removeFromLeft(half);
-            loadButton.setBounds(loadArea.reduced(0, 0));
-            pitchMasterButton.setBounds({});
-            pitchSyncButton.setBounds({});
-            topRow.removeFromLeft(2);
-            transientSliceButton.setBounds(topRow);
+            grainSizeSlider.setBounds({});
+            grainDensitySlider.setBounds({});
+            grainSizeSyncToggle.setBounds({});
+            grainSizeDivLabel.setBounds({});
+            grainSizeLabel.setBounds({});
+            grainDensityLabel.setBounds({});
         }
+
+        const int rowGapMini = 2;
+        const int totalMiniRows = (grainSubPage == GrainSubPage::Space) ? 3 : 2;
+        const int minMiniRowH = 10;
+        const int maxMiniRowH = 20;
+        const int rowH = juce::jlimit(minMiniRowH,
+                                      maxMiniRowH,
+                                      (controlsArea.getHeight() - ((totalMiniRows - 1) * rowGapMini)) / totalMiniRows);
+        const int miniLabelW = 36;
+        auto layoutGrainMiniRow = [&](juce::Label& labelA, juce::Slider& sliderA,
+                                      juce::Label& labelB, juce::Slider& sliderB)
+        {
+            if (controlsArea.getHeight() <= 0)
+                return;
+            auto row = controlsArea.removeFromTop(rowH);
+            auto left = row.removeFromLeft(row.getWidth() / 2);
+            labelA.setBounds(left.removeFromLeft(miniLabelW));
+            sliderA.setBounds(left);
+            row.removeFromLeft(2);
+            labelB.setBounds(row.removeFromLeft(miniLabelW));
+            sliderB.setBounds(row);
+            if (controlsArea.getHeight() > rowGapMini)
+                controlsArea.removeFromTop(rowGapMini);
+        };
+        auto layoutGrainSingleRow = [&](juce::Label& label, juce::Slider& slider)
+        {
+            if (controlsArea.getHeight() <= 0)
+                return;
+            auto row = controlsArea.removeFromTop(rowH);
+            label.setBounds(row.removeFromLeft(miniLabelW));
+            slider.setBounds(row);
+            if (controlsArea.getHeight() > rowGapMini)
+                controlsArea.removeFromTop(rowGapMini);
+        };
+
+        if (grainSubPage == GrainSubPage::Pitch)
+        {
+            layoutGrainMiniRow(grainPitchLabel, grainPitchSlider, grainPitchJitterLabel, grainPitchJitterSlider);
+            layoutGrainMiniRow(grainArpLabel, grainArpSlider, grainRandomLabel, grainRandomSlider);
+        }
+        else if (grainSubPage == GrainSubPage::Space)
+        {
+            layoutGrainMiniRow(grainSpreadLabel, grainSpreadSlider, grainJitterLabel, grainJitterSlider);
+            layoutGrainMiniRow(grainCloudLabel, grainCloudSlider, grainEmitterLabel, grainEmitterSlider);
+            layoutGrainSingleRow(grainPositionJitterLabel, grainPositionJitterSlider);
+        }
+        else
+        {
+            layoutGrainMiniRow(grainEnvelopeLabel, grainEnvelopeSlider, grainShapeLabel, grainShapeSlider);
+        }
+        return;
     }
-    controlsArea.removeFromTop(rowGap);
-    
-    // Second row: Play mode and Direction mode (2/3 width each), Group (1/3 width)
-    const int modesRowHeight = isGrainMode ? (isGrainSpacePage ? 12 : 14) : 18;
-    auto modesRow = controlsArea.removeFromTop(modesRowHeight);
-    if (isSampleMode)
-    {
-        int modeWidth = (modesRow.getWidth() * 2) / 3;
-        playModeBox.setBounds(modesRow.removeFromLeft(modeWidth).reduced(1, 0));
-        groupSelector.setBounds(modesRow.reduced(1, 0));
-        directionModeBox.setBounds({});
-    }
-    else
-    {
-        int thirdWidth = modesRow.getWidth() / 3;
-        playModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
-        directionModeBox.setBounds(modesRow.removeFromLeft(thirdWidth).reduced(1, 0));
-        groupSelector.setBounds(modesRow.reduced(1, 0));  // Remaining space
-    }
-    controlsArea.removeFromTop(rowGap);
     
     // Check if we have enough height for compact transport + record controls.
     const int requiredTopControlsHeight = 22 + 2 + 20 + 2 + 30 + 10 + 10;
@@ -3229,6 +3874,7 @@ void StripControl::resized()
     tempoLabel.setVisible(showTempoControls);
     recordBarsBox.setVisible(showRecordBars);
     recordButton.setVisible(showRecordBars);
+    pitchNoteBox.setVisible(false);
     recordBarsLabel.setVisible(false);
 
     // Tempo controls row - only if we have space
@@ -3242,6 +3888,7 @@ void StripControl::resized()
         recordBarsBox.setBounds(recBarsRow.removeFromLeft(70));
         recBarsRow.removeFromLeft(8);
         recordButton.setBounds(recBarsRow.removeFromLeft(46));
+        pitchNoteBox.setBounds({});
         if (isStepMode)
         {
             recBarsRow.removeFromLeft(4);
@@ -3262,6 +3909,7 @@ void StripControl::resized()
         recordBarsBox.setBounds(recBarsRow.removeFromLeft(66));
         recBarsRow.removeFromLeft(8);
         recordButton.setBounds(recBarsRow.removeFromLeft(42));
+        pitchNoteBox.setBounds({});
         if (isStepMode)
         {
             recBarsRow.removeFromLeft(4);
@@ -3278,6 +3926,7 @@ void StripControl::resized()
     }
     else if (isStepMode && controlsArea.getHeight() >= 14)
     {
+        pitchNoteBox.setBounds({});
         auto lenRow = controlsArea.removeFromTop(16);
         const int lenWidth = juce::jlimit(18, 24, lenRow.getWidth());
         patternLengthBox.setBounds(lenRow.removeFromLeft(lenWidth));
@@ -3289,21 +3938,16 @@ void StripControl::resized()
         }
         controlsArea.removeFromTop(2);
     }
+    else
+    {
+        pitchNoteBox.setBounds({});
+    }
     
     // Rotary knobs row.
-    const int knobsRowHeight = isGrainMode ? (isGrainSpacePage ? 20 : 22) : 30;
+    const int knobsRowHeight = 30;
     auto knobsRow = controlsArea.removeFromTop(knobsRowHeight);
-    int totalWidth = knobsRow.getWidth();
-    int mainKnobsWidth = (totalWidth * 7) / 10;
-    int mainKnobWidth = mainKnobsWidth / 3;
 
-    if (isGrainMode)
-    {
-        grainSizeSlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
-        grainDensitySlider.setBounds(knobsRow.removeFromLeft(mainKnobWidth).reduced(1));
-        knobsRow.removeFromLeft(mainKnobWidth);
-    }
-    else if (isStepMode)
+    if (isStepMode)
     {
         const int stepGap = 2;
         const int stepKnobWidth = juce::jmax(8, (knobsRow.getWidth() - (4 * stepGap)) / 5);
@@ -3346,23 +3990,9 @@ void StripControl::resized()
         }
     }
 
-    const int labelsRowHeight = isGrainMode ? (isGrainSpacePage ? 9 : 10) : 9;
+    const int labelsRowHeight = 9;
     auto labelsRow = controlsArea.removeFromTop(labelsRowHeight);
-    if (isGrainMode)
-    {
-        auto sizeLabelArea = labelsRow.removeFromLeft(mainKnobWidth);
-        const int syncToggleW = 14;
-        const int syncModeW = 30;
-        const int labelW = juce::jmax(0, sizeLabelArea.getWidth() - syncToggleW - syncModeW - 4);
-        grainSizeLabel.setBounds(sizeLabelArea.removeFromLeft(labelW));
-        sizeLabelArea.removeFromLeft(2);
-        grainSizeSyncToggle.setBounds(sizeLabelArea.removeFromLeft(syncToggleW));
-        sizeLabelArea.removeFromLeft(2);
-        grainSizeDivLabel.setBounds(sizeLabelArea.removeFromLeft(syncModeW));
-        grainDensityLabel.setBounds(labelsRow.removeFromLeft(mainKnobWidth));
-        labelsRow.removeFromLeft(mainKnobWidth);
-    }
-    else if (isStepMode)
+    if (isStepMode)
     {
         const int stepGap = 2;
         const int stepLabelWidth = juce::jmax(8, (labelsRow.getWidth() - (4 * stepGap)) / 5);
@@ -3403,78 +4033,10 @@ void StripControl::resized()
                 labelsRow.removeFromLeft(labelGap);
         }
     }
-    if (!isGrainMode)
+    if (controlsArea.getHeight() >= 10)
     {
-        if (controlsArea.getHeight() >= 10)
-        {
-            // Recording loop length label (small, at bottom)
-            recordLengthLabel.setBounds(controlsArea.removeFromTop(10));
-        }
-        return;
-    }
-
-    controlsArea.removeFromTop(isGrainSpacePage ? 0 : 1);
-    auto tabRow = controlsArea.removeFromTop(isGrainSpacePage ? 11 : 13);
-    const int tabGap = 2;
-    const int tabW = juce::jmax(1, (tabRow.getWidth() - (2 * tabGap)) / 3);
-    grainTabPitchButton.setBounds(tabRow.removeFromLeft(tabW));
-    tabRow.removeFromLeft(tabGap);
-    grainTabSpaceButton.setBounds(tabRow.removeFromLeft(tabW));
-    tabRow.removeFromLeft(tabGap);
-    grainTabShapeButton.setBounds(tabRow);
-
-    controlsArea.removeFromTop(isGrainSpacePage ? 1 : 2);
-    const int rowGapMini = isGrainSpacePage ? 1 : 2;
-    const int totalMiniRows = (grainSubPage == GrainSubPage::Space) ? 3 : 2;
-    const int minMiniRowH = isGrainSpacePage ? 8 : 12;
-    const int maxMiniRowH = isGrainSpacePage ? 20 : 22;
-    const int rowH = juce::jlimit(minMiniRowH,
-                                  maxMiniRowH,
-                                  (controlsArea.getHeight() - ((totalMiniRows - 1) * rowGapMini)) / totalMiniRows);
-    const int miniLabelW = isGrainSpacePage ? 30 : 34;
-    auto layoutGrainMiniRow = [&](juce::Label& labelA, juce::Slider& sliderA,
-                                  juce::Label& labelB, juce::Slider& sliderB)
-    {
-        if (controlsArea.getHeight() <= 0)
-            return;
-        auto row = controlsArea.removeFromTop(rowH);
-        auto left = row.removeFromLeft(row.getWidth() / 2);
-        labelA.setBounds(left.removeFromLeft(miniLabelW));
-        sliderA.setBounds(left);
-        row.removeFromLeft(2);
-        labelB.setBounds(row.removeFromLeft(miniLabelW));
-        sliderB.setBounds(row);
-        if (controlsArea.getHeight() > rowGapMini)
-            controlsArea.removeFromTop(rowGapMini);
-    };
-    auto layoutGrainSingleRow = [&](juce::Label& label, juce::Slider& slider)
-    {
-        if (controlsArea.getHeight() <= 0)
-            return;
-        auto row = controlsArea.removeFromTop(rowH);
-        label.setBounds(row.removeFromLeft(miniLabelW));
-        slider.setBounds(row);
-        if (controlsArea.getHeight() > rowGapMini)
-            controlsArea.removeFromTop(rowGapMini);
-    };
-
-    if (grainSubPage == GrainSubPage::Pitch)
-    {
-        if (controlsArea.getHeight() > 0)
-        {
-            layoutGrainMiniRow(grainPitchLabel, grainPitchSlider, grainPitchJitterLabel, grainPitchJitterSlider);
-        }
-        layoutGrainMiniRow(grainArpLabel, grainArpSlider, grainRandomLabel, grainRandomSlider);
-    }
-    else if (grainSubPage == GrainSubPage::Space)
-    {
-        layoutGrainMiniRow(grainSpreadLabel, grainSpreadSlider, grainJitterLabel, grainJitterSlider);
-        layoutGrainMiniRow(grainCloudLabel, grainCloudSlider, grainEmitterLabel, grainEmitterSlider);
-        layoutGrainSingleRow(grainPositionJitterLabel, grainPositionJitterSlider);
-    }
-    else
-    {
-        layoutGrainMiniRow(grainEnvelopeLabel, grainEnvelopeSlider, grainShapeLabel, grainShapeSlider);
+        // Recording loop length label (small, at bottom)
+        recordLengthLabel.setBounds(controlsArea.removeFromTop(10));
     }
 }
 
@@ -3488,17 +4050,17 @@ void StripControl::loadSample()
     auto mode = isStepMode ? MlrVSTAudioProcessor::SamplePathMode::Step
                            : (isFlipMode ? MlrVSTAudioProcessor::SamplePathMode::Flip
                                          : MlrVSTAudioProcessor::SamplePathMode::Loop);
-    juce::File startingDirectory = processor.getDefaultSampleDirectory(stripIndex, mode);
-    
-    // If no last path, use default
-    if (!startingDirectory.exists())
-        startingDirectory = juce::File();
+    juce::File startingDirectory = processor.getCurrentBrowserDirectoryForStrip(stripIndex, mode);
     
     juce::FileChooser chooser("Load Sample", startingDirectory, "*.wav;*.aif;*.aiff;*.mp3;*.ogg;*.flac");
     
     if (chooser.browseForFileToOpen())
     {
-        loadSampleFromFile(chooser.getResult());
+        const auto selectedFile = chooser.getResult();
+        const auto selectedDirectory = selectedFile.getParentDirectory();
+        if (selectedDirectory != juce::File())
+            processor.setCurrentBrowserDirectoryForStrip(stripIndex, mode, selectedDirectory);
+        loadSampleFromFile(selectedFile);
     }
 }
 
@@ -3515,15 +4077,7 @@ void StripControl::loadSampleFromFile(const juce::File& file)
     if (!isSupportedAudioFile(file))
         return;
 
-    processor.loadSampleToStrip(stripIndex, file);
-
-    auto* strip = processor.getAudioEngine() ? processor.getAudioEngine()->getStrip(stripIndex) : nullptr;
-    const bool isStepMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
-    const bool isFlipMode = (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample);
-    auto mode = isStepMode ? MlrVSTAudioProcessor::SamplePathMode::Step
-                           : (isFlipMode ? MlrVSTAudioProcessor::SamplePathMode::Flip
-                                         : MlrVSTAudioProcessor::SamplePathMode::Loop);
-    processor.setDefaultSampleDirectory(stripIndex, mode, file.getParentDirectory());
+    processor.loadSampleToStripPreservingPlaybackState(stripIndex, file);
 }
 
 bool StripControl::isInterestedInFileDrag(const juce::StringArray& files)
@@ -3604,9 +4158,13 @@ void StripControl::updateFromEngine()
         return;
     }
 
-    const bool isStepMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
-    const bool isSampleMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample);
-    if (showingStepDisplay != isStepMode || showingSampleMode != isSampleMode)
+    const auto playMode = strip->getPlayMode();
+    const bool isStepMode = (playMode == EnhancedAudioStrip::PlayMode::Step);
+    const bool isSampleMode = (playMode == EnhancedAudioStrip::PlayMode::Sample);
+    const bool isGrainMode = (playMode == EnhancedAudioStrip::PlayMode::Grain);
+    if (showingStepDisplay != isStepMode
+        || showingSampleMode != isSampleMode
+        || grainOverlayVisible != isGrainMode)
     {
         showingStepDisplay = isStepMode;
         showingSampleMode = isSampleMode;
@@ -3687,7 +4245,6 @@ void StripControl::updateFromEngine()
                 }
             }
 
-            const bool isGrainMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain);
             double grainWindowNorm = 0.0;
             if (isGrainMode && buffer->getNumSamples() > 0 && strip->getSourceSampleRate() > 0.0)
             {
@@ -3817,17 +4374,177 @@ void StripControl::updateFromEngine()
     transientSliceButton.setToggleState(transientMode, juce::dontSendNotification);
     transientSliceButton.setButtonText(transientMode ? "TRANS" : "TIME");
     const bool pitchAnalysisBusy = processor.isLoopStripPitchAnalysisInFlight(stripIndex);
+    const float pitchAnalysisProgress = processor.getLoopStripPitchAnalysisProgress(stripIndex);
+    const auto pitchAnalysisStatus = processor.getLoopStripPitchAnalysisStatusText(stripIndex);
     const int detectedPitchMidi = processor.getLoopStripDetectedPitchMidi(stripIndex);
+    const float detectedPitchHz = processor.getLoopStripDetectedPitchHz(stripIndex);
+    const float detectedPitchConfidence = processor.getLoopStripDetectedPitchConfidence(stripIndex);
+    const int detectedScaleIndex = processor.getLoopStripDetectedScaleIndex(stripIndex);
+    const float detectedScaleConfidence = processor.getLoopStripDetectedScaleConfidence(stripIndex);
+    const int assignedPitchMidi = processor.getLoopStripAssignedPitchMidi(stripIndex);
+    const bool assignedPitchManual = processor.isLoopStripAssignedPitchManual(stripIndex);
+    const bool pitchUsedEssentia = processor.didLoopStripPitchUseEssentia(stripIndex);
+    const float pitchSyncCorrectionSemitones = processor.getLoopStripPitchSyncCorrectionSemitones(stripIndex);
+    const auto pitchRole = processor.getLoopPitchRole(stripIndex);
+    const auto pitchSyncTiming = processor.getLoopPitchSyncTiming(stripIndex);
     const int rootNoteMidi = processor.getGlobalRootNoteMidi();
-    pitchMasterButton.setEnabled(!pitchAnalysisBusy);
-    pitchSyncButton.setEnabled(!pitchAnalysisBusy);
-    pitchMasterButton.setButtonText(pitchAnalysisBusy ? "..." : "PM");
-    pitchSyncButton.setButtonText(pitchAnalysisBusy ? "..." : "PS");
-    pitchMasterButton.setTooltip("Analyze this strip asynchronously and set the detected note as the global root note. Current root: "
+    const auto globalScale = processor.getGlobalPitchScale();
+    const juce::String detectedScaleText = detectedScaleIndex >= 0
+        ? pitchScaleDisplayName(static_cast<ModernAudioEngine::PitchScale>(detectedScaleIndex), false)
+        : juce::String();
+    const juce::String detectedPitchConfidenceText = confidencePercentText(detectedPitchConfidence);
+    const juce::String detectedScaleConfidenceText = confidencePercentText(detectedScaleConfidence);
+    const juce::String noteSourceText = assignedPitchManual ? "Manual" : "Detected";
+    const juce::String backendText = pitchUsedEssentia ? "Essentia" : "Fallback";
+    pitchMasterButton.setEnabled(!pitchAnalysisBusy || pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Master);
+    pitchSyncButton.setEnabled(!pitchAnalysisBusy || pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Sync);
+    pitchMasterButton.setButtonText("PM");
+    pitchSyncButton.setButtonText("PS");
+    const bool progressChanged = loopPitchAnalysisActive != pitchAnalysisBusy
+        || std::abs(loopPitchAnalysisProgress - pitchAnalysisProgress) > 0.0001f
+        || loopPitchAnalysisStatus != pitchAnalysisStatus;
+    loopPitchAnalysisActive = pitchAnalysisBusy;
+    loopPitchAnalysisProgress = pitchAnalysisProgress;
+    loopPitchAnalysisStatus = pitchAnalysisStatus;
+    pitchMasterButton.setColour(juce::TextButton::buttonColourId,
+                                pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Master
+                                    ? juce::Colour(0xffc78a3a)
+                                    : juce::Colour(0xff444444));
+    pitchMasterButton.setColour(juce::TextButton::textColourOffId,
+                                pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Master
+                                    ? juce::Colours::black
+                                    : juce::Colour(0xfff0f0f0));
+    pitchSyncButton.setColour(juce::TextButton::buttonColourId,
+                              pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Sync
+                                  ? juce::Colour(0xff4ca7a7)
+                                  : juce::Colour(0xff444444));
+    pitchSyncButton.setColour(juce::TextButton::textColourOffId,
+                              pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Sync
+                                  ? juce::Colours::black
+                                  : juce::Colour(0xfff0f0f0));
+    identityModeButton.setButtonText(playModeDisplayName(playMode, true));
+    identityModeButton.setTooltip("Playback mode for this strip.");
+    identityTargetButton.setButtonText(directionModeDisplayName(strip->getDirectionMode(), true));
+    identityTargetButton.setTooltip("Playback direction for this strip.");
+    identityRoleButton.setButtonText(loopPitchRoleDisplayName(pitchRole, true));
+    identityRoleButton.setTooltip("Pitch role for this strip. PM suggests or sets the global tonal center. PS follows that shared tonal center. Free stays independent.");
+    identityRoleButton.setColour(juce::TextButton::buttonColourId,
+                                 pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Master
+                                     ? juce::Colour(0xffc78a3a)
+                                     : (pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Sync
+                                            ? juce::Colour(0xff4ca7a7)
+                                            : juce::Colour(0xff3b4146)));
+    identityRoleButton.setColour(juce::TextButton::textColourOffId,
+                                 pitchRole == MlrVSTAudioProcessor::LoopPitchRole::None
+                                     ? kTextPrimary
+                                     : juce::Colours::black);
+    identityNoteButton.setButtonText(assignedPitchMidi >= 0 ? getCompactNoteName(assignedPitchMidi) : "--");
+    identityNoteButton.setTooltip("Source note of this material. Click to set detected or manual source metadata for the strip.");
+    identityTimingButton.setButtonText(loopPitchSyncTimingDisplayName(pitchSyncTiming, true));
+    identityTimingButton.setTooltip("Retune timing for PS strips. Global root: "
+                                    + getCompactNoteName(rootNoteMidi)
+                                    + " | scale: "
+                                    + pitchScaleDisplayName(globalScale, false));
+    pitchMasterButton.setTooltip("Pitch Master. Active strip analysis sets the global root note. Current root: "
                                  + getCompactNoteName(rootNoteMidi)
-                                 + (detectedPitchMidi >= 0 ? (" | last detect: " + getCompactNoteName(detectedPitchMidi)) : juce::String()));
-    pitchSyncButton.setTooltip("Analyze this strip asynchronously and repitch it to the current global root note ("
-                               + getCompactNoteName(rootNoteMidi) + ").");
+                                 + " | scale: " + pitchScaleDisplayName(globalScale, false)
+                                 + (detectedPitchMidi >= 0 ? (" | detected: " + getCompactNoteName(detectedPitchMidi)
+                                                              + (detectedPitchConfidenceText.isNotEmpty() ? (" " + detectedPitchConfidenceText) : juce::String()))
+                                                         : juce::String())
+                                 + (detectedScaleText.isNotEmpty() ? (" | scale sugg: " + detectedScaleText
+                                                                      + (detectedScaleConfidenceText.isNotEmpty() ? (" " + detectedScaleConfidenceText) : juce::String()))
+                                                                 : juce::String())
+                                 + " | source: " + noteSourceText
+                                 + " | backend: " + backendText);
+    pitchSyncButton.setTooltip("Pitch Sync. Active strips retune from their note to the global root note ("
+                               + getCompactNoteName(rootNoteMidi) + "). Timing: "
+                               + loopPitchSyncTimingDisplayName(pitchSyncTiming, false)
+                               + " | Option-click cycles timing.");
+    pitchNoteBox.setEnabled(!pitchAnalysisBusy);
+    pitchNoteBox.setTooltip(
+        (pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Master
+            ? "Pitch Master note. Manual changes also set the global root note."
+            : "Source note for this strip. PS strips retune from this note to the global root.")
+        + juce::String(" | source: ") + noteSourceText
+        + (detectedPitchConfidenceText.isNotEmpty() ? (" | note conf: " + detectedPitchConfidenceText) : juce::String())
+        + (detectedScaleText.isNotEmpty() ? (" | scale: " + detectedScaleText) : juce::String())
+        + (detectedScaleConfidenceText.isNotEmpty() ? (" " + detectedScaleConfidenceText) : juce::String())
+        + " | backend: " + backendText);
+    const int pitchNoteId = assignedPitchMidi >= 0 ? ((assignedPitchMidi % 12) + 1) : 0;
+    if (pitchNoteBox.getSelectedId() != pitchNoteId)
+        pitchNoteBox.setSelectedId(pitchNoteId, juce::dontSendNotification);
+    const auto sampleName = processor.getStripDisplaySampleName(stripIndex);
+    const auto sampleLabelText = sampleName.isNotEmpty() ? sampleName : juce::String("No sample");
+    stripSampleNameLabel.setText(sampleLabelText, juce::dontSendNotification);
+    stripSampleNameLabel.setTooltip(sampleName.isNotEmpty()
+                                        ? sampleName
+                                        : juce::String("No sample. Click to load."));
+    if (progressChanged)
+        repaint(loopPitchProgressBounds);
+
+    const bool showLoopPitchOverlay = !showingStepDisplay
+        && !showingSampleMode
+        && (playMode == EnhancedAudioStrip::PlayMode::OneShot
+            || playMode == EnhancedAudioStrip::PlayMode::Loop
+            || playMode == EnhancedAudioStrip::PlayMode::Gate);
+    if (showLoopPitchOverlay)
+    {
+        juce::String lineA;
+        juce::String lineB;
+        if (pitchAnalysisBusy)
+        {
+            lineA = pitchAnalysisStatus.isNotEmpty()
+                ? pitchAnalysisStatus
+                : "Analyzing";
+            lineB = juce::String(juce::roundToInt(pitchAnalysisProgress * 100.0f)) + "%";
+        }
+        else if (detectedPitchMidi >= 0)
+        {
+            lineA = getCompactNoteName(detectedPitchMidi);
+            if (detectedPitchHz > 0.0f && std::isfinite(detectedPitchHz))
+                lineA << " " << juce::String(detectedPitchHz, detectedPitchHz >= 100.0f ? 1 : 2) << "Hz";
+            if (detectedPitchConfidenceText.isNotEmpty())
+                lineA << " " << detectedPitchConfidenceText;
+            if (detectedScaleText.isNotEmpty())
+            {
+                lineB = (pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Master ? "Sugg " : juce::String())
+                    + pitchScaleDisplayName(static_cast<ModernAudioEngine::PitchScale>(detectedScaleIndex), true);
+                if (detectedScaleConfidenceText.isNotEmpty())
+                    lineB << " " << detectedScaleConfidenceText;
+            }
+            if (pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Sync)
+            {
+                if (lineB.isNotEmpty())
+                    lineB << " • ";
+                lineB << "PS "
+                      << (pitchSyncCorrectionSemitones >= 0.0f ? "+" : "")
+                      << juce::String(pitchSyncCorrectionSemitones, 1) << " st";
+            }
+            if (lineB.isNotEmpty())
+                lineB << " • ";
+            lineB << (assignedPitchManual ? "Man" : "Det");
+        }
+        else if (detectedScaleText.isNotEmpty())
+        {
+            lineA = (pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Master ? "Sugg " : juce::String()) + detectedScaleText;
+            if (detectedScaleConfidenceText.isNotEmpty())
+                lineA << " " << detectedScaleConfidenceText;
+            if (pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Sync)
+            {
+                lineB << "PS "
+                      << (pitchSyncCorrectionSemitones >= 0.0f ? "+" : "")
+                      << juce::String(pitchSyncCorrectionSemitones, 1) << " st";
+                lineB << " • ";
+            }
+            lineB << (assignedPitchManual ? "Man" : "Det");
+        }
+        waveform.setLoopPitchOverlay(lineA.isNotEmpty() || lineB.isNotEmpty(), lineA, lineB);
+    }
+    else
+    {
+        waveform.setLoopPitchOverlay(false, {}, {});
+    }
+
     updateGrainOverlayVisibility();
     if (!modulates(ModernAudioEngine::ModTarget::GrainSize))
         grainSizeSlider.setValue(strip->getGrainSizeMs(), juce::dontSendNotification);
@@ -3885,6 +4602,8 @@ void StripControl::updateFromEngine()
     {
         groupSelector.setSelectedId(selectedId, juce::dontSendNotification);
     }
+    identityGroupButton.setButtonText(currentGroup >= 0 ? ("G" + juce::String(currentGroup + 1)) : "None");
+    identityGroupButton.setTooltip("Mute group assignment for this strip.");
 
     // Mod target pulse indication on actual control colours (not label text).
     auto tintSlider = [](juce::Slider& s, juce::Colour c, float pulseAmount)
@@ -4234,7 +4953,7 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     auto setupDuckLabel = [this](juce::Label& label, const juce::String& text)
     {
         label.setText(text, juce::dontSendNotification);
-        label.setJustificationType(juce::Justification::centred);
+        label.setJustificationType(juce::Justification::centredLeft);
         label.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
         label.setColour(juce::Label::textColourId, stripColor);
         addAndMakeVisible(label);
@@ -4242,7 +4961,7 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
 
     auto setupDuckSlider = [](juce::Slider& slider)
     {
-        slider.setSliderStyle(juce::Slider::Rotary);
+        slider.setSliderStyle(juce::Slider::LinearHorizontal);
         slider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     };
 
@@ -4279,7 +4998,7 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     addAndMakeVisible(duckReleaseSlider);
 
     setupDuckLabel(duckGainCompLabel, "Gain");
-    duckGainCompSlider.setSliderStyle(juce::Slider::LinearVertical);
+    duckGainCompSlider.setSliderStyle(juce::Slider::LinearHorizontal);
     duckGainCompSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     duckGainCompSlider.setRange(0.0, 24.0, 0.1);
     duckGainCompSlider.setValue(0.0);
@@ -4343,7 +5062,7 @@ void FXStripControl::resized()
     // Match Play strip padding
     bounds.reduce(8, 8);
     
-    const int filterWidth = bounds.getWidth() / 3;
+    const int filterWidth = juce::jlimit(170, juce::jmax(170, bounds.getWidth() / 3), (bounds.getWidth() * 3) / 8);
 
     // Field 1: Filter controls (left third)
     auto field1 = bounds.removeFromLeft(filterWidth).reduced(6, 0);
@@ -4382,36 +5101,42 @@ void FXStripControl::resized()
     duckEnableButton.setBounds(duckTopRow.removeFromLeft(54));
     duckTopRow.removeFromLeft(4);
     duckFollowMasterButton.setBounds(duckTopRow.removeFromLeft(78));
-    compField.removeFromTop(3);
-
-    auto duckSourceRow = compField.removeFromTop(22);
-    duckSourceLabel.setBounds(duckSourceRow.removeFromLeft(26));
-    duckSourceRow.removeFromLeft(4);
-    duckSourceBox.setBounds(duckSourceRow);
+    duckTopRow.removeFromLeft(8);
+    duckSourceLabel.setBounds(duckTopRow.removeFromLeft(28));
+    duckTopRow.removeFromLeft(4);
+    duckSourceBox.setBounds(duckTopRow);
     compField.removeFromTop(4);
 
-    auto duckMainArea = compField.removeFromTop(86);
-    auto gainCompArea = duckMainArea.removeFromRight(42).reduced(2, 0);
-    auto duckMainRow = duckMainArea;
-    const int duckColumnWidth = duckMainRow.getWidth() / 4;
-    auto thresholdCol = duckMainRow.removeFromLeft(duckColumnWidth).reduced(2, 0);
-    duckThresholdLabel.setBounds(thresholdCol.removeFromTop(12));
-    duckThresholdSlider.setBounds(thresholdCol);
+    const int duckRowCount = 5;
+    const int duckRowGap = 2;
+    const int duckRowHeight = juce::jmax(12,
+                                         (compField.getHeight() - ((duckRowCount - 1) * duckRowGap))
+                                             / juce::jmax(1, duckRowCount));
 
-    auto ratioCol = duckMainRow.removeFromLeft(duckColumnWidth).reduced(2, 0);
-    duckRatioLabel.setBounds(ratioCol.removeFromTop(12));
-    duckRatioSlider.setBounds(ratioCol);
+    auto layoutDuckRow = [&compField, duckRowHeight](juce::Label& label, juce::Slider& slider)
+    {
+        if (compField.getHeight() <= 0)
+        {
+            label.setBounds({});
+            slider.setBounds({});
+            return;
+        }
 
-    auto attackCol = duckMainRow.removeFromLeft(duckColumnWidth).reduced(2, 0);
-    duckAttackLabel.setBounds(attackCol.removeFromTop(12));
-    duckAttackSlider.setBounds(attackCol);
+        const int rowHeight = juce::jmin(duckRowHeight, compField.getHeight());
+        auto row = compField.removeFromTop(rowHeight);
+        const int labelWidth = juce::jmin(42, juce::jmax(30, row.getWidth() / 8));
+        label.setBounds(row.removeFromLeft(labelWidth));
+        row.removeFromLeft(4);
+        slider.setBounds(row);
+        if (compField.getHeight() > duckRowGap)
+            compField.removeFromTop(duckRowGap);
+    };
 
-    auto releaseCol = duckMainRow.removeFromLeft(duckColumnWidth).reduced(2, 0);
-    duckReleaseLabel.setBounds(releaseCol.removeFromTop(12));
-    duckReleaseSlider.setBounds(releaseCol);
-
-    duckGainCompLabel.setBounds(gainCompArea.removeFromTop(12));
-    duckGainCompSlider.setBounds(gainCompArea.reduced(3, 0));
+    layoutDuckRow(duckThresholdLabel, duckThresholdSlider);
+    layoutDuckRow(duckRatioLabel, duckRatioSlider);
+    layoutDuckRow(duckAttackLabel, duckAttackSlider);
+    layoutDuckRow(duckReleaseLabel, duckReleaseSlider);
+    layoutDuckRow(duckGainCompLabel, duckGainCompSlider);
 }
 
 void FXStripControl::updateFromEngine()
@@ -5166,7 +5891,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     versionLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
     versionLabel.setColour(juce::Label::textColourId, kTextMuted);
     versionLabel.setTooltip("Plugin version. Build " + juce::String(MLRVST_BUILD_STAMP) + ".");
-    addAndMakeVisible(versionLabel);
+    addChildComponent(versionLabel);
     
     // Master volume
     masterVolumeLabel.setText("Master", juce::dontSendNotification);
@@ -5307,6 +6032,39 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     {
         if (globalUiReady)
             processor.markPersistentGlobalUserChange();
+    };
+
+    rootNoteLabel.setText("Root", juce::dontSendNotification);
+    rootNoteLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(rootNoteLabel);
+
+    for (int i = 0; i < 12; ++i)
+        rootNoteBox.addItem(getPitchClassName(i), i + 1);
+    rootNoteBox.setSelectedId(processor.getGlobalRootNotePitchClass() + 1, juce::dontSendNotification);
+    addAndMakeVisible(rootNoteBox);
+    styleUiCombo(rootNoteBox);
+    rootNoteBox.setTooltip("Global target root note. PM suggests or sets this. PS strips follow this target tonal center.");
+    rootNoteBox.onChange = [this]()
+    {
+        processor.setGlobalRootNotePitchClass(rootNoteBox.getSelectedId() - 1);
+    };
+
+    globalScaleLabel.setText("Scale", juce::dontSendNotification);
+    globalScaleLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(globalScaleLabel);
+
+    globalScaleBox.addItem("Chromatic", 1);
+    globalScaleBox.addItem("Major", 2);
+    globalScaleBox.addItem("Minor", 3);
+    globalScaleBox.addItem("Dorian", 4);
+    globalScaleBox.addItem("Pentatonic", 5);
+    globalScaleBox.setSelectedId(pitchScaleToComboId(processor.getGlobalPitchScale()), juce::dontSendNotification);
+    addAndMakeVisible(globalScaleBox);
+    styleUiCombo(globalScaleBox);
+    globalScaleBox.setTooltip("Global target scale. Pitch controls quantize against this tonal world; it is not source metadata.");
+    globalScaleBox.onChange = [this]()
+    {
+        processor.setGlobalPitchScale(comboIdToPitchScale(globalScaleBox.getSelectedId()));
     };
     
     // Grain quality (global for all strips in Grain mode)
@@ -5454,7 +6212,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
 PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     : processor(p)
 {
-    instructionsLabel.setText("Click=load default/preset  Shift+Click=save  Right-click=delete", juce::dontSendNotification);
+    instructionsLabel.setText("Click=load default/preset  Shift+Click=save  Right-click=delete  Init=resets runtime", juce::dontSendNotification);
     instructionsLabel.setJustificationType(juce::Justification::centredLeft);
     instructionsLabel.setColour(juce::Label::textColourId, kTextMuted);
     addAndMakeVisible(instructionsLabel);
@@ -5474,6 +6232,20 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
         savePresetClicked(selectedPresetIndex, presetNameEditor.getText());
     };
     addAndMakeVisible(presetNameEditor);
+
+    initButton.setButtonText("Init");
+    initButton.onClick = [this]()
+    {
+        processor.initRuntimeStateToDefaults();
+        presetNameDraft = processor.presetExists(selectedPresetIndex)
+            ? processor.getPresetName(selectedPresetIndex)
+            : juce::String();
+        presetNameEditor.setText(presetNameDraft, juce::dontSendNotification);
+        updatePresetButtons();
+    };
+    initButton.setTooltip("Reset the current runtime state to defaults and clear all loaded sample buffers.");
+    addAndMakeVisible(initButton);
+    styleUiButton(initButton);
 
     saveButton.setButtonText("Save");
     saveButton.onClick = [this]()
@@ -5558,12 +6330,15 @@ void PresetControlPanel::resized()
 
     auto editorArea = bounds.removeFromTop(26);
     const int saveDeleteButtonW = 60;
+    const int initButtonW = 52;
     const int exportButtonW = 78;
     deleteButton.setBounds(editorArea.removeFromRight(saveDeleteButtonW));
     editorArea.removeFromRight(4);
     exportWavButton.setBounds(editorArea.removeFromRight(exportButtonW));
     editorArea.removeFromRight(4);
     saveButton.setBounds(editorArea.removeFromRight(saveDeleteButtonW));
+    editorArea.removeFromRight(6);
+    initButton.setBounds(editorArea.removeFromRight(initButtonW));
     editorArea.removeFromRight(6);
 
     // Keep name input compact to protect button layout on narrow widths.
@@ -5816,12 +6591,12 @@ PathsControlPanel::PathsControlPanel(MlrVSTAudioProcessor& p)
         scrollContent.addAndMakeVisible(row.loopPathLabel);
 
         row.loopSetButton.setButtonText("Set");
-        row.loopSetButton.setTooltip("Set default loop-mode sample folder.");
+        row.loopSetButton.setTooltip("Set pinned default loop-mode sample folder.");
         row.loopSetButton.onClick = [this, i]() { chooseDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Loop); };
         scrollContent.addAndMakeVisible(row.loopSetButton);
 
         row.loopClearButton.setButtonText("Clear");
-        row.loopClearButton.setTooltip("Clear default loop-mode folder.");
+        row.loopClearButton.setTooltip("Clear pinned default loop-mode folder.");
         row.loopClearButton.onClick = [this, i]() { clearDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Loop); };
         scrollContent.addAndMakeVisible(row.loopClearButton);
 
@@ -5830,12 +6605,12 @@ PathsControlPanel::PathsControlPanel(MlrVSTAudioProcessor& p)
         scrollContent.addAndMakeVisible(row.stepPathLabel);
 
         row.stepSetButton.setButtonText("Set");
-        row.stepSetButton.setTooltip("Set default step-mode sample folder.");
+        row.stepSetButton.setTooltip("Set pinned default step-mode sample folder.");
         row.stepSetButton.onClick = [this, i]() { chooseDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Step); };
         scrollContent.addAndMakeVisible(row.stepSetButton);
 
         row.stepClearButton.setButtonText("Clear");
-        row.stepClearButton.setTooltip("Clear default step-mode folder.");
+        row.stepClearButton.setTooltip("Clear pinned default step-mode folder.");
         row.stepClearButton.onClick = [this, i]() { clearDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Step); };
         scrollContent.addAndMakeVisible(row.stepClearButton);
 
@@ -5844,12 +6619,12 @@ PathsControlPanel::PathsControlPanel(MlrVSTAudioProcessor& p)
         scrollContent.addAndMakeVisible(row.flipPathLabel);
 
         row.flipSetButton.setButtonText("Set");
-        row.flipSetButton.setTooltip("Set default flip-mode sample folder.");
+        row.flipSetButton.setTooltip("Set pinned default flip-mode sample folder.");
         row.flipSetButton.onClick = [this, i]() { chooseDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Flip); };
         scrollContent.addAndMakeVisible(row.flipSetButton);
 
         row.flipClearButton.setButtonText("Clear");
-        row.flipClearButton.setTooltip("Clear default flip-mode folder.");
+        row.flipClearButton.setTooltip("Clear pinned default flip-mode folder.");
         row.flipClearButton.onClick = [this, i]() { clearDirectory(i, MlrVSTAudioProcessor::SamplePathMode::Flip); };
         scrollContent.addAndMakeVisible(row.flipClearButton);
     }
@@ -5952,6 +6727,8 @@ void PathsControlPanel::chooseDirectory(int stripIndex, MlrVSTAudioProcessor::Sa
 {
     auto startDir = processor.getDefaultSampleDirectory(stripIndex, mode);
     if (!startDir.exists() || !startDir.isDirectory())
+        startDir = processor.getCurrentBrowserDirectoryForStrip(stripIndex, mode);
+    if (!startDir.exists() || !startDir.isDirectory())
         startDir = juce::File::getSpecialLocation(juce::File::userHomeDirectory);
 
     juce::String modeName = "Loop";
@@ -6002,8 +6779,7 @@ void GlobalControlPanel::resized()
     stretchBackendBox.setBounds(titleRow.removeFromRight(118));
     titleRow.removeFromRight(6);
     momentaryToggle.setBounds(titleRow.removeFromRight(92));
-    titleRow.removeFromRight(6);
-    versionLabel.setBounds(titleRow.removeFromRight(62));
+    versionLabel.setBounds({});
     titleRow.removeFromRight(6);
     titleLabel.setBounds(titleRow);
     
@@ -6016,7 +6792,7 @@ void GlobalControlPanel::resized()
     const int sliderWidth = 48;      // Vertical sliders
     const int meterWidth = 28;       // L/R meters
     const int knobWidth = 100;       // Rotary fade controls
-    const int dropdownWidth = 84;    // Dropdowns
+    const int dropdownWidth = 76;    // Dropdowns
     const int spacing = 6;           // Between controls
     
     // Master volume
@@ -6094,7 +6870,19 @@ void GlobalControlPanel::resized()
     pitchControlModeBox.setBounds(pitchModeArea.removeFromTop(28));
     controlsArea.removeFromLeft(spacing);
 
-    auto outputRoutingArea = controlsArea.removeFromLeft(120);
+    auto rootArea = controlsArea.removeFromLeft(dropdownWidth);
+    rootNoteLabel.setBounds(rootArea.removeFromTop(16));
+    rootArea.removeFromTop(2);
+    rootNoteBox.setBounds(rootArea.removeFromTop(28));
+    controlsArea.removeFromLeft(spacing);
+
+    auto scaleArea = controlsArea.removeFromLeft(108);
+    globalScaleLabel.setBounds(scaleArea.removeFromTop(16));
+    scaleArea.removeFromTop(2);
+    globalScaleBox.setBounds(scaleArea.removeFromTop(28));
+    controlsArea.removeFromLeft(spacing);
+
+    auto outputRoutingArea = controlsArea.removeFromLeft(108);
     outputRoutingLabel.setBounds(outputRoutingArea.removeFromTop(16));
     outputRoutingArea.removeFromTop(2);
     outputRoutingBox.setBounds(outputRoutingArea.removeFromTop(28));
@@ -6110,6 +6898,8 @@ void GlobalControlPanel::refreshFromProcessor()
 {
     swingDivisionBox.setSelectedId(processor.getSwingDivisionSelection() + 1, juce::dontSendNotification);
     momentaryToggle.setToggleState(processor.isControlPageMomentary(), juce::dontSendNotification);
+    rootNoteBox.setSelectedId(processor.getGlobalRootNotePitchClass() + 1, juce::dontSendNotification);
+    globalScaleBox.setSelectedId(pitchScaleToComboId(processor.getGlobalPitchScale()), juce::dontSendNotification);
 }
 
 //==============================================================================
@@ -7591,6 +8381,8 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
         int& visibleStripCount;
         juce::Label& masterDuckLabel;
         juce::ComboBox& masterDuckTriggerBox;
+        juce::Viewport viewport;
+        juce::Component content;
         
         FXPanel(juce::OwnedArray<FXStripControl>& s,
                 int& visibleCount,
@@ -7599,7 +8391,21 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
             : strips(s),
               visibleStripCount(visibleCount),
               masterDuckLabel(headerLabel),
-              masterDuckTriggerBox(headerBox) {}
+              masterDuckTriggerBox(headerBox)
+        {
+            addAndMakeVisible(masterDuckLabel);
+            addAndMakeVisible(masterDuckTriggerBox);
+            viewport.setScrollBarsShown(true, false);
+            viewport.setScrollBarThickness(10);
+            viewport.setViewedComponent(&content, false);
+            addAndMakeVisible(viewport);
+        }
+
+        void addStrip(FXStripControl* strip)
+        {
+            if (strip != nullptr)
+                content.addAndMakeVisible(strip);
+        }
         
         void resized() override
         {
@@ -7609,23 +8415,34 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
             header.removeFromLeft(6);
             masterDuckTriggerBox.setBounds(header.removeFromLeft(116));
             bounds.removeFromTop(4);
+            viewport.setBounds(bounds);
             const int gap = 1;
             const int totalStrips = strips.size();
             if (totalStrips <= 0)
+            {
+                content.setSize(juce::jmax(1, viewport.getWidth()), juce::jmax(1, viewport.getHeight()));
                 return;
+            }
 
             const int stripCount = juce::jlimit(1, totalStrips, visibleStripCount);
+            const int stripHeight = 136;
             const int totalGap = gap * juce::jmax(0, stripCount - 1);
-            const int stripHeight = juce::jmax(1, (bounds.getHeight() - totalGap) / stripCount);
+            const int contentWidth = juce::jmax(1, viewport.getWidth() - viewport.getScrollBarThickness());
+            const int contentHeight = juce::jmax(bounds.getHeight(), (stripCount * stripHeight) + totalGap);
+            content.setSize(contentWidth, contentHeight);
             
             for (int i = 0; i < stripCount; ++i)
             {
                 if (auto* strip = strips[i])
                 {
                     const int y = i * (stripHeight + gap);
-                    strip->setBounds(0, y, bounds.getWidth(), stripHeight);
+                    strip->setBounds(0, y, contentWidth, stripHeight);
                 }
             }
+
+            for (int i = stripCount; i < totalStrips; ++i)
+                if (auto* strip = strips[i])
+                    strip->setBounds({});
         }
     };
     
@@ -7655,13 +8472,11 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     
     // FX TAB - filter controls for each strip
     auto* fxPanel = new FXPanel(fxStripControls, activeGuiStripCount, fxMasterDuckLabel, fxMasterDuckTriggerBox);
-    fxPanel->addAndMakeVisible(fxMasterDuckLabel);
-    fxPanel->addAndMakeVisible(fxMasterDuckTriggerBox);
     for (int i = 0; i < kTotalSampleStrips; ++i)
     {
         auto* fxStrip = new FXStripControl(i, audioProcessor);
         fxStripControls.add(fxStrip);
-        fxPanel->addAndMakeVisible(fxStrip);
+        fxPanel->addStrip(fxStrip);
     }
     
     // PATTERNS TAB

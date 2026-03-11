@@ -102,15 +102,52 @@ else
     AU_DEST_DIR="${HOME}/Library/Audio/Plug-Ins/Components"
 fi
 
+shell_quote() {
+    local value="${1//\'/\'\"\'\"\'}"
+    printf "'%s'" "${value}"
+}
+
+build_shell_command() {
+    local quoted_args=()
+    for arg in "$@"; do
+        quoted_args+=("$(shell_quote "${arg}")")
+    done
+
+    local IFS=' '
+    printf '%s' "${quoted_args[*]}"
+}
+
+escape_applescript_string() {
+    local value="${1//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '%s' "${value}"
+}
+
 run_install_cmd() {
     if "$@"; then
         return 0
     fi
 
     if [[ "${SCOPE}" == "system" && "${EUID}" -ne 0 && "${NO_SUDO}" -eq 0 ]]; then
-        echo "Retrying with sudo: $*" >&2
-        sudo "$@"
-        return 0
+        if sudo -n "$@" 2>/dev/null; then
+            return 0
+        fi
+
+        if [[ -t 0 || -t 1 || -t 2 ]]; then
+            echo "Retrying with sudo: $*" >&2
+            sudo "$@"
+            return 0
+        fi
+
+        if command -v osascript >/dev/null 2>&1; then
+            local shell_cmd
+            local applescript_cmd
+            shell_cmd="$(build_shell_command "$@")"
+            applescript_cmd="$(escape_applescript_string "${shell_cmd}")"
+            echo "Retrying with administrator privileges: ${shell_cmd}" >&2
+            osascript -e "do shell script \"${applescript_cmd}\" with administrator privileges"
+            return 0
+        fi
     fi
 
     return 1

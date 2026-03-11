@@ -13,6 +13,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(MLRVST_ENABLE_HUOVILAINEN "Enable Huovilainen Moog model (LGPL-derived upstream)" OFF)
 option(MLRVST_ENABLE_SOUNDTOUCH "Enable SoundTouch-based swing time-stretch path" ON)
 option(MLRVST_ENABLE_BUNGEE "Enable Bungee-based stretch backend" ON)
+option(MLRVST_ENABLE_LIBPYIN "Enable vendored LibPyin monophonic pitch detection for loop analysis" ON)
 set(MLRVST_NATIVE_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/_native" CACHE PATH
     "Path to persistent repo-local native dependency prefixes")
 set(MLRVST_DEFAULT_ESSENTIA_PREFIX "${MLRVST_NATIVE_DEPS_DIR}/essentia-prefix")
@@ -198,6 +199,36 @@ target_sources(mlrVST
         Source/MonomeFileBrowserActions.h
 )
 
+set(MLRVST_LIBPYIN_ENABLED FALSE)
+if(MLRVST_ENABLE_LIBPYIN
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/LibPyin/source/libpyincpp.h")
+    target_sources(mlrVST
+        PRIVATE
+            third_party/LibPyin/source/libpyincpp.cpp
+            third_party/LibPyin/source/normal_dist_pdf.cpp
+            third_party/LibPyin/source/pyin/MonoNote.cpp
+            third_party/LibPyin/source/pyin/MonoNoteHMM.cpp
+            third_party/LibPyin/source/pyin/MonoNoteParameters.cpp
+            third_party/LibPyin/source/pyin/MonoPitch.cpp
+            third_party/LibPyin/source/pyin/MonoPitchHMM.cpp
+            third_party/LibPyin/source/pyin/PYIN.cpp
+            third_party/LibPyin/source/pyin/SparseHMM.cpp
+            third_party/LibPyin/source/pyin/VampYin.cpp
+            third_party/LibPyin/source/pyin/Yin.cpp
+            third_party/LibPyin/source/pyin/YinUtil.cpp
+            third_party/LibPyin/source/vamp-sdk/FFT.cpp
+            third_party/LibPyin/source/vamp-sdk/FFTimpl.cpp
+            third_party/LibPyin/source/vamp-sdk/PluginAdapter.cpp
+            third_party/LibPyin/source/vamp-sdk/RealTime.cpp)
+    target_include_directories(mlrVST SYSTEM PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/LibPyin/source"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/LibPyin/source/pyin"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/LibPyin/source/vamp-sdk"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/LibPyin/source/vamp")
+    target_compile_definitions(mlrVST PRIVATE LIBPYIN_BUILD_SHARED=1)
+    set(MLRVST_LIBPYIN_ENABLED TRUE)
+endif()
+
 # Compile definitions
 target_compile_definitions(mlrVST
     PUBLIC
@@ -213,6 +244,12 @@ if(MLRVST_ENABLE_HUOVILAINEN)
     target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_HUOVILAINEN=1)
 else()
     target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_HUOVILAINEN=0)
+endif()
+
+if(MLRVST_LIBPYIN_ENABLED)
+    target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_LIBPYIN=1)
+else()
+    target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_LIBPYIN=0)
 endif()
 
 set(MLRVST_SOUNDTOUCH_ENABLED FALSE)
