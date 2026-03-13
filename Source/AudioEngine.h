@@ -115,6 +115,8 @@ struct QuantisedTrigger
     double targetPPQ = 0.0;      // Exact PPQ grid value (calculated at schedule time)
     int stripIndex = -1;
     int column = 0;
+    int sampleSliceId = -1;
+    int64_t sampleStartSample = -1;
     bool clearPendingOnFire = true;
     bool isMomentaryStutter = false;
     bool isSequencerRetrigger = false;
@@ -133,7 +135,12 @@ public:
     void advance(int numSamples);
     void updateFromPPQ(double ppq, int numSamples); // NEW: Update from master PPQ clock
     int64_t getCurrentSample() const { return currentSample.load(std::memory_order_acquire); }
-    void scheduleTrigger(int stripIndex, int column, double currentPPQ, EnhancedAudioStrip* strip); // NEW: Takes PPQ and strip
+    void scheduleTrigger(int stripIndex,
+                         int column,
+                         double currentPPQ,
+                         EnhancedAudioStrip* strip,
+                         int sampleSliceId = -1,
+                         int64_t sampleStartSample = -1); // NEW: Takes PPQ and strip
     bool hasPendingTrigger(int stripIndex) const;
     void clearPendingTriggers();
     void clearPendingTriggersForStrip(int stripIndex); // Clear all pending triggers for a specific strip
@@ -442,6 +449,13 @@ public:
     void prepareToPlay(double sampleRate, int maxBlockSize);
     void loadSample(const juce::AudioBuffer<float>& buffer, double sourceRate);
     bool loadSampleFromFile(const juce::File& file);
+    void adoptPreparedSample(juce::AudioBuffer<float>& preparedSampleBuffer,
+                             double sourceRate,
+                             juce::AudioBuffer<float>* preparedLoopTempoMatchBuffer = nullptr,
+                             double preparedLoopTempoMatchHostTempo = -1.0,
+                             double preparedLoopTempoMatchBeatsForLoop = -1.0,
+                             double preparedLoopTempoMatchSourceSampleRate = -1.0,
+                             TimeStretchBackend preparedLoopTempoMatchBackend = TimeStretchBackend::Resample);
     void clearSample();
     
     void process(juce::AudioBuffer<float>& output, 
@@ -571,6 +585,11 @@ public:
     TimeStretchBackend getStretchBackend() const
     {
         return sanitizeTimeStretchBackend(soundTouchEnabled.load(std::memory_order_acquire));
+    }
+    void setTempoMatchBackend(TimeStretchBackend backend);
+    TimeStretchBackend getTempoMatchBackend() const
+    {
+        return sanitizeTimeStretchBackend(tempoMatchBackend.load(std::memory_order_acquire));
     }
     void setSoundTouchEnabled(bool enabled);
     bool isSoundTouchEnabled() const { return getStretchBackend() != TimeStretchBackend::Resample; }
@@ -940,6 +959,16 @@ private:
     bool soundTouchSwingCacheUsesTransientAnchors = false;
     std::uint64_t soundTouchSwingCacheAnchorHash = 0;
 #endif
+#if MLRVST_ENABLE_BUNGEE
+    juce::AudioBuffer<float> loopTempoMatchCacheBuffer;
+    bool loopTempoMatchCacheValid = false;
+    double loopTempoMatchCacheHostTempo = -1.0;
+    double loopTempoMatchCacheBeatsForLoop = -1.0;
+    double loopTempoMatchCacheSourceSampleRate = -1.0;
+    int loopTempoMatchCacheSourceSamples = -1;
+    TimeStretchBackend loopTempoMatchCacheBackend = TimeStretchBackend::Resample;
+    double loopTempoMatchCachePositionScale = 1.0;
+#endif
     std::array<double, 16> neutralResampleSegmentSourceStarts{};
     std::uint64_t neutralResampleAnchorHash = 0;
     bool neutralResampleAnchorsValid = false;
@@ -957,6 +986,7 @@ private:
     std::atomic<int> resamplePitchEnabled{0};
     std::atomic<float> resamplePitchRatio{1.0f};
     std::atomic<int> soundTouchEnabled{1};
+    std::atomic<int> tempoMatchBackend{0};
     std::atomic<float> scratchAmount{0.0f};  // Per-strip scratch: 0-100%
     std::atomic<float> loopCrossfadeLengthMs{10.0f};
     std::atomic<float> triggerFadeInMs{12.0f};
@@ -1230,6 +1260,10 @@ public:
     bool rebuildSoundTouchSwingCache(double loopStartSamples, double loopLength, double beatsForLoop, int loopCols);
     void invalidateSoundTouchSwingCache();
 #endif
+#if MLRVST_ENABLE_BUNGEE
+    bool rebuildLoopTempoMatchCache(double hostTempo, double beatsForLoop);
+    void invalidateLoopTempoMatchCache();
+#endif
     double getTriggerTargetPositionForColumn(int column, double loopStartSamples, double loopLengthSamples) const;
     double snapToNearestZeroCrossing(double targetPos, int radiusSamples) const;
     double getWrappedSamplePosition(double samplePos, double loopStartSamples, double loopLengthSamples) const;
@@ -1397,7 +1431,11 @@ public:
     
     // Quantization
     void setQuantization(int division);
-    void scheduleQuantizedTrigger(int stripIndex, int column, double currentPPQ);
+    void scheduleQuantizedTrigger(int stripIndex,
+                                  int column,
+                                  double currentPPQ,
+                                  int sampleSliceId = -1,
+                                  int64_t sampleStartSample = -1);
     void triggerStripWithQuantization(int stripIndex,
                                       int column,
                                       bool useQuantize,
@@ -1429,6 +1467,7 @@ public:
     PatternRecorder* getPattern(int index);
     static int groupIndexForPattern(int patternIndex);
     bool patternRecorderMatchesStrip(int patternIndex, int stripIndex) const;
+    void setPatternRecorderIgnoreGroups(bool ignoreGroups);
 
     // Per-strip modulation sequencers.
     void setModSequencerSlot(int stripIndex, int slot);
@@ -1512,9 +1551,14 @@ public:
     void setGlobalSwingDivision(EnhancedAudioStrip::SwingDivision division);
     EnhancedAudioStrip::SwingDivision getGlobalSwingDivision() const;
     void setGlobalStretchBackend(TimeStretchBackend backend);
+    void setGlobalTempoMatchBackend(TimeStretchBackend backend);
     TimeStretchBackend getGlobalStretchBackend() const
     {
         return sanitizeTimeStretchBackend(soundTouchEnabled.load(std::memory_order_acquire));
+    }
+    TimeStretchBackend getGlobalTempoMatchBackend() const
+    {
+        return sanitizeTimeStretchBackend(tempoMatchBackend.load(std::memory_order_acquire));
     }
     void setGlobalSoundTouchEnabled(bool enabled);
     bool isGlobalSoundTouchEnabled() const { return getGlobalStretchBackend() != TimeStretchBackend::Resample; }
@@ -1568,6 +1612,7 @@ private:
     std::array<std::unique_ptr<PatternRecorder>, 4> patterns;
     std::array<std::array<ModSequencer, NumModSequencers>, MaxStrips> modSequencers;
     std::array<std::atomic<int>, MaxStrips> activeModSequencerSlots{};
+    std::atomic<int> patternRecorderIgnoreGroups{0};
     std::atomic<int> momentaryStutterActive{0};
     std::atomic<double> momentaryStutterDivisionBeats{0.5}; // quarter-note units
     std::atomic<double> momentaryStutterStartPpq{0.0};
@@ -1596,6 +1641,7 @@ private:
     std::atomic<float> crossfadeLengthMs{10.0f}; // Inner-loop and capture-loop crossfade (ms)
     std::atomic<float> triggerFadeInMs{12.0f}; // Trigger fade-in de-click time (ms)
     std::atomic<int> soundTouchEnabled{1};
+    std::atomic<int> tempoMatchBackend{0};
     
     std::atomic<double> currentTempo{120.0};
     std::atomic<int> currentTimeSigNumerator{4};

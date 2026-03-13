@@ -489,6 +489,7 @@ private:
     juce::Label tempoLabel;         // Shows current beats setting
     juce::ComboBox recordBarsBox;   // Selects input recording buffer bars for this strip
     juce::TextButton recordButton;  // Captures recent input into this strip
+    juce::ComboBox tempoMatchOverrideBox; // Per-strip loop tempo match override
     juce::Label recordBarsLabel;    // Label above recording bars selector
     juce::Label recordLengthLabel;  // Shows input recording buffer length for this strip
     juce::Label volumeLabel;        // Label below knob
@@ -581,6 +582,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> pitchAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> speedAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> sliceLengthAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> tempoMatchOverrideAttachment;
     
     void setupComponents();
     void loadSample();
@@ -763,6 +765,8 @@ private:
     juce::Label outputRoutingLabel;
     juce::ComboBox pitchControlModeBox;
     juce::Label pitchControlModeLabel;
+    juce::ComboBox flipTempoMatchModeBox;
+    juce::Label flipTempoMatchModeLabel;
     juce::ComboBox rootNoteBox;
     juce::Label rootNoteLabel;
     juce::ComboBox globalScaleBox;
@@ -782,6 +786,7 @@ private:
     juce::Label triggerFadeInLabel;
     juce::ToggleButton momentaryToggle;
     juce::ComboBox stretchBackendBox;
+    juce::Label stretchBackendLabel;
     juce::ToggleButton tooltipsToggle;
     
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterVolumeAttachment;
@@ -794,6 +799,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> triggerFadeInAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> outputRoutingAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> pitchControlModeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> flipTempoMatchModeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> stretchBackendAttachment;
     bool globalUiReady = false;
     
@@ -1121,6 +1127,32 @@ private:
 
 //==============================================================================
 /**
+ * SceneControlPanel - Scene mode and scene chain settings
+ */
+class SceneControlPanel : public juce::Component
+{
+public:
+    SceneControlPanel(MlrVSTAudioProcessor& p);
+
+    void paint(juce::Graphics& g) override;
+    void resized() override;
+    void refreshFromProcessor();
+
+private:
+    MlrVSTAudioProcessor& processor;
+
+    juce::Label titleLabel;
+    juce::Label hintLabel;
+    juce::ToggleButton sceneModeToggle;
+    juce::Label sceneRepeatsLabel;
+    std::array<juce::Label, MlrVSTAudioProcessor::SceneSlots> sceneRepeatSlotLabels;
+    std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneRepeatBoxes;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SceneControlPanel)
+};
+
+//==============================================================================
+/**
  * Modern mlrVST Editor - Main window
  */
 class MlrVSTAudioProcessorEditor : public juce::AudioProcessorEditor,
@@ -1141,12 +1173,12 @@ private:
     public:
         juce::Font getComboBoxFont(juce::ComboBox&) override
         {
-            return juce::Font(juce::FontOptions(11.0f, juce::Font::bold));
+            return juce::Font(juce::FontOptions(12.5f, juce::Font::bold));
         }
 
         juce::Font getPopupMenuFont() override
         {
-            return juce::Font(juce::FontOptions(14.0f, juce::Font::bold));
+            return juce::Font(juce::FontOptions(15.0f, juce::Font::bold));
         }
     };
 
@@ -1160,6 +1192,7 @@ private:
     std::unique_ptr<MonomePagesPanel> monomePagesControl;
     std::unique_ptr<PresetControlPanel> presetControl;
     std::unique_ptr<PathsControlPanel> pathsControl;
+    std::unique_ptr<SceneControlPanel> sceneControl;
     
     // Top controls in tabs (to save space)
     std::unique_ptr<juce::TabbedComponent> topTabs;
@@ -1191,16 +1224,18 @@ private:
     uint32_t lastPresetRefreshToken = 0;
     int activeGuiStripCount = 6;
     int lastTopTabIndex = -1;
+    bool lastSceneModeEnabled = false;
 
     int getDetectedGuiStripCount() const;
     void setActiveGuiStripCount(int stripCount, bool forceRelayout);
     void createUIComponents();
     void setupLookAndFeel();
     void layoutComponents();
+    void refreshSceneModeLayout();
     void setTooltipsEnabled(bool enabled);
     
     static constexpr int windowWidth = 1000;
-    static constexpr int windowHeight = 1020;  // Taller to accommodate recording label
+    static constexpr int windowHeight = 1020;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MlrVSTAudioProcessorEditor)
 };

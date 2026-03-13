@@ -3,6 +3,7 @@
 #include "MonomeFilterActions.h"
 #include "MonomeGroupAssignActions.h"
 #include "MonomeMixActions.h"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
@@ -440,8 +441,15 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
     {
         return (gridY * PresetColumns) + gridX;
     };
+    const auto isSceneTopCell = [](int gridX, int gridY)
+    {
+        return gridY == 0 && gridX >= 0 && gridX < SceneSlots;
+    };
     const bool presetModeActive = (controlModeActive && currentControlMode == ControlMode::Preset);
     const bool stepEditModeActive = (controlModeActive && currentControlMode == ControlMode::StepEdit);
+    const bool sceneModeActive = isSceneModeEnabled();
+    const bool topRowSceneMode = sceneModeActive
+        && (presetModeActive || (!controlModeActive || currentControlMode == ControlMode::Normal));
     const auto isDisplayedDataRow = [presetModeActive, lastDisplayedStripRow, lastPresetRow](int row)
     {
         if (row < 1)
@@ -460,6 +468,147 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         // GROUP ROW (y=0): Groups 0-3 + Pattern Recorders 4-7
         if (y == GROUP_ROW)
         {
+            if (topRowSceneMode && isSceneTopCell(x, y))
+            {
+                const int sceneSlot = juce::jlimit(0, SceneSlots - 1, x);
+                const uint32_t nowMs = juce::Time::getMillisecondCounter();
+                constexpr uint32_t kSceneSequenceHoldMs = 140;
+                const bool anyHeldBefore =
+                    std::any_of(scenePadHeld.begin(), scenePadHeld.end(),
+                                [](bool v) { return v; });
+                bool qualifiesForSequence = false;
+                if (anyHeldBefore)
+                {
+                    for (int i = 0; i < SceneSlots; ++i)
+                    {
+                        const auto idx = static_cast<size_t>(i);
+                        if (!scenePadHeld[idx])
+                            continue;
+                        const uint32_t heldMs = nowMs - scenePadPressStartMs[idx];
+                        if (heldMs >= kSceneSequenceHoldMs)
+                        {
+                            qualifiesForSequence = true;
+                            break;
+                        }
+                    }
+                }
+
+                scenePadHeld[static_cast<size_t>(sceneSlot)] = true;
+                scenePadHoldSaveTriggered[static_cast<size_t>(sceneSlot)] = false;
+                scenePadPressStartMs[static_cast<size_t>(sceneSlot)] = nowMs;
+
+                const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+                const int previousSceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+                activeSceneMainPresetIndex = mainPresetIndex;
+
+                if (!anyHeldBefore || !qualifiesForSequence)
+                {
+                    if (sceneSlot != previousSceneSlot)
+                    {
+                        const bool saved = saveSceneForMainPreset(mainPresetIndex, previousSceneSlot);
+                        if (!saved)
+                        {
+                            DBG("Scene auto-save failed while switching from slot "
+                                << (previousSceneSlot + 1) << " to " << (sceneSlot + 1));
+                        }
+                    }
+
+                    for (int i = 0; i < SceneSlots; ++i)
+                    {
+                        if (i == sceneSlot)
+                            continue;
+                        const auto idx = static_cast<size_t>(i);
+                        scenePadHeld[idx] = false;
+                        scenePadHoldSaveTriggered[idx] = false;
+                    }
+
+                    sceneSequenceSlots.clear();
+                    sceneSequenceSlots.push_back(sceneSlot);
+                    sceneSequenceActive = false;
+                    sceneSequenceStartPpqValid = false;
+                    if (pendingSceneRecall.sequenceDriven)
+                    {
+                        pendingSceneRecall.active = false;
+                        pendingSceneRecall.targetResolved = false;
+                        pendingSceneRecall.sequenceDriven = false;
+                    }
+                    pendingSceneApplyMainPreset.store(-1, std::memory_order_release);
+                    pendingSceneApplySlot.store(-1, std::memory_order_release);
+                    pendingSceneApplySequenceDriven.store(0, std::memory_order_release);
+                    pendingSceneApplyTargetPpq.store(-1.0, std::memory_order_release);
+                    pendingSceneApplyTargetTempo.store(120.0, std::memory_order_release);
+                    pendingSceneApplyTargetSample.store(-1, std::memory_order_release);
+                    requestSceneRecallQuantized(mainPresetIndex, sceneSlot, false);
+                }
+                else
+                {
+                    auto resolveSequenceAnchor = [&]() -> int
+                    {
+                        int anchor = -1;
+                        uint32_t longestHeldMs = 0;
+                        for (int i = 0; i < SceneSlots; ++i)
+                        {
+                            if (i == sceneSlot)
+                                continue;
+                            const auto idx = static_cast<size_t>(i);
+                            if (!scenePadHeld[idx])
+                                continue;
+
+                            const uint32_t heldMs = nowMs - scenePadPressStartMs[idx];
+                            if (anchor < 0 || heldMs > longestHeldMs)
+                            {
+                                anchor = i;
+                                longestHeldMs = heldMs;
+                            }
+                        }
+
+                        if (anchor >= 0)
+                            return anchor;
+                        if (!sceneSequenceSlots.empty())
+                            return juce::jlimit(0, SceneSlots - 1, sceneSequenceSlots.front());
+                        return sceneSlot;
+                    };
+
+                    const int anchorSlot = resolveSequenceAnchor();
+                    sceneSequenceSlots.clear();
+                    const int step = (sceneSlot >= anchorSlot) ? 1 : -1;
+                    for (int slot = anchorSlot;; slot += step)
+                    {
+                        sceneSequenceSlots.push_back(juce::jlimit(0, SceneSlots - 1, slot));
+                        if (slot == sceneSlot)
+                            break;
+                    }
+
+                    if (sceneSequenceSlots.size() >= 2)
+                    {
+                        sceneSequenceActive = true;
+                        pendingSceneRecall.sequenceDriven = true;
+                        if (!pendingSceneRecall.active)
+                        {
+                            const int firstSceneSlot =
+                                juce::jlimit(0, SceneSlots - 1, sceneSequenceSlots.front());
+                            if (firstSceneSlot == previousSceneSlot
+                                && activeSceneStartPpqValid
+                                && std::isfinite(activeSceneStartPpq))
+                            {
+                                armNextSceneInSequence(
+                                    mainPresetIndex,
+                                    previousSceneSlot,
+                                    activeSceneStartPpq);
+                            }
+                            else
+                            {
+                                sceneSequenceStartPpqValid = false;
+                                requestSceneRecallQuantized(mainPresetIndex, firstSceneSlot, true);
+                            }
+                        }
+                    }
+                }
+
+                updateMonomeLEDs();
+                return;
+            }
+
             if (presetModeActive && isPresetCell(x, y))
             {
                 const int presetIndex = toPresetIndex(x, y);
@@ -756,6 +905,13 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             {
                 const bool wasStepEditMode = (controlModeActive && currentControlMode == ControlMode::StepEdit);
                 const auto selectedMode = getControlModeForControlButton(x);
+                if (sceneModeActive && selectedMode == ControlMode::GroupAssign)
+                {
+                    currentControlMode = ControlMode::Normal;
+                    controlModeActive = false;
+                    updateMonomeLEDs();
+                    return;
+                }
                 if (isControlPageMomentary())
                 {
                     currentControlMode = selectedMode;
@@ -1256,6 +1412,39 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
     }
     else if (state == 0) // Key up
     {
+        if (topRowSceneMode && isSceneTopCell(x, y))
+        {
+            const int sceneSlot = juce::jlimit(0, SceneSlots - 1, x);
+            scenePadHeld[static_cast<size_t>(sceneSlot)] = false;
+            scenePadHoldSaveTriggered[static_cast<size_t>(sceneSlot)] = false;
+
+            const bool anyHeld =
+                std::any_of(scenePadHeld.begin(), scenePadHeld.end(),
+                            [](bool v) { return v; });
+            if (!anyHeld)
+            {
+                const bool wasSequenceDriven = sceneSequenceActive || pendingSceneRecall.sequenceDriven;
+                sceneSequenceActive = false;
+                sceneSequenceSlots.clear();
+                sceneSequenceStartPpqValid = false;
+                if (wasSequenceDriven)
+                {
+                    pendingSceneRecall.active = false;
+                    pendingSceneRecall.targetResolved = false;
+                    pendingSceneRecall.sequenceDriven = false;
+                    pendingSceneApplyMainPreset.store(-1, std::memory_order_release);
+                    pendingSceneApplySlot.store(-1, std::memory_order_release);
+                    pendingSceneApplySequenceDriven.store(0, std::memory_order_release);
+                    pendingSceneApplyTargetPpq.store(-1.0, std::memory_order_release);
+                    pendingSceneApplyTargetTempo.store(120.0, std::memory_order_release);
+                    pendingSceneApplyTargetSample.store(-1, std::memory_order_release);
+                }
+            }
+
+            updateMonomeLEDs();
+            return;
+        }
+
         if (presetModeActive && isPresetCell(x, y))
         {
             const int presetIndex = toPresetIndex(x, y);
@@ -1438,6 +1627,8 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     const int beatIndexInBar = juce::jmax(0, static_cast<int>(std::floor(beatNow)) % 4);
     const bool metroDownbeat = (beatIndexInBar == 0);
     const auto nowMs = juce::Time::getMillisecondCounter();
+    const bool sceneModeActive = isSceneModeEnabled();
+    const int activeSceneMainPreset = getActiveMainPresetIndexForScenes();
 
     if (controlModeActive && currentControlMode == ControlMode::FileBrowser)
     {
@@ -1502,6 +1693,52 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                     level = slowBlinkOn ? 15 : 0;  // Loaded preset blinks.
                 }
                 newLedState[x][y] = level;
+            }
+        }
+
+        if (sceneModeActive)
+        {
+            for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
+            {
+                const auto slotIdx = static_cast<size_t>(sceneSlot);
+                if (scenePadHeld[slotIdx] && !scenePadHoldSaveTriggered[slotIdx])
+                {
+                    const uint32_t elapsed = nowMs - scenePadPressStartMs[slotIdx];
+                    if (elapsed >= presetHoldSaveMs)
+                    {
+                        const bool saved = saveSceneForMainPreset(activeSceneMainPreset, sceneSlot);
+                        scenePadHoldSaveTriggered[slotIdx] = true;
+                        if (saved)
+                            scenePadSaveBurstUntilMs[slotIdx] = nowMs + presetSaveBurstDurationMs;
+                    }
+                }
+
+                const bool exists = sceneSlotExistsForMainPreset(activeSceneMainPreset, sceneSlot);
+                const bool held = scenePadHeld[slotIdx];
+                const bool active = (sceneSlot == activeSceneSlot);
+                const bool inSequence = sceneSequenceActive
+                    && std::find(sceneSequenceSlots.begin(), sceneSequenceSlots.end(), sceneSlot)
+                        != sceneSequenceSlots.end();
+                const bool queued = pendingSceneRecall.active
+                    && pendingSceneRecall.sceneSlot == sceneSlot;
+                const bool burstActive = nowMs < scenePadSaveBurstUntilMs[slotIdx];
+
+                int level = exists ? 8 : 2;
+                if (active)
+                    level = 11;
+                if (inSequence)
+                    level = fastBlinkOn ? 15 : 6;
+                if (queued)
+                    level = slowBlinkOn ? 15 : 7;
+                if (held)
+                    level = 15;
+                if (burstActive)
+                {
+                    const bool burstOn = ((nowMs / presetSaveBurstIntervalMs) & 1u) == 0u;
+                    level = burstOn ? 15 : 0;
+                }
+
+                newLedState[sceneSlot][GROUP_ROW] = level;
             }
         }
 
@@ -1714,48 +1951,90 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     }
     else
     {
-        // Normal mode: Groups 0-3 + Patterns 4-7
-        for (int groupId = 0; groupId < 4; ++groupId)
-    {
-        auto* group = audioEngine->getGroup(groupId);
-        if (group)
+        if (sceneModeActive)
         {
-            bool anyPlaying = false;
-            bool isMuted = group->isMuted();
-            bool hasStrips = !group->getStrips().empty();
-            
-            // Check if any strip in this group is playing
-            if (!isMuted && hasStrips)
+            for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
             {
-                auto strips = group->getStrips();
-                for (int stripIdx : strips)
+                const auto slotIdx = static_cast<size_t>(sceneSlot);
+                if (scenePadHeld[slotIdx] && !scenePadHoldSaveTriggered[slotIdx])
                 {
-                    if (auto* strip = audioEngine->getStrip(stripIdx))
+                    const uint32_t elapsed = nowMs - scenePadPressStartMs[slotIdx];
+                    if (elapsed >= presetHoldSaveMs)
                     {
-                        if (strip->isPlaying())
+                        const bool saved = saveSceneForMainPreset(activeSceneMainPreset, sceneSlot);
+                        scenePadHoldSaveTriggered[slotIdx] = true;
+                        if (saved)
+                            scenePadSaveBurstUntilMs[slotIdx] = nowMs + presetSaveBurstDurationMs;
+                    }
+                }
+
+                const bool exists = sceneSlotExistsForMainPreset(activeSceneMainPreset, sceneSlot);
+                const bool held = scenePadHeld[slotIdx];
+                const bool active = (sceneSlot == activeSceneSlot);
+                const bool inSequence = sceneSequenceActive
+                    && std::find(sceneSequenceSlots.begin(), sceneSequenceSlots.end(), sceneSlot)
+                        != sceneSequenceSlots.end();
+                const bool queued = pendingSceneRecall.active
+                    && pendingSceneRecall.sceneSlot == sceneSlot;
+                const bool burstActive = nowMs < scenePadSaveBurstUntilMs[slotIdx];
+
+                int level = exists ? 8 : 2;
+                if (active)
+                    level = 11;
+                if (inSequence)
+                    level = fastBlinkOn ? 15 : 6;
+                if (queued)
+                    level = slowBlinkOn ? 15 : 7;
+                if (held)
+                    level = 15;
+                if (burstActive)
+                {
+                    const bool burstOn = ((nowMs / presetSaveBurstIntervalMs) & 1u) == 0u;
+                    level = burstOn ? 15 : 0;
+                }
+
+                newLedState[sceneSlot][GROUP_ROW] = level;
+            }
+        }
+        else
+        {
+            // Normal mode: Groups 0-3 + Patterns 4-7
+            for (int groupId = 0; groupId < 4; ++groupId)
+            {
+                auto* group = audioEngine->getGroup(groupId);
+                if (!group)
+                    continue;
+
+                bool anyPlaying = false;
+                bool isMuted = group->isMuted();
+                bool hasStrips = !group->getStrips().empty();
+
+                if (!isMuted && hasStrips)
+                {
+                    auto strips = group->getStrips();
+                    for (int stripIdx : strips)
+                    {
+                        if (auto* strip = audioEngine->getStrip(stripIdx))
                         {
-                            anyPlaying = true;
-                            break;
+                            if (strip->isPlaying())
+                            {
+                                anyPlaying = true;
+                                break;
+                            }
                         }
                     }
                 }
+
+                if (anyPlaying)
+                    newLedState[groupId][GROUP_ROW] = 15;
+                else if (isMuted)
+                    newLedState[groupId][GROUP_ROW] = 3;
+                else if (hasStrips)
+                    newLedState[groupId][GROUP_ROW] = 8;
+                else
+                    newLedState[groupId][GROUP_ROW] = 0;
             }
-            
-            // LED brightness based on state:
-            // - BRIGHT (15): Group has strips playing
-            // - MEDIUM (8): Group has strips assigned but not playing
-            // - DIM (3): Group is muted
-            // - OFF (0): Group is empty
-            if (anyPlaying)
-                newLedState[groupId][GROUP_ROW] = 15;  // Playing
-            else if (isMuted)
-                newLedState[groupId][GROUP_ROW] = 3;   // Muted
-            else if (hasStrips)
-                newLedState[groupId][GROUP_ROW] = 8;   // Has strips but not playing
-            else
-                newLedState[groupId][GROUP_ROW] = 0;   // Empty group
         }
-    }
     
         // Row 0, columns 4-7: Pattern recorder status (normal mode only)
         for (int i = 0; i < 4; ++i)

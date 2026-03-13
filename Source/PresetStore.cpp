@@ -6,7 +6,9 @@
 
 namespace PresetStore
 {
-static constexpr int kMaxPresetSlots = 16 * 7;
+static constexpr int kVisiblePresetSlots = 16 * 7;
+static constexpr int kHiddenScenePresetSlots = kVisiblePresetSlots * 4;
+static constexpr int kMaxPresetSlots = kVisiblePresetSlots + kHiddenScenePresetSlots;
 
 namespace
 {
@@ -35,6 +37,7 @@ struct GlobalParameterSnapshot
     float triggerFadeInMs = 12.0f;
     float outputRouting = 0.0f;
     float pitchControlMode = 0.0f;
+    float sceneMode = 0.0f;
 };
 
 bool isPresetFileSizeValid(const juce::File& file, int64_t maxBytes)
@@ -130,6 +133,8 @@ GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeSta
         snapshot.outputRouting = *p;
     if (auto* p = parameters.getRawParameterValue("pitchControlMode"))
         snapshot.pitchControlMode = *p;
+    if (auto* p = parameters.getRawParameterValue("sceneMode"))
+        snapshot.sceneMode = *p;
     return snapshot;
 }
 
@@ -164,6 +169,8 @@ void restoreGlobalParameters(juce::AudioProcessorValueTreeState& parameters, con
     }
     if (auto* param = parameters.getParameter("pitchControlMode"))
         param->setValueNotifyingHost(snapshot.pitchControlMode > 0.5f ? 1.0f : 0.0f);
+    if (auto* param = parameters.getParameter("sceneMode"))
+        param->setValueNotifyingHost(snapshot.sceneMode > 0.5f ? 1.0f : 0.0f);
 }
 
 void setParameterToDefault(juce::AudioProcessorValueTreeState& parameters, const juce::String& parameterId)
@@ -553,7 +560,8 @@ bool savePreset(int presetIndex,
                 const juce::File* recentStepDirectories,
                 const juce::File* recentFlipDirectories,
                 const std::function<std::unique_ptr<juce::XmlElement>(int)>& createFlipStateXml,
-                const std::function<std::unique_ptr<juce::XmlElement>(int)>& createLoopPitchStateXml)
+                const std::function<std::unique_ptr<juce::XmlElement>(int)>& createLoopPitchStateXml,
+                const std::function<std::unique_ptr<juce::XmlElement>()>& createAuxStateXml)
 {
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots
         || audioEngine == nullptr
@@ -792,6 +800,12 @@ bool savePreset(int presetIndex,
         preset.addChildElement(stateXml.release());
     }
 
+    if (createAuxStateXml)
+    {
+        if (auto auxStateXml = createAuxStateXml())
+            preset.addChildElement(auxStateXml.release());
+    }
+
     auto* globalsXml = preset.createNewChildElement("Globals");
     if (auto* masterVol = parameters.getRawParameterValue("masterVolume"))
         globalsXml->setAttribute("masterVolume", *masterVol);
@@ -834,8 +848,11 @@ bool loadPreset(int presetIndex,
                 const std::function<void(int, const juce::File&, const juce::File&, const juce::File&)>& restoreStripRecentDirectories,
                 const std::function<void(int, const juce::XmlElement*)>& applyFlipStateXml,
                 const std::function<void(int, const juce::XmlElement*)>& applyLoopPitchStateXml,
+                const std::function<void(const juce::XmlElement&)>& applyAuxStateXml,
                 double hostPpqSnapshot,
-                double hostTempoSnapshot)
+                double hostTempoSnapshot,
+                bool preserveGlobalParameters,
+                int64_t hostGlobalSampleSnapshot)
 {
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots || audioEngine == nullptr)
         return false;
@@ -879,7 +896,9 @@ bool loadPreset(int presetIndex,
             }
         }
 
-        const auto globalSnapshot = captureGlobalParameters(parameters);
+        GlobalParameterSnapshot globalSnapshot;
+        if (preserveGlobalParameters)
+            globalSnapshot = captureGlobalParameters(parameters);
 
         bool restoredParameterState = false;
         if (auto* paramsXml = preset->getChildByName("ParametersState"))
@@ -892,8 +911,8 @@ bool loadPreset(int presetIndex,
             }
         }
 
-        // Preset recall should not overwrite global controls.
-        restoreGlobalParameters(parameters, globalSnapshot);
+        if (preserveGlobalParameters)
+            restoreGlobalParameters(parameters, globalSnapshot);
 
         const int safeMaxStrips = juce::jlimit(0, ModernAudioEngine::MaxStrips, maxStrips);
         if (!restoredParameterState)
@@ -1025,7 +1044,9 @@ bool loadPreset(int presetIndex,
                                                    0, ModernAudioEngine::MaxColumns - 1, safeLoopStart);
         const bool restorePpqAnchored = stripXml->getBoolAttribute("ppqTimelineAnchored", false);
         const double restorePpqOffsetBeats = stripXml->getDoubleAttribute("ppqTimelineOffsetBeats", 0.0);
-        const int64_t restoreGlobalSample = audioEngine->getGlobalSampleCount();
+        const int64_t restoreGlobalSample = hostGlobalSampleSnapshot >= 0
+            ? hostGlobalSampleSnapshot
+            : audioEngine->getGlobalSampleCount();
         const double restoreTimelineBeat = recallPpq;
         const double restoreTempo = recallTempo;
 
@@ -1371,6 +1392,9 @@ bool loadPreset(int presetIndex,
                 pattern->startPlayback(nowBeat);
         }
     }
+
+    if (applyAuxStateXml)
+        applyAuxStateXml(*preset);
 
         DBG("Preset " << (presetIndex + 1) << " loaded");
         return true;

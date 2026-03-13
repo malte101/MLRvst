@@ -225,6 +225,14 @@ float computeDuckGainFromEnvelope(float envelope,
     return juce::Decibels::decibelsToGain(reductionDb);
 }
 
+std::uint64_t hashMix64(std::uint64_t hash, std::uint64_t value)
+{
+    constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
+    hash ^= value;
+    hash *= kFnvPrime;
+    return hash;
+}
+
 #if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
 double swingUnitBeatsFromDivision(EnhancedAudioStrip::SwingDivision division)
 {
@@ -259,13 +267,6 @@ float linearReadWrapped(const juce::AudioBuffer<float>& buffer, int channel, dou
     return a + ((b - a) * t);
 }
 
-std::uint64_t hashMix64(std::uint64_t hash, std::uint64_t value)
-{
-    constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
-    hash ^= value;
-    hash *= kFnvPrime;
-    return hash;
-}
 #endif
 
 template <size_t N>
@@ -717,7 +718,12 @@ int QuantizationClock::getQuantSamples() const
 }
 
 // PPQ-based scheduling
-void QuantizationClock::scheduleTrigger(int stripIndex, int column, double ppq, EnhancedAudioStrip* strip)
+void QuantizationClock::scheduleTrigger(int stripIndex,
+                                        int column,
+                                        double ppq,
+                                        EnhancedAudioStrip* strip,
+                                        int sampleSliceId,
+                                        int64_t sampleStartSample)
 {
     (void)strip;
     // Calculate next quantize grid in PPQ
@@ -785,6 +791,8 @@ void QuantizationClock::scheduleTrigger(int stripIndex, int column, double ppq, 
     t.targetPPQ = nextGridPPQ;  // Store exact grid PPQ for debugging
     t.stripIndex = stripIndex;
     t.column = column;
+    t.sampleSliceId = sampleSliceId;
+    t.sampleStartSample = sampleStartSample;
     
     // Keep triggers sorted by target sample so event extraction is linear-time.
     const juce::SpinLock::ScopedLockType lock(pendingTriggersLock);
@@ -1654,6 +1662,100 @@ void EnhancedAudioStrip::loadSample(const juce::AudioBuffer<float>& buffer, doub
     rebuildSampleAnalysisCacheLocked();
 #if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     invalidateSoundTouchSwingCache();
+#endif
+#if MLRVST_ENABLE_BUNGEE
+    invalidateLoopTempoMatchCache();
+#endif
+}
+
+void EnhancedAudioStrip::adoptPreparedSample(juce::AudioBuffer<float>& preparedSampleBuffer,
+                                             double sourceRate,
+                                             juce::AudioBuffer<float>* preparedLoopTempoMatchBuffer,
+                                             double preparedLoopTempoMatchHostTempo,
+                                             double preparedLoopTempoMatchBeatsForLoop,
+                                             double preparedLoopTempoMatchSourceSampleRate,
+                                             TimeStretchBackend preparedLoopTempoMatchBackend)
+{
+    juce::ScopedLock lock(bufferLock);
+    triggerOutputBlendActive = false;
+    triggerOutputBlendSamplesRemaining = 0;
+    triggerOutputBlendTotalSamples = 0;
+    triggerOutputBlendStartL = 0.0f;
+    triggerOutputBlendStartR = 0.0f;
+    lastOutputSampleL = 0.0f;
+    lastOutputSampleR = 0.0f;
+
+    if (preparedSampleBuffer.getNumSamples() <= 0 || preparedSampleBuffer.getNumChannels() <= 0)
+    {
+        DBG("WARNING: Attempting to adopt empty prepared buffer into strip");
+        return;
+    }
+
+    const bool wasPlaying = playing;
+    const double previousLength = sampleLength;
+    const double savedNormalizedPosition = previousLength > 0.0
+        ? juce::jlimit(0.0, 1.0, playbackPosition.load() / previousLength)
+        : 0.0;
+
+    sampleBuffer = std::move(preparedSampleBuffer);
+    sourceSampleRate = sourceRate;
+    sampleLength = static_cast<double>(sampleBuffer.getNumSamples());
+    playbackPosition = juce::jlimit(0.0, juce::jmax(0.0, sampleLength - 1.0), savedNormalizedPosition * sampleLength);
+
+    if (playMode == PlayMode::Step)
+    {
+        stepSampler.loadSampleFromBuffer(sampleBuffer, sourceSampleRate);
+    }
+    else
+    {
+        playing = wasPlaying;
+    }
+
+    if (transientSliceMode.load(std::memory_order_acquire))
+        rebuildTransientSliceMap();
+    else
+        transientSliceMapDirty = true;
+
+    grainCenterSmoother.setCurrentAndTargetValue(playbackPosition.load());
+    resetGrainState();
+    resetPitchShifter();
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
+    invalidateSoundTouchSwingCache();
+#endif
+
+#if MLRVST_ENABLE_BUNGEE
+    const bool hasPreparedTempoMatchCache = preparedLoopTempoMatchBuffer != nullptr
+        && preparedLoopTempoMatchBackend == TimeStretchBackend::Bungee
+        && preparedLoopTempoMatchBuffer->getNumSamples() > 0
+        && preparedLoopTempoMatchBuffer->getNumChannels() > 0
+        && preparedLoopTempoMatchHostTempo > 0.0
+        && preparedLoopTempoMatchBeatsForLoop > 0.0
+        && preparedLoopTempoMatchSourceSampleRate > 0.0
+        && sampleBuffer.getNumSamples() > 0
+        && std::abs(preparedLoopTempoMatchSourceSampleRate - sourceSampleRate) <= 1.0e-4;
+
+    if (hasPreparedTempoMatchCache)
+    {
+        loopTempoMatchCacheBuffer = std::move(*preparedLoopTempoMatchBuffer);
+        loopTempoMatchCacheValid = loopTempoMatchCacheBuffer.getNumSamples() > 0;
+        loopTempoMatchCacheHostTempo = preparedLoopTempoMatchHostTempo;
+        loopTempoMatchCacheBeatsForLoop = preparedLoopTempoMatchBeatsForLoop;
+        loopTempoMatchCacheSourceSampleRate = preparedLoopTempoMatchSourceSampleRate;
+        loopTempoMatchCacheSourceSamples = sampleBuffer.getNumSamples();
+        loopTempoMatchCacheBackend = preparedLoopTempoMatchBackend;
+        loopTempoMatchCachePositionScale = static_cast<double>(loopTempoMatchCacheBuffer.getNumSamples())
+            / static_cast<double>(juce::jmax(1, sampleBuffer.getNumSamples()));
+    }
+    else
+    {
+        invalidateLoopTempoMatchCache();
+    }
+#else
+    juce::ignoreUnused(preparedLoopTempoMatchBuffer,
+                       preparedLoopTempoMatchHostTempo,
+                       preparedLoopTempoMatchBeatsForLoop,
+                       preparedLoopTempoMatchSourceSampleRate,
+                       preparedLoopTempoMatchBackend);
 #endif
 }
 
@@ -2914,6 +3016,22 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     if (sampleBuffer.getNumSamples() <= 0)
         return;
 
+    const juce::AudioBuffer<float>* grainSourceBuffer = &sampleBuffer;
+    double grainPlaybackPositionScale = 1.0;
+#if MLRVST_ENABLE_BUNGEE
+    if (loopTempoMatchCacheValid
+        && getTempoMatchBackend() == TimeStretchBackend::Bungee
+        && loopTempoMatchCacheBuffer.getNumSamples() > 0)
+    {
+        grainSourceBuffer = &loopTempoMatchCacheBuffer;
+        grainPlaybackPositionScale = juce::jmax(1.0e-9, loopTempoMatchCachePositionScale);
+    }
+#endif
+    const auto mapGrainReadPosition = [&](double logicalPosition)
+    {
+        return logicalPosition * grainPlaybackPositionScale;
+    };
+
     int loopCols = loopEnd - loopStart;
     if (loopCols <= 0)
         loopCols = ModernAudioEngine::MaxColumns;
@@ -3227,14 +3345,15 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         && !grainGesture.returningToTimeline;
     const bool entryIdentityScheduler = grainEntryTransitionActive;
     const double neutralReadPos = getWrappedSamplePosition(centerSamplePos, loopStartSamples, loopLengthSamplesLocal);
+    const double neutralSourceReadPos = mapGrainReadPosition(neutralReadPos);
     const double neutralStep = 1.0;
-    const float neutralSampleL = grainResampler.getSample(sampleBuffer, 0, neutralReadPos, neutralStep);
-    const float neutralSampleR = (sampleBuffer.getNumChannels() > 1)
-        ? grainResampler.getSample(sampleBuffer, 1, neutralReadPos, neutralStep)
+    const float neutralSampleL = grainResampler.getSample(*grainSourceBuffer, 0, neutralSourceReadPos, neutralStep);
+    const float neutralSampleR = (grainSourceBuffer->getNumChannels() > 1)
+        ? grainResampler.getSample(*grainSourceBuffer, 1, neutralSourceReadPos, neutralStep)
         : neutralSampleL;
-    const float entryDrySampleL = resampler.getSample(sampleBuffer, 0, neutralReadPos, neutralStep);
-    const float entryDrySampleR = (sampleBuffer.getNumChannels() > 1)
-        ? resampler.getSample(sampleBuffer, 1, neutralReadPos, neutralStep)
+    const float entryDrySampleL = resampler.getSample(*grainSourceBuffer, 0, neutralSourceReadPos, neutralStep);
+    const float entryDrySampleR = (grainSourceBuffer->getNumChannels() > 1)
+        ? resampler.getSample(*grainSourceBuffer, 1, neutralSourceReadPos, neutralStep)
         : entryDrySampleL;
 
     float neutralTargetBlend = 0.0f;
@@ -3552,9 +3671,10 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         windowSumR += std::abs(ampR);
         windowEnergy += 0.5f * ((ampL * ampL) + (ampR * ampR));
 
-        float l = grainResampler.getSample(sampleBuffer, 0, voice.readPos, 1.0);
-        float r = (sampleBuffer.getNumChannels() > 1)
-            ? grainResampler.getSample(sampleBuffer, 1, voice.readPos, 1.0)
+        const double sourceReadPos = mapGrainReadPosition(voice.readPos);
+        float l = grainResampler.getSample(*grainSourceBuffer, 0, sourceReadPos, 1.0);
+        float r = (grainSourceBuffer->getNumChannels() > 1)
+            ? grainResampler.getSample(*grainSourceBuffer, 1, sourceReadPos, 1.0)
             : l;
 
         outL += l * ampL;
@@ -3762,6 +3882,9 @@ bool EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
 #if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
         invalidateSoundTouchSwingCache();
 #endif
+#if MLRVST_ENABLE_BUNGEE
+        invalidateLoopTempoMatchCache();
+#endif
         return true;
     }
     catch (const std::exception& e)
@@ -3824,6 +3947,9 @@ void EnhancedAudioStrip::clearSample()
 #if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     invalidateSoundTouchSwingCache();
 #endif
+#if MLRVST_ENABLE_BUNGEE
+    invalidateLoopTempoMatchCache();
+#endif
     resetGrainState();
     resetPitchShifter();
     resetScratchComboState();
@@ -3844,6 +3970,84 @@ void EnhancedAudioStrip::invalidateSoundTouchSwingCache()
     soundTouchSwingCacheUsesTransientAnchors = false;
     soundTouchSwingCacheAnchorHash = 0;
 }
+
+#if MLRVST_ENABLE_BUNGEE
+void EnhancedAudioStrip::invalidateLoopTempoMatchCache()
+{
+    loopTempoMatchCacheValid = false;
+    loopTempoMatchCacheBuffer.setSize(0, 0, false, false, true);
+    loopTempoMatchCacheHostTempo = -1.0;
+    loopTempoMatchCacheBeatsForLoop = -1.0;
+    loopTempoMatchCacheSourceSampleRate = -1.0;
+    loopTempoMatchCacheSourceSamples = -1;
+    loopTempoMatchCacheBackend = TimeStretchBackend::Resample;
+    loopTempoMatchCachePositionScale = 1.0;
+}
+
+bool EnhancedAudioStrip::rebuildLoopTempoMatchCache(double hostTempo, double beatsForLoop)
+{
+    const auto backend = getTempoMatchBackend();
+    if (backend != TimeStretchBackend::Bungee
+        || !(hostTempo > 0.0)
+        || !(beatsForLoop > 0.0)
+        || sampleBuffer.getNumSamples() <= 0
+        || sampleBuffer.getNumChannels() <= 0
+        || !(sourceSampleRate > 0.0))
+    {
+        invalidateLoopTempoMatchCache();
+        return false;
+    }
+
+    const int sourceSamples = sampleBuffer.getNumSamples();
+    const double targetDurationSeconds = (beatsForLoop * 60.0) / hostTempo;
+    if (!(targetDurationSeconds > 0.0) || !std::isfinite(targetDurationSeconds))
+    {
+        invalidateLoopTempoMatchCache();
+        return false;
+    }
+
+    const int targetFrames = juce::jmax(
+        1, static_cast<int>(std::llround(targetDurationSeconds * sourceSampleRate)));
+    if (targetFrames == sourceSamples)
+    {
+        invalidateLoopTempoMatchCache();
+        return false;
+    }
+
+    const bool cacheMatches = loopTempoMatchCacheValid
+        && loopTempoMatchCacheBackend == backend
+        && loopTempoMatchCacheSourceSamples == sourceSamples
+        && std::abs(loopTempoMatchCacheHostTempo - hostTempo) <= 1.0e-4
+        && std::abs(loopTempoMatchCacheBeatsForLoop - beatsForLoop) <= 1.0e-6
+        && std::abs(loopTempoMatchCacheSourceSampleRate - sourceSampleRate) <= 1.0e-4
+        && loopTempoMatchCacheBuffer.getNumSamples() == targetFrames;
+    if (cacheMatches)
+        return true;
+
+    juce::AudioBuffer<float> stretchedBuffer;
+    if (!renderTimeStretchedBuffer(sampleBuffer,
+                                   sourceSampleRate,
+                                   targetFrames,
+                                   0.0f,
+                                   backend,
+                                   stretchedBuffer))
+    {
+        invalidateLoopTempoMatchCache();
+        return false;
+    }
+
+    loopTempoMatchCacheBuffer = std::move(stretchedBuffer);
+    loopTempoMatchCacheValid = loopTempoMatchCacheBuffer.getNumSamples() > 0;
+    loopTempoMatchCacheHostTempo = hostTempo;
+    loopTempoMatchCacheBeatsForLoop = beatsForLoop;
+    loopTempoMatchCacheSourceSampleRate = sourceSampleRate;
+    loopTempoMatchCacheSourceSamples = sourceSamples;
+    loopTempoMatchCacheBackend = backend;
+    loopTempoMatchCachePositionScale = static_cast<double>(loopTempoMatchCacheBuffer.getNumSamples())
+        / static_cast<double>(juce::jmax(1, sourceSamples));
+    return loopTempoMatchCacheValid;
+}
+#endif
 
 bool EnhancedAudioStrip::shouldUseSoundTouchSwingCache(double loopLength,
                                                        double beatsForLoop,
@@ -4318,8 +4522,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     if (!hasAudio && playMode != PlayMode::Step)
         return;
     
-    const int numChannels = juce::jmin(output.getNumChannels(), sampleBuffer.getNumChannels());
-    
     // Update smoothed targets
     smoothedVolume.setTargetValue(volume.load());
     smoothedPan.setTargetValue(pan.load());
@@ -4718,17 +4920,40 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     }
 
     bool soundTouchSwingActive = false;
+    bool loopTempoMatchActive = false;
     const juce::AudioBuffer<float>* playbackSourceBuffer = &sampleBuffer;
+    double playbackSourcePositionScale = 1.0;
     double playbackSourceLoopStartSamples = loopStartSamples;
     double playbackSourceSampleLength = sampleLength;
+    double playbackSourceLoopLength = juce::jmax(1.0, loopLength);
+#if MLRVST_ENABLE_BUNGEE
+    const bool canUseLoopTempoMatchCache = !isScratching
+        && (playMode == PlayMode::Loop
+            || playMode == PlayMode::Gate
+            || playMode == PlayMode::OneShot
+            || playMode == PlayMode::Grain)
+        && rebuildLoopTempoMatchCache(tempo, beatsForLoop);
+    if (canUseLoopTempoMatchCache)
+    {
+        loopTempoMatchActive = true;
+        playbackSourceBuffer = &loopTempoMatchCacheBuffer;
+        playbackSourcePositionScale = juce::jmax(1.0e-9, loopTempoMatchCachePositionScale);
+        playbackSourceLoopStartSamples = loopStartSamples * playbackSourcePositionScale;
+        playbackSourceSampleLength = static_cast<double>(loopTempoMatchCacheBuffer.getNumSamples());
+        playbackSourceLoopLength = juce::jmax(1.0, loopLength * playbackSourcePositionScale);
+    }
+#endif
 #if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
-    if (shouldUseSoundTouchSwingCache(loopLength, beatsForLoop, loopCols, isScratching, playheadTraversalRatio)
+    if (!loopTempoMatchActive
+        && shouldUseSoundTouchSwingCache(loopLength, beatsForLoop, loopCols, isScratching, playheadTraversalRatio)
         && rebuildSoundTouchSwingCache(loopStartSamples, loopLength, beatsForLoop, loopCols))
     {
         soundTouchSwingActive = true;
         playbackSourceBuffer = &soundTouchSwingCacheBuffer;
+        playbackSourcePositionScale = 1.0;
         playbackSourceLoopStartSamples = 0.0;
         playbackSourceSampleLength = static_cast<double>(soundTouchSwingCacheBuffer.getNumSamples());
+        playbackSourceLoopLength = juce::jmax(1.0, playbackSourceSampleLength);
     }
 #endif
 
@@ -4740,9 +4965,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         && loopCols > 0;
     const int loopSegmentCount = juce::jmax(1, loopCols);
     const double loopSegmentLength = juce::jmax(1.0, loopLength) / static_cast<double>(loopSegmentCount);
-    const double playbackSourceLoopLength = soundTouchSwingActive
-        ? juce::jmax(1.0, playbackSourceSampleLength)
-        : juce::jmax(1.0, loopLength);
     const double playbackSourceSegmentLength = playbackSourceLoopLength / static_cast<double>(loopSegmentCount);
     const bool resamplePitchModeActive = (resamplePitchEnabled.load(std::memory_order_acquire) != 0)
         && (playMode != PlayMode::Step)
@@ -5776,7 +5998,9 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 
             }
             const double timelineSamplePosition = loopStartSamples + positionInLoop;
-            samplePosition = playbackSourceLoopStartSamples + positionInLoop;
+            samplePosition = (playMode == PlayMode::Grain)
+                ? timelineSamplePosition
+                : (playbackSourceLoopStartSamples + (positionInLoop * playbackSourcePositionScale));
 
             const bool hasLoopSegmentState = resolveLoopSegmentState(
                 positionInLoop, activeLoopSegmentIndex, activeLoopSegmentPhase);
@@ -5907,8 +6131,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 
                 // Calculate position BEFORE loop start (pre-roll)
                 // We're at the end of the loop, need audio from before the start
-                double offsetIntoFade = positionInLoop - fadeStart;
-                prerollSamplePosition = playbackSourceLoopStartSamples - crossfadeSamples + offsetIntoFade;
+                prerollSamplePosition = playbackSourceLoopStartSamples
+                    + ((positionInLoop - loopLength) * playbackSourcePositionScale);
                 prerollPositionInLoop = positionInLoop - loopLength;
                 
                 // Handle wrapping if pre-roll goes before sample start
@@ -6054,19 +6278,21 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             float oldLeft = 0.0f;
             float oldRight = 0.0f;
             const double oldPos = retriggerBlendOldPosition;
+            const double oldPositionInLoop = oldPos - loopStartSamples;
             const double oldReadPos = mapResampleReadPosition(
-                oldPos, oldPos - playbackSourceLoopStartSamples);
+                playbackSourceLoopStartSamples + (oldPositionInLoop * playbackSourcePositionScale),
+                oldPositionInLoop);
 
-            if (numChannels == 1)
+            if (playbackNumChannels == 1)
             {
-                const float monoOld = resampler.getSample(sampleBuffer, 0, oldReadPos, playbackSpeed);
+                const float monoOld = resampler.getSample(*playbackSourceBuffer, 0, oldReadPos, playbackSpeed);
                 oldLeft = monoOld * leftGain;
                 oldRight = monoOld * rightGain;
             }
-            else if (numChannels == 2)
+            else if (playbackNumChannels == 2)
             {
-                oldLeft = resampler.getSample(sampleBuffer, 0, oldReadPos, playbackSpeed) * leftGain;
-                oldRight = resampler.getSample(sampleBuffer, 1, oldReadPos, playbackSpeed) * rightGain;
+                oldLeft = resampler.getSample(*playbackSourceBuffer, 0, oldReadPos, playbackSpeed) * leftGain;
+                oldRight = resampler.getSample(*playbackSourceBuffer, 1, oldReadPos, playbackSpeed) * rightGain;
             }
 
             const float progress = 1.0f - (static_cast<float>(retriggerBlendSamplesRemaining)
@@ -7805,6 +8031,17 @@ void EnhancedAudioStrip::setStretchBackend(TimeStretchBackend backend)
         return;
 #if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     invalidateSoundTouchSwingCache();
+#endif
+}
+
+void EnhancedAudioStrip::setTempoMatchBackend(TimeStretchBackend backend)
+{
+    const int newValue = static_cast<int>(sanitizeTimeStretchBackend(static_cast<int>(backend)));
+    const int oldValue = tempoMatchBackend.exchange(newValue, std::memory_order_acq_rel);
+    if (oldValue == newValue)
+        return;
+#if MLRVST_ENABLE_BUNGEE
+    invalidateLoopTempoMatchCache();
 #endif
 }
 
@@ -9974,8 +10211,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     const int64_t triggerSample = blockStart + eventOffset;
                     sampleModeTriggerCallback(event.stripIndex,
                                               event.column,
-                                              -1,
-                                              -1,
+                                              event.sampleSliceId,
+                                              event.sampleStartSample,
                                               triggerSample,
                                               triggerPosInfo,
                                               event.isMomentaryStutter);
@@ -10475,12 +10712,21 @@ void ModernAudioEngine::setSampleModeStopCallback(SampleModeStopCallback callbac
     sampleModeStopCallback = std::move(callback);
 }
 
-void ModernAudioEngine::scheduleQuantizedTrigger(int stripIndex, int column, double currentPPQ)
+void ModernAudioEngine::scheduleQuantizedTrigger(int stripIndex,
+                                                 int column,
+                                                 double currentPPQ,
+                                                 int sampleSliceId,
+                                                 int64_t sampleStartSample)
 {
     // Use provided PPQ or fall back to last known
     double ppq = (currentPPQ > 0.0) ? currentPPQ : lastKnownPPQ.load();
     auto* strip = getStrip(stripIndex);
-    quantizeClock.scheduleTrigger(stripIndex, column, ppq, strip);
+    quantizeClock.scheduleTrigger(stripIndex,
+                                  column,
+                                  ppq,
+                                  strip,
+                                  sampleSliceId,
+                                  sampleStartSample);
 }
 
 void ModernAudioEngine::triggerStripWithQuantization(int stripIndex,
@@ -10505,7 +10751,11 @@ void ModernAudioEngine::triggerStripWithQuantization(int stripIndex,
     if (useQuantize)
     {
         // Schedule for next quantize point (use lastKnownPPQ)
-        scheduleQuantizedTrigger(stripIndex, column, 0.0);
+        scheduleQuantizedTrigger(stripIndex,
+                                 column,
+                                 0.0,
+                                 sampleSliceId,
+                                 sampleStartSample);
     }
     else
     {
@@ -10635,6 +10885,20 @@ void ModernAudioEngine::setGlobalStretchBackend(TimeStretchBackend backend)
     {
         if (strip)
             strip->setStretchBackend(backend);
+    }
+}
+
+void ModernAudioEngine::setGlobalTempoMatchBackend(TimeStretchBackend backend)
+{
+    const int newValue = static_cast<int>(sanitizeTimeStretchBackend(static_cast<int>(backend)));
+    if (tempoMatchBackend.load(std::memory_order_acquire) == newValue)
+        return;
+
+    tempoMatchBackend.store(newValue, std::memory_order_release);
+    for (auto& strip : strips)
+    {
+        if (strip)
+            strip->setTempoMatchBackend(backend);
     }
 }
 
@@ -10782,11 +11046,19 @@ bool ModernAudioEngine::patternRecorderMatchesStrip(int patternIndex, int stripI
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return false;
 
+    if (patternRecorderIgnoreGroups.load(std::memory_order_acquire) != 0)
+        return true;
+
     const auto* strip = const_cast<ModernAudioEngine*>(this)->getStrip(stripIndex);
     if (strip == nullptr)
         return false;
 
     return strip->getGroup() == groupIndexForPattern(patternIndex);
+}
+
+void ModernAudioEngine::setPatternRecorderIgnoreGroups(bool ignoreGroups)
+{
+    patternRecorderIgnoreGroups.store(ignoreGroups ? 1 : 0, std::memory_order_release);
 }
 
 bool ModernAudioEngine::modTargetSupportsBipolar(ModTarget target)

@@ -58,6 +58,13 @@ struct SampleCuePoint
     int64_t loopEndSample = 0;
 };
 
+struct SampleWarpMarker
+{
+    int id = -1;
+    int64_t samplePosition = 0;
+    double beatPosition = 0.0;
+};
+
 struct SampleSlice
 {
     int id = -1;
@@ -72,7 +79,7 @@ struct SampleSlice
 
 struct LoadedSampleData
 {
-    static constexpr int PreviewPointCount = 8192;
+    static constexpr int PreviewPointCount = 16384;
 
     juce::AudioBuffer<float> audioBuffer;
     juce::String sourcePath;
@@ -93,6 +100,7 @@ struct StretchedSliceBuffer
     int64_t sliceEndSample = 0;
     float playbackRate = 1.0f;
     float pitchSemitones = 0.0f;
+    TimeStretchBackend backend = TimeStretchBackend::Resample;
     double sourceSampleRate = 44100.0;
     juce::AudioBuffer<float> audioBuffer;
 };
@@ -101,7 +109,7 @@ struct SampleModePersistentState
 {
     juce::String samplePath;
     int visibleSliceBankIndex = 0;
-    SampleSliceMode sliceMode = SampleSliceMode::Uniform;
+    SampleSliceMode sliceMode = SampleSliceMode::Transient;
     SampleTriggerMode triggerMode = SampleTriggerMode::OneShot;
     bool useLegacyLoopEngine = false;
     int legacyLoopBarSelection = 0;
@@ -115,6 +123,8 @@ struct SampleModePersistentState
     bool essentiaUsed = false;
     juce::String analysisSource;
     std::vector<SampleCuePoint> cuePoints;
+    std::vector<SampleWarpMarker> warpMarkers;
+    bool transientMarkersEdited = false;
     std::vector<int64_t> transientEditSamples;
     std::vector<SampleSlice> storedSlices;
 
@@ -259,11 +269,14 @@ public:
         std::array<SampleSlice, SliceModel::VisibleSliceCount> visibleSlices {};
         int visibleBankIndex = 0;
         int triggerVisibleSlot = -1;
+        int64_t bankStartSample = -1;
+        int64_t bankEndSample = -1;
         float visibleBankBeats = 0.0f;
         double analyzedTempoBpm = 0.0;
         int legacyLoopBarSelection = 0;
-        SampleSliceMode sliceMode = SampleSliceMode::Uniform;
+        SampleSliceMode sliceMode = SampleSliceMode::Transient;
         std::vector<int64_t> markerSamples;
+        std::vector<SampleWarpMarker> warpMarkers;
     };
 
     struct RenderResult
@@ -290,7 +303,7 @@ public:
         int activeVisibleSliceSlot = -1;
         int pendingVisibleSliceSlot = -1;
         float playbackProgress = -1.0f;
-        SampleSliceMode sliceMode = SampleSliceMode::Uniform;
+        SampleSliceMode sliceMode = SampleSliceMode::Transient;
         SampleTriggerMode triggerMode = SampleTriggerMode::OneShot;
         bool useLegacyLoopEngine = false;
         int legacyLoopBarSelection = 0;
@@ -301,9 +314,11 @@ public:
         double estimatedTempoBpm = 0.0;
         double estimatedPitchHz = 0.0;
         int estimatedPitchMidi = -1;
+        int estimatedScaleIndex = -1;
         bool essentiaUsed = false;
         juce::String analysisSource;
         std::vector<SampleCuePoint> cuePoints;
+        std::vector<SampleWarpMarker> warpMarkers;
         std::vector<int64_t> transientMarkers;
         std::array<SampleSlice, SliceModel::VisibleSliceCount> visibleSlices {};
     };
@@ -332,6 +347,7 @@ public:
     bool hasVisibleSlice(int visibleSlot) const;
     bool getVisibleSliceInfo(int visibleSlot, SampleSlice& sliceOut) const;
     bool getLegacyLoopSyncInfo(LegacyLoopSyncInfo& syncInfo) const;
+    uint64_t getLegacyLoopRenderStateVersion() const noexcept;
     bool resolveLegacyLoopTriggerSyncInfo(int preferredVisibleSlot,
                                           int sliceId,
                                           int64_t sliceStartSample,
@@ -385,24 +401,63 @@ public:
     int createCuePointAtNormalizedPosition(float normalizedPosition);
     int moveCuePoint(int cueIndex, float normalizedPosition);
     bool deleteCuePoint(int cueIndex);
+    void beginInteractiveLegacyLoopEdit();
+    void endInteractiveLegacyLoopEdit();
+    void beginInteractiveWarpEdit();
+    void endInteractiveWarpEdit();
+    int createWarpMarkerAtNormalizedPosition(float normalizedPosition);
+    int moveWarpMarker(int markerIndex, float normalizedPosition);
+    int createWarpMarkerAtNearestGuide(float normalizedPosition);
+    int createWarpMarkersFromVisibleTransientClusters();
+    int moveWarpMarkerToNearestGuide(int markerIndex, float normalizedPosition);
+    bool clearWarpMarkers();
+    bool keepBoundaryWarpMarkers();
+    bool deleteWarpMarker(int markerIndex);
     int createTransientMarkerAtNormalizedPosition(float normalizedPosition);
     int moveTransientMarker(int markerIndex, float normalizedPosition);
     int moveTransientMarkerToNearestDetectedTransient(int markerIndex, float normalizedPosition);
+    int resolveTransientMarkerIndexForVisibleSlot(int visibleSlot);
     bool moveVisibleSliceToPosition(int visibleSlot, float normalizedPosition);
     bool moveVisibleSliceToNearestTransient(int visibleSlot, float normalizedPosition);
     bool deleteTransientMarker(int markerIndex);
+    bool snapSlicePointsToNearestPpqGrid(double gridStepBeats, bool currentSelectionOnly);
+    bool canUndoSliceEdit() const;
+    bool undoLastSliceEdit();
+    void beginSliceEditGesture();
+    void endSliceEditGesture();
 
     using LoadStatusCallback = std::function<void(const SampleFileManager::LoadResult&)>;
     using LoadProgressCallback = std::function<void(int requestId, float progress, juce::String statusText)>;
+    using LegacyLoopRenderStateChangedCallback = std::function<void()>;
     void setLoadStatusCallback(LoadStatusCallback callback);
+    void setLegacyLoopRenderStateChangedCallback(LegacyLoopRenderStateChangedCallback callback);
 
 private:
+    void notifyLegacyLoopRenderStateChanged();
     bool resolveVisibleSlice(int visibleSlot, SampleSlice& sliceOut) const;
     std::array<SampleSlice, SliceModel::VisibleSliceCount> getCurrentVisibleSlicesLocked() const;
     bool computeLegacyLoopWindowRangeLocked(int64_t& rangeStartSample, int64_t& rangeEndSample) const;
     int findTransientMarkerIndexForVisibleSlotLocked(int visibleSlot);
+    std::vector<int64_t> buildCanonicalTransientMarkerSamplesLocked() const;
+    std::vector<int64_t> buildCanonicalTransientMarkerSamplesForRangeLocked(int64_t rangeStartSample,
+                                                                            int64_t rangeEndSample) const;
+    std::vector<int64_t> buildLegacyLoopWindowTransientMarkerSamplesLocked(int64_t rangeStartSample,
+                                                                           int64_t rangeEndSample) const;
     std::array<SampleSlice, SliceModel::VisibleSliceCount> buildLegacyLoopWindowVisibleSlicesLocked(int64_t rangeStartSample,
                                                                                                      int64_t rangeEndSample) const;
+    std::vector<int64_t> buildLegacyLoopWindowTransientCandidatesLocked(int64_t rangeStartSample,
+                                                                        int64_t rangeEndSample) const;
+    std::vector<int64_t> buildTransientGuideCandidatesLocked(int64_t lowerBound,
+                                                             int64_t upperBound,
+                                                             bool preferLocalTransients) const;
+    int64_t snapTransientMarkerSampleToGuideLocked(int64_t targetSample,
+                                                   int64_t lowerBound,
+                                                   int64_t upperBound,
+                                                   bool preferLocalTransients) const;
+    void quantizeTransientEditSamplesToGuidesLocked();
+    std::vector<int64_t> buildTransientSnapCandidatesLocked(int64_t targetSample,
+                                                            int64_t lowerBound,
+                                                            int64_t upperBound) const;
     int64_t getDefaultLegacyLoopWindowStartSampleLocked() const;
     std::vector<int64_t> buildLegacyLoopAnchorCandidatesLocked() const;
     void fitViewToLegacyLoopWindowLocked();
@@ -418,6 +473,17 @@ private:
                                  int visibleBankIndex);
     void materializeTransientMarkersLocked();
     void rebuildSlicesLocked();
+    void pushSliceEditUndoStateLocked();
+    void clearSliceEditUndoHistoryLocked();
+    void invalidateCanonicalTransientMarkerCacheLocked();
+    void invalidateLegacyLoopTransientWindowCacheLocked();
+    void invalidateTransientMarkerCachesLocked();
+    int64_t snapSampleToPpqGridLocked(int64_t samplePosition,
+                                      double gridStepBeats,
+                                      int64_t lowerBound,
+                                      int64_t upperBound) const;
+    bool snapTransientMarkersToPpqGridLocked(double gridStepBeats, bool currentSelectionOnly);
+    bool snapCuePointsToPpqGridLocked(double gridStepBeats, bool currentSelectionOnly);
     bool triggerResolvedSlice(const SampleSlice& slice, int resolvedVisibleSlot, SampleTriggerMode triggerMode);
     bool resolveRecordedSlice(int sliceId,
                               int64_t sliceStartSample,
@@ -425,14 +491,24 @@ private:
                               int& resolvedVisibleSlot) const;
     std::shared_ptr<const StretchedSliceBuffer> findKeyLockCacheForSlice(const SampleSlice& slice,
                                                                          float playbackRate,
-                                                                         float pitchSemitones) const;
+                                                                         float pitchSemitones,
+                                                                         TimeStretchBackend backend) const;
     bool voiceHasMatchingKeyLockCache(const SamplePlaybackVoice& voice,
                                       float playbackRate,
-                                      float pitchSemitones) const;
+                                      float pitchSemitones,
+                                      TimeStretchBackend backend) const;
     static int clampCueSelection(int selectedCueIndex, int cueCount);
 
     mutable juce::CriticalSection stateLock;
     juce::SpinLock playbackLock;
+    struct SliceEditUndoState
+    {
+        std::vector<SampleCuePoint> cuePoints;
+        int selectedCueIndex = -1;
+        bool transientMarkersEdited = false;
+        std::vector<int64_t> transientEditSamples;
+        std::vector<SampleWarpMarker> warpMarkers;
+    };
     SampleFileManager fileManager;
     juce::ThreadPool keyLockCacheThreadPool { 1 };
     SampleAnalysisEngine analysisEngine;
@@ -441,16 +517,26 @@ private:
     std::array<SamplePlaybackVoice, MaxPlaybackVoices> playbackVoices;
     std::shared_ptr<const LoadedSampleData> loadedSample;
     LoadStatusCallback loadStatusCallback;
+    LegacyLoopRenderStateChangedCallback legacyLoopRenderStateChangedCallback;
+    std::atomic<uint64_t> legacyLoopRenderStateVersion { 1 };
     bool isLoading = false;
     float analysisProgress = 0.0f;
     juce::String statusText { "No sample loaded" };
     int activeRequestId = 0;
     bool pendingTriggerSliceValid = false;
     SampleSlice pendingTriggerSlice;
+    bool interactiveLegacyLoopEditActive = false;
+    bool interactiveLegacyLoopEditDirty = false;
+    bool interactiveWarpEditActive = false;
+    bool interactiveWarpEditDirty = false;
     bool randomVisibleSliceOverrideActive = false;
     std::array<SampleSlice, SliceModel::VisibleSliceCount> randomVisibleSlices {};
     int64_t legacyLoopWindowStartSample = -1;
     bool legacyLoopWindowManualAnchor = false;
+    int legacyLoopTransientPageStartIndex = 0;
+    std::vector<SliceEditUndoState> sliceEditUndoStack;
+    bool sliceEditGestureActive = false;
+    bool sliceEditGestureUndoCaptured = false;
     std::atomic<double> preparedSampleRate { 44100.0 };
     std::atomic<int> preparedMaxBlockSize { 512 };
     std::atomic<int> activeVisibleSliceSlot { -1 };
@@ -469,6 +555,19 @@ private:
     TimeStretchBackend keyLockCacheBackend = TimeStretchBackend::SoundTouch;
     int keyLockCacheVisibleBankIndex = -1;
     std::vector<std::shared_ptr<const StretchedSliceBuffer>> keyLockCaches;
+    mutable bool canonicalTransientMarkerCacheValid = false;
+    mutable std::vector<int64_t> canonicalTransientMarkerCache;
+    struct LegacyLoopTransientWindowCache
+    {
+        bool valid = false;
+        int64_t rangeStartSample = -1;
+        int64_t rangeEndSample = -1;
+        std::vector<int64_t> markerSamples;
+        bool visibleSlicesValid = false;
+        int visibleSlicesPageStart = -1;
+        std::array<SampleSlice, SliceModel::VisibleSliceCount> visibleSlices {};
+    };
+    mutable LegacyLoopTransientWindowCache legacyLoopTransientWindowCache;
 
     JUCE_DECLARE_WEAK_REFERENCEABLE(SampleModeEngine)
 };
@@ -487,6 +586,7 @@ public:
     void paint(juce::Graphics& g) override;
     void resized() override;
     void mouseDown(const juce::MouseEvent& event) override;
+    void mouseDoubleClick(const juce::MouseEvent& event) override;
     void mouseDrag(const juce::MouseEvent& event) override;
     void mouseUp(const juce::MouseEvent& event) override;
     void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override;
@@ -502,18 +602,30 @@ public:
 
 private:
     void refreshFromEngine();
+    int64_t getVisibleSliceMarkerSample(int visibleSlot) const;
     int hitTestVisibleSlice(const juce::Point<int>& point) const;
     int hitTestVisibleSliceMarker(const juce::Point<int>& point) const;
+    int hitTestExactVisibleSliceMarkerHandle(const juce::Point<int>& point) const;
     int hitTestCuePoint(const juce::Point<int>& point) const;
+    int hitTestWarpMarker(const juce::Point<int>& point) const;
+    int hitTestWarpMarker(const juce::Point<int>& point, float hitRadius) const;
+    int hitTestExactWarpMarkerHandle(const juce::Point<int>& point) const;
+    int hitTestWarpGuideMarker(const juce::Point<int>& point) const;
     int findCuePointForVisibleSlice(int visibleSlot) const;
     int findTransientMarkerForVisibleSlice(int visibleSlot) const;
     float normalizedPositionFromPoint(const juce::Point<int>& point) const;
     juce::Range<float> getVisibleRange() const;
+    juce::Range<float> getVisibleDisplayRange() const;
+    juce::Rectangle<int> getWarpMarkerLaneBounds() const;
+    juce::Rectangle<int> getSliceMarkerHandleBounds() const;
     juce::Rectangle<int> getSliceModeButtonBounds(SampleSliceMode mode) const;
     juce::Rectangle<int> getTriggerModeButtonBounds(SampleTriggerMode mode) const;
     juce::Rectangle<int> getLegacyLoopButtonBounds() const;
     juce::Rectangle<int> getLegacyLoopBarsButtonBounds() const;
     juce::Rectangle<int> getVisibleLegacyLoopRangeBounds() const;
+    void showWarpContextMenu(const juce::Point<int>& point);
+    void showSliceContextMenu(const juce::Point<int>& point);
+    double getCurrentPpqGridStepBeats() const;
     void timerCallback() override;
 
     SampleModeEngine* engine = nullptr;
@@ -536,6 +648,8 @@ private:
     int legacyLoopDragStepOffset = 0;
     int draggingVisibleSliceSlot = -1;
     int draggingCueIndex = -1;
+    int draggingWarpMarkerIndex = -1;
+    juce::Point<int> draggingWarpMouseDownPoint;
     int draggingTransientIndex = -1;
     bool createdCueOnMouseDown = false;
     juce::Colour waveformColour { juce::Colour(0xff6ca7ff) };

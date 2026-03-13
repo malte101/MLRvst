@@ -260,8 +260,24 @@ public:
         PitchShift = 0,
         Resample = 1
     };
+    enum class FlipTempoMatchMode
+    {
+        Repitch = 0,
+        MlrTs
+    };
+    enum class StripTempoMatchMode
+    {
+        Global = 0,
+        Repitch,
+        MlrTs
+    };
     PitchControlMode getPitchControlMode() const;
     TimeStretchBackend getStretchBackend() const;
+    TimeStretchBackend getLoopTempoMatchBackend() const;
+    StripTempoMatchMode getStripTempoMatchMode(int stripIndex) const;
+    TimeStretchBackend resolveLoopTempoMatchBackendForStrip(int stripIndex) const;
+    FlipTempoMatchMode getFlipTempoMatchMode() const;
+    TimeStretchBackend getFlipTempoMatchBackend() const;
     bool usesTimeStretchBackend() const { return getStretchBackend() != TimeStretchBackend::Resample; }
     bool isPitchControlResampleMode() const { return getPitchControlMode() == PitchControlMode::Resample; }
     void applyPitchControlToStrip(EnhancedAudioStrip& strip, float semitones);
@@ -271,6 +287,9 @@ public:
     float quantizePitchSemitonesForStripControl(int stripIndex, float semitones) const;
     bool requestLoopStripPitchMaster(int stripIndex);
     bool requestLoopStripPitchSync(int stripIndex);
+    bool isLoopStripLoadInFlight(int stripIndex) const;
+    float getLoopStripLoadProgress(int stripIndex) const;
+    juce::String getLoopStripLoadStatusText(int stripIndex) const;
     bool isLoopStripPitchAnalysisInFlight(int stripIndex) const;
     float getLoopStripPitchAnalysisProgress(int stripIndex) const;
     juce::String getLoopStripPitchAnalysisStatusText(int stripIndex) const;
@@ -322,6 +341,21 @@ public:
         float detectedScaleConfidence = 0.0f;
         bool essentiaUsed = false;
         juce::String analysisSource;
+    };
+    struct LoopStripLoadResult
+    {
+        int stripIndex = -1;
+        int requestId = 0;
+        bool success = false;
+        juce::File sourceFile;
+        juce::AudioBuffer<float> decodedBuffer;
+        double sourceSampleRate = 44100.0;
+        int detectedBars = 1;
+        float detectedBeatsForLoop = 4.0f;
+        juce::AudioBuffer<float> preparedTempoMatchBuffer;
+        double preparedTempoMatchHostTempo = -1.0;
+        TimeStretchBackend preparedTempoMatchBackend = TimeStretchBackend::Resample;
+        juce::String errorMessage;
     };
     
     // Control mode (for GUI to check if level/pan/etc controls are active)
@@ -398,6 +432,12 @@ public:
     juce::String getPresetName(int presetIndex) const;
     bool setPresetName(int presetIndex, const juce::String& name);
     bool presetExists(int presetIndex) const;
+    bool isSceneModeEnabled() const { return sceneModeEnabled.load(std::memory_order_acquire) != 0; }
+    void setSceneModeEnabled(bool enabled);
+    static constexpr int SceneSlots = 4;
+    static constexpr int MaxSceneRepeatCount = 16;
+    int getSceneRepeatCount(int sceneSlot) const;
+    void setSceneRepeatCount(int sceneSlot, int repeats);
     uint32_t getPresetRefreshToken() const { return presetRefreshToken.load(std::memory_order_acquire); }
     static constexpr int PresetColumns = 16;
     static constexpr int PresetRows = 7;
@@ -487,6 +527,46 @@ private:
         SelectedStrip,
         Modulation
     };
+
+    struct ResolvedPitchControl
+    {
+        int globalRootMidi = 60;
+        ModernAudioEngine::PitchScale globalScale = ModernAudioEngine::PitchScale::Chromatic;
+        float quantizedSemitones = 0.0f;
+        float resampleRatio = 1.0f;
+        float stepSamplerRatio = 1.0f;
+        bool updatesStepSampler = false;
+        bool useResamplePitch = false;
+    };
+
+    struct ResolvedFlipTempoMatch
+    {
+        FlipTempoMatchMode mode = FlipTempoMatchMode::Repitch;
+        TimeStretchBackend backend = TimeStretchBackend::Resample;
+
+        bool usesTimeStretch() const noexcept { return backend != TimeStretchBackend::Resample; }
+        bool usesRepitch() const noexcept { return backend == TimeStretchBackend::Resample; }
+    };
+
+    struct ResolvedFlipPlaybackState
+    {
+        ResolvedFlipTempoMatch tempoMatch;
+        float tempoMatchRatio = 1.0f;
+        float playbackRate = 1.0f;
+        float internalPitchSemitones = 0.0f;
+        bool keyLockEnabled = false;
+        bool shouldBuildKeyLockCache = false;
+        bool preferHighQualityKeyLock = false;
+    };
+
+    ResolvedPitchControl resolvePitchControl(const EnhancedAudioStrip& strip,
+                                             float semitones,
+                                             int referenceRootMidi) const;
+    void applyResolvedPitchControl(EnhancedAudioStrip& strip,
+                                   const ResolvedPitchControl& resolved) const;
+    ResolvedFlipTempoMatch resolveFlipTempoMatch() const;
+    ResolvedFlipPlaybackState resolveFlipPlaybackState(const EnhancedAudioStrip& strip,
+                                                       const SampleModeEngine& engine) const;
     
     std::unique_ptr<ModernAudioEngine> audioEngine;
     MonomeConnection monomeConnection;
@@ -530,6 +610,7 @@ private:
     std::atomic<float>* outputRoutingParam = nullptr;
     std::atomic<float>* pitchControlModeParam = nullptr;
     std::atomic<float>* stretchBackendParam = nullptr;
+    std::atomic<float>* flipTempoMatchModeParam = nullptr;
     std::atomic<float>* soundTouchEnabledParam = nullptr;
     std::atomic<float>* masterDuckTriggerStripParam = nullptr;
     std::array<std::atomic<float>*, MaxStrips> stripVolumeParams{};
@@ -537,6 +618,7 @@ private:
     std::array<std::atomic<float>*, MaxStrips> stripSpeedParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPitchParams{};
     std::array<std::atomic<float>*, MaxStrips> stripSliceLengthParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripTempoMatchModeParams{};
     std::array<std::atomic<float>*, MaxStrips> stripDuckEnabledParams{};
     std::array<std::atomic<float>*, MaxStrips> stripDuckSourceParams{};
     std::array<std::atomic<float>*, MaxStrips> stripDuckThresholdParams{};
@@ -587,6 +669,7 @@ private:
     std::atomic<bool> controlPageMomentary{true};
     std::atomic<int> swingDivisionSelection{1}; // 0=1/4,1=1/8,2=1/16,3=1/8T,4=1/2,5=1/32,6=1/16T
     int lastAppliedStretchBackend = -1; // -1 = force initial sync on first process block
+    int lastAppliedLoopTempoMatchBackend = -1;
     
     // LED state cache to prevent flickering
     int ledCache[MaxGridWidth][MaxGridHeight] = {{0}};
@@ -632,9 +715,13 @@ private:
     
     // Current file per strip for proper next/prev browsing
     std::array<juce::File, MaxStrips> currentStripFiles;
+    std::array<juce::File, MaxStrips> pendingLoopStripFiles;
     std::array<std::unique_ptr<SampleModeEngine>, MaxStrips> sampleModeEngines;
     std::array<juce::AudioBuffer<float>, MaxStrips> sampleModeScratchBuffers;
     std::array<std::atomic<int>, MaxStrips> sampleModeHeldVisibleSliceSlots{};
+    std::array<std::atomic<int>, MaxStrips> loopStripLoadRequestIds{};
+    std::array<std::atomic<int>, MaxStrips> loopStripLoadInFlight{};
+    std::array<std::atomic<int>, MaxStrips> loopStripLoadProgressPermille{};
     std::array<std::atomic<int>, MaxStrips> loopPitchAnalysisRequestIds{};
     std::array<std::atomic<int>, MaxStrips> loopPitchAnalysisInFlight{};
     std::array<std::atomic<int>, MaxStrips> loopPitchAnalysisProgressPermille{};
@@ -651,9 +738,14 @@ private:
     std::array<std::atomic<int>, MaxStrips> loopPitchPendingRetune{};
     std::atomic<int> globalRootNoteMidi{60};
     std::atomic<int> globalPitchScale{static_cast<int>(ModernAudioEngine::PitchScale::Chromatic)};
+    juce::ThreadPool loopStripLoadThreadPool{1};
     juce::ThreadPool loopPitchAnalysisThreadPool{1};
+    mutable juce::CriticalSection loopStripLoadStatusLock;
+    std::array<juce::String, MaxStrips> loopStripLoadStatusTexts;
     mutable juce::CriticalSection loopPitchAnalysisStatusLock;
     std::array<juce::String, MaxStrips> loopPitchAnalysisStatusTexts;
+    juce::CriticalSection loopStripLoadResultLock;
+    std::vector<LoopStripLoadResult> loopStripLoadResults;
     juce::CriticalSection loopPitchAnalysisResultLock;
     std::vector<LoopPitchAnalysisResult> loopPitchAnalysisResults;
     std::array<int, MaxStrips> loopPitchLastObservedColumns{};
@@ -662,14 +754,64 @@ private:
     {
         const void* loadedSampleToken = nullptr;
         int visibleBankIndex = -1;
+        int64_t bankStartSample = -1;
+        int64_t bankEndSample = -1;
         uint64_t sliceSignature = 0;
+        uint64_t warpSignature = 0;
         float beatsPerLoop = 4.0f;
         int legacyLoopBarSelection = 0;
         TimeStretchBackend backend = TimeStretchBackend::Resample;
         double hostTempo = 0.0;
+        juce::AudioBuffer<float> cachedBankBuffer;
+        std::array<int, SliceModel::VisibleSliceCount> cachedTransientSliceStarts{};
+        std::array<float, 128> cachedRmsMap{};
+        std::array<int, 128> cachedZeroCrossMap{};
+        int cachedSourceLengthSamples = 0;
+        double cachedSampleRate = 0.0;
+        bool renderValid = false;
+        bool renderInFlight = false;
         bool valid = false;
+        bool stripApplied = false;
+        uint64_t renderGeneration = 0;
     };
+    struct FlipLegacyLoopRenderRequest
+    {
+        int cacheIndex = -1;
+        uint64_t renderGeneration = 0;
+        SampleModeEngine::LegacyLoopSyncInfo syncInfo;
+        double hostTempo = 0.0;
+        TimeStretchBackend backend = TimeStretchBackend::Resample;
+        float visibleBankBeats = 0.0f;
+        int64_t bankStartSample = 0;
+        int64_t bankEndSample = 0;
+    };
+    struct FlipLegacyLoopRenderResult
+    {
+        int cacheIndex = -1;
+        uint64_t renderGeneration = 0;
+        FlipLegacyLoopSyncCache cacheEntry;
+    };
+    struct FlipLegacyLoopSyncInfoCacheEntry
+    {
+        uint64_t version = 0;
+        std::shared_ptr<const SampleModeEngine::LegacyLoopSyncInfo> syncInfo;
+    };
+    struct PendingFlipLegacyLoopTrigger
+    {
+        bool valid = false;
+        SampleModeEngine::LegacyLoopSyncInfo syncInfo;
+        bool isMomentaryStutter = false;
+    };
+    class FlipLegacyLoopRenderJob;
     std::array<FlipLegacyLoopSyncCache, MaxStrips> flipLegacyLoopSyncCache{};
+    std::array<FlipLegacyLoopSyncInfoCacheEntry, MaxStrips> flipLegacyLoopSyncInfoCache{};
+    std::array<PendingFlipLegacyLoopTrigger, MaxStrips> pendingFlipLegacyLoopTriggers{};
+    juce::ThreadPool flipLegacyLoopRenderThreadPool{1};
+    juce::SpinLock flipLegacyLoopSyncCacheLock;
+    juce::SpinLock flipLegacyLoopSyncInfoCacheLock;
+    juce::SpinLock pendingFlipLegacyLoopTriggerLock;
+    juce::CriticalSection flipLegacyLoopRenderResultLock;
+    std::vector<FlipLegacyLoopRenderResult> flipLegacyLoopRenderResults;
     
     // LED update
     void updateMonomeLEDs();
@@ -693,18 +835,60 @@ private:
                                       EnhancedAudioStrip& strip,
                                       const SampleModeEngine::LegacyLoopSyncInfo& syncInfo,
                                       double hostTempo,
-                                      TimeStretchBackend backend);
+                                      double hostPpq,
+                                      int64_t currentGlobalSample,
+                                      bool preservePlaybackState,
+                                      TimeStretchBackend backend,
+                                      bool allowInlineBuild = true);
+    bool flipLegacyLoopCacheMatchesRenderKey(const FlipLegacyLoopSyncCache& entry,
+                                             const SampleModeEngine::LegacyLoopSyncInfo& syncInfo,
+                                             double hostTempo,
+                                             TimeStretchBackend backend,
+                                             float visibleBankBeats) const;
+    bool flipLegacyLoopCacheMatchesReusableAudioKey(const FlipLegacyLoopSyncCache& entry,
+                                                    const SampleModeEngine::LegacyLoopSyncInfo& syncInfo,
+                                                    double hostTempo,
+                                                    TimeStretchBackend backend,
+                                                    float visibleBankBeats) const;
+    void assignFlipLegacyLoopRenderKey(FlipLegacyLoopSyncCache& cache,
+                                       const SampleModeEngine::LegacyLoopSyncInfo& syncInfo,
+                                       double hostTempo,
+                                       TimeStretchBackend backend,
+                                       float visibleBankBeats) const;
+    void applyFlipLegacyLoopRenderCacheToStrip(EnhancedAudioStrip& strip,
+                                               const FlipLegacyLoopSyncCache& entry,
+                                               TimeStretchBackend backend,
+                                               float visibleBankBeats) const;
+    void applyFlipLegacyLoopTransientSliceCacheToStrip(EnhancedAudioStrip& strip,
+                                                       const FlipLegacyLoopSyncCache& entry,
+                                                       TimeStretchBackend backend,
+                                                       float visibleBankBeats) const;
+    bool queueFlipLegacyLoopRender(int preferredCacheIndex,
+                                   const SampleModeEngine::LegacyLoopSyncInfo& syncInfo,
+                                   double hostTempo,
+                                   TimeStretchBackend backend);
+    void pushFlipLegacyLoopRenderResult(FlipLegacyLoopRenderResult result);
+    void applyCompletedFlipLegacyLoopRenders();
+    void prewarmFlipLegacyLoopRenders();
+    std::shared_ptr<const SampleModeEngine::LegacyLoopSyncInfo> getCachedFlipLegacyLoopSyncInfo(int stripIndex,
+                                                                                                 SampleModeEngine& engine);
     void queueLoopPitchAnalysisResult(LoopPitchAnalysisResult result);
     void applyCompletedLoopPitchAnalyses();
+    void queueLoopStripLoadResult(LoopStripLoadResult result);
+    void applyCompletedLoopStripLoads();
     bool beginLoopStripPitchAnalysis(int stripIndex, bool setDetectedAsRoot);
     void updateLoopPitchAnalysisProgress(int stripIndex, int requestId, float progress, const juce::String& statusText);
     void resetLoopPitchAnalysisProgress(int stripIndex);
+    void updateLoopStripLoadProgress(int stripIndex, int requestId, float progress, const juce::String& statusText);
+    void resetLoopStripLoadProgress(int stripIndex);
     void applyLoopStripPitchSemitones(int stripIndex, float semitones);
     void normalizeLoopPitchMasterRoles();
     int getEffectiveLoopPitchMasterRootMidi(int stripIndex) const;
     void applyLoopPitchRoleStateToStrip(int stripIndex);
     void applyLoopPitchSyncToAllStrips();
     int getPitchQuantizeReferenceRootMidiForStrip(int stripIndex) const;
+    float getLoopPitchTempoMatchOffsetSemitones(int stripIndex) const;
+    float getEffectiveLoopPitchSourceMidi(int stripIndex) const;
     void requestLoopPitchRoleStateUpdate(int stripIndex);
     void applyPendingLoopPitchRetunes();
     bool applyPendingLoopPitchRetuneOnTrigger(int stripIndex);
@@ -712,6 +896,8 @@ private:
     void loadLoopPitchStateFromState(const juce::ValueTree& state);
     std::unique_ptr<juce::XmlElement> createLoopPitchPresetStateXml(int stripIndex) const;
     void applyLoopPitchPresetStateXml(int stripIndex, const juce::XmlElement* stateXml);
+    void handleSampleModeLegacyLoopRenderStateChanged(int stripIndex, bool preferInlineBuild = false);
+    void handleFlipTempoMatchModeChanged();
     void invalidateFlipLegacyLoopSync(int stripIndex);
     void stopSampleModeStrip(int stripIndex, bool immediateStop);
     void timerCallback() override;
@@ -768,6 +954,32 @@ private:
     void applyMomentaryStutterMacro(const juce::AudioPlayHead::PositionInfo& posInfo);
     void restoreMomentaryStutterMacroBaseline();
     bool getHostSyncSnapshot(double& outPpq, double& outTempo) const;
+    int getActiveMainPresetIndexForScenes() const;
+    int getSceneStoragePresetIndex(int mainPresetIndex, int sceneSlot) const;
+    bool saveSceneForMainPreset(int mainPresetIndex, int sceneSlot);
+    bool sceneSlotExistsForMainPreset(int mainPresetIndex, int sceneSlot) const;
+    void requestSceneRecallQuantized(int mainPresetIndex, int sceneSlot, bool sequenceDriven);
+    double getSceneRecallIntervalBeats() const;
+    void updateSceneQuantizedRecall(const juce::AudioPlayHead::PositionInfo& posInfo, int numSamples);
+    void processPendingSceneApply();
+    void performEmptySceneLoad();
+    void performSceneLoad(int mainPresetIndex,
+                          int sceneSlot,
+                          double hostPpqSnapshot,
+                          double hostTempoSnapshot,
+                          int64_t hostGlobalSampleSnapshot);
+    double computeCurrentSceneSequenceLengthBeats() const;
+    double computeStripSceneSequenceLengthBeats(int stripIndex) const;
+    void armNextSceneInSequence(int mainPresetIndex, int currentSceneSlot, double sceneStartPpq);
+    std::unique_ptr<juce::XmlElement> createSceneChainStateXml(int sceneSlotOverride) const;
+    void applySceneChainStateXml(const juce::XmlElement* xml, int sceneSlotOverride);
+    void syncSceneModeFromParameters();
+    void applySceneModeState(bool enabled);
+    void captureSceneModeGroupSnapshot();
+    void restoreSceneModeGroupSnapshot();
+    void clearAllStripGroupsForSceneMode();
+    void appendSceneModeStateToState(juce::ValueTree& state) const;
+    void loadSceneModeStateFromState(const juce::ValueTree& state);
     void handleIncomingMacroCc(const juce::MidiBuffer& midiMessages);
     int getMacroTargetStripIndex() const;
     float getMacroNormalizedValueForTarget(const EnhancedAudioStrip& strip, MacroTarget target) const;
@@ -787,6 +999,7 @@ private:
         bool success = false;
     };
     class PresetSaveJob;
+    class LoopStripLoadJob;
     class LoopPitchAnalysisJob;
     bool runPresetSaveRequest(const PresetSaveRequest& request);
     void pushPresetSaveResult(const PresetSaveResult& result);
@@ -851,6 +1064,46 @@ private:
     std::array<uint32_t, MaxPresetSlots> presetPadSaveBurstUntilMs{};
     std::atomic<uint32_t> presetRefreshToken{0};
     std::array<uint32_t, MaxPresetSlots> presetPadLastTapMs{};
+    std::atomic<int> sceneModeEnabled{0};
+    std::atomic<float>* sceneModeParam = nullptr;
+    int activeSceneMainPresetIndex = 0;
+    int activeSceneSlot = 0;
+    struct SceneModeGroupSnapshot
+    {
+        bool valid = false;
+        std::array<int, MaxStrips> stripGroups{};
+        std::array<float, ModernAudioEngine::MaxGroups> groupVolumes{};
+        std::array<bool, ModernAudioEngine::MaxGroups> groupMuted{};
+    };
+    SceneModeGroupSnapshot sceneModeGroupSnapshot;
+    struct PendingSceneRecall
+    {
+        bool active = false;
+        bool sequenceDriven = false;
+        bool targetResolved = false;
+        int mainPresetIndex = 0;
+        int sceneSlot = 0;
+        double targetPpq = 0.0;
+        double intervalBeats = 4.0;
+    };
+    PendingSceneRecall pendingSceneRecall;
+    std::array<int, SceneSlots> sceneRepeatCounts{};
+    std::array<bool, SceneSlots> scenePadHeld{};
+    std::array<bool, SceneSlots> scenePadHoldSaveTriggered{};
+    std::array<uint32_t, SceneSlots> scenePadPressStartMs{};
+    std::array<uint32_t, SceneSlots> scenePadSaveBurstUntilMs{};
+    std::vector<int> sceneSequenceSlots;
+    bool sceneSequenceActive = false;
+    bool activeSceneStartPpqValid = false;
+    double activeSceneStartPpq = 0.0;
+    bool sceneSequenceStartPpqValid = false;
+    double sceneSequenceStartPpq = 0.0;
+    std::atomic<int> pendingSceneApplyMainPreset{-1};
+    std::atomic<int> pendingSceneApplySlot{-1};
+    std::atomic<int> pendingSceneApplySequenceDriven{0};
+    std::atomic<double> pendingSceneApplyTargetPpq{-1.0};
+    std::atomic<double> pendingSceneApplyTargetTempo{120.0};
+    std::atomic<int64_t> pendingSceneApplyTargetSample{-1};
     static constexpr uint32_t presetHoldSaveMs = 3000;
     static constexpr uint32_t presetDoubleTapMs = 350;
     static constexpr uint32_t presetSaveBurstDurationMs = 260;

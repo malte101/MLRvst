@@ -130,10 +130,11 @@ void styleUiButton(juce::Button& button, bool primary = false)
 
 void styleUiCombo(juce::ComboBox& combo)
 {
-    combo.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff32363a));
-    combo.setColour(juce::ComboBox::outlineColourId, juce::Colour(0xff5a5f64));
+    combo.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff353b42));
+    combo.setColour(juce::ComboBox::outlineColourId, juce::Colour(0xff6a7076));
     combo.setColour(juce::ComboBox::textColourId, kTextPrimary);
-    combo.setColour(juce::ComboBox::arrowColourId, kTextSecondary);
+    combo.setColour(juce::ComboBox::arrowColourId, kAccent.brighter(0.08f));
+    combo.setJustificationType(juce::Justification::centredLeft);
 }
 
 juce::String getGrainArpModeName(int mode)
@@ -2464,6 +2465,17 @@ void StripControl::setupComponents()
     addAndMakeVisible(recordButton);
     recordButton.addMouseListener(this, false);
 
+    tempoMatchOverrideBox.addItem("Global", 1);
+    tempoMatchOverrideBox.addItem("Repitch", 2);
+    tempoMatchOverrideBox.addItem("MLR TS", 3);
+    tempoMatchOverrideBox.setSelectedId(1, juce::dontSendNotification);
+    tempoMatchOverrideBox.setJustificationType(juce::Justification::centred);
+    tempoMatchOverrideBox.setTooltip("Per-strip loop tempo-match override. Global follows the Global tab, Repitch forces resample tempo match, MLR TS forces Bungee.");
+    addAndMakeVisible(tempoMatchOverrideBox);
+    styleUiCombo(tempoMatchOverrideBox);
+    tempoMatchOverrideAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "stripTempoMatchMode" + juce::String(stripIndex), tempoMatchOverrideBox);
+
     modTargetLabel.setText("TARGET", juce::dontSendNotification);
     modTargetLabel.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
     modTargetLabel.setColour(juce::Label::textColourId, kTextMuted);
@@ -3377,7 +3389,7 @@ void StripControl::hideAllPrimaryControls()
     hide(loadButton); hide(pitchMasterButton); hide(pitchSyncButton); hide(pitchNoteBox); hide(transientSliceButton); hide(playModeBox); hide(directionModeBox); hide(groupSelector);
     hide(volumeSlider); hide(panSlider); hide(pitchSlider); hide(speedSlider); hide(scratchSlider); hide(sliceLengthSlider); hide(patternLengthBox); hide(stepLengthReadoutBox);
     hide(stepAttackSlider); hide(stepDecaySlider); hide(stepReleaseSlider);
-    hide(tempoLabel); hide(recordBarsBox); hide(recordButton); hide(recordBarsLabel);
+    hide(tempoLabel); hide(recordBarsBox); hide(recordButton); hide(tempoMatchOverrideBox); hide(recordBarsLabel);
     hide(volumeLabel); hide(panLabel); hide(pitchLabel); hide(speedLabel); hide(scratchLabel); hide(sliceLengthLabel);
     hide(stepAttackLabel); hide(stepDecayLabel); hide(stepReleaseLabel);
     hide(recordLengthLabel);
@@ -3483,6 +3495,7 @@ void StripControl::resized()
     showingStepDisplay = isStepMode;
     showingSampleMode = isSampleMode;
     grainOverlayVisible = isGrainMode;
+    const bool sceneModeEnabled = processor.isSceneModeEnabled();
 
     const bool showPitchIdentity = !isSampleMode && !isStepMode;
     const bool showDirectionIdentity = !isSampleMode;
@@ -3490,7 +3503,7 @@ void StripControl::resized()
         && processor.getLoopPitchRole(stripIndex) == MlrVSTAudioProcessor::LoopPitchRole::Sync;
 
     identityTargetButton.setVisible(showDirectionIdentity);
-    identityGroupButton.setVisible(true);
+    identityGroupButton.setVisible(!sceneModeEnabled);
     identityRoleButton.setVisible(showPitchIdentity);
     identityNoteButton.setVisible(showPitchIdentity);
     identityTimingButton.setVisible(showIdentityTiming);
@@ -3508,7 +3521,10 @@ void StripControl::resized()
         placeChip(identityTargetButton, 52);
     else
         identityTargetButton.setBounds({});
-    placeChip(identityGroupButton, 38);
+    if (!sceneModeEnabled)
+        placeChip(identityGroupButton, 38);
+    else
+        identityGroupButton.setBounds({});
     if (showPitchIdentity)
     {
         placeChip(identityRoleButton, 44);
@@ -3722,10 +3738,12 @@ void StripControl::resized()
         tempoLabel.setVisible(false);
         recordBarsBox.setVisible(false);
         recordButton.setVisible(false);
+        tempoMatchOverrideBox.setVisible(false);
         recordBarsLabel.setVisible(false);
         tempoLabel.setBounds({});
         recordBarsBox.setBounds({});
         recordButton.setBounds({});
+        tempoMatchOverrideBox.setBounds({});
         recordBarsLabel.setBounds({});
         patternLengthBox.setVisible(false);
         stepLengthReadoutBox.setVisible(false);
@@ -3869,11 +3887,17 @@ void StripControl::resized()
     const int requiredTopControlsHeight = 22 + 2 + 20 + 2 + 30 + 10 + 10;
     bool showTempoControls = (!isGrainMode) && !isSampleMode && (controlsArea.getHeight() >= requiredTopControlsHeight);
 
+    // Per-strip tempo-match override only appears on the standard Loop page so
+    // Gate / One-shot / Step / Grain layouts stay unchanged.
+    const bool isLoopMode = (playMode == EnhancedAudioStrip::PlayMode::Loop);
+
     // Update visibility
     const bool showRecordBars = (!isGrainMode) && !isSampleMode && controlsArea.getHeight() >= 18;
+    const bool showTempoMatchOverride = showRecordBars && isLoopMode;
     tempoLabel.setVisible(showTempoControls);
     recordBarsBox.setVisible(showRecordBars);
     recordButton.setVisible(showRecordBars);
+    tempoMatchOverrideBox.setVisible(showTempoMatchOverride);
     pitchNoteBox.setVisible(false);
     recordBarsLabel.setVisible(false);
 
@@ -3888,6 +3912,15 @@ void StripControl::resized()
         recordBarsBox.setBounds(recBarsRow.removeFromLeft(70));
         recBarsRow.removeFromLeft(8);
         recordButton.setBounds(recBarsRow.removeFromLeft(46));
+        if (showTempoMatchOverride && recBarsRow.getWidth() >= 50)
+        {
+            recBarsRow.removeFromLeft(6);
+            tempoMatchOverrideBox.setBounds(recBarsRow.removeFromLeft(juce::jmin(60, recBarsRow.getWidth())));
+        }
+        else
+        {
+            tempoMatchOverrideBox.setBounds({});
+        }
         pitchNoteBox.setBounds({});
         if (isStepMode)
         {
@@ -3909,6 +3942,15 @@ void StripControl::resized()
         recordBarsBox.setBounds(recBarsRow.removeFromLeft(66));
         recBarsRow.removeFromLeft(8);
         recordButton.setBounds(recBarsRow.removeFromLeft(42));
+        if (showTempoMatchOverride && recBarsRow.getWidth() >= 48)
+        {
+            recBarsRow.removeFromLeft(6);
+            tempoMatchOverrideBox.setBounds(recBarsRow.removeFromLeft(juce::jmin(58, recBarsRow.getWidth())));
+        }
+        else
+        {
+            tempoMatchOverrideBox.setBounds({});
+        }
         pitchNoteBox.setBounds({});
         if (isStepMode)
         {
@@ -3924,23 +3966,23 @@ void StripControl::resized()
         }
         controlsArea.removeFromTop(2);
     }
-    else if (isStepMode && controlsArea.getHeight() >= 14)
-    {
-        pitchNoteBox.setBounds({});
-        auto lenRow = controlsArea.removeFromTop(16);
-        const int lenWidth = juce::jlimit(18, 24, lenRow.getWidth());
-        patternLengthBox.setBounds(lenRow.removeFromLeft(lenWidth));
-        if (lenRow.getWidth() > 0)
-        {
-            lenRow.removeFromLeft(3);
-            const int readoutWidth = juce::jlimit(32, 58, lenRow.getWidth());
-            stepLengthReadoutBox.setBounds(lenRow.removeFromLeft(readoutWidth));
-        }
-        controlsArea.removeFromTop(2);
-    }
     else
     {
+        tempoMatchOverrideBox.setBounds({});
         pitchNoteBox.setBounds({});
+        if (isStepMode && controlsArea.getHeight() >= 14)
+        {
+            auto lenRow = controlsArea.removeFromTop(16);
+            const int lenWidth = juce::jlimit(18, 24, lenRow.getWidth());
+            patternLengthBox.setBounds(lenRow.removeFromLeft(lenWidth));
+            if (lenRow.getWidth() > 0)
+            {
+                lenRow.removeFromLeft(3);
+                const int readoutWidth = juce::jlimit(32, 58, lenRow.getWidth());
+                stepLengthReadoutBox.setBounds(lenRow.removeFromLeft(readoutWidth));
+            }
+            controlsArea.removeFromTop(2);
+        }
     }
     
     // Rotary knobs row.
@@ -4373,9 +4415,15 @@ void StripControl::updateFromEngine()
     const bool transientMode = strip->isTransientSliceMode();
     transientSliceButton.setToggleState(transientMode, juce::dontSendNotification);
     transientSliceButton.setButtonText(transientMode ? "TRANS" : "TIME");
+    const bool stripLoadBusy = processor.isLoopStripLoadInFlight(stripIndex);
+    const float stripLoadProgress = processor.getLoopStripLoadProgress(stripIndex);
+    const auto stripLoadStatus = processor.getLoopStripLoadStatusText(stripIndex);
     const bool pitchAnalysisBusy = processor.isLoopStripPitchAnalysisInFlight(stripIndex);
     const float pitchAnalysisProgress = processor.getLoopStripPitchAnalysisProgress(stripIndex);
     const auto pitchAnalysisStatus = processor.getLoopStripPitchAnalysisStatusText(stripIndex);
+    const bool stripTaskBusy = stripLoadBusy || pitchAnalysisBusy;
+    const float stripTaskProgress = stripLoadBusy ? stripLoadProgress : pitchAnalysisProgress;
+    const auto stripTaskStatus = stripLoadBusy ? stripLoadStatus : pitchAnalysisStatus;
     const int detectedPitchMidi = processor.getLoopStripDetectedPitchMidi(stripIndex);
     const float detectedPitchHz = processor.getLoopStripDetectedPitchHz(stripIndex);
     const float detectedPitchConfidence = processor.getLoopStripDetectedPitchConfidence(stripIndex);
@@ -4396,16 +4444,18 @@ void StripControl::updateFromEngine()
     const juce::String detectedScaleConfidenceText = confidencePercentText(detectedScaleConfidence);
     const juce::String noteSourceText = assignedPitchManual ? "Manual" : "Detected";
     const juce::String backendText = pitchUsedEssentia ? "Essentia" : "Fallback";
-    pitchMasterButton.setEnabled(!pitchAnalysisBusy || pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Master);
-    pitchSyncButton.setEnabled(!pitchAnalysisBusy || pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Sync);
+    pitchMasterButton.setEnabled(!stripLoadBusy
+                                 && (!pitchAnalysisBusy || pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Master));
+    pitchSyncButton.setEnabled(!stripLoadBusy
+                               && (!pitchAnalysisBusy || pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Sync));
     pitchMasterButton.setButtonText("PM");
     pitchSyncButton.setButtonText("PS");
-    const bool progressChanged = loopPitchAnalysisActive != pitchAnalysisBusy
-        || std::abs(loopPitchAnalysisProgress - pitchAnalysisProgress) > 0.0001f
-        || loopPitchAnalysisStatus != pitchAnalysisStatus;
-    loopPitchAnalysisActive = pitchAnalysisBusy;
-    loopPitchAnalysisProgress = pitchAnalysisProgress;
-    loopPitchAnalysisStatus = pitchAnalysisStatus;
+    const bool progressChanged = loopPitchAnalysisActive != stripTaskBusy
+        || std::abs(loopPitchAnalysisProgress - stripTaskProgress) > 0.0001f
+        || loopPitchAnalysisStatus != stripTaskStatus;
+    loopPitchAnalysisActive = stripTaskBusy;
+    loopPitchAnalysisProgress = stripTaskProgress;
+    loopPitchAnalysisStatus = stripTaskStatus;
     pitchMasterButton.setColour(juce::TextButton::buttonColourId,
                                 pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Master
                                     ? juce::Colour(0xffc78a3a)
@@ -4460,7 +4510,7 @@ void StripControl::updateFromEngine()
                                + getCompactNoteName(rootNoteMidi) + "). Timing: "
                                + loopPitchSyncTimingDisplayName(pitchSyncTiming, false)
                                + " | Option-click cycles timing.");
-    pitchNoteBox.setEnabled(!pitchAnalysisBusy);
+    pitchNoteBox.setEnabled(!stripTaskBusy);
     pitchNoteBox.setTooltip(
         (pitchRole == MlrVSTAudioProcessor::LoopPitchRole::Master
             ? "Pitch Master note. Manual changes also set the global root note."
@@ -4491,12 +4541,12 @@ void StripControl::updateFromEngine()
     {
         juce::String lineA;
         juce::String lineB;
-        if (pitchAnalysisBusy)
+        if (stripTaskBusy)
         {
-            lineA = pitchAnalysisStatus.isNotEmpty()
-                ? pitchAnalysisStatus
-                : "Analyzing";
-            lineB = juce::String(juce::roundToInt(pitchAnalysisProgress * 100.0f)) + "%";
+            lineA = stripTaskStatus.isNotEmpty()
+                ? stripTaskStatus
+                : "Loading";
+            lineB = juce::String(juce::roundToInt(stripTaskProgress * 100.0f)) + "%";
         }
         else if (detectedPitchMidi >= 0)
         {
@@ -6016,7 +6066,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
             processor.markPersistentGlobalUserChange();
     };
 
-    pitchControlModeLabel.setText("Pitch Mode", juce::dontSendNotification);
+    pitchControlModeLabel.setText("Pitch", juce::dontSendNotification);
     pitchControlModeLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(pitchControlModeLabel);
 
@@ -6034,7 +6084,25 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
             processor.markPersistentGlobalUserChange();
     };
 
-    rootNoteLabel.setText("Root", juce::dontSendNotification);
+    flipTempoMatchModeLabel.setText("Tempo Match", juce::dontSendNotification);
+    flipTempoMatchModeLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(flipTempoMatchModeLabel);
+
+    flipTempoMatchModeBox.addItem("Repitch", 1);
+    flipTempoMatchModeBox.addItem("MLR TS", 2);
+    flipTempoMatchModeBox.setSelectedId(1, juce::dontSendNotification);
+    addAndMakeVisible(flipTempoMatchModeBox);
+    styleUiCombo(flipTempoMatchModeBox);
+    flipTempoMatchModeBox.setTooltip("Loop/Gate/One-shot/Grain host-tempo matching. Repitch keeps the current PPQ-safe loop path. MLR TS uses Bungee on a separate loop render path.");
+    flipTempoMatchModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "flipTempoMatchMode", flipTempoMatchModeBox);
+    flipTempoMatchModeBox.onChange = [this]()
+    {
+        if (globalUiReady)
+            processor.markPersistentGlobalUserChange();
+    };
+
+    rootNoteLabel.setText("Root Note", juce::dontSendNotification);
     rootNoteLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(rootNoteLabel);
 
@@ -6068,7 +6136,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     };
     
     // Grain quality (global for all strips in Grain mode)
-    qualityLabel.setText("Grain Q", juce::dontSendNotification);
+    qualityLabel.setText("Grain Quality", juce::dontSendNotification);
     qualityLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(qualityLabel);
     
@@ -6172,10 +6240,14 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(momentaryToggle);
     styleUiButton(momentaryToggle);
 
+    stretchBackendLabel.setText("Stretch Backend", juce::dontSendNotification);
+    stretchBackendLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(stretchBackendLabel);
+
     stretchBackendBox.addItem("Resample", 1);
     stretchBackendBox.addItem("SoundTouch", 2);
     stretchBackendBox.addItem("Bungee", 3);
-    stretchBackendBox.setTooltip("Select the tempo/pitch backend for Loop/Gate swing and Flip host-tempo matching.");
+    stretchBackendBox.setTooltip("Tempo/pitch backend for Loop/Gate swing and non-Flip strip timestretch work.");
     styleUiCombo(stretchBackendBox);
     addAndMakeVisible(stretchBackendBox);
     stretchBackendAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
@@ -6771,121 +6843,125 @@ void GlobalControlPanel::paint(juce::Graphics& g)
 
 void GlobalControlPanel::resized()
 {
-    auto bounds = getLocalBounds().reduced(6);  // Less padding (was 8)
-    
-    auto titleRow = bounds.removeFromTop(20);  // Smaller title (was 24)
+    auto bounds = getLocalBounds().reduced(6);
+
+    auto titleRow = bounds.removeFromTop(20);
     tooltipsToggle.setBounds(titleRow.removeFromRight(86));
-    titleRow.removeFromRight(6);
-    stretchBackendBox.setBounds(titleRow.removeFromRight(118));
     titleRow.removeFromRight(6);
     momentaryToggle.setBounds(titleRow.removeFromRight(92));
     versionLabel.setBounds({});
-    titleRow.removeFromRight(6);
     titleLabel.setBounds(titleRow);
-    
-    bounds.removeFromTop(4);  // Less gap (was 8)
-    
+
+    bounds.removeFromTop(4);
     auto controlsArea = bounds;
-    
-    // COMPACT LAYOUT: Reduce individual column widths
-    // Calculate based on actual needs rather than equal division
-    const int sliderWidth = 48;      // Vertical sliders
-    const int meterWidth = 28;       // L/R meters
-    const int knobWidth = 100;       // Rotary fade controls
-    const int dropdownWidth = 76;    // Dropdowns
-    const int spacing = 6;           // Between controls
-    
-    // Master volume
-    auto masterArea = controlsArea.removeFromLeft(sliderWidth);
-    masterVolumeLabel.setBounds(masterArea.removeFromTop(16));  // Smaller label (was 20)
-    masterArea.removeFromTop(2);  // Less gap (was 4)
-    masterVolumeSlider.setBounds(masterArea);
-    controlsArea.removeFromLeft(spacing);
 
-    auto limiterArea = controlsArea.removeFromLeft(84);
+    const int labelHeight = 14;
+    const int controlGap = 6;
+    const int sectionGap = 10;
+    const int sliderWidth = 42;
+    const int limiterWidth = 70;
+    const int meterWidth = 28;
+    const int knobWidth = 80;
+
+    auto layoutTallControl = [](juce::Rectangle<int> area, juce::Label& label, juce::Component& control)
+    {
+        label.setBounds(area.removeFromTop(labelHeight));
+        area.removeFromTop(2);
+        control.setBounds(area);
+    };
+
+    auto layoutCompactComboCell = [](juce::Rectangle<int> area, juce::Label& label, juce::ComboBox& box)
+    {
+        label.setJustificationType(juce::Justification::centredLeft);
+        const int minBoxWidth = 54;
+        const int maxBoxWidth = juce::jmax(minBoxWidth, area.getWidth() / 2);
+        const int boxWidth = juce::jlimit(minBoxWidth, maxBoxWidth, area.getWidth() - 28);
+        const int gap = 4;
+        const int availableLabelWidth = juce::jmax(0, area.getWidth() - boxWidth - gap);
+        const int minLabelWidth = juce::jmin(28, availableLabelWidth);
+        const int labelTextWidth = juce::GlyphArrangement::getStringWidthInt(label.getFont(), label.getText());
+        const int naturalLabelWidth = juce::jlimit(minLabelWidth,
+                                                   availableLabelWidth,
+                                                   labelTextWidth + 10);
+
+        auto labelArea = area.removeFromLeft(naturalLabelWidth);
+        label.setBounds(labelArea);
+        area.removeFromLeft(gap);
+        box.setBounds(area.removeFromLeft(boxWidth).withTrimmedTop(1).withTrimmedBottom(1));
+    };
+
+    auto gainArea = controlsArea.removeFromLeft((sliderWidth * 2) + limiterWidth + meterWidth + (controlGap * 3));
+    controlsArea.removeFromLeft(sectionGap);
+    auto knobArea = controlsArea.removeFromLeft((knobWidth * 2) + controlGap);
+    controlsArea.removeFromLeft(sectionGap);
+    auto comboArea = controlsArea;
+
+    auto masterArea = gainArea.removeFromLeft(sliderWidth);
+    gainArea.removeFromLeft(controlGap);
+    auto limiterArea = gainArea.removeFromLeft(limiterWidth);
+    gainArea.removeFromLeft(controlGap);
+    auto inputArea = gainArea.removeFromLeft(sliderWidth);
+    gainArea.removeFromLeft(controlGap);
+    auto meterArea = gainArea;
+
+    layoutTallControl(masterArea, masterVolumeLabel, masterVolumeSlider);
+    layoutTallControl(inputArea, inputMonitorLabel, inputMonitorSlider);
+
+    limiterArea.removeFromTop(labelHeight + 10);
     limiterToggle.setBounds(limiterArea.removeFromTop(24));
-    controlsArea.removeFromLeft(spacing);
-    
-    // Input monitor slider
-    auto inputArea = controlsArea.removeFromLeft(sliderWidth);
-    inputMonitorLabel.setBounds(inputArea.removeFromTop(16));
-    inputArea.removeFromTop(2);
-    inputMonitorSlider.setBounds(inputArea);
-    controlsArea.removeFromLeft(spacing);
-    
-    // Input meters (L/R) - compact
-    auto meterArea = controlsArea.removeFromLeft(meterWidth);
-    inputMeterLabel.setBounds(meterArea.removeFromTop(16));
+
+    inputMeterLabel.setBounds(meterArea.removeFromTop(labelHeight));
     meterArea.removeFromTop(2);
-    auto halfMeter = meterArea.getWidth() / 2;
-    inputMeterL.setBounds(meterArea.removeFromLeft(halfMeter).reduced(1));
+    auto leftMeter = meterArea.removeFromLeft(meterArea.getWidth() / 2);
+    inputMeterL.setBounds(leftMeter.reduced(1));
     inputMeterR.setBounds(meterArea.reduced(1));
-    controlsArea.removeFromLeft(spacing);
-    
-    // Crossfade length - compact knob
-    auto crossfadeArea = controlsArea.removeFromLeft(knobWidth);
-    crossfadeLengthLabel.setBounds(crossfadeArea.removeFromTop(16));
-    crossfadeArea.removeFromTop(2);
-    crossfadeLengthSlider.setBounds(crossfadeArea.removeFromTop(104));
-    controlsArea.removeFromLeft(2);
 
-    // Trigger fade-in - compact knob
-    auto triggerFadeArea = controlsArea.removeFromLeft(knobWidth);
-    triggerFadeInLabel.setBounds(triggerFadeArea.removeFromTop(16));
-    triggerFadeArea.removeFromTop(2);
-    triggerFadeInSlider.setBounds(triggerFadeArea.removeFromTop(104));
-    controlsArea.removeFromLeft(spacing);
-    
-    // Quantize - compact dropdown
-    auto quantizeArea = controlsArea.removeFromLeft(dropdownWidth);
-    quantizeLabel.setBounds(quantizeArea.removeFromTop(16));
-    quantizeArea.removeFromTop(2);
-    quantizeSelector.setBounds(quantizeArea.removeFromTop(28));
-    controlsArea.removeFromLeft(spacing);
+    auto crossfadeArea = knobArea.removeFromLeft(knobWidth);
+    knobArea.removeFromLeft(controlGap);
+    auto triggerFadeArea = knobArea;
+    layoutTallControl(crossfadeArea, crossfadeLengthLabel, crossfadeLengthSlider);
+    layoutTallControl(triggerFadeArea, triggerFadeInLabel, triggerFadeInSlider);
 
-    // Inner loop length divisor
-    auto innerLoopArea = controlsArea.removeFromLeft(dropdownWidth);
-    innerLoopLengthLabel.setBounds(innerLoopArea.removeFromTop(16));
-    innerLoopArea.removeFromTop(2);
-    innerLoopLengthBox.setBounds(innerLoopArea.removeFromTop(28));
-    controlsArea.removeFromLeft(spacing);
+    const int rowGap = 4;
+    const int cellGap = 6;
+    auto timingRow = comboArea.removeFromTop(26);
+    comboArea.removeFromTop(rowGap);
+    auto policyRow = comboArea.removeFromTop(26);
+    comboArea.removeFromTop(rowGap);
+    auto musicalRow = comboArea;
 
-    // Quality - compact dropdown
-    auto qualityArea = controlsArea.removeFromLeft(dropdownWidth);
-    qualityLabel.setBounds(qualityArea.removeFromTop(16));
-    qualityArea.removeFromTop(2);
-    resamplingQualityBox.setBounds(qualityArea.removeFromTop(28));
-    controlsArea.removeFromLeft(spacing);
+    auto nextComboCell = [](juce::Rectangle<int>& row, int columnsRemaining)
+    {
+        if (columnsRemaining <= 1)
+            return row;
 
-    // Swing grid - compact dropdown
-    auto swingArea = controlsArea.removeFromLeft(dropdownWidth);
-    swingDivisionLabel.setBounds(swingArea.removeFromTop(16));
-    swingArea.removeFromTop(2);
-    swingDivisionBox.setBounds(swingArea.removeFromTop(28));
-    controlsArea.removeFromLeft(spacing);
+        const int cellWidth = juce::jmax(72, (row.getWidth() - (cellGap * (columnsRemaining - 1))) / columnsRemaining);
+        auto cell = row.removeFromLeft(cellWidth);
+        row.removeFromLeft(cellGap);
+        return cell;
+    };
 
-    auto pitchModeArea = controlsArea.removeFromLeft(dropdownWidth);
-    pitchControlModeLabel.setBounds(pitchModeArea.removeFromTop(16));
-    pitchModeArea.removeFromTop(2);
-    pitchControlModeBox.setBounds(pitchModeArea.removeFromTop(28));
-    controlsArea.removeFromLeft(spacing);
+    {
+        auto row = timingRow;
+        layoutCompactComboCell(nextComboCell(row, 4), quantizeLabel, quantizeSelector);
+        layoutCompactComboCell(nextComboCell(row, 3), innerLoopLengthLabel, innerLoopLengthBox);
+        layoutCompactComboCell(nextComboCell(row, 2), swingDivisionLabel, swingDivisionBox);
+        layoutCompactComboCell(row, outputRoutingLabel, outputRoutingBox);
+    }
 
-    auto rootArea = controlsArea.removeFromLeft(dropdownWidth);
-    rootNoteLabel.setBounds(rootArea.removeFromTop(16));
-    rootArea.removeFromTop(2);
-    rootNoteBox.setBounds(rootArea.removeFromTop(28));
-    controlsArea.removeFromLeft(spacing);
+    {
+        auto row = policyRow;
+        layoutCompactComboCell(nextComboCell(row, 3), flipTempoMatchModeLabel, flipTempoMatchModeBox);
+        layoutCompactComboCell(nextComboCell(row, 2), pitchControlModeLabel, pitchControlModeBox);
+        layoutCompactComboCell(row, stretchBackendLabel, stretchBackendBox);
+    }
 
-    auto scaleArea = controlsArea.removeFromLeft(108);
-    globalScaleLabel.setBounds(scaleArea.removeFromTop(16));
-    scaleArea.removeFromTop(2);
-    globalScaleBox.setBounds(scaleArea.removeFromTop(28));
-    controlsArea.removeFromLeft(spacing);
-
-    auto outputRoutingArea = controlsArea.removeFromLeft(108);
-    outputRoutingLabel.setBounds(outputRoutingArea.removeFromTop(16));
-    outputRoutingArea.removeFromTop(2);
-    outputRoutingBox.setBounds(outputRoutingArea.removeFromTop(28));
+    {
+        auto row = musicalRow;
+        layoutCompactComboCell(nextComboCell(row, 3), rootNoteLabel, rootNoteBox);
+        layoutCompactComboCell(nextComboCell(row, 2), globalScaleLabel, globalScaleBox);
+        layoutCompactComboCell(row, qualityLabel, resamplingQualityBox);
+    }
 }
 
 void GlobalControlPanel::updateMeters(float leftLevel, float rightLevel)
@@ -6900,6 +6976,114 @@ void GlobalControlPanel::refreshFromProcessor()
     momentaryToggle.setToggleState(processor.isControlPageMomentary(), juce::dontSendNotification);
     rootNoteBox.setSelectedId(processor.getGlobalRootNotePitchClass() + 1, juce::dontSendNotification);
     globalScaleBox.setSelectedId(pitchScaleToComboId(processor.getGlobalPitchScale()), juce::dontSendNotification);
+}
+
+//==============================================================================
+// SceneControlPanel Implementation
+//==============================================================================
+
+SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
+    : processor(p)
+{
+    titleLabel.setText("SCENE CONTROLS", juce::dontSendNotification);
+    titleLabel.setFont(juce::Font(juce::FontOptions(12.0f, juce::Font::bold)));
+    titleLabel.setColour(juce::Label::textColourId, kTextPrimary);
+    addAndMakeVisible(titleLabel);
+
+    hintLabel.setText("Scene mode swaps the Groups tab for four scene/sub-preset slots. Chain repeat counts stay here.", juce::dontSendNotification);
+    hintLabel.setFont(juce::Font(juce::FontOptions(10.5f)));
+    hintLabel.setColour(juce::Label::textColourId, kTextMuted);
+    hintLabel.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(hintLabel);
+
+    sceneModeToggle.setButtonText("Scene Mode");
+    sceneModeToggle.setClickingTogglesState(true);
+    sceneModeToggle.setTooltip("Replace group controls with four scene/sub-preset slots.");
+    sceneModeToggle.onClick = [this]()
+    {
+        processor.setSceneModeEnabled(sceneModeToggle.getToggleState());
+    };
+    addAndMakeVisible(sceneModeToggle);
+    styleUiButton(sceneModeToggle);
+
+    sceneRepeatsLabel.setText("Scene Chain Repeats", juce::dontSendNotification);
+    sceneRepeatsLabel.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(sceneRepeatsLabel);
+
+    for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
+    {
+        auto& slotLabel = sceneRepeatSlotLabels[static_cast<size_t>(sceneSlot)];
+        auto& repeatBox = sceneRepeatBoxes[static_cast<size_t>(sceneSlot)];
+
+        slotLabel.setText("S" + juce::String(sceneSlot + 1), juce::dontSendNotification);
+        slotLabel.setJustificationType(juce::Justification::centred);
+        addAndMakeVisible(slotLabel);
+
+        for (int repeats = 1; repeats <= MlrVSTAudioProcessor::MaxSceneRepeatCount; ++repeats)
+            repeatBox.addItem(juce::String(repeats) + "x", repeats);
+
+        repeatBox.setTooltip("When scenes are chained from the top row, this scene plays its longest strip or pattern cycle this many times before switching.");
+        repeatBox.onChange = [this, sceneSlot]()
+        {
+            processor.setSceneRepeatCount(sceneSlot, sceneRepeatBoxes[static_cast<size_t>(sceneSlot)].getSelectedId());
+        };
+        addAndMakeVisible(repeatBox);
+        styleUiCombo(repeatBox);
+    }
+
+    refreshFromProcessor();
+}
+
+void SceneControlPanel::paint(juce::Graphics& g)
+{
+    drawPanel(g, getLocalBounds().toFloat(), kAccent, 8.0f);
+}
+
+void SceneControlPanel::resized()
+{
+    auto bounds = getLocalBounds().reduced(6);
+
+    auto titleRow = bounds.removeFromTop(20);
+    sceneModeToggle.setBounds(titleRow.removeFromRight(110));
+    titleLabel.setBounds(titleRow);
+
+    bounds.removeFromTop(2);
+    hintLabel.setBounds(bounds.removeFromTop(13));
+    bounds.removeFromTop(4);
+
+    auto repeatHeaderRow = bounds.removeFromTop(12);
+    sceneRepeatsLabel.setBounds(repeatHeaderRow);
+    bounds.removeFromTop(2);
+
+    auto repeatRow = bounds.removeFromTop(22);
+    const int repeatGap = 8;
+    const int repeatCellWidth = juce::jmax(60, (repeatRow.getWidth() - ((MlrVSTAudioProcessor::SceneSlots - 1) * repeatGap))
+                                                   / juce::jmax(1, MlrVSTAudioProcessor::SceneSlots));
+    for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
+    {
+        auto cell = (sceneSlot == MlrVSTAudioProcessor::SceneSlots - 1)
+            ? repeatRow
+            : repeatRow.removeFromLeft(repeatCellWidth);
+        if (sceneSlot < MlrVSTAudioProcessor::SceneSlots - 1)
+            repeatRow.removeFromLeft(repeatGap);
+
+        auto& slotLabel = sceneRepeatSlotLabels[static_cast<size_t>(sceneSlot)];
+        auto& repeatBox = sceneRepeatBoxes[static_cast<size_t>(sceneSlot)];
+        slotLabel.setBounds(cell.removeFromTop(12));
+        cell.removeFromTop(2);
+        repeatBox.setBounds(cell);
+    }
+}
+
+void SceneControlPanel::refreshFromProcessor()
+{
+    sceneModeToggle.setToggleState(processor.isSceneModeEnabled(), juce::dontSendNotification);
+    for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
+    {
+        sceneRepeatBoxes[static_cast<size_t>(sceneSlot)].setSelectedId(
+            processor.getSceneRepeatCount(sceneSlot),
+            juce::dontSendNotification);
+    }
 }
 
 //==============================================================================
@@ -7252,7 +7436,16 @@ void MonomePagesPanel::refreshFromProcessor()
     {
         auto& row = rows[static_cast<size_t>(i)];
         const auto modeAtButton = order[static_cast<size_t>(i)];
+        const bool hideGroupPage = processor.isSceneModeEnabled()
+            && modeAtButton == MlrVSTAudioProcessor::ControlMode::GroupAssign;
         const bool isActive = (activeMode == modeAtButton) && (activeMode != MlrVSTAudioProcessor::ControlMode::Normal);
+
+        row.positionLabel.setVisible(!hideGroupPage);
+        row.modeButton.setVisible(!hideGroupPage);
+        row.upButton.setVisible(!hideGroupPage);
+        row.downButton.setVisible(!hideGroupPage);
+        if (hideGroupPage)
+            continue;
 
         row.positionLabel.setText("#" + juce::String(i + 1), juce::dontSendNotification);
         row.modeButton.setButtonText(getMonomePageShortName(modeAtButton));
@@ -8330,6 +8523,7 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     monomePagesControl = std::make_unique<MonomePagesPanel>(audioProcessor);
     presetControl = std::make_unique<PresetControlPanel>(audioProcessor);
     pathsControl = std::make_unique<PathsControlPanel>(audioProcessor);
+    sceneControl = std::make_unique<SceneControlPanel>(audioProcessor);
     
     // Create TABBED top controls to save space
     topTabs = std::make_unique<juce::TabbedComponent>(juce::TabbedButtonBar::TabsAtTop);
@@ -8338,6 +8532,7 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     topTabs->addTab("Presets", juce::Colour(0xff2c2c2c), presetControl.get(), false);
     topTabs->addTab("Monome Device", juce::Colour(0xff2c2c2c), monomeControl.get(), false);
     topTabs->addTab("Paths", juce::Colour(0xff2c2c2c), pathsControl.get(), false);
+    topTabs->addTab("Scene", juce::Colour(0xff2c2c2c), sceneControl.get(), false);
     topTabs->setTabBarDepth(28);
     topTabs->setCurrentTabIndex(0);  // Global Controls visible by default
     addAndMakeVisible(*topTabs);
@@ -8351,13 +8546,19 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
         
         PlayPanel(juce::OwnedArray<StripControl>& s, int& visibleCount)
             : strips(s), visibleStripCount(visibleCount) {}
+
+        void addStrip(StripControl* strip)
+        {
+            if (strip != nullptr)
+                addAndMakeVisible(strip);
+        }
         
         void resized() override
         {
             auto bounds = getLocalBounds();
             const int gap = 1;
             const int totalStrips = strips.size();
-            if (totalStrips <= 0)
+            if (totalStrips <= 0 || bounds.isEmpty())
                 return;
 
             const int stripCount = juce::jlimit(1, totalStrips, visibleStripCount);
@@ -8372,6 +8573,10 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
                     strip->setBounds(0, y, bounds.getWidth(), stripHeight);
                 }
             }
+
+            for (int i = stripCount; i < totalStrips; ++i)
+                if (auto* strip = strips[i])
+                    strip->setBounds({});
         }
     };
     
@@ -8381,8 +8586,6 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
         int& visibleStripCount;
         juce::Label& masterDuckLabel;
         juce::ComboBox& masterDuckTriggerBox;
-        juce::Viewport viewport;
-        juce::Component content;
         
         FXPanel(juce::OwnedArray<FXStripControl>& s,
                 int& visibleCount,
@@ -8395,16 +8598,12 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
         {
             addAndMakeVisible(masterDuckLabel);
             addAndMakeVisible(masterDuckTriggerBox);
-            viewport.setScrollBarsShown(true, false);
-            viewport.setScrollBarThickness(10);
-            viewport.setViewedComponent(&content, false);
-            addAndMakeVisible(viewport);
         }
 
         void addStrip(FXStripControl* strip)
         {
             if (strip != nullptr)
-                content.addAndMakeVisible(strip);
+                addAndMakeVisible(strip);
         }
         
         void resized() override
@@ -8415,28 +8614,21 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
             header.removeFromLeft(6);
             masterDuckTriggerBox.setBounds(header.removeFromLeft(116));
             bounds.removeFromTop(4);
-            viewport.setBounds(bounds);
             const int gap = 1;
             const int totalStrips = strips.size();
-            if (totalStrips <= 0)
-            {
-                content.setSize(juce::jmax(1, viewport.getWidth()), juce::jmax(1, viewport.getHeight()));
+            if (totalStrips <= 0 || bounds.isEmpty())
                 return;
-            }
 
             const int stripCount = juce::jlimit(1, totalStrips, visibleStripCount);
-            const int stripHeight = 136;
             const int totalGap = gap * juce::jmax(0, stripCount - 1);
-            const int contentWidth = juce::jmax(1, viewport.getWidth() - viewport.getScrollBarThickness());
-            const int contentHeight = juce::jmax(bounds.getHeight(), (stripCount * stripHeight) + totalGap);
-            content.setSize(contentWidth, contentHeight);
+            const int stripHeight = juce::jmax(1, (bounds.getHeight() - totalGap) / stripCount);
             
             for (int i = 0; i < stripCount; ++i)
             {
                 if (auto* strip = strips[i])
                 {
                     const int y = i * (stripHeight + gap);
-                    strip->setBounds(0, y, contentWidth, stripHeight);
+                    strip->setBounds(0, y, bounds.getWidth(), stripHeight);
                 }
             }
 
@@ -8455,7 +8647,7 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     {
         auto* strip = new StripControl(i, audioProcessor);
         stripControls.add(strip);
-        playPanel->addAndMakeVisible(strip);
+        playPanel->addStrip(strip);
     }
 
     fxMasterDuckLabel.setText("Master Duck", juce::dontSendNotification);
@@ -8493,11 +8685,80 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
     mainTabs->setTabBarDepth(28);
     mainTabs->setCurrentTabIndex(0);  // Start on Play tab
     addAndMakeVisible(*mainTabs);
+
+    lastSceneModeEnabled = audioProcessor.isSceneModeEnabled();
+    refreshSceneModeLayout();
 }
 
 MlrVSTAudioProcessorEditor::~MlrVSTAudioProcessorEditor()
 {
     stopTimer();
+}
+
+void MlrVSTAudioProcessorEditor::refreshSceneModeLayout()
+{
+    if (!mainTabs)
+        return;
+
+    const bool sceneModeEnabled = audioProcessor.isSceneModeEnabled();
+    auto findTabIndex = [this](const juce::String& name) -> int
+    {
+        if (!mainTabs)
+            return -1;
+        for (int i = 0; i < mainTabs->getNumTabs(); ++i)
+        {
+            if (mainTabs->getTabNames()[i] == name)
+                return i;
+        }
+        return -1;
+    };
+
+    const int currentTabIndex = mainTabs->getCurrentTabIndex();
+    const auto currentTabName = (currentTabIndex >= 0 && currentTabIndex < mainTabs->getNumTabs())
+        ? mainTabs->getTabNames()[currentTabIndex]
+        : juce::String();
+
+    auto removeTabByName = [&](const juce::String& name)
+    {
+        const int index = findTabIndex(name);
+        if (index >= 0)
+            mainTabs->removeTab(index);
+    };
+
+    auto ensureTab = [&](const juce::String& name, juce::Component* content)
+    {
+        if (content == nullptr || findTabIndex(name) >= 0)
+            return;
+        mainTabs->addTab(name, juce::Colour(0xff282828), content, false);
+    };
+
+    if (sceneModeEnabled)
+    {
+        removeTabByName("Groups");
+    }
+    else
+    {
+        ensureTab("Patterns", patternControl.get());
+        ensureTab("Groups", groupControl.get());
+    }
+
+    if (currentTabName.isNotEmpty())
+    {
+        const int restoredIndex = findTabIndex(currentTabName);
+        if (restoredIndex >= 0)
+            mainTabs->setCurrentTabIndex(restoredIndex);
+        else
+            mainTabs->setCurrentTabIndex(0);
+    }
+    else
+    {
+        mainTabs->setCurrentTabIndex(0);
+    }
+
+    for (auto* strip : stripControls)
+        if (strip) strip->resized();
+    for (auto* fxStrip : fxStripControls)
+        if (fxStrip) fxStrip->resized();
 }
 
 void MlrVSTAudioProcessorEditor::setupLookAndFeel()
@@ -8517,14 +8778,14 @@ void MlrVSTAudioProcessorEditor::setupLookAndFeel()
     darkLookAndFeel.setColour(juce::Slider::rotarySliderFillColourId, kAccent.withAlpha(0.9f));
     darkLookAndFeel.setColour(juce::Slider::rotarySliderOutlineColourId, juce::Colour(0xff525252));
 
-    darkLookAndFeel.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff32363a));
+    darkLookAndFeel.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff353b42));
     darkLookAndFeel.setColour(juce::ComboBox::textColourId, kTextPrimary);
-    darkLookAndFeel.setColour(juce::ComboBox::outlineColourId, juce::Colour(0xff545454));
-    darkLookAndFeel.setColour(juce::ComboBox::arrowColourId, kTextSecondary);
-    darkLookAndFeel.setColour(juce::PopupMenu::backgroundColourId, juce::Colour(0xff262626));
+    darkLookAndFeel.setColour(juce::ComboBox::outlineColourId, juce::Colour(0xff6a7076));
+    darkLookAndFeel.setColour(juce::ComboBox::arrowColourId, kAccent.brighter(0.08f));
+    darkLookAndFeel.setColour(juce::PopupMenu::backgroundColourId, juce::Colour(0xff202428));
     darkLookAndFeel.setColour(juce::PopupMenu::textColourId, kTextPrimary);
-    darkLookAndFeel.setColour(juce::PopupMenu::highlightedBackgroundColourId, kAccent.withAlpha(0.35f));
-    darkLookAndFeel.setColour(juce::PopupMenu::highlightedTextColourId, juce::Colour(0xfff7f7f7));
+    darkLookAndFeel.setColour(juce::PopupMenu::highlightedBackgroundColourId, kAccent.withAlpha(0.72f));
+    darkLookAndFeel.setColour(juce::PopupMenu::highlightedTextColourId, juce::Colour(0xff101010));
 
     darkLookAndFeel.setColour(juce::Label::textColourId, kTextPrimary);
 
@@ -8605,7 +8866,8 @@ void MlrVSTAudioProcessorEditor::resized()
     
     // Top section: TABBED controls (Global/Presets/Monome)
     const int selectedTopTab = topTabs->getCurrentTabIndex();
-    const int requestedTopBarHeight = (selectedTopTab == 1) ? 300 : 124;
+    const int requestedTopBarHeight = (selectedTopTab == 1) ? 300
+        : (selectedTopTab == 0 ? 156 : 124);
     const int maxTopBarHeight = juce::jmax(124, bounds.getHeight() - 180);
     auto topBar = bounds.removeFromTop(juce::jmin(requestedTopBarHeight, maxTopBarHeight));
     topTabs->setBounds(topBar);
@@ -8635,6 +8897,14 @@ void MlrVSTAudioProcessorEditor::timerCallback()
             resized();
         }
     }
+
+    const bool sceneModeEnabled = audioProcessor.isSceneModeEnabled();
+    if (sceneModeEnabled != lastSceneModeEnabled)
+    {
+        lastSceneModeEnabled = sceneModeEnabled;
+        refreshSceneModeLayout();
+        resized();
+    }
     
     // Update input meters
     if (globalControl)
@@ -8644,6 +8914,9 @@ void MlrVSTAudioProcessorEditor::timerCallback()
         globalControl->updateMeters(levelL, levelR);
         globalControl->refreshFromProcessor();
     }
+
+    if (sceneControl)
+        sceneControl->refreshFromProcessor();
 
     if (macroControl)
         macroControl->refreshFromProcessor();

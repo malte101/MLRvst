@@ -14,6 +14,10 @@ option(MLRVST_ENABLE_HUOVILAINEN "Enable Huovilainen Moog model (LGPL-derived up
 option(MLRVST_ENABLE_SOUNDTOUCH "Enable SoundTouch-based swing time-stretch path" ON)
 option(MLRVST_ENABLE_BUNGEE "Enable Bungee-based stretch backend" ON)
 option(MLRVST_ENABLE_LIBPYIN "Enable vendored LibPyin monophonic pitch detection for loop analysis" ON)
+option(MLRVST_ENABLE_ESSENTIA_NATIVE "Enable native Essentia analysis backend when available" ON)
+option(MLRVST_ALLOW_UNSUPPORTED_MINGW_WINDOWS
+    "Allow unsupported MinGW Windows builds for local cross-build packaging"
+    OFF)
 set(MLRVST_NATIVE_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/_native" CACHE PATH
     "Path to persistent repo-local native dependency prefixes")
 set(MLRVST_DEFAULT_ESSENTIA_PREFIX "${MLRVST_NATIVE_DEPS_DIR}/essentia-prefix")
@@ -104,13 +108,26 @@ endif()
 
 # JUCE 8 does not support MinGW on Windows targets.
 if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    message(FATAL_ERROR
-        "MinGW is not supported by JUCE 8 for this project.\n"
-        "Use Visual Studio (MSVC) or clang-cl with the Windows SDK.")
+    if(NOT MLRVST_ALLOW_UNSUPPORTED_MINGW_WINDOWS)
+        message(FATAL_ERROR
+            "MinGW is not supported by JUCE 8 for this project.\n"
+            "Use Visual Studio (MSVC) or clang-cl with the Windows SDK.\n"
+            "If you intentionally need the legacy local cross-build path, configure with\n"
+            "  -DMLRVST_ALLOW_UNSUPPORTED_MINGW_WINDOWS=ON")
+    endif()
+
+    message(WARNING
+        "Configuring an unsupported MinGW Windows build for local packaging.\n"
+        "Use this only for explicit cross-build workflows.")
 endif()
 
 # Add JUCE
 add_subdirectory("${MLRVST_JUCE_PATH}" "${CMAKE_CURRENT_BINARY_DIR}/JUCE")
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND MLRVST_ALLOW_UNSUPPORTED_MINGW_WINDOWS)
+    set(JUCE_WINDOWS_HELPERS_CAN_RUN FALSE CACHE INTERNAL
+        "Signals whether plugin related helper utilities can run on the build machine" FORCE)
+endif()
 
 set(MLRVST_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(MLRVST_BUILD_INFO_HEADER "${MLRVST_GENERATED_DIR}/mlrvst_build_info.h")
@@ -132,9 +149,14 @@ add_custom_target(mlrVST_build_info ALL
 # Plugin formats by platform
 set(MLRVST_PLUGIN_FORMATS VST3)
 set(MLRVST_AU_MAIN_TYPE_ARGS)
+set(MLRVST_COPY_PLUGIN_AFTER_BUILD TRUE)
 if(APPLE)
     list(APPEND MLRVST_PLUGIN_FORMATS AU)
     list(APPEND MLRVST_AU_MAIN_TYPE_ARGS AU_MAIN_TYPE kAudioUnitType_MusicEffect)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND MLRVST_ALLOW_UNSUPPORTED_MINGW_WINDOWS)
+    set(MLRVST_COPY_PLUGIN_AFTER_BUILD FALSE)
 endif()
 
 # Plugin configuration
@@ -147,7 +169,7 @@ juce_add_plugin(mlrVST
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
-    COPY_PLUGIN_AFTER_BUILD TRUE
+    COPY_PLUGIN_AFTER_BUILD ${MLRVST_COPY_PLUGIN_AFTER_BUILD}
     
     PLUGIN_MANUFACTURER_CODE Mlrx
     PLUGIN_CODE Mlrv
@@ -185,6 +207,8 @@ target_sources(mlrVST
         Source/PresetStore.h
         Source/TimeStretchBackend.cpp
         Source/TimeStretchBackend.h
+        Source/WarpGrid.cpp
+        Source/WarpGrid.h
         Source/SampleMode.cpp
         Source/SampleMode.h
         Source/MonomeController.cpp
@@ -312,34 +336,39 @@ else()
 endif()
 
 set(MLRVST_ESSENTIA_ENABLED FALSE)
-find_path(MLRVST_ESSENTIA_INCLUDE_DIR
-    NAMES essentia/essentia.h
-    PATHS
-        "${MLRVST_ESSENTIA_PREFIX}/include"
-        /opt/homebrew/include
-        /usr/local/include)
-find_library(MLRVST_ESSENTIA_LIBRARY
-    NAMES essentia libessentia
-    PATHS
-        "${MLRVST_ESSENTIA_PREFIX}/lib"
-        /opt/homebrew/lib
-        /usr/local/lib)
+if(MLRVST_ENABLE_ESSENTIA_NATIVE)
+    find_path(MLRVST_ESSENTIA_INCLUDE_DIR
+        NAMES essentia/essentia.h
+        PATHS
+            "${MLRVST_ESSENTIA_PREFIX}/include"
+            /opt/homebrew/include
+            /usr/local/include)
+    find_library(MLRVST_ESSENTIA_LIBRARY
+        NAMES essentia libessentia
+        PATHS
+            "${MLRVST_ESSENTIA_PREFIX}/lib"
+            /opt/homebrew/lib
+            /usr/local/lib)
 
-if(MLRVST_ESSENTIA_INCLUDE_DIR AND MLRVST_ESSENTIA_LIBRARY)
-    target_include_directories(mlrVST SYSTEM PRIVATE
-        "${MLRVST_ESSENTIA_INCLUDE_DIR}"
-        /opt/homebrew/Cellar/eigen/5.0.1/include/eigen3)
-    target_link_libraries(mlrVST PRIVATE "${MLRVST_ESSENTIA_LIBRARY}")
-    if(APPLE)
-        find_library(ACCELERATE_FRAMEWORK Accelerate)
-        if(ACCELERATE_FRAMEWORK)
-            target_link_libraries(mlrVST PRIVATE "${ACCELERATE_FRAMEWORK}")
+    if(MLRVST_ESSENTIA_INCLUDE_DIR AND MLRVST_ESSENTIA_LIBRARY)
+        target_include_directories(mlrVST SYSTEM PRIVATE
+            "${MLRVST_ESSENTIA_INCLUDE_DIR}"
+            /opt/homebrew/Cellar/eigen/5.0.1/include/eigen3)
+        target_link_libraries(mlrVST PRIVATE "${MLRVST_ESSENTIA_LIBRARY}")
+        if(APPLE)
+            find_library(ACCELERATE_FRAMEWORK Accelerate)
+            if(ACCELERATE_FRAMEWORK)
+                target_link_libraries(mlrVST PRIVATE "${ACCELERATE_FRAMEWORK}")
+            endif()
         endif()
+        target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_ESSENTIA_NATIVE=1)
+        set(MLRVST_ESSENTIA_ENABLED TRUE)
+    else()
+        message(WARNING "Native Essentia not found; building with internal Flip analysis only.")
+        target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_ESSENTIA_NATIVE=0)
     endif()
-    target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_ESSENTIA_NATIVE=1)
-    set(MLRVST_ESSENTIA_ENABLED TRUE)
 else()
-    message(WARNING "Native Essentia not found; building with internal Flip analysis only.")
+    message(STATUS "Native Essentia disabled; building with internal Flip analysis only.")
     target_compile_definitions(mlrVST PRIVATE MLRVST_ENABLE_ESSENTIA_NATIVE=0)
 endif()
 
@@ -401,6 +430,87 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
         target_compile_options(mlrVST PRIVATE /O2 /GL)
     else()
         target_compile_options(mlrVST PRIVATE -O3 -ffast-math)
+    endif()
+endif()
+
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND MLRVST_ALLOW_UNSUPPORTED_MINGW_WINDOWS)
+    set(MLRVST_MINGW_SHIM_DEFINES
+        JUCE_ALLOW_MINGW=1
+        JUCE_MINGW=1
+        JUCE_USE_WINDOWS_MEDIA_FORMAT=0)
+    set(MLRVST_MINGW_SHIM_C_OPTIONS
+        -U__MINGW32__
+        -D_WIN64)
+    set(MLRVST_MINGW_SHIM_CXX_OPTIONS
+        -U__MINGW32__
+        -D_WIN64
+        -DJUCE_64BIT=1
+        -include
+        cstring)
+
+    get_filename_component(MLRVST_MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(MLRVST_MINGW_ROOT_DIR "${MLRVST_MINGW_BIN_DIR}/.." ABSOLUTE)
+
+    set(MLRVST_MINGW_DLL_HINTS
+        "${MLRVST_MINGW_BIN_DIR}"
+        "${MLRVST_MINGW_ROOT_DIR}/bin"
+        "${MLRVST_MINGW_ROOT_DIR}/lib")
+
+    find_file(MLRVST_MINGW_LIBGCC_DLL
+        NAMES libgcc_s_seh-1.dll
+        HINTS ${MLRVST_MINGW_DLL_HINTS})
+    find_file(MLRVST_MINGW_LIBSTDCPP_DLL
+        NAMES libstdc++-6.dll
+        HINTS ${MLRVST_MINGW_DLL_HINTS})
+    find_file(MLRVST_MINGW_WINPTHREAD_DLL
+        NAMES libwinpthread-1.dll
+        HINTS ${MLRVST_MINGW_DLL_HINTS})
+
+    if(TARGET mlrVST_VST3)
+        set(MLRVST_MINGW_WIN32_LIBS
+            winmm
+            imm32
+            comctl32
+            dwmapi
+            dwrite
+            d2d1
+            dxgi
+            d3d11
+            dcomp
+            dxguid
+            shlwapi
+            version
+            ws2_32)
+
+        target_compile_definitions(mlrVST PRIVATE ${MLRVST_MINGW_SHIM_DEFINES})
+        target_compile_definitions(mlrVST_VST3 PRIVATE ${MLRVST_MINGW_SHIM_DEFINES})
+        target_compile_options(mlrVST PRIVATE
+            $<$<COMPILE_LANGUAGE:C>:${MLRVST_MINGW_SHIM_C_OPTIONS}>
+            $<$<COMPILE_LANGUAGE:CXX>:${MLRVST_MINGW_SHIM_CXX_OPTIONS}>)
+        target_compile_options(mlrVST_VST3 PRIVATE
+            $<$<COMPILE_LANGUAGE:C>:${MLRVST_MINGW_SHIM_C_OPTIONS}>
+            $<$<COMPILE_LANGUAGE:CXX>:${MLRVST_MINGW_SHIM_CXX_OPTIONS}>)
+
+        if(TARGET mlrVST_vst3_helper)
+            target_compile_definitions(mlrVST_vst3_helper PRIVATE ${MLRVST_MINGW_SHIM_DEFINES})
+            target_compile_options(mlrVST_vst3_helper PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:${MLRVST_MINGW_SHIM_CXX_OPTIONS}>)
+        endif()
+        target_link_libraries(mlrVST PRIVATE ${MLRVST_MINGW_WIN32_LIBS})
+        target_link_libraries(mlrVST_VST3 PRIVATE ${MLRVST_MINGW_WIN32_LIBS})
+
+        foreach(runtime_dll
+                ${MLRVST_MINGW_LIBGCC_DLL}
+                ${MLRVST_MINGW_LIBSTDCPP_DLL}
+                ${MLRVST_MINGW_WINPTHREAD_DLL})
+            if(runtime_dll)
+                add_custom_command(TARGET mlrVST_VST3 POST_BUILD
+                    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "${runtime_dll}"
+                        "$<TARGET_FILE_DIR:mlrVST_VST3>/"
+                    VERBATIM)
+            endif()
+        endforeach()
     endif()
 endif()
 

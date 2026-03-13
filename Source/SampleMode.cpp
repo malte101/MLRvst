@@ -1,4 +1,5 @@
 #include "SampleMode.h"
+#include "WarpGrid.h"
 
 #include <algorithm>
 #include <cmath>
@@ -25,226 +26,46 @@ constexpr int kMaxInitialSliceCount = 256;
 constexpr int kDefaultSliceFadeSamples = 96;
 constexpr int kMaxStoredTransientCount = 512;
 constexpr float kMinViewZoom = 1.0f;
-constexpr float kMaxViewZoom = 32.0f;
+constexpr float kMaxViewZoom = 96.0f;
 constexpr float kCueHitRadiusPixels = 8.0f;
-constexpr float kVisibleSliceMarkerHitRadiusPixels = 16.0f;
-constexpr float kDetailedWaveformZoomThreshold = 3.0f;
-constexpr int kDetailedWaveformMaxVisibleSamples = 240000;
-#if !MLRVST_ENABLE_ESSENTIA_NATIVE
-constexpr const char* kEssentiaScriptName = "mlrvst_flip_essentia_analysis.py";
-constexpr const char* kAnalysisPythonPackageName = "essentia";
-#endif
+constexpr float kWarpMarkerHitRadiusPixels = 4.0f;
+constexpr float kDetailedWaveformZoomThreshold = 2.25f;
+constexpr int kDetailedWaveformMaxVisibleSamples = 320000;
+constexpr int kWarpMarkerLaneTopOffset = 6;
+constexpr int kWarpMarkerLaneHeight = 10;
+constexpr int kSliceMarkerHandleLaneGap = 2;
+constexpr int kSliceMarkerHandleLaneHeight = 16;
+constexpr double kWarpDisplayActivationEpsilon = 1.0e-5;
+constexpr double kWarpMarkerGuideSnapSeconds = 0.02;
+constexpr double kWarpMarkerTransientClusterSeconds = 0.006;
+constexpr float kWarpMarkerFineDragScale = 0.08f;
+constexpr int kWarpAutoMarkerMaxInsertions = 12;
+constexpr double kWarpMarkerMinStretchRatio = 0.10001;
+constexpr double kWarpMarkerMaxStretchRatio = 19.9999;
+constexpr int64_t kWarpMarkerDuplicateSampleTolerance = 1;
+constexpr size_t kMaxSliceEditUndoDepth = 64;
 constexpr float kKeyLockCacheRateTolerance = 0.0005f;
 constexpr float kKeyLockCachePitchTolerance = 0.01f;
 
-#if !MLRVST_ENABLE_ESSENTIA_NATIVE
-struct EssentiaPythonConfig
+using WarpAnchorPoint = WarpGrid::Anchor;
+
+struct SampleWarpDisplayMap
 {
-    bool valid = false;
-    juce::String executable;
-    juce::String pythonPath;
-    juce::String pathEnv;
-    juce::String failureReason;
+    bool active = false;
+    int64_t totalSamples = 0;
+    double startBeatPosition = 0.0;
+    double endBeatPosition = 0.0;
+    std::vector<int64_t> beatTicks;
+    std::vector<SampleWarpMarker> warpMarkers;
+    std::vector<WarpAnchorPoint> anchors;
 };
 
-int compareVersionTag(const juce::String& lhs, const juce::String& rhs)
+float computeWarpMarkerHitRadiusForZoom(float viewZoom)
 {
-    const auto leftParts = juce::StringArray::fromTokens(lhs, ".", "");
-    const auto rightParts = juce::StringArray::fromTokens(rhs, ".", "");
-    const int maxParts = juce::jmax(leftParts.size(), rightParts.size());
-    for (int i = 0; i < maxParts; ++i)
-    {
-        const int left = i < leftParts.size() ? leftParts[i].getIntValue() : 0;
-        const int right = i < rightParts.size() ? rightParts[i].getIntValue() : 0;
-        if (left != right)
-            return left < right ? -1 : 1;
-    }
-    return 0;
+    return juce::jlimit(2.0f,
+                        kWarpMarkerHitRadiusPixels,
+                        kWarpMarkerHitRadiusPixels - (std::log2(juce::jmax(1.0f, viewZoom)) * 0.35f));
 }
-
-juce::String sanitizeEssentiaFailureReason(juce::String reason)
-{
-    reason = reason.trim();
-    if (reason.isEmpty())
-        return "ES unavailable";
-    reason = reason.replaceCharacters("\r\n\t", "   ");
-    while (reason.contains("  "))
-        reason = reason.replace("  ", " ");
-    if (reason.containsIgnoreCase("No module named 'essentia'")
-        || reason.containsIgnoreCase("No module named \"essentia\""))
-        return "ES import failed";
-    if (reason.containsIgnoreCase("timed out"))
-        return "ES timeout";
-    if (reason.containsIgnoreCase("can't open file"))
-        return "ES script launch failed";
-    return "ES " + reason.upToFirstOccurrenceOf("Traceback", false, false).trim().substring(0, 64);
-}
-
-bool pythonSiteContainsPackage(const juce::File& sitePackagesDir)
-{
-    return sitePackagesDir.getChildFile(kAnalysisPythonPackageName).isDirectory()
-        || sitePackagesDir.getChildFile(kAnalysisPythonPackageName).getChildFile("__init__.py").existsAsFile();
-}
-
-juce::String findNewestEssentiaSitePackages()
-{
-    juce::String bestVersion;
-    juce::String bestSitePackages;
-
-    auto considerSiteDir = [&](const juce::File& sitePackagesDir, const juce::String& version)
-    {
-        if (!sitePackagesDir.isDirectory() || !pythonSiteContainsPackage(sitePackagesDir))
-            return;
-
-        if (bestVersion.isEmpty() || compareVersionTag(version, bestVersion) > 0)
-        {
-            bestVersion = version;
-            bestSitePackages = sitePackagesDir.getFullPathName();
-        }
-    };
-
-    const auto userPythonRoot = juce::File::getSpecialLocation(juce::File::userHomeDirectory)
-        .getChildFile("Library/Python");
-    if (userPythonRoot.isDirectory())
-    {
-        const auto children = userPythonRoot.findChildFiles(juce::File::findDirectories, false);
-        for (const auto& child : children)
-        {
-            const auto version = child.getFileName();
-            considerSiteDir(child.getChildFile("lib").getChildFile("python").getChildFile("site-packages"), version);
-        }
-    }
-
-    for (const auto& rootPath : { juce::String("/opt/homebrew/lib"), juce::String("/usr/local/lib") })
-    {
-        const juce::File root(rootPath);
-        if (!root.isDirectory())
-            continue;
-
-        const auto children = root.findChildFiles(juce::File::findDirectories, false, "python*");
-        for (const auto& child : children)
-        {
-            const auto version = child.getFileName().fromFirstOccurrenceOf("python", false, false);
-            considerSiteDir(child.getChildFile("site-packages"), version);
-        }
-    }
-
-    return bestSitePackages;
-}
-
-juce::String extractPythonVersionFromUserSite(const juce::String& userSite)
-{
-    const int libIndex = userSite.indexOfIgnoreCase("/lib/python");
-    if (libIndex < 0)
-        return {};
-
-    const int versionStart = libIndex + juce::String("/lib/python").length();
-    const int versionEnd = userSite.indexOfIgnoreCase(versionStart, "/");
-    if (versionEnd <= versionStart)
-        return {};
-
-    return userSite.substring(versionStart, versionEnd);
-}
-
-bool probeEssentiaPythonExecutable(const juce::String& executable,
-                                   const juce::String& pythonPath,
-                                   const juce::String& pathEnv,
-                                   juce::String& failureReason)
-{
-    juce::ChildProcess probe;
-    juce::StringArray args;
-    args.add("/usr/bin/env");
-    args.add("HOME=" + juce::File::getSpecialLocation(juce::File::userHomeDirectory).getFullPathName());
-    args.add("PATH=" + pathEnv);
-    if (pythonPath.isNotEmpty())
-        args.add("PYTHONPATH=" + pythonPath);
-    args.add("MPLCONFIGDIR=" + juce::File::getSpecialLocation(juce::File::tempDirectory)
-                                   .getChildFile("mlrvst_essentia_mpl")
-                                   .getFullPathName());
-    args.add("XDG_CACHE_HOME=" + juce::File::getSpecialLocation(juce::File::tempDirectory).getFullPathName());
-    args.add(executable);
-    args.add("-c");
-    args.add("import essentia, essentia.standard, sys; print(sys.executable)");
-
-    if (!probe.start(args))
-    {
-        failureReason = "could not start " + executable;
-        return false;
-    }
-
-    if (!probe.waitForProcessToFinish(20000))
-    {
-        probe.kill();
-        failureReason = "timed out probing " + executable;
-        return false;
-    }
-
-    const auto output = probe.readAllProcessOutput().trim();
-    const auto lines = juce::StringArray::fromLines(output);
-    const auto lastLine = lines.isEmpty() ? output : lines[lines.size() - 1].trim();
-    if (lastLine == executable || lastLine.endsWithIgnoreCase(juce::File(executable).getFileName()))
-        return true;
-
-    failureReason = output.isNotEmpty() ? output : ("probe failed for " + executable);
-    return false;
-}
-
-EssentiaPythonConfig resolveEssentiaPythonConfig()
-{
-    EssentiaPythonConfig config;
-    const auto userSite = findNewestEssentiaSitePackages();
-
-    juce::StringArray candidates;
-    const auto envOverride = juce::SystemStats::getEnvironmentVariable("MLRVST_ESSENTIA_PYTHON", {});
-    if (envOverride.isNotEmpty())
-        candidates.add(envOverride);
-
-    const auto version = extractPythonVersionFromUserSite(userSite);
-    if (version.isNotEmpty())
-    {
-        candidates.add("/opt/homebrew/opt/python@" + version + "/bin/python" + version);
-        candidates.add("/opt/homebrew/bin/python" + version);
-        candidates.add("/usr/local/bin/python" + version);
-        candidates.add("python" + version);
-    }
-
-    candidates.add("/opt/homebrew/bin/python3");
-    candidates.add("/usr/local/bin/python3");
-    candidates.add("python3");
-    candidates.removeDuplicates(false);
-
-    juce::String pathEnv;
-    pathEnv << "/opt/homebrew/opt/python@" << (version.isNotEmpty() ? version : "3.12") << "/bin"
-            << ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-
-    juce::String lastFailure = userSite.isEmpty()
-        ? juce::String("ES package not found in Python site-packages")
-        : juce::String();
-    for (const auto& candidate : candidates)
-    {
-        juce::String failure;
-        if (probeEssentiaPythonExecutable(candidate, userSite, pathEnv, failure))
-        {
-            config.valid = true;
-            config.executable = candidate;
-            config.pythonPath = userSite;
-            config.pathEnv = pathEnv;
-            return config;
-        }
-        if (failure.isNotEmpty())
-            lastFailure = failure;
-    }
-
-    config.failureReason = sanitizeEssentiaFailureReason(lastFailure);
-    return config;
-}
-
-const EssentiaPythonConfig& getEssentiaPythonConfig()
-{
-    static const EssentiaPythonConfig config = resolveEssentiaPythonConfig();
-    return config;
-}
-#endif
 
 juce::String buildSliceLabel(int index);
 float safeNormalizedPosition(int64_t samplePosition, int64_t totalSamples);
@@ -360,6 +181,26 @@ std::array<SampleSlice, SliceModel::VisibleSliceCount> buildDistributedRandomSli
     return selection;
 }
 
+std::array<SampleSlice, SliceModel::VisibleSliceCount> buildSequentialVisibleSliceSelection(
+    const std::vector<SampleSlice>& allSlices,
+    int startIndex)
+{
+    std::array<SampleSlice, SliceModel::VisibleSliceCount> selection {};
+    if (allSlices.empty())
+        return selection;
+
+    const int selectionCount = juce::jmin(SliceModel::VisibleSliceCount, static_cast<int>(allSlices.size()));
+    if (selectionCount <= 0)
+        return selection;
+
+    const int maxStartIndex = juce::jmax(0, static_cast<int>(allSlices.size()) - selectionCount);
+    const int clampedStartIndex = juce::jlimit(0, maxStartIndex, startIndex);
+    for (int slot = 0; slot < selectionCount; ++slot)
+        selection[static_cast<size_t>(slot)] = allSlices[static_cast<size_t>(clampedStartIndex + slot)];
+
+    return selection;
+}
+
 const char* sampleSliceModeName(SampleSliceMode mode)
 {
     switch (mode)
@@ -382,7 +223,7 @@ SampleSliceMode sampleSliceModeFromString(const juce::String& text)
         return SampleSliceMode::Beat;
     if (normalized == "manual")
         return SampleSliceMode::Manual;
-    return SampleSliceMode::Uniform;
+    return SampleSliceMode::Transient;
 }
 
 const char* sampleTriggerModeName(SampleTriggerMode mode)
@@ -401,17 +242,6 @@ SampleTriggerMode sampleTriggerModeFromString(const juce::String& text)
     return text.trim().equalsIgnoreCase("loop")
         ? SampleTriggerMode::Loop
         : SampleTriggerMode::OneShot;
-}
-
-juce::String noteNameForMidi(int midiNote)
-{
-    static const char* names[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
-    if (midiNote < 0)
-        return {};
-
-    const int pitchClass = ((midiNote % 12) + 12) % 12;
-    const int octave = (midiNote / 12) - 1;
-    return juce::String(names[pitchClass]) + juce::String(octave);
 }
 
 int pitchClassFromKeyName(const juce::String& keyName)
@@ -449,6 +279,25 @@ int pitchScaleIndexFromEssentiaName(const juce::String& scaleName)
 double midiToPitchHz(int midiNote)
 {
     return 440.0 * std::pow(2.0, (static_cast<double>(midiNote) - 69.0) / 12.0);
+}
+
+juce::String formatDetectedKeyLabel(int midiNote, int scaleIndex)
+{
+    if (midiNote < 0)
+        return "--";
+
+    static constexpr std::array<const char*, 12> noteNames
+    {
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+    };
+
+    const int pitchClass = ((midiNote % 12) + 12) % 12;
+    const auto noteName = juce::String(noteNames[static_cast<size_t>(pitchClass)]);
+    if (scaleIndex == 1)
+        return noteName + " major";
+    if (scaleIndex == 2)
+        return noteName + " minor";
+    return noteName;
 }
 
 #if MLRVST_ENABLE_LIBPYIN
@@ -706,40 +555,6 @@ std::optional<LibPyinPitchEstimate> runLibPyinMonophonicPitch(const LoadedSample
 }
 #endif
 
-juce::String analysisBackendDisplayText(bool essentiaUsed, const juce::String& analysisSource)
-{
-    const auto source = analysisSource.trim();
-
-    if (essentiaUsed)
-    {
-        if (source.containsIgnoreCase("pitch unresolved"))
-            return "Essentia partial";
-        return "Essentia OK";
-    }
-
-    if (source.startsWithIgnoreCase("manual tempo"))
-        return "Manual tempo";
-
-    if (source.containsIgnoreCase("import failed"))
-        return "Internal fallback";
-    if (source.containsIgnoreCase("timeout"))
-        return "Internal fallback";
-    if (source.containsIgnoreCase("script launch failed"))
-        return "Internal fallback";
-    if (source.containsIgnoreCase("invalid json")
-        || source.containsIgnoreCase("invalid result")
-        || source.containsIgnoreCase("empty output"))
-        return "Internal fallback";
-    if (source.startsWithIgnoreCase("ES "))
-        return "Internal fallback";
-    if (source.containsIgnoreCase("essentia"))
-        return "Internal fallback";
-    if (source.containsIgnoreCase("internal"))
-        return "Internal fallback";
-
-    return "Analysis fallback";
-}
-
 juce::String compactLoadStatusText(const juce::String& statusText)
 {
     const auto source = statusText.trim();
@@ -779,6 +594,308 @@ float safeNormalizedPosition(int64_t samplePosition, int64_t totalSamples)
     return juce::jlimit(0.0f,
                         1.0f,
                         static_cast<float>(samplePosition / static_cast<double>(juce::jmax<int64_t>(1, totalSamples))));
+}
+
+std::vector<int64_t> sanitizeWarpBeatTicks(const std::vector<int64_t>& beatTickSamples,
+                                           int64_t totalSamples)
+{
+    return WarpGrid::sanitizeBeatTicks(beatTickSamples, totalSamples);
+}
+
+double computeWarpBeatPositionFromSample(const std::vector<int64_t>& beatTicks,
+                                         int64_t samplePosition)
+{
+    return WarpGrid::computeBeatPositionFromSample(beatTicks, samplePosition);
+}
+
+std::vector<SampleWarpMarker> sanitizePersistentWarpMarkers(const std::vector<SampleWarpMarker>& warpMarkers,
+                                                            int64_t totalSamples)
+{
+    return WarpGrid::sanitizeMarkers(warpMarkers, totalSamples);
+}
+
+std::vector<WarpAnchorPoint> buildWarpAnchorPoints(const std::vector<int64_t>& beatTicks,
+                                                   const std::vector<SampleWarpMarker>& warpMarkers,
+                                                   int64_t totalSamples)
+{
+    return WarpGrid::buildAnchors(beatTicks, warpMarkers, totalSamples);
+}
+
+int64_t clampWarpMarkerSamplePositionByStretchRatio(const std::vector<int64_t>& beatTicks,
+                                                    const std::vector<SampleWarpMarker>& warpMarkers,
+                                                    int markerIndex,
+                                                    int64_t samplePosition,
+                                                    int64_t totalSamples)
+{
+    if (beatTicks.size() < 2
+        || markerIndex < 0
+        || markerIndex >= static_cast<int>(warpMarkers.size())
+        || totalSamples <= 1)
+    {
+        return samplePosition;
+    }
+
+    const auto& marker = warpMarkers[static_cast<size_t>(markerIndex)];
+    const int64_t endSample = juce::jmax<int64_t>(1, totalSamples - 1);
+
+    const int64_t leftSample = (markerIndex > 0)
+        ? warpMarkers[static_cast<size_t>(markerIndex - 1)].samplePosition
+        : 0;
+    const int64_t rightSample = (markerIndex + 1 < static_cast<int>(warpMarkers.size()))
+        ? warpMarkers[static_cast<size_t>(markerIndex + 1)].samplePosition
+        : endSample;
+
+    const double leftBaseBeat = computeWarpBeatPositionFromSample(beatTicks, leftSample);
+    const double rightBaseBeat = computeWarpBeatPositionFromSample(beatTicks, rightSample);
+    const double leftTargetBeat = (markerIndex > 0)
+        ? warpMarkers[static_cast<size_t>(markerIndex - 1)].beatPosition
+        : leftBaseBeat;
+    const double rightTargetBeat = (markerIndex + 1 < static_cast<int>(warpMarkers.size()))
+        ? warpMarkers[static_cast<size_t>(markerIndex + 1)].beatPosition
+        : rightBaseBeat;
+
+    double minAllowedBaseBeat = -std::numeric_limits<double>::infinity();
+    double maxAllowedBaseBeat = std::numeric_limits<double>::infinity();
+
+    const double leftTargetSpan = marker.beatPosition - leftTargetBeat;
+    if (leftTargetSpan > WarpGrid::kMarkerOrderEpsilon)
+    {
+        minAllowedBaseBeat = juce::jmax(minAllowedBaseBeat,
+                                        leftBaseBeat + (leftTargetSpan / kWarpMarkerMaxStretchRatio));
+        maxAllowedBaseBeat = juce::jmin(maxAllowedBaseBeat,
+                                        leftBaseBeat + (leftTargetSpan / kWarpMarkerMinStretchRatio));
+    }
+
+    const double rightTargetSpan = rightTargetBeat - marker.beatPosition;
+    if (rightTargetSpan > WarpGrid::kMarkerOrderEpsilon)
+    {
+        minAllowedBaseBeat = juce::jmax(minAllowedBaseBeat,
+                                        rightBaseBeat - (rightTargetSpan / kWarpMarkerMinStretchRatio));
+        maxAllowedBaseBeat = juce::jmin(maxAllowedBaseBeat,
+                                        rightBaseBeat - (rightTargetSpan / kWarpMarkerMaxStretchRatio));
+    }
+
+    if (!std::isfinite(minAllowedBaseBeat) || !std::isfinite(maxAllowedBaseBeat))
+        return samplePosition;
+
+    if (maxAllowedBaseBeat <= (minAllowedBaseBeat + WarpGrid::kMarkerOrderEpsilon))
+        return samplePosition;
+
+    const double proposedBaseBeat = computeWarpBeatPositionFromSample(beatTicks, samplePosition);
+    const double clampedBaseBeat = juce::jlimit(minAllowedBaseBeat, maxAllowedBaseBeat, proposedBaseBeat);
+    return WarpGrid::computeSamplePositionFromBeatPosition(beatTicks, clampedBaseBeat, totalSamples);
+}
+
+int64_t computeWarpGuideSnapToleranceSamples(const std::vector<int64_t>& beatTicks,
+                                             int64_t samplePosition,
+                                             double sampleRate)
+{
+    int64_t tolerance = juce::jmax<int64_t>(64,
+        static_cast<int64_t>(std::llround(juce::jmax(1.0, sampleRate) * kWarpMarkerGuideSnapSeconds)));
+
+    if (beatTicks.size() >= 2)
+    {
+        auto it = std::lower_bound(beatTicks.begin(), beatTicks.end(), samplePosition);
+        int64_t interval = 0;
+        if (it == beatTicks.begin())
+        {
+            interval = WarpGrid::computeEdgeTickInterval(beatTicks, false);
+        }
+        else if (it == beatTicks.end())
+        {
+            interval = WarpGrid::computeEdgeTickInterval(beatTicks, true);
+        }
+        else
+        {
+            const int64_t prev = *(it - 1);
+            const int64_t next = *it;
+            interval = juce::jmax<int64_t>(1, next - prev);
+        }
+
+        if (interval > 0)
+            tolerance = juce::jlimit<int64_t>(64, 4096, juce::jmax<int64_t>(tolerance, interval / 10));
+    }
+
+    return tolerance;
+}
+
+std::vector<int64_t> clusterWarpMarkerTransientGuides(const std::vector<int64_t>& transientMarkers,
+                                                      int64_t lowerBound,
+                                                      int64_t upperBound,
+                                                      double sampleRate)
+{
+    std::vector<int64_t> candidates;
+    candidates.reserve(transientMarkers.size());
+
+    for (const auto sample : transientMarkers)
+    {
+        if (sample >= lowerBound && sample <= upperBound)
+            candidates.push_back(sample);
+    }
+
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    if (candidates.empty())
+        return candidates;
+
+    const int64_t clusterTolerance = static_cast<int64_t>(juce::jmax(1.0,
+        std::round(juce::jmax(1.0, sampleRate) * kWarpMarkerTransientClusterSeconds)));
+    std::vector<int64_t> clustered;
+    clustered.reserve(candidates.size());
+
+    size_t clusterStart = 0;
+    while (clusterStart < candidates.size())
+    {
+        size_t clusterEnd = clusterStart + 1;
+        double clusterSum = static_cast<double>(candidates[clusterStart]);
+        while (clusterEnd < candidates.size()
+               && (candidates[clusterEnd] - candidates[clusterEnd - 1]) <= clusterTolerance)
+        {
+            clusterSum += static_cast<double>(candidates[clusterEnd]);
+            ++clusterEnd;
+        }
+
+        const auto clusterCount = static_cast<double>(clusterEnd - clusterStart);
+        const int64_t clusterCenter = static_cast<int64_t>(std::llround(clusterSum / juce::jmax(1.0, clusterCount)));
+        clustered.push_back(juce::jlimit(lowerBound, upperBound, clusterCenter));
+        clusterStart = clusterEnd;
+    }
+
+    std::sort(clustered.begin(), clustered.end());
+    clustered.erase(std::unique(clustered.begin(), clustered.end()), clustered.end());
+    return clustered;
+}
+
+int64_t snapWarpMarkerSampleToGuide(const std::vector<int64_t>& beatTicks,
+                                    const std::vector<int64_t>& transientMarkers,
+                                    int64_t samplePosition,
+                                    int64_t lowerBound,
+                                    int64_t upperBound,
+                                    double sampleRate)
+{
+    int64_t snappedSample = juce::jlimit(lowerBound, upperBound, samplePosition);
+    int64_t bestDistance = std::numeric_limits<int64_t>::max();
+    const int64_t tolerance = computeWarpGuideSnapToleranceSamples(beatTicks, samplePosition, sampleRate);
+
+    auto considerCandidate = [&](int64_t candidate)
+    {
+        if (candidate < lowerBound || candidate > upperBound)
+            return;
+
+        const int64_t distance = std::abs(candidate - samplePosition);
+        if (distance <= tolerance && distance < bestDistance)
+        {
+            bestDistance = distance;
+            snappedSample = candidate;
+        }
+    };
+
+    for (const auto marker : transientMarkers)
+        considerCandidate(marker);
+
+    for (const auto tick : beatTicks)
+        considerCandidate(tick);
+
+    return snappedSample;
+}
+
+SampleWarpDisplayMap buildSampleWarpDisplayMap(const LoadedSampleData* loadedSample,
+                                               const SampleModeEngine::StateSnapshot& snapshot)
+{
+    SampleWarpDisplayMap map;
+    if (loadedSample == nullptr || loadedSample->sourceLengthSamples <= 1)
+        return map;
+
+    map.totalSamples = loadedSample->sourceLengthSamples;
+    map.beatTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples, map.totalSamples);
+    if (map.beatTicks.size() < 2)
+        return map;
+
+    map.warpMarkers = sanitizePersistentWarpMarkers(snapshot.warpMarkers, map.totalSamples);
+    if (map.warpMarkers.empty())
+        return map;
+
+    bool hasMeaningfulWarp = false;
+    for (const auto& marker : map.warpMarkers)
+    {
+        const double baseBeatPosition = computeWarpBeatPositionFromSample(map.beatTicks, marker.samplePosition);
+        if (std::abs(baseBeatPosition - marker.beatPosition) > kWarpDisplayActivationEpsilon)
+        {
+            hasMeaningfulWarp = true;
+            break;
+        }
+    }
+    if (!hasMeaningfulWarp)
+        return map;
+
+    map.anchors = buildWarpAnchorPoints(map.beatTicks, map.warpMarkers, map.totalSamples);
+    if (map.anchors.size() < 3)
+        return map;
+
+    map.startBeatPosition = map.anchors.front().targetBeatPosition;
+    map.endBeatPosition = map.anchors.back().targetBeatPosition;
+    if ((map.endBeatPosition - map.startBeatPosition) <= WarpGrid::kBeatEpsilon)
+        return map;
+
+    map.active = true;
+    return map;
+}
+
+float displayNormalizedPositionForSample(const SampleWarpDisplayMap& warpDisplayMap,
+                                         int64_t samplePosition)
+{
+    if (warpDisplayMap.totalSamples <= 0)
+        return 0.0f;
+
+    if (!warpDisplayMap.active)
+        return safeNormalizedPosition(samplePosition, warpDisplayMap.totalSamples);
+
+    const double warpedBeatPosition = WarpGrid::computeWarpedBeatPositionForSample(warpDisplayMap.beatTicks,
+                                                                                   warpDisplayMap.anchors,
+                                                                                   samplePosition,
+                                                                                   warpDisplayMap.totalSamples);
+    const double beatSpan = warpDisplayMap.endBeatPosition - warpDisplayMap.startBeatPosition;
+    if (!(beatSpan > WarpGrid::kBeatEpsilon))
+        return safeNormalizedPosition(samplePosition, warpDisplayMap.totalSamples);
+
+    return juce::jlimit(0.0f,
+                        1.0f,
+                        static_cast<float>((warpedBeatPosition - warpDisplayMap.startBeatPosition) / beatSpan));
+}
+
+int64_t samplePositionFromDisplayNormalized(const SampleWarpDisplayMap& warpDisplayMap,
+                                            float normalizedPosition)
+{
+    if (warpDisplayMap.totalSamples <= 0)
+        return 0;
+
+    const float clampedNormalized = juce::jlimit(0.0f, 1.0f, normalizedPosition);
+    if (!warpDisplayMap.active)
+    {
+        return juce::jlimit<int64_t>(0,
+                                     warpDisplayMap.totalSamples - 1,
+                                     static_cast<int64_t>(std::llround(clampedNormalized
+                                                                       * static_cast<float>(warpDisplayMap.totalSamples - 1))));
+    }
+
+    const double targetBeatPosition = warpDisplayMap.startBeatPosition
+        + (static_cast<double>(clampedNormalized)
+           * (warpDisplayMap.endBeatPosition - warpDisplayMap.startBeatPosition));
+    return WarpGrid::computeSamplePositionFromWarpedBeatPosition(warpDisplayMap.beatTicks,
+                                                                 warpDisplayMap.anchors,
+                                                                 targetBeatPosition,
+                                                                 warpDisplayMap.totalSamples);
+}
+
+int findWarpMarkerIndexById(const std::vector<SampleWarpMarker>& warpMarkers, int markerId)
+{
+    for (size_t i = 0; i < warpMarkers.size(); ++i)
+    {
+        if (warpMarkers[i].id == markerId)
+            return static_cast<int>(i);
+    }
+
+    return -1;
 }
 
 juce::AudioBuffer<float> buildMonoBuffer(const LoadedSampleData& sampleData)
@@ -887,6 +1004,25 @@ std::vector<int64_t> refineOnsetSamplesToLeadingEdges(const juce::AudioBuffer<fl
             }
         }
 
+        double localPeakLevel = 0.0;
+        for (int sampleIndex = refinedIndex; sampleIndex <= juce::jmin(searchEnd, refinedIndex + (lookAhead * 3)); ++sampleIndex)
+            localPeakLevel = juce::jmax(localPeakLevel, static_cast<double>(std::abs(mono[sampleIndex])));
+
+        const double floorLevel = meanAbsoluteLevelInRange(absolutePrefixSum,
+                                                           juce::jmax(0, refinedIndex - (lookBehind * 8)),
+                                                           juce::jmax(0, refinedIndex - lookBehind));
+        const double onsetThreshold = floorLevel + ((localPeakLevel - floorLevel) * 0.18);
+        for (int sampleIndex = refinedIndex; sampleIndex > searchStart; --sampleIndex)
+        {
+            const double previousAbs = std::abs(mono[sampleIndex - 1]);
+            const double currentAbs = std::abs(mono[sampleIndex]);
+            if (previousAbs <= onsetThreshold && currentAbs >= onsetThreshold)
+            {
+                refinedIndex = sampleIndex;
+                break;
+            }
+        }
+
         refined.push_back(static_cast<int64_t>(refinedIndex));
     }
 
@@ -912,58 +1048,196 @@ std::array<int64_t, SliceModel::VisibleSliceCount> buildLoopStyleAnchorStarts(in
         return starts;
     }
 
+    std::vector<int64_t> sanitizedCandidates;
+    sanitizedCandidates.reserve(onsetSamples.size());
+    for (const auto onsetSample : onsetSamples)
+    {
+        if (onsetSample < 0 || onsetSample > lastSample)
+            continue;
+        sanitizedCandidates.push_back(onsetSample);
+    }
+    std::sort(sanitizedCandidates.begin(), sanitizedCandidates.end());
+    sanitizedCandidates.erase(std::unique(sanitizedCandidates.begin(), sanitizedCandidates.end()),
+                              sanitizedCandidates.end());
+
+    if (sanitizedCandidates.empty())
+    {
+        for (int i = 0; i < SliceModel::VisibleSliceCount; ++i)
+            starts[static_cast<size_t>(i)] = juce::jlimit<int64_t>(0,
+                                                                   lastSample,
+                                                                   (static_cast<int64_t>(i) * safeTotalSamples)
+                                                                       / SliceModel::VisibleSliceCount);
+        return starts;
+    }
+
     const int lastIndex = SliceModel::VisibleSliceCount - 1;
-    const int64_t nominalStep = juce::jmax<int64_t>(1,
-        static_cast<int64_t>(std::llround(static_cast<double>(lastSample)
-                                          / static_cast<double>(juce::jmax(1, lastIndex)))));
-    const int64_t maxSnapDistance = juce::jmax<int64_t>(1, (nominalStep * 45) / 100);
+    int64_t previousStart = -1;
+    int previousCandidateIndex = -1;
     for (int i = 0; i < SliceModel::VisibleSliceCount; ++i)
     {
-        if (i == 0)
+        const double candidatePosition = (sanitizedCandidates.size() == 1)
+            ? 0.0
+            : (static_cast<double>(i) / static_cast<double>(juce::jmax(1, lastIndex)))
+                * static_cast<double>(sanitizedCandidates.size() - 1);
+        int candidateIndex = juce::jlimit(0,
+                                          static_cast<int>(sanitizedCandidates.size()) - 1,
+                                          static_cast<int>(std::llround(candidatePosition)));
+        if (candidateIndex <= previousCandidateIndex)
+            candidateIndex = juce::jmin(static_cast<int>(sanitizedCandidates.size()) - 1, previousCandidateIndex + 1);
+
+        int64_t chosen = sanitizedCandidates[static_cast<size_t>(candidateIndex)];
+        if (chosen <= previousStart)
         {
-            starts[static_cast<size_t>(i)] = 0;
-            continue;
-        }
-
-        const int64_t target = juce::jlimit<int64_t>(0,
-                                                     lastSample,
-                                                     static_cast<int64_t>((static_cast<double>(i)
-                                                         / static_cast<double>(lastIndex))
-                                                         * static_cast<double>(lastSample)));
-
-        int64_t chosen = target;
-        auto it = std::lower_bound(onsetSamples.begin(), onsetSamples.end(), target);
-
-        int64_t bestCandidate = chosen;
-        int64_t bestDistance = std::numeric_limits<int64_t>::max();
-        if (it != onsetSamples.end())
-        {
-            const int64_t dist = std::abs(*it - target);
-            if (dist < bestDistance)
+            auto it = std::upper_bound(sanitizedCandidates.begin(),
+                                       sanitizedCandidates.end(),
+                                       previousStart);
+            if (it != sanitizedCandidates.end())
             {
-                bestDistance = dist;
-                bestCandidate = *it;
+                candidateIndex = static_cast<int>(std::distance(sanitizedCandidates.begin(), it));
+                chosen = *it;
             }
-        }
-        if (it != onsetSamples.begin())
-        {
-            const int64_t prev = *std::prev(it);
-            const int64_t dist = std::abs(prev - target);
-            if (dist < bestDistance)
+            else
             {
-                bestDistance = dist;
-                bestCandidate = prev;
+                chosen = juce::jmin(lastSample, previousStart + 1);
             }
         }
 
-        if (bestDistance < std::numeric_limits<int64_t>::max() && bestDistance <= maxSnapDistance)
-            chosen = bestCandidate;
-
-        chosen = juce::jmax(starts[static_cast<size_t>(i - 1)] + 1, chosen);
         starts[static_cast<size_t>(i)] = juce::jlimit<int64_t>(0, lastSample, chosen);
+        previousStart = starts[static_cast<size_t>(i)];
+        previousCandidateIndex = candidateIndex;
     }
 
     return starts;
+}
+
+std::vector<int64_t> snapTickMarkersToNearestTransientSamples(const LoadedSampleData& sampleData,
+                                                              const std::vector<int64_t>& tickSamples,
+                                                              const std::vector<int64_t>& transientSamples)
+{
+    auto adjustedTicks = WarpGrid::sanitizeBeatTicks(tickSamples, sampleData.sourceLengthSamples);
+    const auto sanitizedTransients = WarpGrid::sanitizeBeatTicks(transientSamples, sampleData.sourceLengthSamples);
+    if (adjustedTicks.empty() || sanitizedTransients.empty() || sampleData.sourceSampleRate <= 0.0)
+        return adjustedTicks;
+
+    const int64_t totalSamples = juce::jmax<int64_t>(1, sampleData.sourceLengthSamples);
+    const int64_t maxSnapSamples = static_cast<int64_t>(std::llround(sampleData.sourceSampleRate * 0.045));
+    const int64_t minSnapSamples = static_cast<int64_t>(std::llround(sampleData.sourceSampleRate * 0.003));
+
+    for (size_t i = 0; i < adjustedTicks.size(); ++i)
+    {
+        const int64_t tickSample = adjustedTicks[i];
+        const int64_t searchLower = (i > 0)
+            ? juce::jmax<int64_t>(1, ((adjustedTicks[i - 1] + tickSample + 1) / 2))
+            : 1;
+        const int64_t searchUpper = (i + 1 < adjustedTicks.size())
+            ? juce::jmin<int64_t>(totalSamples - 1, ((tickSample + adjustedTicks[i + 1]) / 2))
+            : (totalSamples - 1);
+        if (searchUpper < searchLower)
+            continue;
+
+        const int64_t leftGap = (i > 0)
+            ? juce::jmax<int64_t>(1, tickSample - adjustedTicks[i - 1])
+            : juce::jmax<int64_t>(1, searchUpper - tickSample);
+        const int64_t rightGap = (i + 1 < adjustedTicks.size())
+            ? juce::jmax<int64_t>(1, adjustedTicks[i + 1] - tickSample)
+            : juce::jmax<int64_t>(1, tickSample - searchLower);
+        const int64_t localGap = juce::jmax<int64_t>(1, juce::jmin(leftGap, rightGap));
+        const int64_t snapTolerance = juce::jlimit<int64_t>(minSnapSamples,
+                                                            maxSnapSamples,
+                                                            static_cast<int64_t>(std::llround(static_cast<double>(localGap) * 0.35)));
+
+        const auto transientBegin = std::lower_bound(sanitizedTransients.begin(), sanitizedTransients.end(), searchLower);
+        const auto transientEnd = std::upper_bound(transientBegin, sanitizedTransients.end(), searchUpper);
+        if (transientBegin == transientEnd)
+            continue;
+
+        auto nearestIt = std::lower_bound(transientBegin, transientEnd, tickSample);
+        int64_t bestSample = tickSample;
+        int64_t bestDistance = std::numeric_limits<int64_t>::max();
+
+        if (nearestIt != transientEnd)
+        {
+            bestSample = *nearestIt;
+            bestDistance = std::abs(*nearestIt - tickSample);
+        }
+
+        if (nearestIt != transientBegin)
+        {
+            const auto prevIt = std::prev(nearestIt);
+            const int64_t prevDistance = std::abs(*prevIt - tickSample);
+            if (prevDistance <= bestDistance)
+            {
+                bestSample = *prevIt;
+                bestDistance = prevDistance;
+            }
+        }
+
+        if (bestDistance <= snapTolerance)
+            adjustedTicks[i] = bestSample;
+    }
+
+    adjustedTicks = WarpGrid::sanitizeBeatTicks(adjustedTicks, sampleData.sourceLengthSamples);
+    return adjustedTicks;
+}
+
+std::vector<int64_t> buildCanonicalTransientMarkerSamples(const LoadedSampleData& sampleData,
+                                                          const std::vector<int64_t>& transientEditSamples,
+                                                          bool transientMarkersEdited)
+{
+    const bool useEditedMarkers = transientMarkersEdited && !transientEditSamples.empty();
+    auto markerSamples = useEditedMarkers
+        ? WarpGrid::sanitizeBeatTicks(transientEditSamples, sampleData.sourceLengthSamples)
+        : snapTickMarkersToNearestTransientSamples(sampleData,
+                                                   sampleData.analysis.beatTickSamples,
+                                                   sampleData.analysis.transientSamples);
+
+    if (markerSamples.empty())
+    {
+        markerSamples = WarpGrid::sanitizeBeatTicks(sampleData.analysis.transientSamples,
+                                                   sampleData.sourceLengthSamples);
+    }
+
+    markerSamples.erase(std::remove_if(markerSamples.begin(),
+                                       markerSamples.end(),
+                                       [&sampleData](int64_t sample)
+                                       {
+                                           return sample <= 0 || sample >= sampleData.sourceLengthSamples;
+                                       }),
+                        markerSamples.end());
+    return markerSamples;
+}
+
+std::vector<int64_t> filterMarkerSamplesToRange(const std::vector<int64_t>& markerSamples,
+                                                int64_t rangeStartSample,
+                                                int64_t rangeEndSample)
+{
+    std::vector<int64_t> filtered;
+    if (rangeEndSample <= rangeStartSample)
+        return filtered;
+
+    filtered.reserve(markerSamples.size());
+    for (const auto sample : markerSamples)
+    {
+        if (sample >= rangeStartSample && sample < rangeEndSample)
+            filtered.push_back(sample);
+    }
+
+    return filtered;
+}
+
+int getLegacyLoopTransientLastPageStart(int candidateCount)
+{
+    if (candidateCount <= SliceModel::VisibleSliceCount)
+        return 0;
+
+    return ((candidateCount - 1) / SliceModel::VisibleSliceCount) * SliceModel::VisibleSliceCount;
+}
+
+int getLegacyLoopTransientPageStartIndex(int requestedStartIndex, int candidateCount)
+{
+    return juce::jlimit(0,
+                        getLegacyLoopTransientLastPageStart(candidateCount),
+                        requestedStartIndex);
 }
 
 std::vector<int64_t> detectLoopStyleTransientSamples(const juce::AudioBuffer<float>& monoBuffer,
@@ -1384,255 +1658,18 @@ float quantizeKeyLockPitch(float pitchSemitones)
 bool matchesKeyLockRequest(const StretchedSliceBuffer& cache,
                            const SampleSlice& slice,
                            float playbackRate,
-                           float pitchSemitones)
+                           float pitchSemitones,
+                           TimeStretchBackend backend)
 {
     return cache.sliceId == slice.id
         && cache.sliceStartSample == slice.startSample
         && cache.sliceEndSample == slice.endSample
+        && cache.backend == sanitizeTimeStretchBackend(static_cast<int>(backend))
         && std::abs(cache.playbackRate - quantizeKeyLockRate(playbackRate)) <= kKeyLockCacheRateTolerance
         && std::abs(cache.pitchSemitones - quantizeKeyLockPitch(pitchSemitones)) <= kKeyLockCachePitchTolerance;
 }
 
-#if !MLRVST_ENABLE_ESSENTIA_NATIVE
-juce::String buildEssentiaScript()
-{
-    return juce::String(
-R"PY(import json
-import math
-import os
-import sys
-import tempfile
-
-os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "mlrvst_essentia_mpl"))
-os.environ.setdefault("XDG_CACHE_HOME", tempfile.gettempdir())
-
-try:
-    import numpy as np
-    import essentia
-    import essentia.standard as es
-except Exception as exc:
-    print(json.dumps({"ok": False, "error": str(exc)}))
-    raise SystemExit(0)
-
-path = sys.argv[1]
-
-try:
-    sr = 44100
-    audio_arr = es.MonoLoader(filename=path, sampleRate=sr)()
-    audio_arr = np.asarray(audio_arr, dtype=np.float32).reshape(-1)
-
-    if audio_arr.size == 0:
-        raise RuntimeError("empty audio")
-
-    rhythm = es.RhythmExtractor2013(method="multifeature")
-    bpm, beats, beats_confidence, _, _ = rhythm(audio_arr)
-    beats = np.asarray(beats, dtype=np.float32).reshape(-1)
-    transient_samples = [int(round(float(t) * sr)) for t in beats[:512]]
-    tempo = float(bpm) if np.isfinite(bpm) else 0.0
-
-    print(json.dumps({
-        "ok": True,
-        "tempo_bpm": tempo,
-        "pitch_hz": 0.0,
-        "pitch_midi": -1,
-        "transient_samples": transient_samples,
-        "analysis_source": "essentia"
-    }))
-except Exception as exc:
-    print(json.dumps({"ok": False, "error": str(exc)}))
-)PY");
-}
-
-juce::File ensureEssentiaScriptFile()
-{
-    const auto scriptFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
-        .getChildFile(kEssentiaScriptName);
-    const auto scriptText = buildEssentiaScript();
-
-    if (!scriptFile.existsAsFile() || scriptFile.loadFileAsString() != scriptText)
-        scriptFile.replaceWithText(scriptText);
-
-    return scriptFile;
-}
-
-std::optional<juce::File> createEssentiaAnalysisWaveFile(const LoadedSampleData& sampleData,
-                                                         juce::String* failureReason = nullptr)
-{
-    if (sampleData.audioBuffer.getNumSamples() <= 0 || sampleData.audioBuffer.getNumChannels() <= 0)
-    {
-        if (failureReason != nullptr)
-            *failureReason = "ES empty analysis buffer";
-        return std::nullopt;
-    }
-
-    juce::TemporaryFile tempFile("wav");
-    const auto tempPath = tempFile.getFile();
-
-    juce::WavAudioFormat wavFormat;
-    auto outputStream = std::unique_ptr<juce::FileOutputStream>(tempPath.createOutputStream());
-    if (outputStream == nullptr)
-    {
-        if (failureReason != nullptr)
-            *failureReason = "ES temp file open failed";
-        return std::nullopt;
-    }
-
-    auto* rawStream = outputStream.release();
-    std::unique_ptr<juce::AudioFormatWriter> writer(wavFormat.createWriterFor(rawStream,
-                                                                              sampleData.sourceSampleRate,
-                                                                              static_cast<unsigned int>(sampleData.audioBuffer.getNumChannels()),
-                                                                              24,
-                                                                              {},
-                                                                              0));
-    if (writer == nullptr)
-    {
-        delete rawStream;
-        if (failureReason != nullptr)
-            *failureReason = "ES temp writer failed";
-        return std::nullopt;
-    }
-
-    if (!writer->writeFromAudioSampleBuffer(sampleData.audioBuffer, 0, sampleData.audioBuffer.getNumSamples()))
-    {
-        writer.reset();
-        tempPath.deleteFile();
-        if (failureReason != nullptr)
-            *failureReason = "ES temp write failed";
-        return std::nullopt;
-    }
-
-    writer.reset();
-    return tempPath;
-}
-
-std::optional<SampleAnalysisSummary> runEssentiaAnalysis(const juce::File& sourceFile,
-                                                         SamplePitchAnalysisProfile pitchProfile,
-                                                         juce::String* failureReason = nullptr)
-{
-    juce::ignoreUnused(pitchProfile);
-    if (!sourceFile.existsAsFile())
-    {
-        if (failureReason != nullptr)
-            *failureReason = "ES source file missing";
-        return std::nullopt;
-    }
-
-    const auto scriptFile = ensureEssentiaScriptFile();
-    if (!scriptFile.existsAsFile())
-    {
-        if (failureReason != nullptr)
-            *failureReason = "ES script missing";
-        return std::nullopt;
-    }
-
-    const auto& pythonConfig = getEssentiaPythonConfig();
-    if (!pythonConfig.valid)
-    {
-        if (failureReason != nullptr)
-            *failureReason = pythonConfig.failureReason;
-        return std::nullopt;
-    }
-
-    juce::ChildProcess childProcess;
-    juce::StringArray args;
-    args.add("/usr/bin/env");
-    args.add("HOME=" + juce::File::getSpecialLocation(juce::File::userHomeDirectory).getFullPathName());
-    args.add("PATH=" + pythonConfig.pathEnv);
-    if (pythonConfig.pythonPath.isNotEmpty())
-        args.add("PYTHONPATH=" + pythonConfig.pythonPath);
-    args.add("MPLCONFIGDIR=" + juce::File::getSpecialLocation(juce::File::tempDirectory)
-                                   .getChildFile("mlrvst_essentia_mpl")
-                                   .getFullPathName());
-    args.add("XDG_CACHE_HOME=" + juce::File::getSpecialLocation(juce::File::tempDirectory).getFullPathName());
-    args.add(pythonConfig.executable);
-    args.add(scriptFile.getFullPathName());
-    args.add(sourceFile.getFullPathName());
-
-    if (!childProcess.start(args))
-    {
-        if (failureReason != nullptr)
-            *failureReason = "ES worker launch failed";
-        return std::nullopt;
-    }
-
-    if (!childProcess.waitForProcessToFinish(30000))
-    {
-        childProcess.kill();
-        if (failureReason != nullptr)
-            *failureReason = "ES timeout";
-        return std::nullopt;
-    }
-
-    const auto output = childProcess.readAllProcessOutput().trim();
-    if (output.isEmpty())
-    {
-        if (failureReason != nullptr)
-            *failureReason = "ES empty output";
-        return std::nullopt;
-    }
-
-    juce::var parsed;
-    {
-        const auto lines = juce::StringArray::fromLines(output);
-        for (int i = lines.size() - 1; i >= 0; --i)
-        {
-            const auto candidate = lines[i].trim();
-            if (!candidate.startsWithChar('{'))
-                continue;
-
-            parsed = juce::JSON::parse(candidate);
-            if (!parsed.isVoid())
-                break;
-        }
-    }
-
-    if (parsed.isVoid())
-    {
-        if (failureReason != nullptr)
-            *failureReason = sanitizeEssentiaFailureReason(output);
-        parsed = juce::JSON::parse(output);
-    }
-
-    if (!parsed.isObject())
-    {
-        if (failureReason != nullptr && failureReason->isEmpty())
-            *failureReason = "ES invalid JSON";
-        return std::nullopt;
-    }
-
-    auto* object = parsed.getDynamicObject();
-    if (object == nullptr)
-    {
-        if (failureReason != nullptr)
-            *failureReason = "ES invalid result";
-        return std::nullopt;
-    }
-
-    if (!static_cast<bool>(object->getProperty("ok")))
-    {
-        if (failureReason != nullptr)
-            *failureReason = sanitizeEssentiaFailureReason(object->getProperty("error").toString());
-        return std::nullopt;
-    }
-
-    SampleAnalysisSummary summary;
-    summary.estimatedTempoBpm = normalizeTempoEstimate(static_cast<double>(object->getProperty("tempo_bpm")));
-    summary.estimatedPitchHz = static_cast<double>(object->getProperty("pitch_hz"));
-    summary.estimatedPitchMidi = static_cast<int>(object->getProperty("pitch_midi"));
-    summary.essentiaUsed = true;
-    summary.analysisSource = object->getProperty("analysis_source").toString();
-
-    const auto transientVar = object->getProperty("transient_samples");
-    if (auto* transientArray = transientVar.getArray())
-    {
-        summary.transientSamples.reserve(static_cast<size_t>(transientArray->size()));
-        for (const auto& item : *transientArray)
-            summary.transientSamples.push_back(static_cast<int64_t>(item));
-    }
-
-    return summary;
-}
-#else
+#if MLRVST_ENABLE_ESSENTIA_NATIVE
 struct EssentiaNativeRuntime
 {
     EssentiaNativeRuntime() { essentia::init(); }
@@ -2072,6 +2109,7 @@ std::shared_ptr<const StretchedSliceBuffer> buildStretchedSliceBuffer(const Load
     cache->sliceEndSample = slice.endSample;
     cache->playbackRate = quantizedRate;
     cache->pitchSemitones = quantizedPitch;
+    cache->backend = sanitizeTimeStretchBackend(static_cast<int>(backend));
     cache->sourceSampleRate = sampleData.sourceSampleRate;
     cache->audioBuffer.setSize(2, outputFrames, false, false, true);
 
@@ -2137,27 +2175,6 @@ std::vector<int64_t> sanitizeBeatTickSamples(const std::vector<int64_t>& beatTic
     return sanitized;
 }
 
-int64_t computeMedianBeatTickInterval(const std::vector<int64_t>& beatTicks)
-{
-    if (beatTicks.size() < 2)
-        return 0;
-
-    std::vector<int64_t> intervals;
-    intervals.reserve(beatTicks.size() - 1);
-    for (size_t i = 1; i < beatTicks.size(); ++i)
-    {
-        const int64_t interval = beatTicks[i] - beatTicks[i - 1];
-        if (interval > 0)
-            intervals.push_back(interval);
-    }
-
-    if (intervals.empty())
-        return 0;
-
-    std::sort(intervals.begin(), intervals.end());
-    return intervals[intervals.size() / 2];
-}
-
 int64_t computeMedianBeatTickIntervalWindow(const std::vector<int64_t>& beatTicks,
                                             int startIntervalIndex,
                                             int endIntervalIndexExclusive)
@@ -2194,149 +2211,6 @@ int64_t computeEdgeBeatTickInterval(const std::vector<int64_t>& beatTicks, bool 
     const int windowSize = juce::jmin(4, intervalCount);
     const int startInterval = useEndEdge ? (intervalCount - windowSize) : 0;
     return computeMedianBeatTickIntervalWindow(beatTicks, startInterval, startInterval + windowSize);
-}
-
-double computeMedianDouble(std::vector<double> values)
-{
-    if (values.empty())
-        return 0.0;
-
-    std::sort(values.begin(), values.end());
-    const size_t mid = values.size() / 2;
-    if ((values.size() & 1u) == 0u)
-        return 0.5 * (values[mid - 1] + values[mid]);
-    return values[mid];
-}
-
-std::vector<int64_t> buildWholeFileDriftCorrectedBeatTicks(const std::vector<int64_t>& rawBeatTicks,
-                                                           const std::vector<int64_t>& transientSamples,
-                                                           int64_t totalSamples)
-{
-    auto corrected = sanitizeBeatTickSamples(rawBeatTicks, totalSamples);
-    if (corrected.size() < 2 || totalSamples <= 0)
-        return corrected;
-
-    const int64_t medianInterval = computeMedianBeatTickInterval(corrected);
-    if (medianInterval <= 0)
-        return corrected;
-
-    const auto snappedTransients = sanitizeBeatTickSamples(transientSamples, totalSamples);
-    if (snappedTransients.empty())
-        return corrected;
-
-    const int64_t maxSnapDistance = juce::jmax<int64_t>(1, static_cast<int64_t>(std::llround(static_cast<double>(medianInterval) * 0.18)));
-    const int64_t strictSnapDistance = juce::jmax<int64_t>(1, maxSnapDistance / 2);
-
-    std::vector<int64_t> snappedTargets(corrected.size(), 0);
-    std::vector<bool> hasSnappedTarget(corrected.size(), false);
-    std::vector<double> snappedOffsets(corrected.size(), 0.0);
-
-    auto findNearestTransient = [&](int64_t targetSample) -> std::pair<int64_t, int64_t>
-    {
-        auto it = std::lower_bound(snappedTransients.begin(), snappedTransients.end(), targetSample);
-        int64_t bestCandidate = targetSample;
-        int64_t bestDistance = std::numeric_limits<int64_t>::max();
-
-        if (it != snappedTransients.end())
-        {
-            const int64_t distance = std::abs(*it - targetSample);
-            if (distance < bestDistance)
-            {
-                bestDistance = distance;
-                bestCandidate = *it;
-            }
-        }
-        if (it != snappedTransients.begin())
-        {
-            const int64_t candidate = *std::prev(it);
-            const int64_t distance = std::abs(candidate - targetSample);
-            if (distance < bestDistance)
-            {
-                bestDistance = distance;
-                bestCandidate = candidate;
-            }
-        }
-
-        return { bestCandidate, bestDistance };
-    };
-
-    for (size_t i = 0; i < corrected.size(); ++i)
-    {
-        const auto [candidate, distance] = findNearestTransient(corrected[i]);
-        if (distance <= maxSnapDistance)
-        {
-            snappedTargets[i] = candidate;
-            snappedOffsets[i] = static_cast<double>(candidate - corrected[i]);
-            hasSnappedTarget[i] = true;
-        }
-        else
-        {
-            snappedTargets[i] = corrected[i];
-        }
-    }
-
-    std::vector<int64_t> stabilized;
-    stabilized.reserve(corrected.size());
-    int64_t previous = -1;
-    const int intervalCount = static_cast<int>(corrected.size()) - 1;
-
-    for (size_t i = 0; i < corrected.size(); ++i)
-    {
-        std::vector<double> offsetWindow;
-        offsetWindow.reserve(9);
-        const int index = static_cast<int>(i);
-        const int windowStart = juce::jmax(0, index - 4);
-        const int windowEnd = juce::jmin(static_cast<int>(corrected.size()) - 1, index + 4);
-        for (int j = windowStart; j <= windowEnd; ++j)
-        {
-            if (hasSnappedTarget[static_cast<size_t>(j)])
-                offsetWindow.push_back(snappedOffsets[static_cast<size_t>(j)]);
-        }
-
-        const double smoothedOffset = offsetWindow.empty()
-            ? 0.0
-            : computeMedianDouble(std::move(offsetWindow));
-        int64_t chosen = static_cast<int64_t>(std::llround(static_cast<double>(corrected[i]) + smoothedOffset));
-
-        if (hasSnappedTarget[i])
-        {
-            const int64_t snapped = snappedTargets[i];
-            if (std::abs(snapped - chosen) <= maxSnapDistance)
-                chosen = snapped;
-        }
-        else
-        {
-            const auto [candidate, distance] = findNearestTransient(chosen);
-            if (distance <= strictSnapDistance)
-                chosen = candidate;
-        }
-
-        if (previous >= 0)
-        {
-            const int64_t localInterval = juce::jmax<int64_t>(
-                1,
-                computeMedianBeatTickIntervalWindow(corrected,
-                                                    juce::jmax(0, index - 3),
-                                                    juce::jmin(intervalCount, index + 4)));
-            const int64_t minInterval = juce::jmax<int64_t>(1, static_cast<int64_t>(std::llround(static_cast<double>(localInterval) * 0.35)));
-            const int64_t maxInterval = juce::jmax<int64_t>(minInterval + 1,
-                                                            static_cast<int64_t>(std::llround(static_cast<double>(localInterval) * 2.25)));
-            const int64_t minChosen = juce::jmax<int64_t>(previous + 1, previous + minInterval);
-            const int64_t maxChosen = juce::jmin<int64_t>(totalSamples - 1, previous + maxInterval);
-            chosen = juce::jlimit<int64_t>(minChosen,
-                                           juce::jmax(minChosen, maxChosen),
-                                           chosen);
-        }
-        else
-        {
-            chosen = juce::jlimit<int64_t>(0, juce::jmax<int64_t>(0, totalSamples - 1), chosen);
-        }
-
-        stabilized.push_back(chosen);
-        previous = chosen;
-    }
-
-    return sanitizeBeatTickSamples(stabilized, totalSamples);
 }
 
 int findNearestBeatTickIndex(const std::vector<int64_t>& beatTicks, int64_t targetSample)
@@ -2528,6 +2402,31 @@ float normalizedPositionFromSample(int64_t samplePosition, int64_t totalSamples)
     return safeNormalizedPosition(samplePosition, totalSamples);
 }
 
+double choosePpqGridBeatStep(double visibleBeatSpan, int pixelWidth, double minimumPixels)
+{
+    if (!(visibleBeatSpan > 0.0) || pixelWidth <= 0 || !(minimumPixels > 0.0))
+        return 1.0;
+
+    const double pixelsPerBeat = static_cast<double>(pixelWidth) / visibleBeatSpan;
+    static constexpr std::array<double, 10> beatSteps { 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0 };
+    for (const auto step : beatSteps)
+    {
+        if ((step * pixelsPerBeat) >= minimumPixels)
+            return step;
+    }
+
+    return beatSteps.back();
+}
+
+bool beatGridMatchesDivision(double beatPosition, double divisionBeats)
+{
+    if (!(divisionBeats > 0.0) || !std::isfinite(beatPosition))
+        return false;
+
+    const double nearestDivision = std::round(beatPosition / divisionBeats) * divisionBeats;
+    return std::abs(beatPosition - nearestDivision) <= 1.0e-4;
+}
+
 std::optional<juce::Range<float>> computeSampleLoopVisualRange(const SampleModeEngine::StateSnapshot& snapshot)
 {
     if (!snapshot.hasSample || snapshot.totalSamples <= 0)
@@ -2632,6 +2531,7 @@ juce::ValueTree SampleModePersistentState::createValueTree(const juce::Identifie
     tree.setProperty("analyzedPitchMidi", analyzedPitchMidi, nullptr);
     tree.setProperty("essentiaUsed", essentiaUsed, nullptr);
     tree.setProperty("analysisSource", analysisSource, nullptr);
+    tree.setProperty("transientMarkersEdited", transientMarkersEdited, nullptr);
 
     juce::ValueTree cuesNode("CuePoints");
     for (const auto& cue : cuePoints)
@@ -2645,6 +2545,17 @@ juce::ValueTree SampleModePersistentState::createValueTree(const juce::Identifie
         cuesNode.addChild(cueNode, -1, nullptr);
     }
     tree.addChild(cuesNode, -1, nullptr);
+
+    juce::ValueTree warpNode("WarpMarkers");
+    for (const auto& marker : warpMarkers)
+    {
+        juce::ValueTree markerNode("WarpMarker");
+        markerNode.setProperty("id", marker.id, nullptr);
+        markerNode.setProperty("samplePosition", static_cast<juce::int64>(marker.samplePosition), nullptr);
+        markerNode.setProperty("beatPosition", marker.beatPosition, nullptr);
+        warpNode.addChild(markerNode, -1, nullptr);
+    }
+    tree.addChild(warpNode, -1, nullptr);
 
     juce::ValueTree transientNode("TransientMarkers");
     for (const auto sample : transientEditSamples)
@@ -2680,7 +2591,7 @@ SampleModePersistentState SampleModePersistentState::fromValueTree(const juce::V
 
     persistentState.samplePath = state.getProperty("samplePath").toString();
     persistentState.visibleSliceBankIndex = juce::jmax(0, static_cast<int>(state.getProperty("visibleSliceBankIndex", 0)));
-    persistentState.sliceMode = sampleSliceModeFromString(state.getProperty("sliceMode", "uniform").toString());
+    persistentState.sliceMode = sampleSliceModeFromString(state.getProperty("sliceMode", "transient").toString());
     persistentState.triggerMode = sampleTriggerModeFromString(state.getProperty("triggerMode", "oneshot").toString());
     persistentState.useLegacyLoopEngine = static_cast<bool>(state.getProperty("useLegacyLoopEngine", false));
     persistentState.legacyLoopBarSelection = static_cast<int>(state.getProperty("legacyLoopBarSelection", 0));
@@ -2693,6 +2604,7 @@ SampleModePersistentState SampleModePersistentState::fromValueTree(const juce::V
     persistentState.analyzedPitchMidi = static_cast<int>(state.getProperty("analyzedPitchMidi", -1));
     persistentState.essentiaUsed = static_cast<bool>(state.getProperty("essentiaUsed", false));
     persistentState.analysisSource = state.getProperty("analysisSource").toString();
+    persistentState.transientMarkersEdited = static_cast<bool>(state.getProperty("transientMarkersEdited", false));
 
     if (auto cuesNode = state.getChildWithName("CuePoints"); cuesNode.isValid())
     {
@@ -2708,6 +2620,21 @@ SampleModePersistentState SampleModePersistentState::fromValueTree(const juce::V
             cue.loopEnabled = static_cast<bool>(cueNode.getProperty("loopEnabled", false));
             cue.loopEndSample = static_cast<int64_t>(static_cast<juce::int64>(cueNode.getProperty("loopEndSample", cue.samplePosition)));
             persistentState.cuePoints.push_back(std::move(cue));
+        }
+    }
+
+    if (auto warpNode = state.getChildWithName("WarpMarkers"); warpNode.isValid())
+    {
+        for (auto markerNode : warpNode)
+        {
+            if (!markerNode.hasType("WarpMarker"))
+                continue;
+
+            SampleWarpMarker marker;
+            marker.id = static_cast<int>(markerNode.getProperty("id", -1));
+            marker.samplePosition = static_cast<int64_t>(static_cast<juce::int64>(markerNode.getProperty("samplePosition", 0)));
+            marker.beatPosition = static_cast<double>(markerNode.getProperty("beatPosition", 0.0));
+            persistentState.warpMarkers.push_back(std::move(marker));
         }
     }
 
@@ -2762,6 +2689,7 @@ std::unique_ptr<juce::XmlElement> SampleModePersistentState::createXml(const juc
     xml->setAttribute("analyzedPitchMidi", analyzedPitchMidi);
     xml->setAttribute("essentiaUsed", essentiaUsed);
     xml->setAttribute("analysisSource", analysisSource);
+    xml->setAttribute("transientMarkersEdited", transientMarkersEdited);
 
     for (const auto& cue : cuePoints)
     {
@@ -2771,6 +2699,15 @@ std::unique_ptr<juce::XmlElement> SampleModePersistentState::createXml(const juc
         cueXml->setAttribute("name", cue.name);
         cueXml->setAttribute("loopEnabled", cue.loopEnabled);
         cueXml->setAttribute("loopEndSample", juce::String(static_cast<juce::int64>(cue.loopEndSample)));
+    }
+
+    auto* warpXml = xml->createNewChildElement("WarpMarkers");
+    for (const auto& marker : warpMarkers)
+    {
+        auto* markerXml = warpXml->createNewChildElement("WarpMarker");
+        markerXml->setAttribute("id", marker.id);
+        markerXml->setAttribute("samplePosition", juce::String(static_cast<juce::int64>(marker.samplePosition)));
+        markerXml->setAttribute("beatPosition", marker.beatPosition);
     }
 
     auto* transientXml = xml->createNewChildElement("TransientMarkers");
@@ -2992,9 +2929,6 @@ std::vector<SampleSlice> SliceModel::buildTransientSlices(const LoadedSampleData
     if (transientSamples.empty())
         return buildUniformSlices(sampleData, SliceModel::VisibleSliceCount);
 
-    const int64_t minGapSamples = static_cast<int64_t>(juce::jmax(64.0,
-        std::round(sampleData.sourceSampleRate * 0.015)));
-
     std::vector<int64_t> starts;
     starts.reserve(transientSamples.size());
     for (auto samplePosition : transientSamples)
@@ -3002,7 +2936,7 @@ std::vector<SampleSlice> SliceModel::buildTransientSlices(const LoadedSampleData
         if (samplePosition < 0 || samplePosition >= sampleData.sourceLengthSamples)
             continue;
 
-        if (!starts.empty() && (samplePosition - starts.back()) < minGapSamples)
+        if (!starts.empty() && samplePosition <= starts.back())
             continue;
 
         starts.push_back(samplePosition);
@@ -3105,44 +3039,39 @@ void SampleAnalysisEngine::enrichAnalysisForFile(const juce::File& file,
                                                  ProgressCallback progressCallback) const
 {
     juce::ignoreUnused(file);
-    if (progressCallback)
-        progressCallback(0.62f, "Analyzing transients...");
-    const auto internalSummary = buildInternalAnalysis(sampleData);
-
     juce::String essentiaFailureReason;
     if (progressCallback)
-        progressCallback(0.70f, "Preparing Essentia...");
+        progressCallback(0.62f, "Preparing Essentia...");
 
     if (progressCallback)
     {
-        progressCallback(0.76f,
-                         pitchProfile == SamplePitchAnalysisProfile::Polyphonic
-                             ? "Essentia key..."
-                             :
+        const char* progressLabel = "Essentia pitch...";
+        if (pitchProfile == SamplePitchAnalysisProfile::Polyphonic)
+            progressLabel = "Essentia key...";
 #if MLRVST_ENABLE_LIBPYIN
-                               "pYIN pitch..."
-#else
-                               "Essentia pitch..."
+        else
+            progressLabel = "pYIN pitch...";
 #endif
-                               );
+        progressCallback(0.70f, progressLabel);
     }
+
+    std::optional<SampleAnalysisSummary> essentiaSummary;
 #if MLRVST_ENABLE_ESSENTIA_NATIVE
-    if (const auto essentiaSummary = runEssentiaAnalysis(sampleData, pitchProfile, &essentiaFailureReason))
-#else
-    std::optional<juce::File> essentiaInputFile = createEssentiaAnalysisWaveFile(sampleData, &essentiaFailureReason);
-    if (essentiaInputFile)
-    {
-        if (const auto essentiaSummary = runEssentiaAnalysis(*essentiaInputFile, pitchProfile, &essentiaFailureReason))
+    essentiaSummary = runEssentiaAnalysis(sampleData, pitchProfile, &essentiaFailureReason);
 #endif
+
+    if (progressCallback)
+        progressCallback(0.82f, "Analyzing transients...");
+    const auto internalSummary = buildInternalAnalysis(sampleData);
+
+    if (essentiaSummary)
     {
         sampleData.analysis = internalSummary;
         sampleData.analysis.essentiaUsed = true;
-        sampleData.analysis.beatTickSamples = buildWholeFileDriftCorrectedBeatTicks(
-            essentiaSummary->beatTickSamples,
-            internalSummary.transientSamples,
-            sampleData.sourceLengthSamples);
+        sampleData.analysis.beatTickSamples = sanitizeBeatTickSamples(essentiaSummary->beatTickSamples,
+                                                                      sampleData.sourceLengthSamples);
         if (progressCallback)
-            progressCallback(0.9f, "Snapping loop-style transients...");
+            progressCallback(0.9f, "Finalizing Essentia ticks...");
 
         if (essentiaSummary->estimatedTempoBpm > 0.0)
             sampleData.analysis.estimatedTempoBpm = essentiaSummary->estimatedTempoBpm;
@@ -3152,13 +3081,13 @@ void SampleAnalysisEngine::enrichAnalysisForFile(const juce::File& file,
             sampleData.analysis.estimatedPitchHz = essentiaSummary->estimatedPitchHz;
             sampleData.analysis.estimatedPitchMidi = essentiaSummary->estimatedPitchMidi;
             sampleData.analysis.analysisSource = sampleData.analysis.estimatedTempoBpm > 0.0
-                ? essentiaSummary->analysisSource + " + drift-corrected ticks + internal transients"
+                ? essentiaSummary->analysisSource + " + native ticks + internal transients"
                 : "essentia native pitch + internal transients";
         }
         else
         {
             sampleData.analysis.analysisSource = sampleData.analysis.estimatedTempoBpm > 0.0
-                ? essentiaSummary->analysisSource + " + drift-corrected ticks + internal pitch/transients"
+                ? essentiaSummary->analysisSource + " + native ticks + internal pitch/transients"
                 : "ES pitch unresolved";
         }
 
@@ -3169,16 +3098,8 @@ void SampleAnalysisEngine::enrichAnalysisForFile(const juce::File& file,
             sampleData.analysis.estimatedPitchHz = internalSummary.estimatedPitchHz;
             sampleData.analysis.estimatedPitchMidi = internalSummary.estimatedPitchMidi;
         }
-#if !MLRVST_ENABLE_ESSENTIA_NATIVE
-        essentiaInputFile->deleteFile();
-#endif
         return;
     }
-
-#if !MLRVST_ENABLE_ESSENTIA_NATIVE
-    if (essentiaInputFile)
-        essentiaInputFile->deleteFile();
-#endif
 
     if (progressCallback)
         progressCallback(0.86f, "Internal analysis fallback...");
@@ -3192,23 +3113,15 @@ void SampleAnalysisEngine::enrichAnalysisForFile(const juce::File& file,
 std::vector<SampleSlice> SampleAnalysisEngine::buildSlicesForState(const LoadedSampleData& sampleData,
                                                                    const SampleModePersistentState& state) const
 {
-    if (!state.storedSlices.empty())
-    {
-        auto slices = state.storedSlices;
-        for (size_t i = 0; i < slices.size(); ++i)
-            fillSliceMetadata(slices[i], static_cast<int>(i), sampleData.sourceLengthSamples);
-        return slices;
-    }
-
     switch (state.sliceMode)
     {
         case SampleSliceMode::Manual:
             return SliceModel::buildManualSlices(sampleData, state.cuePoints);
         case SampleSliceMode::Transient:
             return SliceModel::buildTransientSlices(sampleData,
-                                                    state.transientEditSamples.empty()
-                                                        ? sampleData.analysis.transientSamples
-                                                        : state.transientEditSamples);
+                                                    buildCanonicalTransientMarkerSamples(sampleData,
+                                                                                         state.transientEditSamples,
+                                                                                         state.transientMarkersEdited));
         case SampleSliceMode::Beat:
             return SliceModel::buildBeatSlices(sampleData,
                                                state.analyzedTempoBpm > 0.0
@@ -3503,7 +3416,9 @@ bool SampleModeEngine::loadSampleFromBuffer(const juce::AudioBuffer<float>& buff
         resetSampleSpecificStateLocked();
         loadedSample = std::move(sample);
         persistentState.samplePath = sourcePath;
+        invalidateTransientMarkerCachesLocked();
         rebuildSlicesLocked();
+        [[maybe_unused]] const auto warmedCanonicalMarkers = buildCanonicalTransientMarkerSamplesLocked();
         sliceModel.setVisibleBankIndex(persistentState.visibleSliceBankIndex);
         clearRandomVisibleSliceOverrideLocked();
         isLoading = false;
@@ -3518,6 +3433,7 @@ bool SampleModeEngine::loadSampleFromBuffer(const juce::AudioBuffer<float>& buff
 
     stop(true);
     clearPendingVisibleSlice();
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
     return true;
 }
@@ -3534,12 +3450,6 @@ int SampleModeEngine::loadSampleAsync(const juce::File& file)
         isLoading = true;
         analysisProgress = 0.05f;
         statusText = "Loading " + file.getFileName() + "...";
-        persistentState.samplePath = file.getFullPathName();
-        persistentState.analyzedTempoBpm = 0.0;
-        persistentState.analyzedPitchHz = 0.0;
-        persistentState.analyzedPitchMidi = -1;
-        persistentState.essentiaUsed = false;
-        persistentState.analysisSource.clear();
         activeRequestId = fileManager.loadFileAsync(file,
             [weakThis](SampleFileManager::LoadResult result) mutable
             {
@@ -3568,6 +3478,8 @@ void SampleModeEngine::clear()
         sliceModel.clear();
         persistentState = {};
         clearRandomVisibleSliceOverrideLocked();
+        clearSliceEditUndoHistoryLocked();
+        invalidateTransientMarkerCachesLocked();
         legacyLoopWindowStartSample = -1;
         isLoading = false;
         analysisProgress = 0.0f;
@@ -3582,6 +3494,7 @@ void SampleModeEngine::clear()
     stop();
     clearPendingVisibleSlice();
 
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
 }
 
@@ -3637,10 +3550,30 @@ SampleModeEngine::StateSnapshot SampleModeEngine::getStateSnapshot() const
     const bool hasLegacyWindow = computeLegacyLoopWindowRangeLocked(legacyRangeStartSample, legacyRangeEndSample);
     snapshot.visibleSliceBankIndex = hasLegacyWindow ? 0 : sliceModel.getVisibleBankIndex();
     snapshot.visibleSliceBankCount = hasLegacyWindow ? 0 : sliceModel.getVisibleBankCount();
-    snapshot.canNavigateLeft = hasLegacyWindow ? (legacyRangeStartSample > 0) : sliceModel.canNavigateLeft();
-    snapshot.canNavigateRight = hasLegacyWindow
-        ? (loadedSample != nullptr && legacyRangeEndSample < loadedSample->sourceLengthSamples)
-        : sliceModel.canNavigateRight();
+    if (hasLegacyWindow)
+    {
+        bool canNavigateLeft = (legacyRangeStartSample > 0);
+        bool canNavigateRight = (loadedSample != nullptr && legacyRangeEndSample < loadedSample->sourceLengthSamples);
+
+        if (persistentState.sliceMode == SampleSliceMode::Transient)
+        {
+            const auto localTransientCandidates = buildLegacyLoopWindowTransientMarkerSamplesLocked(legacyRangeStartSample,
+                                                                                                    legacyRangeEndSample);
+            const int pageStart = getLegacyLoopTransientPageStartIndex(legacyLoopTransientPageStartIndex,
+                                                                       static_cast<int>(localTransientCandidates.size()));
+            canNavigateLeft = canNavigateLeft || pageStart > 0;
+            canNavigateRight = canNavigateRight
+                || (pageStart + SliceModel::VisibleSliceCount) < static_cast<int>(localTransientCandidates.size());
+        }
+
+        snapshot.canNavigateLeft = canNavigateLeft;
+        snapshot.canNavigateRight = canNavigateRight;
+    }
+    else
+    {
+        snapshot.canNavigateLeft = sliceModel.canNavigateLeft();
+        snapshot.canNavigateRight = sliceModel.canNavigateRight();
+    }
     const bool useLegacyMonitor = persistentState.useLegacyLoopEngine;
     snapshot.isPlaying = useLegacyMonitor
         ? (legacyLoopPlayingAtomic.load(std::memory_order_acquire) != 0)
@@ -3664,10 +3597,25 @@ SampleModeEngine::StateSnapshot SampleModeEngine::getStateSnapshot() const
     snapshot.estimatedTempoBpm = persistentState.analyzedTempoBpm;
     snapshot.estimatedPitchHz = persistentState.analyzedPitchHz;
     snapshot.estimatedPitchMidi = persistentState.analyzedPitchMidi;
+    snapshot.estimatedScaleIndex = -1;
     snapshot.essentiaUsed = persistentState.essentiaUsed;
     snapshot.analysisSource = persistentState.analysisSource;
     snapshot.cuePoints = persistentState.cuePoints;
-    snapshot.transientMarkers = persistentState.transientEditSamples;
+    snapshot.warpMarkers = loadedSample != nullptr
+        ? sanitizePersistentWarpMarkers(persistentState.warpMarkers, loadedSample->sourceLengthSamples)
+        : persistentState.warpMarkers;
+    if (loadedSample != nullptr && persistentState.sliceMode == SampleSliceMode::Transient)
+    {
+        if (hasLegacyWindow)
+        {
+            snapshot.transientMarkers = buildLegacyLoopWindowTransientMarkerSamplesLocked(legacyRangeStartSample,
+                                                                                          legacyRangeEndSample);
+        }
+        else
+        {
+            snapshot.transientMarkers = buildCanonicalTransientMarkerSamplesLocked();
+        }
+    }
 
     if (loadedSample != nullptr)
     {
@@ -3675,8 +3623,9 @@ SampleModeEngine::StateSnapshot SampleModeEngine::getStateSnapshot() const
         snapshot.displayName = loadedSample->displayName;
         snapshot.sourceSampleRate = loadedSample->sourceSampleRate;
         snapshot.totalSamples = loadedSample->sourceLengthSamples;
+        snapshot.estimatedScaleIndex = loadedSample->analysis.estimatedScaleIndex;
         if (snapshot.transientMarkers.empty())
-            snapshot.transientMarkers = loadedSample->analysis.transientSamples;
+            snapshot.transientMarkers = buildCanonicalTransientMarkerSamplesLocked();
     }
 
     return snapshot;
@@ -3694,7 +3643,19 @@ bool SampleModeEngine::canNavigateVisibleBankLeft() const
     int64_t rangeStartSample = 0;
     int64_t rangeEndSample = 0;
     if (computeLegacyLoopWindowRangeLocked(rangeStartSample, rangeEndSample))
+    {
+        if (persistentState.sliceMode == SampleSliceMode::Transient)
+        {
+            const auto localTransientCandidates = buildLegacyLoopWindowTransientMarkerSamplesLocked(rangeStartSample,
+                                                                                                    rangeEndSample);
+            const int pageStart = getLegacyLoopTransientPageStartIndex(legacyLoopTransientPageStartIndex,
+                                                                       static_cast<int>(localTransientCandidates.size()));
+            if (pageStart > 0)
+                return true;
+        }
+
         return rangeStartSample > 0;
+    }
     return sliceModel.canNavigateLeft();
 }
 
@@ -3704,12 +3665,26 @@ bool SampleModeEngine::canNavigateVisibleBankRight() const
     int64_t rangeStartSample = 0;
     int64_t rangeEndSample = 0;
     if (computeLegacyLoopWindowRangeLocked(rangeStartSample, rangeEndSample))
+    {
+        if (persistentState.sliceMode == SampleSliceMode::Transient)
+        {
+            const auto localTransientCandidates = buildLegacyLoopWindowTransientMarkerSamplesLocked(rangeStartSample,
+                                                                                                    rangeEndSample);
+            const int pageStart = getLegacyLoopTransientPageStartIndex(legacyLoopTransientPageStartIndex,
+                                                                       static_cast<int>(localTransientCandidates.size()));
+            if ((pageStart + SliceModel::VisibleSliceCount) < static_cast<int>(localTransientCandidates.size()))
+                return true;
+        }
+
         return loadedSample != nullptr && rangeEndSample < loadedSample->sourceLengthSamples;
+    }
     return sliceModel.canNavigateRight();
 }
 
 void SampleModeEngine::stepVisibleBank(int delta)
 {
+    bool changed = false;
+    bool renderStateChanged = false;
     {
         const juce::ScopedLock lock(stateLock);
         clearRandomVisibleSliceOverrideLocked();
@@ -3717,55 +3692,86 @@ void SampleModeEngine::stepVisibleBank(int delta)
         int64_t rangeEndSample = 0;
         if (computeLegacyLoopWindowRangeLocked(rangeStartSample, rangeEndSample))
         {
-            bool updatedFromBeatTicks = false;
-            if (loadedSample != nullptr)
+            if (persistentState.sliceMode == SampleSliceMode::Transient)
             {
-                const float beatsForLoop = legacyLoopBarSelectionToBeats(persistentState.legacyLoopBarSelection);
-                const int integerBeatCount = juce::roundToInt(beatsForLoop);
-                const auto beatTicks = sanitizeBeatTickSamples(loadedSample->analysis.beatTickSamples,
-                                                               loadedSample->sourceLengthSamples);
-                if (integerBeatCount > 0
-                    && std::abs(beatsForLoop - static_cast<float>(integerBeatCount)) < 1.0e-4f
-                    && beatTicks.size() >= 2)
+                const auto localTransientCandidates = buildLegacyLoopWindowTransientMarkerSamplesLocked(rangeStartSample,
+                                                                                                        rangeEndSample);
+                const int candidateCount = static_cast<int>(localTransientCandidates.size());
+                const int pageStart = getLegacyLoopTransientPageStartIndex(legacyLoopTransientPageStartIndex,
+                                                                           candidateCount);
+                const int nextPageStart = pageStart + (delta * SliceModel::VisibleSliceCount);
+
+                if (candidateCount > SliceModel::VisibleSliceCount
+                    && nextPageStart >= 0
+                    && nextPageStart < candidateCount)
                 {
-                    const int currentStartIndex = findNearestBeatTickIndex(beatTicks, rangeStartSample);
-                    if (currentStartIndex >= 0)
-                    {
-                        const int requestedIndex = juce::jlimit(0,
-                                                                static_cast<int>(beatTicks.size()) - 1,
-                                                                currentStartIndex + (delta * integerBeatCount));
-                        int64_t alignedStartSample = 0;
-                        int64_t alignedEndSample = 0;
-                        if (computeBeatTickAlignedWindowRange(beatTicks,
-                                                             loadedSample->sourceLengthSamples,
-                                                             beatTicks[static_cast<size_t>(requestedIndex)],
-                                                             integerBeatCount,
-                                                             alignedStartSample,
-                                                             alignedEndSample))
-                        {
-                            legacyLoopWindowStartSample = alignedStartSample;
-                            updatedFromBeatTicks = true;
-                        }
-                    }
+                    legacyLoopTransientPageStartIndex = getLegacyLoopTransientPageStartIndex(nextPageStart, candidateCount);
+                    const int pageNumber = (legacyLoopTransientPageStartIndex / SliceModel::VisibleSliceCount) + 1;
+                    const int pageCount = (candidateCount + SliceModel::VisibleSliceCount - 1) / SliceModel::VisibleSliceCount;
+                    statusText = "Viewing transient page "
+                        + juce::String(pageNumber)
+                        + "/"
+                        + juce::String(juce::jmax(1, pageCount));
+                    changed = true;
+                    renderStateChanged = persistentState.useLegacyLoopEngine;
                 }
             }
 
-            if (!updatedFromBeatTicks)
+            if (!changed)
             {
-                const int64_t windowLength = juce::jmax<int64_t>(1, rangeEndSample - rangeStartSample);
-                const int64_t maxWindowStart = juce::jmax<int64_t>(0, loadedSample != nullptr
-                                                                      ? (loadedSample->sourceLengthSamples - windowLength)
-                                                                      : 0);
-                legacyLoopWindowStartSample = juce::jlimit<int64_t>(0,
-                                                                    maxWindowStart,
-                                                                    rangeStartSample + (static_cast<int64_t>(delta) * windowLength));
-            }
-            legacyLoopWindowManualAnchor = false;
-            fitViewToLegacyLoopWindowLocked();
+                bool updatedFromBeatTicks = false;
+                if (loadedSample != nullptr)
+                {
+                    const float beatsForLoop = legacyLoopBarSelectionToBeats(persistentState.legacyLoopBarSelection);
+                    const int integerBeatCount = juce::roundToInt(beatsForLoop);
+                    const auto beatTicks = sanitizeBeatTickSamples(loadedSample->analysis.beatTickSamples,
+                                                                   loadedSample->sourceLengthSamples);
+                    if (integerBeatCount > 0
+                        && std::abs(beatsForLoop - static_cast<float>(integerBeatCount)) < 1.0e-4f
+                        && beatTicks.size() >= 2)
+                    {
+                        const int currentStartIndex = findNearestBeatTickIndex(beatTicks, rangeStartSample);
+                        if (currentStartIndex >= 0)
+                        {
+                            const int requestedIndex = juce::jlimit(0,
+                                                                    static_cast<int>(beatTicks.size()) - 1,
+                                                                    currentStartIndex + (delta * integerBeatCount));
+                            int64_t alignedStartSample = 0;
+                            int64_t alignedEndSample = 0;
+                            if (computeBeatTickAlignedWindowRange(beatTicks,
+                                                                 loadedSample->sourceLengthSamples,
+                                                                 beatTicks[static_cast<size_t>(requestedIndex)],
+                                                                 integerBeatCount,
+                                                                 alignedStartSample,
+                                                                 alignedEndSample))
+                            {
+                                legacyLoopWindowStartSample = alignedStartSample;
+                                updatedFromBeatTicks = true;
+                            }
+                        }
+                    }
+                }
 
-            const double sr = loadedSample != nullptr ? loadedSample->sourceSampleRate : 0.0;
-            const double seconds = sr > 0.0 ? static_cast<double>(legacyLoopWindowStartSample) / sr : 0.0;
-            statusText = "Viewing MLR window @ " + juce::String(seconds, 2) + "s";
+                if (!updatedFromBeatTicks)
+                {
+                    const int64_t windowLength = juce::jmax<int64_t>(1, rangeEndSample - rangeStartSample);
+                    const int64_t maxWindowStart = juce::jmax<int64_t>(0, loadedSample != nullptr
+                                                                          ? (loadedSample->sourceLengthSamples - windowLength)
+                                                                          : 0);
+                    legacyLoopWindowStartSample = juce::jlimit<int64_t>(0,
+                                                                        maxWindowStart,
+                                                                        rangeStartSample + (static_cast<int64_t>(delta) * windowLength));
+                }
+                legacyLoopWindowManualAnchor = false;
+                legacyLoopTransientPageStartIndex = 0;
+                fitViewToLegacyLoopWindowLocked();
+
+                const double sr = loadedSample != nullptr ? loadedSample->sourceSampleRate : 0.0;
+                const double seconds = sr > 0.0 ? static_cast<double>(legacyLoopWindowStartSample) / sr : 0.0;
+                statusText = "Viewing MLR window @ " + juce::String(seconds, 2) + "s";
+                changed = true;
+                renderStateChanged = persistentState.useLegacyLoopEngine;
+            }
         }
         else
         {
@@ -3775,10 +3781,16 @@ void SampleModeEngine::stepVisibleBank(int delta)
                 ? ("Viewing slice bank " + juce::String(sliceModel.getVisibleBankIndex() + 1)
                    + "/" + juce::String(juce::jmax(1, sliceModel.getVisibleBankCount())))
                 : juce::String("No sample loaded");
+            changed = true;
+            renderStateChanged = persistentState.useLegacyLoopEngine;
         }
     }
 
-    sendChangeMessage();
+    if (changed && renderStateChanged)
+        notifyLegacyLoopRenderStateChanged();
+
+    if (changed)
+        sendChangeMessage();
 }
 
 void SampleModeEngine::randomizeVisibleBank()
@@ -3786,6 +3798,9 @@ void SampleModeEngine::randomizeVisibleBank()
     bool changed = false;
     {
         const juce::ScopedLock lock(stateLock);
+        if (persistentState.useLegacyLoopEngine)
+            return;
+
         const auto& allSlices = sliceModel.getAllSlices();
         if (allSlices.empty())
             return;
@@ -3802,7 +3817,10 @@ void SampleModeEngine::randomizeVisibleBank()
     }
 
     if (changed)
+    {
+        notifyLegacyLoopRenderStateChanged();
         sendChangeMessage();
+    }
 }
 
 bool SampleModeEngine::hasVisibleSlice(int visibleSlot) const
@@ -3830,17 +3848,22 @@ bool SampleModeEngine::getLegacyLoopSyncInfo(LegacyLoopSyncInfo& syncInfo) const
         : loadedSample->analysis.estimatedTempoBpm;
     int64_t rangeStartSample = 0;
     int64_t rangeEndSample = 0;
-    syncInfo.visibleBankIndex = (randomVisibleSliceOverrideActive || computeLegacyLoopWindowRangeLocked(rangeStartSample, rangeEndSample))
+    const bool hasLegacyWindow = computeLegacyLoopWindowRangeLocked(rangeStartSample, rangeEndSample);
+    syncInfo.visibleBankIndex = (randomVisibleSliceOverrideActive || hasLegacyWindow)
         ? -1
         : sliceModel.getVisibleBankIndex();
+    if (hasLegacyWindow)
+    {
+        syncInfo.bankStartSample = rangeStartSample;
+        syncInfo.bankEndSample = rangeEndSample;
+    }
     syncInfo.legacyLoopBarSelection = persistentState.legacyLoopBarSelection;
     syncInfo.sliceMode = persistentState.sliceMode;
+    syncInfo.warpMarkers = persistentState.warpMarkers;
     switch (persistentState.sliceMode)
     {
         case SampleSliceMode::Transient:
-            syncInfo.markerSamples = persistentState.transientEditSamples.empty()
-                ? loadedSample->analysis.transientSamples
-                : persistentState.transientEditSamples;
+            syncInfo.markerSamples = buildCanonicalTransientMarkerSamplesLocked();
             break;
         case SampleSliceMode::Manual:
             syncInfo.markerSamples.reserve(persistentState.cuePoints.size());
@@ -3897,16 +3920,18 @@ bool SampleModeEngine::resolveLegacyLoopTriggerSyncInfo(int preferredVisibleSlot
         syncInfo.visibleSlices = buildLegacyLoopWindowVisibleSlicesLocked(legacyRangeStartSample, legacyRangeEndSample);
         syncInfo.visibleBankIndex = -1;
         syncInfo.triggerVisibleSlot = clampedSlot;
+        syncInfo.bankStartSample = legacyRangeStartSample;
+        syncInfo.bankEndSample = legacyRangeEndSample;
         syncInfo.analyzedTempoBpm = persistentState.analyzedTempoBpm > 0.0
             ? persistentState.analyzedTempoBpm
             : loadedSample->analysis.estimatedTempoBpm;
         syncInfo.legacyLoopBarSelection = persistentState.legacyLoopBarSelection;
         syncInfo.sliceMode = persistentState.sliceMode;
+        syncInfo.warpMarkers = persistentState.warpMarkers;
         if (persistentState.sliceMode == SampleSliceMode::Transient)
         {
-            syncInfo.markerSamples = persistentState.transientEditSamples.empty()
-                ? loadedSample->analysis.transientSamples
-                : persistentState.transientEditSamples;
+            syncInfo.markerSamples = buildLegacyLoopWindowTransientMarkerSamplesLocked(legacyRangeStartSample,
+                                                                                       legacyRangeEndSample);
         }
         else if (persistentState.sliceMode == SampleSliceMode::Manual)
         {
@@ -3945,6 +3970,7 @@ bool SampleModeEngine::resolveLegacyLoopTriggerSyncInfo(int preferredVisibleSlot
             : loadedSample->analysis.estimatedTempoBpm;
         syncInfo.legacyLoopBarSelection = persistentState.legacyLoopBarSelection;
         syncInfo.sliceMode = persistentState.sliceMode;
+        syncInfo.warpMarkers = persistentState.warpMarkers;
         syncInfo.markerSamples.reserve(syncInfo.visibleSlices.size());
         for (const auto& slice : syncInfo.visibleSlices)
         {
@@ -4042,6 +4068,11 @@ int SampleModeEngine::getPendingVisibleSliceSlot() const noexcept
     return pendingVisibleSliceSlot.load(std::memory_order_acquire);
 }
 
+uint64_t SampleModeEngine::getLegacyLoopRenderStateVersion() const noexcept
+{
+    return legacyLoopRenderStateVersion.load(std::memory_order_acquire);
+}
+
 void SampleModeEngine::setPendingVisibleSlice(int visibleSlot)
 {
     const int clampedSlot = juce::jlimit(0, SliceModel::VisibleSliceCount - 1, visibleSlot);
@@ -4073,15 +4104,20 @@ void SampleModeEngine::requestKeyLockRenderCache(float playbackRate,
     return;
 #else
     const auto sanitizedBackend = sanitizeTimeStretchBackend(static_cast<int>(backend));
+    bool clearActiveVoiceCaches = false;
+    bool shouldReturnAfterUnlock = false;
     if (sanitizedBackend == TimeStretchBackend::Resample
         || !isTimeStretchBackendAvailable(sanitizedBackend))
     {
-        const juce::ScopedLock lock(stateLock);
-        keyLockCacheEnabled = false;
-        keyLockCaches.clear();
-        keyLockCacheBuildInFlight = false;
-        ++keyLockCacheGeneration;
-        return;
+        {
+            const juce::ScopedLock lock(stateLock);
+            keyLockCacheEnabled = false;
+            keyLockCaches.clear();
+            keyLockCacheBuildInFlight = false;
+            ++keyLockCacheGeneration;
+        }
+        clearActiveVoiceCaches = true;
+        shouldReturnAfterUnlock = true;
     }
 
     juce::WeakReference<SampleModeEngine> weakThis(this);
@@ -4092,43 +4128,66 @@ void SampleModeEngine::requestKeyLockRenderCache(float playbackRate,
     float quantizedRate = quantizeKeyLockRate(playbackRate);
     float quantizedPitch = quantizeKeyLockPitch(pitchSemitones);
 
+    if (!shouldReturnAfterUnlock)
     {
         const juce::ScopedLock lock(stateLock);
+        const bool backendChanged = keyLockCacheBackend != sanitizedBackend;
         keyLockCacheEnabled = enabled;
         keyLockCacheBackend = sanitizedBackend;
+        clearActiveVoiceCaches = clearActiveVoiceCaches || backendChanged;
 
         if (!enabled || loadedSample == nullptr)
         {
             keyLockCaches.clear();
             keyLockCacheBuildInFlight = false;
             ++keyLockCacheGeneration;
-            return;
+            clearActiveVoiceCaches = true;
+            shouldReturnAfterUnlock = true;
         }
 
-        if (std::abs(quantizedRate - 1.0f) <= kKeyLockCacheRateTolerance
+        if (!shouldReturnAfterUnlock
+            && std::abs(quantizedRate - 1.0f) <= kKeyLockCacheRateTolerance
             && std::abs(quantizedPitch) <= kKeyLockCachePitchTolerance)
         {
             keyLockCaches.clear();
             keyLockCacheBuildInFlight = false;
             ++keyLockCacheGeneration;
-            return;
+            clearActiveVoiceCaches = true;
+            shouldReturnAfterUnlock = true;
         }
 
-        const int currentBankIndex = randomVisibleSliceOverrideActive ? -1 : sliceModel.getVisibleBankIndex();
-        const bool matchesExisting = !keyLockCaches.empty()
-            && currentBankIndex == keyLockCacheVisibleBankIndex
-            && std::abs(keyLockCachePlaybackRate - quantizedRate) <= kKeyLockCacheRateTolerance
-            && std::abs(keyLockCachePitchSemitones - quantizedPitch) <= kKeyLockCachePitchTolerance
-            && keyLockCacheBackend == sanitizedBackend;
-        if (matchesExisting || keyLockCacheBuildInFlight)
-            return;
-
-        sampleData = loadedSample;
-        visibleSlices = getCurrentVisibleSlicesLocked();
-        visibleBankIndex = currentBankIndex;
-        keyLockCacheBuildInFlight = true;
-        generation = ++keyLockCacheGeneration;
+        if (!shouldReturnAfterUnlock)
+        {
+            const int currentBankIndex = randomVisibleSliceOverrideActive ? -1 : sliceModel.getVisibleBankIndex();
+            const bool matchesExisting = !keyLockCaches.empty()
+                && currentBankIndex == keyLockCacheVisibleBankIndex
+                && std::abs(keyLockCachePlaybackRate - quantizedRate) <= kKeyLockCacheRateTolerance
+                && std::abs(keyLockCachePitchSemitones - quantizedPitch) <= kKeyLockCachePitchTolerance
+                && keyLockCacheBackend == sanitizedBackend;
+            if (matchesExisting || keyLockCacheBuildInFlight)
+            {
+                shouldReturnAfterUnlock = true;
+            }
+            else
+            {
+                sampleData = loadedSample;
+                visibleSlices = getCurrentVisibleSlicesLocked();
+                visibleBankIndex = currentBankIndex;
+                keyLockCacheBuildInFlight = true;
+                generation = ++keyLockCacheGeneration;
+            }
+        }
     }
+
+    if (clearActiveVoiceCaches)
+    {
+        const juce::SpinLock::ScopedLockType playbackScopedLock(playbackLock);
+        for (auto& voice : playbackVoices)
+            voice.clearStretchedBuffer();
+    }
+
+    if (shouldReturnAfterUnlock)
+        return;
 
     class KeyLockCacheJob : public juce::ThreadPoolJob
     {
@@ -4456,7 +4515,8 @@ SampleModeEngine::RenderResult SampleModeEngine::renderToBuffer(juce::AudioBuffe
     {
         for (const auto& cache : availableKeyLockCaches)
         {
-            if (cache != nullptr && matchesKeyLockRequest(*cache, slice, playbackRate, pitchSemitones))
+            if (cache != nullptr
+                && matchesKeyLockRequest(*cache, slice, playbackRate, pitchSemitones, activeKeyLockBackend))
                 return cache;
         }
         return {};
@@ -4474,7 +4534,11 @@ SampleModeEngine::RenderResult SampleModeEngine::renderToBuffer(juce::AudioBuffe
 
             const auto existing = voice.getStretchedBuffer();
             const bool hasMatchingExisting = existing != nullptr
-                && matchesKeyLockRequest(*existing, voice.getActiveSlice(), playbackRate, pitchSemitones);
+                && matchesKeyLockRequest(*existing,
+                                         voice.getActiveSlice(),
+                                         playbackRate,
+                                         pitchSemitones,
+                                         activeKeyLockBackend);
             if (hasMatchingExisting)
                 continue;
 
@@ -4497,7 +4561,11 @@ SampleModeEngine::RenderResult SampleModeEngine::renderToBuffer(juce::AudioBuffe
 
                 const auto existing = voice.getStretchedBuffer();
                 const bool hasMatchingExisting = existing != nullptr
-                    && matchesKeyLockRequest(*existing, voice.getActiveSlice(), playbackRate, pitchSemitones);
+                    && matchesKeyLockRequest(*existing,
+                                             voice.getActiveSlice(),
+                                             playbackRate,
+                                             pitchSemitones,
+                                             activeKeyLockBackend);
                 if (!hasMatchingExisting)
                 {
                     if (deferHotSwapForBackend && existing != nullptr)
@@ -4650,12 +4718,79 @@ void SampleModeEngine::setLoadStatusCallback(LoadStatusCallback callback)
     loadStatusCallback = std::move(callback);
 }
 
+void SampleModeEngine::setLegacyLoopRenderStateChangedCallback(LegacyLoopRenderStateChangedCallback callback)
+{
+    const juce::ScopedLock lock(stateLock);
+    legacyLoopRenderStateChangedCallback = std::move(callback);
+}
+
+void SampleModeEngine::beginInteractiveLegacyLoopEdit()
+{
+    const juce::ScopedLock lock(stateLock);
+    interactiveLegacyLoopEditActive = true;
+    interactiveLegacyLoopEditDirty = false;
+}
+
+void SampleModeEngine::endInteractiveLegacyLoopEdit()
+{
+    bool shouldNotify = false;
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (!interactiveLegacyLoopEditActive)
+            return;
+
+        interactiveLegacyLoopEditActive = false;
+        shouldNotify = interactiveLegacyLoopEditDirty;
+        interactiveLegacyLoopEditDirty = false;
+    }
+
+    if (shouldNotify)
+        notifyLegacyLoopRenderStateChanged();
+}
+
+void SampleModeEngine::beginInteractiveWarpEdit()
+{
+    const juce::ScopedLock lock(stateLock);
+    interactiveWarpEditActive = true;
+    interactiveWarpEditDirty = false;
+}
+
+void SampleModeEngine::endInteractiveWarpEdit()
+{
+    bool shouldNotify = false;
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (!interactiveWarpEditActive)
+            return;
+
+        interactiveWarpEditActive = false;
+        shouldNotify = interactiveWarpEditDirty;
+        interactiveWarpEditDirty = false;
+    }
+
+    if (shouldNotify)
+        notifyLegacyLoopRenderStateChanged();
+}
+
+void SampleModeEngine::notifyLegacyLoopRenderStateChanged()
+{
+    LegacyLoopRenderStateChangedCallback callbackToInvoke;
+    legacyLoopRenderStateVersion.fetch_add(1, std::memory_order_acq_rel);
+    {
+        const juce::ScopedLock lock(stateLock);
+        callbackToInvoke = legacyLoopRenderStateChangedCallback;
+    }
+
+    if (callbackToInvoke)
+        callbackToInvoke();
+}
+
 SampleModePersistentState SampleModeEngine::capturePersistentState() const
 {
     const juce::ScopedLock lock(stateLock);
     auto state = persistentState;
     state.visibleSliceBankIndex = sliceModel.getVisibleBankIndex();
-    state.storedSlices = sliceModel.getAllSlices();
+    state.storedSlices.clear();
     if (loadedSample != nullptr)
     {
         state.samplePath = loadedSample->sourcePath;
@@ -4682,14 +4817,28 @@ void SampleModeEngine::applyPersistentState(const SampleModePersistentState& sta
         persistentState.viewScroll = juce::jlimit(0.0f, 1.0f, persistentState.viewScroll);
         persistentState.selectedCueIndex = clampCueSelection(persistentState.selectedCueIndex,
                                                              static_cast<int>(persistentState.cuePoints.size()));
+        persistentState.storedSlices.clear();
+        if (!persistentState.transientMarkersEdited)
+            persistentState.transientEditSamples.clear();
+        invalidateTransientMarkerCachesLocked();
+        if (loadedSample != nullptr)
+        {
+            persistentState.warpMarkers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                                       loadedSample->sourceLengthSamples);
+            if (persistentState.transientMarkersEdited)
+                quantizeTransientEditSamplesToGuidesLocked();
+        }
         clearRandomVisibleSliceOverrideLocked();
         if (loadedSample != nullptr)
         {
             rebuildSlicesLocked();
+            [[maybe_unused]] const auto warmedCanonicalMarkers = buildCanonicalTransientMarkerSamplesLocked();
             sliceModel.setVisibleBankIndex(persistentState.visibleSliceBankIndex);
         }
+        legacyLoopTransientPageStartIndex = 0;
     }
 
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
 }
 
@@ -4700,13 +4849,16 @@ void SampleModeEngine::setSliceMode(SampleSliceMode mode)
         persistentState.sliceMode = mode;
         persistentState.storedSlices.clear();
         clearRandomVisibleSliceOverrideLocked();
+        invalidateLegacyLoopTransientWindowCacheLocked();
         if (mode != SampleSliceMode::Manual)
             persistentState.selectedCueIndex = -1;
         if (mode == SampleSliceMode::Transient)
             materializeTransientMarkersLocked();
+        legacyLoopTransientPageStartIndex = 0;
         rebuildSlicesLocked();
     }
 
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
 }
 
@@ -4738,6 +4890,7 @@ void SampleModeEngine::setLegacyLoopEngineEnabled(bool enabled)
         persistentState.useLegacyLoopEngine = enabled;
         if (enabled)
             clearRandomVisibleSliceOverrideLocked();
+        invalidateLegacyLoopTransientWindowCacheLocked();
         if (enabled && legacyLoopWindowStartSample < 0)
         {
             legacyLoopWindowStartSample = getDefaultLegacyLoopWindowStartSampleLocked();
@@ -4748,11 +4901,13 @@ void SampleModeEngine::setLegacyLoopEngineEnabled(bool enabled)
             legacyLoopWindowStartSample = -1;
             legacyLoopWindowManualAnchor = false;
         }
+        legacyLoopTransientPageStartIndex = 0;
         if (persistentState.legacyLoopBarSelection > 0)
             fitViewToLegacyLoopWindowLocked();
     }
     if (!enabled)
         clearLegacyLoopMonitorState();
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
 }
 
@@ -4768,6 +4923,7 @@ void SampleModeEngine::setLegacyLoopBarSelection(int selection)
         const juce::ScopedLock lock(stateLock);
         if (selection > 0)
             clearRandomVisibleSliceOverrideLocked();
+        invalidateLegacyLoopTransientWindowCacheLocked();
         switch (selection)
         {
             case 25:
@@ -4794,6 +4950,7 @@ void SampleModeEngine::setLegacyLoopBarSelection(int selection)
             legacyLoopWindowStartSample = -1;
             legacyLoopWindowManualAnchor = false;
         }
+        legacyLoopTransientPageStartIndex = 0;
         if (persistentState.legacyLoopBarSelection > 0)
         {
             if (legacyLoopWindowStartSample < 0)
@@ -4804,6 +4961,7 @@ void SampleModeEngine::setLegacyLoopBarSelection(int selection)
             fitViewToLegacyLoopWindowLocked();
         }
     }
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
 }
 
@@ -4819,11 +4977,11 @@ bool SampleModeEngine::nudgeLegacyLoopWindowByAnchorDelta(int delta)
         return false;
 
     bool changed = false;
+    bool shouldNotifyRenderState = false;
     {
         const juce::ScopedLock lock(stateLock);
         if (loadedSample == nullptr
-            || !persistentState.useLegacyLoopEngine
-            || persistentState.legacyLoopBarSelection <= 0)
+            || !persistentState.useLegacyLoopEngine)
         {
             return false;
         }
@@ -4832,35 +4990,132 @@ bool SampleModeEngine::nudgeLegacyLoopWindowByAnchorDelta(int delta)
         if (candidates.empty())
             return false;
 
-        int64_t currentRangeStartSample = 0;
-        int64_t currentRangeEndSample = 0;
-        const bool hasCurrentRange = computeLegacyLoopWindowRangeLocked(currentRangeStartSample, currentRangeEndSample);
-        const int64_t currentAnchor = hasCurrentRange
-            ? currentRangeStartSample
-            : (legacyLoopWindowStartSample >= 0 ? legacyLoopWindowStartSample : candidates.front());
-
-        int currentIndex = findNearestBeatTickIndex(candidates, currentAnchor);
-        if (currentIndex < 0)
-            currentIndex = 0;
-
-        const int targetIndex = juce::jlimit(0,
-                                             static_cast<int>(candidates.size()) - 1,
-                                             currentIndex + delta);
-        const int64_t targetAnchor = candidates[static_cast<size_t>(targetIndex)];
-        if (targetAnchor != legacyLoopWindowStartSample || !legacyLoopWindowManualAnchor)
+        if (persistentState.legacyLoopBarSelection > 0)
         {
-            legacyLoopWindowStartSample = targetAnchor;
-            legacyLoopWindowManualAnchor = true;
-            const double seconds = loadedSample->sourceSampleRate > 0.0
-                ? static_cast<double>(legacyLoopWindowStartSample) / loadedSample->sourceSampleRate
-                : 0.0;
-            statusText = "Viewing MLR selection @ " + juce::String(seconds, 2) + "s";
-            changed = true;
+            int64_t currentRangeStartSample = 0;
+            int64_t currentRangeEndSample = 0;
+            const bool hasCurrentRange = computeLegacyLoopWindowRangeLocked(currentRangeStartSample, currentRangeEndSample);
+            const int64_t currentAnchor = hasCurrentRange
+                ? currentRangeStartSample
+                : (legacyLoopWindowStartSample >= 0 ? legacyLoopWindowStartSample : candidates.front());
+
+            int currentIndex = findNearestBeatTickIndex(candidates, currentAnchor);
+            if (currentIndex < 0)
+                currentIndex = 0;
+
+            const int targetIndex = juce::jlimit(0,
+                                                 static_cast<int>(candidates.size()) - 1,
+                                                 currentIndex + delta);
+            const int64_t targetAnchor = candidates[static_cast<size_t>(targetIndex)];
+            if (targetAnchor != legacyLoopWindowStartSample || !legacyLoopWindowManualAnchor)
+            {
+                legacyLoopWindowStartSample = targetAnchor;
+                legacyLoopWindowManualAnchor = true;
+                legacyLoopTransientPageStartIndex = 0;
+                invalidateLegacyLoopTransientWindowCacheLocked();
+                const double seconds = loadedSample->sourceSampleRate > 0.0
+                    ? static_cast<double>(legacyLoopWindowStartSample) / loadedSample->sourceSampleRate
+                    : 0.0;
+                statusText = "Viewing MLR selection @ " + juce::String(seconds, 2) + "s";
+                changed = true;
+                if (interactiveLegacyLoopEditActive)
+                    interactiveLegacyLoopEditDirty = true;
+                else
+                    shouldNotifyRenderState = true;
+            }
+        }
+        else
+        {
+            const auto& allSlices = sliceModel.getAllSlices();
+            if (allSlices.empty())
+                return false;
+
+            const auto visibleSlices = getCurrentVisibleSlicesLocked();
+            int64_t currentAnchor = -1;
+            for (const auto& slice : visibleSlices)
+            {
+                if (slice.id >= 0 && slice.endSample > slice.startSample)
+                {
+                    currentAnchor = slice.startSample;
+                    break;
+                }
+            }
+
+            if (currentAnchor < 0)
+                currentAnchor = candidates.front();
+
+            int currentIndex = findNearestBeatTickIndex(candidates, currentAnchor);
+            if (currentIndex < 0)
+                currentIndex = 0;
+
+            const int targetIndex = juce::jlimit(0,
+                                                 static_cast<int>(candidates.size()) - 1,
+                                                 currentIndex + delta);
+            const int64_t targetAnchor = candidates[static_cast<size_t>(targetIndex)];
+
+            int targetSliceIndex = 0;
+            int64_t bestDistance = std::numeric_limits<int64_t>::max();
+            for (int sliceIndex = 0; sliceIndex < static_cast<int>(allSlices.size()); ++sliceIndex)
+            {
+                const auto& slice = allSlices[static_cast<size_t>(sliceIndex)];
+                if (slice.id < 0 || slice.endSample <= slice.startSample)
+                    continue;
+
+                const int64_t distance = std::abs(slice.startSample - targetAnchor);
+                if (distance < bestDistance)
+                {
+                    bestDistance = distance;
+                    targetSliceIndex = sliceIndex;
+                    if (distance == 0)
+                        break;
+                }
+            }
+
+            const auto nextVisibleSlices = buildSequentialVisibleSliceSelection(allSlices, targetSliceIndex);
+            bool selectionChanged = !randomVisibleSliceOverrideActive;
+            if (!selectionChanged)
+            {
+                for (int slot = 0; slot < SliceModel::VisibleSliceCount; ++slot)
+                {
+                    const auto& existingSlice = randomVisibleSlices[static_cast<size_t>(slot)];
+                    const auto& nextSlice = nextVisibleSlices[static_cast<size_t>(slot)];
+                    if (existingSlice.id != nextSlice.id
+                        || existingSlice.startSample != nextSlice.startSample
+                        || existingSlice.endSample != nextSlice.endSample)
+                    {
+                        selectionChanged = true;
+                        break;
+                    }
+                }
+            }
+
+            if (selectionChanged)
+            {
+                randomVisibleSlices = nextVisibleSlices;
+                randomVisibleSliceOverrideActive = true;
+                const int64_t displayStartSample = randomVisibleSlices.front().id >= 0
+                    ? randomVisibleSlices.front().startSample
+                    : targetAnchor;
+                const double seconds = loadedSample->sourceSampleRate > 0.0
+                    ? static_cast<double>(displayStartSample) / loadedSample->sourceSampleRate
+                    : 0.0;
+                statusText = "Viewing auto MLR selection @ " + juce::String(seconds, 2) + "s";
+                changed = true;
+                if (interactiveLegacyLoopEditActive)
+                    interactiveLegacyLoopEditDirty = true;
+                else
+                    shouldNotifyRenderState = true;
+            }
         }
     }
 
+    if (shouldNotifyRenderState)
+        notifyLegacyLoopRenderStateChanged();
+
     if (changed)
+    {
         sendChangeMessage();
+    }
     return changed;
 }
 
@@ -4882,6 +5137,7 @@ void SampleModeEngine::scaleAnalyzedTempo(double factor)
             persistentState.analysisSource = "manual tempo";
     }
 
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
 }
 
@@ -4903,6 +5159,7 @@ void SampleModeEngine::setBeatDivision(int division)
         if (persistentState.sliceMode == SampleSliceMode::Beat)
             rebuildSlicesLocked();
     }
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
 }
 
@@ -4949,6 +5206,58 @@ int SampleModeEngine::getSelectedCuePoint() const
     return persistentState.selectedCueIndex;
 }
 
+bool SampleModeEngine::canUndoSliceEdit() const
+{
+    const juce::ScopedLock lock(stateLock);
+    return !sliceEditUndoStack.empty();
+}
+
+void SampleModeEngine::beginSliceEditGesture()
+{
+    const juce::ScopedLock lock(stateLock);
+    sliceEditGestureActive = true;
+    sliceEditGestureUndoCaptured = false;
+}
+
+void SampleModeEngine::endSliceEditGesture()
+{
+    const juce::ScopedLock lock(stateLock);
+    sliceEditGestureActive = false;
+    sliceEditGestureUndoCaptured = false;
+}
+
+bool SampleModeEngine::undoLastSliceEdit()
+{
+    bool changed = false;
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (sliceEditUndoStack.empty())
+            return false;
+
+        const auto state = std::move(sliceEditUndoStack.back());
+        sliceEditUndoStack.pop_back();
+        persistentState.cuePoints = state.cuePoints;
+        persistentState.selectedCueIndex = clampCueSelection(state.selectedCueIndex,
+                                                             static_cast<int>(persistentState.cuePoints.size()));
+        persistentState.transientMarkersEdited = state.transientMarkersEdited;
+        persistentState.transientEditSamples = state.transientEditSamples;
+        persistentState.warpMarkers = loadedSample != nullptr
+            ? sanitizePersistentWarpMarkers(state.warpMarkers, loadedSample->sourceLengthSamples)
+            : state.warpMarkers;
+        invalidateTransientMarkerCachesLocked();
+        persistentState.storedSlices.clear();
+        rebuildSlicesLocked();
+        changed = true;
+    }
+
+    if (!changed)
+        return false;
+
+    notifyLegacyLoopRenderStateChanged();
+    sendChangeMessage();
+    return true;
+}
+
 int SampleModeEngine::createCuePointAtNormalizedPosition(float normalizedPosition)
 {
     int selectedIndex = -1;
@@ -4962,6 +5271,7 @@ int SampleModeEngine::createCuePointAtNormalizedPosition(float normalizedPositio
         if (cueSample <= 0 || cueSample >= loadedSample->sourceLengthSamples)
             return -1;
 
+        pushSliceEditUndoStateLocked();
         SampleCuePoint cue;
         cue.id = static_cast<int>(persistentState.cuePoints.size());
         cue.samplePosition = cueSample;
@@ -4984,6 +5294,7 @@ int SampleModeEngine::createCuePointAtNormalizedPosition(float normalizedPositio
         selectedIndex = persistentState.selectedCueIndex;
     }
 
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
     return selectedIndex;
 }
@@ -5006,6 +5317,10 @@ int SampleModeEngine::moveCuePoint(int cueIndex, float normalizedPosition)
             juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 1),
             static_cast<int64_t>(std::llround(juce::jlimit(0.0f, 1.0f, normalizedPosition)
                                               * static_cast<float>(loadedSample->sourceLengthSamples - 1))));
+        if (persistentState.cuePoints[static_cast<size_t>(cueIndex)].samplePosition == cueSample)
+            return cueIndex;
+
+        pushSliceEditUndoStateLocked();
         persistentState.cuePoints[static_cast<size_t>(cueIndex)].samplePosition = cueSample;
         std::sort(persistentState.cuePoints.begin(), persistentState.cuePoints.end(),
                   [](const SampleCuePoint& a, const SampleCuePoint& b) { return a.samplePosition < b.samplePosition; });
@@ -5023,6 +5338,7 @@ int SampleModeEngine::moveCuePoint(int cueIndex, float normalizedPosition)
             rebuildSlicesLocked();
     }
 
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
     return newIndex;
 }
@@ -5034,6 +5350,7 @@ bool SampleModeEngine::deleteCuePoint(int cueIndex)
         if (cueIndex < 0 || cueIndex >= static_cast<int>(persistentState.cuePoints.size()))
             return false;
 
+        pushSliceEditUndoStateLocked();
         persistentState.cuePoints.erase(persistentState.cuePoints.begin() + cueIndex);
         persistentState.selectedCueIndex = clampCueSelection(cueIndex - 1, static_cast<int>(persistentState.cuePoints.size()));
         persistentState.storedSlices.clear();
@@ -5041,6 +5358,491 @@ bool SampleModeEngine::deleteCuePoint(int cueIndex)
             rebuildSlicesLocked();
     }
 
+    notifyLegacyLoopRenderStateChanged();
+    sendChangeMessage();
+    return true;
+}
+
+int SampleModeEngine::createWarpMarkerAtNormalizedPosition(float normalizedPosition)
+{
+    int newIndex = -1;
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (loadedSample == nullptr || loadedSample->sourceLengthSamples <= 1)
+            return -1;
+
+        const auto beatTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples,
+                                                     loadedSample->sourceLengthSamples);
+        if (beatTicks.size() < 2)
+            return -1;
+
+        const int64_t maxMarkerSample = juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 2);
+        const int64_t samplePosition = juce::jlimit<int64_t>(
+            1,
+            maxMarkerSample,
+            static_cast<int64_t>(std::llround(juce::jlimit(0.0f, 1.0f, normalizedPosition)
+                                              * static_cast<float>(loadedSample->sourceLengthSamples - 1))));
+        const double beatPosition = WarpGrid::computeWarpedBeatPositionForSample(beatTicks,
+                                                                                 persistentState.warpMarkers,
+                                                                                 samplePosition,
+                                                                                 loadedSample->sourceLengthSamples);
+        if (!std::isfinite(beatPosition))
+            return -1;
+
+        persistentState.warpMarkers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                                    loadedSample->sourceLengthSamples);
+        for (size_t i = 0; i < persistentState.warpMarkers.size(); ++i)
+        {
+            const auto& marker = persistentState.warpMarkers[i];
+            if (std::abs(marker.samplePosition - samplePosition) <= kWarpMarkerDuplicateSampleTolerance
+                || std::abs(marker.beatPosition - beatPosition) <= WarpGrid::kMarkerOrderEpsilon)
+            {
+                return static_cast<int>(i);
+            }
+        }
+
+        int nextId = 0;
+        for (const auto& marker : persistentState.warpMarkers)
+            nextId = juce::jmax(nextId, marker.id + 1);
+
+        SampleWarpMarker marker;
+        marker.id = nextId;
+        marker.samplePosition = samplePosition;
+        marker.beatPosition = beatPosition;
+        persistentState.warpMarkers.push_back(marker);
+        persistentState.warpMarkers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                                    loadedSample->sourceLengthSamples);
+        newIndex = findWarpMarkerIndexById(persistentState.warpMarkers, marker.id);
+    }
+
+    notifyLegacyLoopRenderStateChanged();
+    sendChangeMessage();
+    return newIndex;
+}
+
+int SampleModeEngine::createWarpMarkerAtNearestGuide(float normalizedPosition)
+{
+    int newIndex = -1;
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (loadedSample == nullptr || loadedSample->sourceLengthSamples <= 1)
+            return -1;
+
+        const auto beatTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples,
+                                                     loadedSample->sourceLengthSamples);
+        if (beatTicks.size() < 2)
+            return -1;
+
+        const int64_t maxMarkerSample = juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 2);
+        const int64_t targetSamplePosition = juce::jlimit<int64_t>(
+            1,
+            maxMarkerSample,
+            static_cast<int64_t>(std::llround(juce::jlimit(0.0f, 1.0f, normalizedPosition)
+                                              * static_cast<float>(loadedSample->sourceLengthSamples - 1))));
+        const auto transientMarkers = buildCanonicalTransientMarkerSamples(*loadedSample,
+                                                                           persistentState.transientEditSamples,
+                                                                           persistentState.transientMarkersEdited);
+        std::vector<int64_t> clusteredTransientGuides;
+        int64_t loopRangeStartSample = 0;
+        int64_t loopRangeEndSample = 0;
+        if (computeLegacyLoopWindowRangeLocked(loopRangeStartSample, loopRangeEndSample)
+            && targetSamplePosition >= loopRangeStartSample
+            && targetSamplePosition < loopRangeEndSample)
+        {
+            clusteredTransientGuides = clusterWarpMarkerTransientGuides(
+                buildLegacyLoopWindowTransientCandidatesLocked(loopRangeStartSample, loopRangeEndSample),
+                1,
+                maxMarkerSample,
+                loadedSample->sourceSampleRate);
+        }
+
+        if (clusteredTransientGuides.empty())
+        {
+            clusteredTransientGuides = clusterWarpMarkerTransientGuides(transientMarkers,
+                                                                        1,
+                                                                        maxMarkerSample,
+                                                                        loadedSample->sourceSampleRate);
+        }
+
+        const int64_t samplePosition = snapWarpMarkerSampleToGuide(beatTicks,
+                                                                   clusteredTransientGuides,
+                                                                   targetSamplePosition,
+                                                                   1,
+                                                                   maxMarkerSample,
+                                                                   loadedSample->sourceSampleRate);
+        const double beatPosition = WarpGrid::computeWarpedBeatPositionForSample(beatTicks,
+                                                                                 persistentState.warpMarkers,
+                                                                                 samplePosition,
+                                                                                 loadedSample->sourceLengthSamples);
+        if (!std::isfinite(beatPosition))
+            return -1;
+
+        persistentState.warpMarkers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                                    loadedSample->sourceLengthSamples);
+        for (size_t i = 0; i < persistentState.warpMarkers.size(); ++i)
+        {
+            const auto& marker = persistentState.warpMarkers[i];
+            if (std::abs(marker.samplePosition - samplePosition) <= kWarpMarkerDuplicateSampleTolerance
+                || std::abs(marker.beatPosition - beatPosition) <= WarpGrid::kMarkerOrderEpsilon)
+            {
+                return static_cast<int>(i);
+            }
+        }
+
+        int nextId = 0;
+        for (const auto& marker : persistentState.warpMarkers)
+            nextId = juce::jmax(nextId, marker.id + 1);
+
+        SampleWarpMarker marker;
+        marker.id = nextId;
+        marker.samplePosition = samplePosition;
+        marker.beatPosition = beatPosition;
+        persistentState.warpMarkers.push_back(marker);
+        persistentState.warpMarkers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                                    loadedSample->sourceLengthSamples);
+        newIndex = findWarpMarkerIndexById(persistentState.warpMarkers, marker.id);
+    }
+
+    notifyLegacyLoopRenderStateChanged();
+    sendChangeMessage();
+    return newIndex;
+}
+
+int SampleModeEngine::createWarpMarkersFromVisibleTransientClusters()
+{
+    int insertedCount = 0;
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (loadedSample == nullptr || loadedSample->sourceLengthSamples <= 1)
+            return 0;
+
+        const auto beatTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples,
+                                                     loadedSample->sourceLengthSamples);
+        if (beatTicks.size() < 2)
+            return 0;
+
+        const int64_t maxMarkerSample = juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 2);
+        int64_t rangeStartSample = 1;
+        int64_t rangeEndSample = maxMarkerSample + 1;
+        if (!computeLegacyLoopWindowRangeLocked(rangeStartSample, rangeEndSample))
+        {
+            const auto visibleSlices = getCurrentVisibleSlicesLocked();
+            int64_t derivedStartSample = std::numeric_limits<int64_t>::max();
+            int64_t derivedEndSample = 0;
+            for (const auto& slice : visibleSlices)
+            {
+                if (slice.id < 0 || slice.endSample <= slice.startSample)
+                    continue;
+
+                derivedStartSample = juce::jmin(derivedStartSample, slice.startSample);
+                derivedEndSample = juce::jmax(derivedEndSample, slice.endSample);
+            }
+
+            if (derivedStartSample != std::numeric_limits<int64_t>::max() && derivedEndSample > derivedStartSample)
+            {
+                rangeStartSample = derivedStartSample;
+                rangeEndSample = derivedEndSample;
+            }
+        }
+
+        const int64_t candidateLowerBound = juce::jlimit<int64_t>(1, maxMarkerSample, rangeStartSample);
+        const int64_t candidateUpperBound = juce::jlimit<int64_t>(candidateLowerBound,
+                                                                  maxMarkerSample,
+                                                                  juce::jmax<int64_t>(candidateLowerBound, rangeEndSample - 1));
+        if (candidateUpperBound < candidateLowerBound)
+            return 0;
+
+        std::vector<int64_t> transientCandidates;
+        if (computeLegacyLoopWindowRangeLocked(rangeStartSample, rangeEndSample))
+        {
+            transientCandidates = clusterWarpMarkerTransientGuides(
+                buildLegacyLoopWindowTransientCandidatesLocked(rangeStartSample, rangeEndSample),
+                candidateLowerBound,
+                candidateUpperBound,
+                loadedSample->sourceSampleRate);
+        }
+
+        if (transientCandidates.empty())
+        {
+            const auto transientMarkers = buildCanonicalTransientMarkerSamples(*loadedSample,
+                                                                               persistentState.transientEditSamples,
+                                                                               persistentState.transientMarkersEdited);
+            transientCandidates = clusterWarpMarkerTransientGuides(transientMarkers,
+                                                                   candidateLowerBound,
+                                                                   candidateUpperBound,
+                                                                   loadedSample->sourceSampleRate);
+        }
+
+        if (transientCandidates.empty())
+            return 0;
+
+        persistentState.warpMarkers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                                    loadedSample->sourceLengthSamples);
+        const auto baseWarpMarkers = persistentState.warpMarkers;
+        auto updatedWarpMarkers = persistentState.warpMarkers;
+
+        auto alreadyAnchored = [&](int64_t samplePosition, double beatPosition)
+        {
+            for (const auto& marker : updatedWarpMarkers)
+            {
+                if (std::abs(marker.samplePosition - samplePosition) <= kWarpMarkerDuplicateSampleTolerance
+                    || std::abs(marker.beatPosition - beatPosition) <= WarpGrid::kMarkerOrderEpsilon)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        };
+
+        int nextId = 0;
+        for (const auto& marker : updatedWarpMarkers)
+            nextId = juce::jmax(nextId, marker.id + 1);
+
+        for (const auto candidateSample : transientCandidates)
+        {
+            if (insertedCount >= kWarpAutoMarkerMaxInsertions)
+                break;
+
+            if (candidateSample <= 0 || candidateSample >= maxMarkerSample)
+                continue;
+
+            const double beatPosition = WarpGrid::computeWarpedBeatPositionForSample(beatTicks,
+                                                                                     baseWarpMarkers,
+                                                                                     candidateSample,
+                                                                                     loadedSample->sourceLengthSamples);
+            if (!std::isfinite(beatPosition) || alreadyAnchored(candidateSample, beatPosition))
+                continue;
+
+            SampleWarpMarker marker;
+            marker.id = nextId++;
+            marker.samplePosition = candidateSample;
+            marker.beatPosition = beatPosition;
+            updatedWarpMarkers.push_back(marker);
+            ++insertedCount;
+        }
+
+        if (insertedCount <= 0)
+            return 0;
+
+        persistentState.warpMarkers = sanitizePersistentWarpMarkers(updatedWarpMarkers,
+                                                                    loadedSample->sourceLengthSamples);
+    }
+
+    notifyLegacyLoopRenderStateChanged();
+    sendChangeMessage();
+    return insertedCount;
+}
+
+int SampleModeEngine::moveWarpMarker(int markerIndex, float normalizedPosition)
+{
+    int resolvedIndex = -1;
+    bool shouldNotifyRenderState = false;
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (loadedSample == nullptr
+            || markerIndex < 0
+            || markerIndex >= static_cast<int>(persistentState.warpMarkers.size()))
+        {
+            return -1;
+        }
+
+        persistentState.warpMarkers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                                    loadedSample->sourceLengthSamples);
+        if (markerIndex >= static_cast<int>(persistentState.warpMarkers.size()))
+            return -1;
+
+        const auto beatTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples,
+                                                     loadedSample->sourceLengthSamples);
+        if (beatTicks.size() < 2)
+            return -1;
+
+        const auto markerId = persistentState.warpMarkers[static_cast<size_t>(markerIndex)].id;
+        const int64_t lowerBound = (markerIndex > 0)
+            ? (persistentState.warpMarkers[static_cast<size_t>(markerIndex - 1)].samplePosition + 1)
+            : 1;
+        const int64_t maxMarkerSample = juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 2);
+        const int64_t upperBound = (markerIndex + 1 < static_cast<int>(persistentState.warpMarkers.size()))
+            ? (persistentState.warpMarkers[static_cast<size_t>(markerIndex + 1)].samplePosition - 1)
+            : maxMarkerSample;
+        if (upperBound < lowerBound)
+            return markerIndex;
+
+        const int64_t unclampedSamplePosition = juce::jlimit<int64_t>(
+            lowerBound,
+            upperBound,
+            static_cast<int64_t>(std::llround(juce::jlimit(0.0f, 1.0f, normalizedPosition)
+                                              * static_cast<float>(loadedSample->sourceLengthSamples - 1))));
+        const int64_t samplePosition = juce::jlimit<int64_t>(
+            lowerBound,
+            upperBound,
+            clampWarpMarkerSamplePositionByStretchRatio(beatTicks,
+                                                        persistentState.warpMarkers,
+                                                        markerIndex,
+                                                        unclampedSamplePosition,
+                                                        loadedSample->sourceLengthSamples));
+        if (persistentState.warpMarkers[static_cast<size_t>(markerIndex)].samplePosition == samplePosition)
+            return markerIndex;
+
+        persistentState.warpMarkers[static_cast<size_t>(markerIndex)].samplePosition = samplePosition;
+        persistentState.warpMarkers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                                    loadedSample->sourceLengthSamples);
+        resolvedIndex = findWarpMarkerIndexById(persistentState.warpMarkers, markerId);
+        if (interactiveWarpEditActive)
+            interactiveWarpEditDirty = true;
+        else
+            shouldNotifyRenderState = true;
+    }
+
+    if (shouldNotifyRenderState)
+        notifyLegacyLoopRenderStateChanged();
+    sendChangeMessage();
+    return resolvedIndex;
+}
+
+int SampleModeEngine::moveWarpMarkerToNearestGuide(int markerIndex, float normalizedPosition)
+{
+    int resolvedIndex = -1;
+    bool shouldNotifyRenderState = false;
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (loadedSample == nullptr
+            || markerIndex < 0
+            || markerIndex >= static_cast<int>(persistentState.warpMarkers.size()))
+        {
+            return -1;
+        }
+
+        persistentState.warpMarkers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                                    loadedSample->sourceLengthSamples);
+        if (markerIndex >= static_cast<int>(persistentState.warpMarkers.size()))
+            return -1;
+
+        const auto beatTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples,
+                                                     loadedSample->sourceLengthSamples);
+        if (beatTicks.size() < 2)
+            return -1;
+
+        const auto markerId = persistentState.warpMarkers[static_cast<size_t>(markerIndex)].id;
+        const int64_t lowerBound = (markerIndex > 0)
+            ? (persistentState.warpMarkers[static_cast<size_t>(markerIndex - 1)].samplePosition + 1)
+            : 1;
+        const int64_t maxMarkerSample = juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 2);
+        const int64_t upperBound = (markerIndex + 1 < static_cast<int>(persistentState.warpMarkers.size()))
+            ? (persistentState.warpMarkers[static_cast<size_t>(markerIndex + 1)].samplePosition - 1)
+            : maxMarkerSample;
+        if (upperBound < lowerBound)
+            return markerIndex;
+
+        const int64_t unclampedSamplePosition = juce::jlimit<int64_t>(
+            lowerBound,
+            upperBound,
+            static_cast<int64_t>(std::llround(juce::jlimit(0.0f, 1.0f, normalizedPosition)
+                                              * static_cast<float>(loadedSample->sourceLengthSamples - 1))));
+        const auto transientMarkers = buildCanonicalTransientMarkerSamples(*loadedSample,
+                                                                           persistentState.transientEditSamples,
+                                                                           persistentState.transientMarkersEdited);
+        std::vector<int64_t> clusteredTransientGuides;
+        int64_t loopRangeStartSample = 0;
+        int64_t loopRangeEndSample = 0;
+        if (computeLegacyLoopWindowRangeLocked(loopRangeStartSample, loopRangeEndSample)
+            && unclampedSamplePosition >= loopRangeStartSample
+            && unclampedSamplePosition < loopRangeEndSample)
+        {
+            clusteredTransientGuides = clusterWarpMarkerTransientGuides(
+                buildLegacyLoopWindowTransientCandidatesLocked(loopRangeStartSample, loopRangeEndSample),
+                lowerBound,
+                upperBound,
+                loadedSample->sourceSampleRate);
+        }
+
+        if (clusteredTransientGuides.empty())
+        {
+            clusteredTransientGuides = clusterWarpMarkerTransientGuides(transientMarkers,
+                                                                        lowerBound,
+                                                                        upperBound,
+                                                                        loadedSample->sourceSampleRate);
+        }
+
+        const int64_t snappedSamplePosition = snapWarpMarkerSampleToGuide(beatTicks,
+                                                                          clusteredTransientGuides,
+                                                                          unclampedSamplePosition,
+                                                                          lowerBound,
+                                                                          upperBound,
+                                                                          loadedSample->sourceSampleRate);
+        const int64_t samplePosition = juce::jlimit<int64_t>(
+            lowerBound,
+            upperBound,
+            clampWarpMarkerSamplePositionByStretchRatio(beatTicks,
+                                                        persistentState.warpMarkers,
+                                                        markerIndex,
+                                                        snappedSamplePosition,
+                                                        loadedSample->sourceLengthSamples));
+        if (persistentState.warpMarkers[static_cast<size_t>(markerIndex)].samplePosition == samplePosition)
+            return markerIndex;
+
+        persistentState.warpMarkers[static_cast<size_t>(markerIndex)].samplePosition = samplePosition;
+        persistentState.warpMarkers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                                    loadedSample->sourceLengthSamples);
+        resolvedIndex = findWarpMarkerIndexById(persistentState.warpMarkers, markerId);
+        if (interactiveWarpEditActive)
+            interactiveWarpEditDirty = true;
+        else
+            shouldNotifyRenderState = true;
+    }
+
+    if (shouldNotifyRenderState)
+        notifyLegacyLoopRenderStateChanged();
+    sendChangeMessage();
+    return resolvedIndex;
+}
+
+bool SampleModeEngine::clearWarpMarkers()
+{
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (persistentState.warpMarkers.empty())
+            return false;
+
+        persistentState.warpMarkers.clear();
+    }
+
+    notifyLegacyLoopRenderStateChanged();
+    sendChangeMessage();
+    return true;
+}
+
+bool SampleModeEngine::keepBoundaryWarpMarkers()
+{
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (loadedSample == nullptr)
+            return false;
+
+        auto markers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                     loadedSample->sourceLengthSamples);
+        if (markers.size() <= 2)
+            return false;
+
+        persistentState.warpMarkers = { markers.front(), markers.back() };
+    }
+
+    notifyLegacyLoopRenderStateChanged();
+    sendChangeMessage();
+    return true;
+}
+
+bool SampleModeEngine::deleteWarpMarker(int markerIndex)
+{
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (markerIndex < 0 || markerIndex >= static_cast<int>(persistentState.warpMarkers.size()))
+            return false;
+
+        persistentState.warpMarkers.erase(persistentState.warpMarkers.begin() + markerIndex);
+    }
+
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
     return true;
 }
@@ -5050,10 +5852,15 @@ void SampleModeEngine::materializeTransientMarkersLocked()
     if (loadedSample == nullptr)
         return;
 
-    if (!persistentState.transientEditSamples.empty())
+    if (persistentState.transientMarkersEdited)
+    {
+        quantizeTransientEditSamplesToGuidesLocked();
         return;
+    }
 
-    persistentState.transientEditSamples = loadedSample->analysis.transientSamples;
+    persistentState.transientEditSamples = buildCanonicalTransientMarkerSamples(*loadedSample,
+                                                                                {},
+                                                                                false);
     persistentState.transientEditSamples.erase(
         std::remove_if(persistentState.transientEditSamples.begin(),
                        persistentState.transientEditSamples.end(),
@@ -5062,10 +5869,7 @@ void SampleModeEngine::materializeTransientMarkersLocked()
                            return sample <= 0 || sample >= loadedSample->sourceLengthSamples;
                        }),
         persistentState.transientEditSamples.end());
-    std::sort(persistentState.transientEditSamples.begin(), persistentState.transientEditSamples.end());
-    persistentState.transientEditSamples.erase(std::unique(persistentState.transientEditSamples.begin(),
-                                                           persistentState.transientEditSamples.end()),
-                                               persistentState.transientEditSamples.end());
+    persistentState.transientMarkersEdited = false;
 }
 
 void SampleModeEngine::resetSampleSpecificStateLocked()
@@ -5079,11 +5883,306 @@ void SampleModeEngine::resetSampleSpecificStateLocked()
     persistentState.analyzedPitchMidi = -1;
     persistentState.analysisSource.clear();
     persistentState.cuePoints.clear();
+    persistentState.warpMarkers.clear();
+    persistentState.transientMarkersEdited = false;
     persistentState.transientEditSamples.clear();
     persistentState.storedSlices.clear();
     clearRandomVisibleSliceOverrideLocked();
+    invalidateTransientMarkerCachesLocked();
     legacyLoopWindowStartSample = -1;
     legacyLoopWindowManualAnchor = false;
+    legacyLoopTransientPageStartIndex = 0;
+    clearSliceEditUndoHistoryLocked();
+}
+
+void SampleModeEngine::pushSliceEditUndoStateLocked()
+{
+    if (sliceEditGestureActive && sliceEditGestureUndoCaptured)
+        return;
+
+    SliceEditUndoState undoState;
+    undoState.cuePoints = persistentState.cuePoints;
+    undoState.selectedCueIndex = persistentState.selectedCueIndex;
+    undoState.transientMarkersEdited = persistentState.transientMarkersEdited;
+    undoState.transientEditSamples = persistentState.transientEditSamples;
+    undoState.warpMarkers = persistentState.warpMarkers;
+    sliceEditUndoStack.push_back(std::move(undoState));
+    if (sliceEditUndoStack.size() > kMaxSliceEditUndoDepth)
+        sliceEditUndoStack.erase(sliceEditUndoStack.begin());
+
+    if (sliceEditGestureActive)
+        sliceEditGestureUndoCaptured = true;
+}
+
+void SampleModeEngine::clearSliceEditUndoHistoryLocked()
+{
+    sliceEditUndoStack.clear();
+    sliceEditGestureActive = false;
+    sliceEditGestureUndoCaptured = false;
+}
+
+void SampleModeEngine::invalidateCanonicalTransientMarkerCacheLocked()
+{
+    canonicalTransientMarkerCacheValid = false;
+    canonicalTransientMarkerCache.clear();
+}
+
+void SampleModeEngine::invalidateLegacyLoopTransientWindowCacheLocked()
+{
+    legacyLoopTransientWindowCache = {};
+}
+
+void SampleModeEngine::invalidateTransientMarkerCachesLocked()
+{
+    invalidateCanonicalTransientMarkerCacheLocked();
+    invalidateLegacyLoopTransientWindowCacheLocked();
+}
+
+int64_t SampleModeEngine::snapSampleToPpqGridLocked(int64_t samplePosition,
+                                                    double gridStepBeats,
+                                                    int64_t lowerBound,
+                                                    int64_t upperBound) const
+{
+    if (loadedSample == nullptr
+        || !(gridStepBeats > 0.0)
+        || !std::isfinite(gridStepBeats)
+        || upperBound < lowerBound)
+    {
+        return samplePosition;
+    }
+
+    const auto beatTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples,
+                                                 loadedSample->sourceLengthSamples);
+    if (beatTicks.size() < 2)
+        return juce::jlimit(lowerBound, upperBound, samplePosition);
+
+    const double beatPosition = computeBeatTickPosition(beatTicks, samplePosition);
+    if (!std::isfinite(beatPosition))
+        return juce::jlimit(lowerBound, upperBound, samplePosition);
+
+    const double snappedBeat = std::round(beatPosition / gridStepBeats) * gridStepBeats;
+    const int64_t snappedSample = samplePositionFromBeatTickPosition(beatTicks,
+                                                                     snappedBeat,
+                                                                     loadedSample->sourceLengthSamples);
+    return juce::jlimit(lowerBound, upperBound, snappedSample);
+}
+
+bool SampleModeEngine::snapTransientMarkersToPpqGridLocked(double gridStepBeats, bool currentSelectionOnly)
+{
+    if (loadedSample == nullptr
+        || loadedSample->sourceLengthSamples <= 1
+        || !(gridStepBeats > 0.0)
+        || !std::isfinite(gridStepBeats))
+    {
+        return false;
+    }
+
+    const auto beatTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples,
+                                                 loadedSample->sourceLengthSamples);
+    if (beatTicks.size() < 2)
+        return false;
+
+    const auto transientSamples = buildCanonicalTransientMarkerSamplesLocked();
+    if (transientSamples.empty())
+        return false;
+
+    std::vector<int64_t> selectedMarkerSamples;
+    if (currentSelectionOnly)
+    {
+        const auto visibleSlices = getCurrentVisibleSlicesLocked();
+        selectedMarkerSamples.reserve(visibleSlices.size());
+        for (const auto& slice : visibleSlices)
+        {
+            if (slice.id >= 0 && slice.startSample > 0)
+                selectedMarkerSamples.push_back(slice.startSample);
+        }
+
+        std::sort(selectedMarkerSamples.begin(), selectedMarkerSamples.end());
+        selectedMarkerSamples.erase(std::unique(selectedMarkerSamples.begin(), selectedMarkerSamples.end()),
+                                    selectedMarkerSamples.end());
+        if (selectedMarkerSamples.empty())
+            return false;
+    }
+
+    auto updatedWarpMarkers = sanitizePersistentWarpMarkers(persistentState.warpMarkers,
+                                                            loadedSample->sourceLengthSamples);
+    int nextWarpMarkerId = 0;
+    for (const auto& marker : updatedWarpMarkers)
+        nextWarpMarkerId = juce::jmax(nextWarpMarkerId, marker.id + 1);
+
+    const double startBeat = computeWarpBeatPositionFromSample(beatTicks, 0);
+    const double endBeat = computeWarpBeatPositionFromSample(beatTicks,
+                                                             juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 1));
+    if (!std::isfinite(startBeat) || !std::isfinite(endBeat) || endBeat <= startBeat)
+        return false;
+
+    bool changed = false;
+    for (const auto currentSample : transientSamples)
+    {
+        if (currentSelectionOnly
+            && !std::binary_search(selectedMarkerSamples.begin(), selectedMarkerSamples.end(), currentSample))
+        {
+            continue;
+        }
+
+        if (currentSample <= 0 || currentSample >= juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 1))
+            continue;
+
+        updatedWarpMarkers = sanitizePersistentWarpMarkers(updatedWarpMarkers,
+                                                           loadedSample->sourceLengthSamples);
+
+        int existingMarkerIndex = -1;
+        for (int markerIndex = 0; markerIndex < static_cast<int>(updatedWarpMarkers.size()); ++markerIndex)
+        {
+            if (std::abs(updatedWarpMarkers[static_cast<size_t>(markerIndex)].samplePosition - currentSample)
+                <= kWarpMarkerDuplicateSampleTolerance)
+            {
+                existingMarkerIndex = markerIndex;
+                break;
+            }
+        }
+
+        auto orderingMarkers = updatedWarpMarkers;
+        if (existingMarkerIndex >= 0)
+            orderingMarkers.erase(orderingMarkers.begin() + existingMarkerIndex);
+
+        const auto insertIt = std::lower_bound(orderingMarkers.begin(),
+                                               orderingMarkers.end(),
+                                               currentSample,
+                                               [](const SampleWarpMarker& marker, int64_t samplePosition)
+                                               {
+                                                   return marker.samplePosition < samplePosition;
+                                               });
+        const int insertIndex = static_cast<int>(std::distance(orderingMarkers.begin(), insertIt));
+        const double lowerBeatBound = (insertIndex > 0)
+            ? orderingMarkers[static_cast<size_t>(insertIndex - 1)].beatPosition
+            : startBeat;
+        const double upperBeatBound = (insertIndex < static_cast<int>(orderingMarkers.size()))
+            ? orderingMarkers[static_cast<size_t>(insertIndex)].beatPosition
+            : endBeat;
+        const double targetBeatPadding = juce::jmax(1.0e-4, WarpGrid::kMarkerOrderEpsilon * 16.0);
+        if (upperBeatBound <= (lowerBeatBound + (targetBeatPadding * 2.0)))
+            continue;
+
+        const double currentWarpedBeat = WarpGrid::computeWarpedBeatPositionForSample(beatTicks,
+                                                                                      updatedWarpMarkers,
+                                                                                      currentSample,
+                                                                                      loadedSample->sourceLengthSamples);
+        if (!std::isfinite(currentWarpedBeat))
+            continue;
+
+        double snappedBeat = std::round(currentWarpedBeat / gridStepBeats) * gridStepBeats;
+        snappedBeat = juce::jlimit(lowerBeatBound + targetBeatPadding,
+                                   upperBeatBound - targetBeatPadding,
+                                   snappedBeat);
+
+        const double existingBeat = existingMarkerIndex >= 0
+            ? updatedWarpMarkers[static_cast<size_t>(existingMarkerIndex)].beatPosition
+            : currentWarpedBeat;
+        if (std::abs(existingBeat - snappedBeat) <= 1.0e-4)
+            continue;
+
+        if (existingMarkerIndex >= 0)
+        {
+            updatedWarpMarkers[static_cast<size_t>(existingMarkerIndex)].beatPosition = snappedBeat;
+        }
+        else
+        {
+            SampleWarpMarker marker;
+            marker.id = nextWarpMarkerId++;
+            marker.samplePosition = currentSample;
+            marker.beatPosition = snappedBeat;
+            updatedWarpMarkers.push_back(marker);
+        }
+
+        updatedWarpMarkers = sanitizePersistentWarpMarkers(updatedWarpMarkers,
+                                                           loadedSample->sourceLengthSamples);
+        changed = true;
+    }
+
+    if (!changed)
+        return false;
+
+    persistentState.warpMarkers = std::move(updatedWarpMarkers);
+    return true;
+}
+
+bool SampleModeEngine::snapCuePointsToPpqGridLocked(double gridStepBeats, bool currentSelectionOnly)
+{
+    if (loadedSample == nullptr || persistentState.cuePoints.empty())
+        return false;
+
+    std::vector<int64_t> selectedCueSamples;
+    if (currentSelectionOnly)
+    {
+        const auto visibleSlices = getCurrentVisibleSlicesLocked();
+        selectedCueSamples.reserve(visibleSlices.size());
+        for (const auto& slice : visibleSlices)
+        {
+            if (slice.id >= 0 && slice.startSample > 0)
+                selectedCueSamples.push_back(slice.startSample);
+        }
+
+        std::sort(selectedCueSamples.begin(), selectedCueSamples.end());
+        selectedCueSamples.erase(std::unique(selectedCueSamples.begin(), selectedCueSamples.end()),
+                                 selectedCueSamples.end());
+        if (selectedCueSamples.empty())
+            return false;
+    }
+
+    auto snappedCues = persistentState.cuePoints;
+    bool changed = false;
+    const int selectedCueId = (persistentState.selectedCueIndex >= 0
+                               && persistentState.selectedCueIndex < static_cast<int>(persistentState.cuePoints.size()))
+        ? persistentState.cuePoints[static_cast<size_t>(persistentState.selectedCueIndex)].id
+        : -1;
+    for (size_t i = 0; i < snappedCues.size(); ++i)
+    {
+        const auto currentSample = snappedCues[i].samplePosition;
+        if (currentSelectionOnly
+            && !std::binary_search(selectedCueSamples.begin(), selectedCueSamples.end(), currentSample))
+        {
+            continue;
+        }
+
+        const int64_t lowerBound = (i > 0) ? (snappedCues[i - 1].samplePosition + 1) : 1;
+        const int64_t upperBound = (i + 1 < snappedCues.size())
+            ? (snappedCues[i + 1].samplePosition - 1)
+            : juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 1);
+        if (upperBound < lowerBound)
+            continue;
+
+        const int64_t snappedSample = snapSampleToPpqGridLocked(currentSample,
+                                                                gridStepBeats,
+                                                                lowerBound,
+                                                                upperBound);
+        changed = changed || (snappedSample != currentSample);
+        snappedCues[i].samplePosition = snappedSample;
+    }
+
+    if (!changed)
+        return false;
+
+    std::sort(snappedCues.begin(), snappedCues.end(),
+              [](const SampleCuePoint& a, const SampleCuePoint& b) { return a.samplePosition < b.samplePosition; });
+    persistentState.cuePoints = std::move(snappedCues);
+    persistentState.selectedCueIndex = -1;
+    if (selectedCueId >= 0)
+    {
+        for (size_t i = 0; i < persistentState.cuePoints.size(); ++i)
+        {
+            if (persistentState.cuePoints[i].id == selectedCueId)
+            {
+                persistentState.selectedCueIndex = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+    persistentState.selectedCueIndex = clampCueSelection(persistentState.selectedCueIndex,
+                                                         static_cast<int>(persistentState.cuePoints.size()));
+    persistentState.storedSlices.clear();
+    rebuildSlicesLocked();
+    return true;
 }
 
 int SampleModeEngine::createTransientMarkerAtNormalizedPosition(float normalizedPosition)
@@ -5101,14 +6200,22 @@ int SampleModeEngine::createTransientMarkerAtNormalizedPosition(float normalized
         if (markerSample <= 0 || markerSample >= loadedSample->sourceLengthSamples)
             return -1;
 
-        persistentState.transientEditSamples.push_back(markerSample);
+        const int64_t snappedSample = snapTransientMarkerSampleToGuideLocked(markerSample,
+                                                                             1,
+                                                                             loadedSample->sourceLengthSamples - 1,
+                                                                             false);
+        pushSliceEditUndoStateLocked();
+        persistentState.transientEditSamples.push_back(snappedSample);
+        persistentState.transientMarkersEdited = true;
+        invalidateTransientMarkerCachesLocked();
+        quantizeTransientEditSamplesToGuidesLocked();
         std::sort(persistentState.transientEditSamples.begin(), persistentState.transientEditSamples.end());
         persistentState.transientEditSamples.erase(std::unique(persistentState.transientEditSamples.begin(),
                                                                persistentState.transientEditSamples.end()),
                                                    persistentState.transientEditSamples.end());
         auto it = std::find(persistentState.transientEditSamples.begin(),
                             persistentState.transientEditSamples.end(),
-                            markerSample);
+                            snappedSample);
         if (it != persistentState.transientEditSamples.end())
             markerIndex = static_cast<int>(std::distance(persistentState.transientEditSamples.begin(), it));
         persistentState.storedSlices.clear();
@@ -5116,6 +6223,7 @@ int SampleModeEngine::createTransientMarkerAtNormalizedPosition(float normalized
             rebuildSlicesLocked();
     }
 
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
     return markerIndex;
 }
@@ -5138,7 +6246,27 @@ int SampleModeEngine::moveTransientMarker(int markerIndex, float normalizedPosit
             juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 1),
             static_cast<int64_t>(std::llround(juce::jlimit(0.0f, 1.0f, normalizedPosition)
                                               * static_cast<float>(loadedSample->sourceLengthSamples - 1))));
-        persistentState.transientEditSamples[static_cast<size_t>(markerIndex)] = markerSample;
+        const int64_t lowerBound = (markerIndex > 0)
+            ? (persistentState.transientEditSamples[static_cast<size_t>(markerIndex - 1)] + 1)
+            : 1;
+        const int64_t upperBound = (markerIndex + 1 < static_cast<int>(persistentState.transientEditSamples.size()))
+            ? (persistentState.transientEditSamples[static_cast<size_t>(markerIndex + 1)] - 1)
+            : juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 1);
+        if (upperBound < lowerBound)
+            return -1;
+
+        const int64_t snappedSample = snapTransientMarkerSampleToGuideLocked(markerSample,
+                                                                             lowerBound,
+                                                                             upperBound,
+                                                                             false);
+        if (persistentState.transientEditSamples[static_cast<size_t>(markerIndex)] == snappedSample)
+            return markerIndex;
+
+        pushSliceEditUndoStateLocked();
+        persistentState.transientEditSamples[static_cast<size_t>(markerIndex)] = snappedSample;
+        persistentState.transientMarkersEdited = true;
+        invalidateTransientMarkerCachesLocked();
+        quantizeTransientEditSamplesToGuidesLocked();
         persistentState.transientEditSamples.erase(
             std::remove_if(persistentState.transientEditSamples.begin(),
                            persistentState.transientEditSamples.end(),
@@ -5153,7 +6281,7 @@ int SampleModeEngine::moveTransientMarker(int markerIndex, float normalizedPosit
                                                    persistentState.transientEditSamples.end());
         auto it = std::lower_bound(persistentState.transientEditSamples.begin(),
                                    persistentState.transientEditSamples.end(),
-                                   markerSample);
+                                   snappedSample);
         if (it != persistentState.transientEditSamples.end())
             newIndex = static_cast<int>(std::distance(persistentState.transientEditSamples.begin(), it));
         if (newIndex < 0 && !persistentState.transientEditSamples.empty())
@@ -5163,6 +6291,7 @@ int SampleModeEngine::moveTransientMarker(int markerIndex, float normalizedPosit
             rebuildSlicesLocked();
     }
 
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
     return newIndex;
 }
@@ -5196,25 +6325,19 @@ int SampleModeEngine::moveTransientMarkerToNearestDetectedTransient(int markerIn
         if (upperBound <= lowerBound)
             return -1;
 
-        int64_t snappedSample = juce::jlimit(lowerBound, upperBound, targetSample);
-        int64_t bestDistance = std::numeric_limits<int64_t>::max();
-        for (const auto detectedSample : loadedSample->analysis.transientSamples)
-        {
-            if (detectedSample < lowerBound || detectedSample > upperBound)
-                continue;
-
-            const int64_t distance = std::abs(detectedSample - targetSample);
-            if (distance < bestDistance)
-            {
-                bestDistance = distance;
-                snappedSample = detectedSample;
-            }
-        }
+        const int64_t snappedSample = snapTransientMarkerSampleToGuideLocked(targetSample,
+                                                                             lowerBound,
+                                                                             upperBound,
+                                                                             true);
 
         if (persistentState.transientEditSamples[static_cast<size_t>(markerIndex)] == snappedSample)
             return markerIndex;
 
+        pushSliceEditUndoStateLocked();
         persistentState.transientEditSamples[static_cast<size_t>(markerIndex)] = snappedSample;
+        persistentState.transientMarkersEdited = true;
+        invalidateTransientMarkerCachesLocked();
+        quantizeTransientEditSamplesToGuidesLocked();
         std::sort(persistentState.transientEditSamples.begin(), persistentState.transientEditSamples.end());
         persistentState.transientEditSamples.erase(std::unique(persistentState.transientEditSamples.begin(),
                                                                persistentState.transientEditSamples.end()),
@@ -5233,6 +6356,7 @@ int SampleModeEngine::moveTransientMarkerToNearestDetectedTransient(int markerIn
             rebuildSlicesLocked();
     }
 
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
     return newIndex;
 }
@@ -5243,7 +6367,7 @@ int SampleModeEngine::findTransientMarkerIndexForVisibleSlotLocked(int visibleSl
     if (loadedSample == nullptr
         || visibleSlot < 0
         || visibleSlot >= SliceModel::VisibleSliceCount
-        || persistentState.transientEditSamples.empty())
+        )
     {
         return -1;
     }
@@ -5253,39 +6377,109 @@ int SampleModeEngine::findTransientMarkerIndexForVisibleSlotLocked(int visibleSl
     if (slice.id < 0 || slice.endSample <= slice.startSample)
         return -1;
 
-    int markerIndex = -1;
-    int64_t bestMarkerDistance = std::numeric_limits<int64_t>::max();
-    for (int index = 0; index < static_cast<int>(persistentState.transientEditSamples.size()); ++index)
+    const int64_t targetMarkerSample = juce::jlimit<int64_t>(1,
+                                                             loadedSample->sourceLengthSamples - 1,
+                                                             slice.startSample);
+    auto findExactMarkerIndex = [&](const std::vector<int64_t>& markerSamples) -> int
     {
-        const int64_t markerSample = persistentState.transientEditSamples[static_cast<size_t>(index)];
-        const int64_t distance = std::abs(markerSample - slice.startSample);
-        if (distance < bestMarkerDistance)
+        auto it = std::lower_bound(markerSamples.begin(), markerSamples.end(), targetMarkerSample);
+        if (it != markerSamples.end() && *it == targetMarkerSample)
+            return static_cast<int>(std::distance(markerSamples.begin(), it));
+
+        if (it != markerSamples.begin())
         {
-            bestMarkerDistance = distance;
-            markerIndex = index;
-            if (distance == 0)
-                break;
+            const auto previousIt = std::prev(it);
+            if (*previousIt == targetMarkerSample)
+                return static_cast<int>(std::distance(markerSamples.begin(), previousIt));
+        }
+
+        return -1;
+    };
+
+    if (const int markerIndex = findExactMarkerIndex(persistentState.transientEditSamples); markerIndex >= 0)
+        return markerIndex;
+
+    // A stale edited marker set can survive reloads and no longer match the visible slices.
+    // If the current auto-derived markers do match the visible slice, drop the stale override.
+    if (persistentState.transientMarkersEdited)
+    {
+        const auto autoMarkers = buildCanonicalTransientMarkerSamples(*loadedSample, {}, false);
+        if (findExactMarkerIndex(autoMarkers) >= 0)
+        {
+            persistentState.transientMarkersEdited = false;
+            persistentState.transientEditSamples.clear();
+            invalidateTransientMarkerCachesLocked();
+            persistentState.storedSlices.clear();
+            rebuildSlicesLocked();
+            materializeTransientMarkersLocked();
+            return findExactMarkerIndex(persistentState.transientEditSamples);
         }
     }
 
-    return markerIndex;
+    return -1;
+}
+
+int SampleModeEngine::resolveTransientMarkerIndexForVisibleSlot(int visibleSlot)
+{
+    const juce::ScopedLock lock(stateLock);
+    if (loadedSample == nullptr || persistentState.sliceMode != SampleSliceMode::Transient)
+        return -1;
+
+    return findTransientMarkerIndexForVisibleSlotLocked(visibleSlot);
 }
 
 bool SampleModeEngine::moveVisibleSliceToPosition(int visibleSlot, float normalizedPosition)
 {
-    int markerIndex = -1;
+    bool moved = false;
     {
         const juce::ScopedLock lock(stateLock);
         if (loadedSample == nullptr || persistentState.sliceMode != SampleSliceMode::Transient)
             return false;
 
-        markerIndex = findTransientMarkerIndexForVisibleSlotLocked(visibleSlot);
+        const int markerIndex = findTransientMarkerIndexForVisibleSlotLocked(visibleSlot);
+        if (markerIndex < 0
+            || markerIndex >= static_cast<int>(persistentState.transientEditSamples.size()))
+        {
+            return false;
+        }
+
+        const int64_t targetSample = juce::jlimit<int64_t>(
+            1,
+            juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 1),
+            static_cast<int64_t>(std::llround(juce::jlimit(0.0f, 1.0f, normalizedPosition)
+                                              * static_cast<float>(loadedSample->sourceLengthSamples - 1))));
+        const int64_t lowerBound = (markerIndex > 0)
+            ? (persistentState.transientEditSamples[static_cast<size_t>(markerIndex - 1)] + 1)
+            : 1;
+        const int64_t upperBound = (markerIndex + 1 < static_cast<int>(persistentState.transientEditSamples.size()))
+            ? (persistentState.transientEditSamples[static_cast<size_t>(markerIndex + 1)] - 1)
+            : juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 1);
+        if (upperBound < lowerBound)
+            return false;
+
+        const int64_t clampedSample = juce::jlimit(lowerBound, upperBound, targetSample);
+        if (persistentState.transientEditSamples[static_cast<size_t>(markerIndex)] == clampedSample)
+            return false;
+
+        pushSliceEditUndoStateLocked();
+        persistentState.transientEditSamples[static_cast<size_t>(markerIndex)] = clampedSample;
+        persistentState.transientMarkersEdited = true;
+        invalidateTransientMarkerCachesLocked();
+        std::sort(persistentState.transientEditSamples.begin(), persistentState.transientEditSamples.end());
+        persistentState.transientEditSamples.erase(std::unique(persistentState.transientEditSamples.begin(),
+                                                               persistentState.transientEditSamples.end()),
+                                                   persistentState.transientEditSamples.end());
+        persistentState.storedSlices.clear();
+        rebuildSlicesLocked();
+        moved = true;
     }
 
-    if (markerIndex < 0)
+    if (!moved)
         return false;
 
-    return moveTransientMarker(markerIndex, normalizedPosition) >= 0;
+    notifyLegacyLoopRenderStateChanged();
+    sendChangeMessage();
+    return true;
 }
 
 bool SampleModeEngine::moveVisibleSliceToNearestTransient(int visibleSlot, float normalizedPosition)
@@ -5305,6 +6499,265 @@ bool SampleModeEngine::moveVisibleSliceToNearestTransient(int visibleSlot, float
     return moveTransientMarkerToNearestDetectedTransient(markerIndex, normalizedPosition) >= 0;
 }
 
+std::vector<int64_t> SampleModeEngine::buildCanonicalTransientMarkerSamplesLocked() const
+{
+    if (loadedSample == nullptr)
+        return {};
+
+    if (!canonicalTransientMarkerCacheValid)
+    {
+        canonicalTransientMarkerCache = buildCanonicalTransientMarkerSamples(*loadedSample,
+                                                                             persistentState.transientEditSamples,
+                                                                             persistentState.transientMarkersEdited);
+        canonicalTransientMarkerCacheValid = true;
+    }
+
+    return canonicalTransientMarkerCache;
+}
+
+std::vector<int64_t> SampleModeEngine::buildCanonicalTransientMarkerSamplesForRangeLocked(int64_t rangeStartSample,
+                                                                                           int64_t rangeEndSample) const
+{
+    return filterMarkerSamplesToRange(buildCanonicalTransientMarkerSamplesLocked(),
+                                      rangeStartSample,
+                                      rangeEndSample);
+}
+
+std::vector<int64_t> SampleModeEngine::buildLegacyLoopWindowTransientMarkerSamplesLocked(int64_t rangeStartSample,
+                                                                                         int64_t rangeEndSample) const
+{
+    if (loadedSample == nullptr || rangeEndSample <= rangeStartSample)
+        return {};
+
+    if (legacyLoopTransientWindowCache.valid
+        && legacyLoopTransientWindowCache.rangeStartSample == rangeStartSample
+        && legacyLoopTransientWindowCache.rangeEndSample == rangeEndSample)
+    {
+        return legacyLoopTransientWindowCache.markerSamples;
+    }
+
+    auto localTransientCandidates = buildCanonicalTransientMarkerSamplesForRangeLocked(rangeStartSample,
+                                                                                       rangeEndSample);
+
+    if (localTransientCandidates.empty())
+    {
+        localTransientCandidates = buildLegacyLoopWindowTransientCandidatesLocked(rangeStartSample,
+                                                                                  rangeEndSample);
+    }
+
+    legacyLoopTransientWindowCache.valid = true;
+    legacyLoopTransientWindowCache.rangeStartSample = rangeStartSample;
+    legacyLoopTransientWindowCache.rangeEndSample = rangeEndSample;
+    legacyLoopTransientWindowCache.markerSamples = localTransientCandidates;
+    legacyLoopTransientWindowCache.visibleSlicesValid = false;
+    legacyLoopTransientWindowCache.visibleSlicesPageStart = -1;
+
+    return localTransientCandidates;
+}
+
+std::vector<int64_t> SampleModeEngine::buildTransientGuideCandidatesLocked(int64_t lowerBound,
+                                                                           int64_t upperBound,
+                                                                           bool preferLocalTransients) const
+{
+    std::vector<int64_t> candidates;
+    if (loadedSample == nullptr || upperBound < lowerBound)
+        return candidates;
+
+    candidates = buildCanonicalTransientMarkerSamplesForRangeLocked(lowerBound, upperBound + 1);
+
+    if (candidates.empty() && preferLocalTransients)
+    {
+        int64_t loopRangeStartSample = 0;
+        int64_t loopRangeEndSample = 0;
+        if (computeLegacyLoopWindowRangeLocked(loopRangeStartSample, loopRangeEndSample)
+            && upperBound >= loopRangeStartSample
+            && lowerBound < loopRangeEndSample)
+        {
+            candidates = buildLegacyLoopWindowTransientCandidatesLocked(loopRangeStartSample,
+                                                                        loopRangeEndSample);
+            candidates.erase(std::remove_if(candidates.begin(),
+                                            candidates.end(),
+                                            [lowerBound, upperBound](int64_t sample)
+                                            {
+                                                return sample < lowerBound || sample > upperBound;
+                                            }),
+                             candidates.end());
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    return candidates;
+}
+
+int64_t SampleModeEngine::snapTransientMarkerSampleToGuideLocked(int64_t targetSample,
+                                                                 int64_t lowerBound,
+                                                                 int64_t upperBound,
+                                                                 bool preferLocalTransients) const
+{
+    if (loadedSample == nullptr || upperBound < lowerBound)
+        return targetSample;
+
+    const int64_t clampedTarget = juce::jlimit(lowerBound, upperBound, targetSample);
+    const auto candidates = buildTransientGuideCandidatesLocked(lowerBound, upperBound, preferLocalTransients);
+    if (candidates.empty())
+        return clampedTarget;
+
+    int64_t snappedSample = clampedTarget;
+    int64_t bestDistance = std::numeric_limits<int64_t>::max();
+    for (const auto candidate : candidates)
+    {
+        const int64_t distance = std::abs(candidate - clampedTarget);
+        if (distance < bestDistance)
+        {
+            bestDistance = distance;
+            snappedSample = candidate;
+        }
+    }
+
+    return snappedSample;
+}
+
+void SampleModeEngine::quantizeTransientEditSamplesToGuidesLocked()
+{
+    if (loadedSample == nullptr || persistentState.transientEditSamples.empty())
+        return;
+
+    auto quantized = WarpGrid::sanitizeBeatTicks(persistentState.transientEditSamples,
+                                                 loadedSample->sourceLengthSamples);
+    if (quantized.empty())
+    {
+        persistentState.transientEditSamples.clear();
+        persistentState.transientMarkersEdited = false;
+        invalidateTransientMarkerCachesLocked();
+        return;
+    }
+
+    for (size_t i = 0; i < quantized.size(); ++i)
+    {
+        const int64_t lowerBound = (i > 0)
+            ? (quantized[i - 1] + 1)
+            : 1;
+        const int64_t upperBound = (i + 1 < quantized.size())
+            ? (quantized[i + 1] - 1)
+            : juce::jmax<int64_t>(1, loadedSample->sourceLengthSamples - 1);
+        if (upperBound < lowerBound)
+            continue;
+
+        quantized[i] = snapTransientMarkerSampleToGuideLocked(quantized[i],
+                                                              lowerBound,
+                                                              upperBound,
+                                                              false);
+    }
+
+    quantized = WarpGrid::sanitizeBeatTicks(quantized, loadedSample->sourceLengthSamples);
+    persistentState.transientEditSamples = std::move(quantized);
+    persistentState.transientMarkersEdited = !persistentState.transientEditSamples.empty();
+    invalidateTransientMarkerCachesLocked();
+}
+
+std::vector<int64_t> SampleModeEngine::buildLegacyLoopWindowTransientCandidatesLocked(int64_t rangeStartSample,
+                                                                                       int64_t rangeEndSample) const
+{
+    std::vector<int64_t> candidates;
+    if (loadedSample == nullptr || rangeEndSample <= rangeStartSample || loadedSample->sourceLengthSamples <= 1)
+        return candidates;
+
+    const int windowLength = static_cast<int>(juce::jmax<int64_t>(1, rangeEndSample - rangeStartSample));
+    juce::AudioBuffer<float> localWindow(1, windowLength);
+    localWindow.clear();
+
+    const int sourceChannels = juce::jmax(1, loadedSample->audioBuffer.getNumChannels());
+    for (int sampleIndex = 0; sampleIndex < windowLength; ++sampleIndex)
+    {
+        const int sourceIndex = static_cast<int>(rangeStartSample) + sampleIndex;
+        float mono = 0.0f;
+        for (int ch = 0; ch < sourceChannels; ++ch)
+            mono += loadedSample->audioBuffer.getSample(ch, sourceIndex);
+        localWindow.setSample(0, sampleIndex, mono / static_cast<float>(sourceChannels));
+    }
+
+    int fftOrder = 8;
+    while ((1 << fftOrder) < juce::jmin(2048, windowLength) && fftOrder < 12)
+        ++fftOrder;
+    const int frameSize = 1 << fftOrder;
+    const int hopSize = juce::jmax(32, frameSize / 8);
+
+    auto refineRangeSamplesToLocalLeadingEdges = [&](const std::vector<int64_t>& sourceSamples)
+    {
+        std::vector<int64_t> localSamples;
+        localSamples.reserve(sourceSamples.size());
+        for (const auto sample : sourceSamples)
+        {
+            if (sample < rangeStartSample || sample >= rangeEndSample)
+                continue;
+            localSamples.push_back(sample - rangeStartSample);
+        }
+
+        if (localSamples.empty())
+            return localSamples;
+
+        auto refined = refineOnsetSamplesToLeadingEdges(localWindow, localSamples, frameSize, hopSize);
+        if (refined.empty())
+            refined = std::move(localSamples);
+        return refined;
+    };
+
+    const auto canonicalTransientMarkers = buildCanonicalTransientMarkerSamplesLocked();
+    const auto refinedTransientMarkers = refineRangeSamplesToLocalLeadingEdges(canonicalTransientMarkers);
+    const auto detectedTransientSamples = detectLoopStyleTransientSamples(localWindow,
+                                                                          loadedSample->sourceSampleRate);
+
+    candidates.reserve(refinedTransientMarkers.size() + detectedTransientSamples.size());
+    for (const auto sample : refinedTransientMarkers)
+        candidates.push_back(rangeStartSample + sample);
+    for (const auto sample : detectedTransientSamples)
+        candidates.push_back(rangeStartSample + sample);
+
+    candidates.erase(std::remove_if(candidates.begin(),
+                                    candidates.end(),
+                                    [rangeStartSample, rangeEndSample](int64_t sample)
+                                    {
+                                        return sample < rangeStartSample || sample >= rangeEndSample;
+                                    }),
+                     candidates.end());
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+
+    if (candidates.empty())
+        return candidates;
+
+    const int64_t clusterTolerance = static_cast<int64_t>(juce::jmax(1.0,
+        std::round(loadedSample->sourceSampleRate * 0.006)));
+    std::vector<int64_t> clustered;
+    clustered.reserve(candidates.size());
+    size_t clusterStart = 0;
+    while (clusterStart < candidates.size())
+    {
+        size_t clusterEnd = clusterStart + 1;
+        int64_t chosen = candidates[clusterStart];
+        while (clusterEnd < candidates.size()
+               && (candidates[clusterEnd] - candidates[clusterEnd - 1]) <= clusterTolerance)
+        {
+            chosen = juce::jmin(chosen, candidates[clusterEnd]);
+            ++clusterEnd;
+        }
+
+        clustered.push_back(chosen);
+        clusterStart = clusterEnd;
+    }
+
+    return clustered;
+}
+
+std::vector<int64_t> SampleModeEngine::buildTransientSnapCandidatesLocked(int64_t targetSample,
+                                                                          int64_t lowerBound,
+                                                                          int64_t upperBound) const
+{
+    juce::ignoreUnused(targetSample);
+    return buildTransientGuideCandidatesLocked(lowerBound, upperBound, true);
+}
+
 bool SampleModeEngine::deleteTransientMarker(int markerIndex)
 {
     {
@@ -5313,12 +6766,58 @@ bool SampleModeEngine::deleteTransientMarker(int markerIndex)
         if (markerIndex < 0 || markerIndex >= static_cast<int>(persistentState.transientEditSamples.size()))
             return false;
 
+        pushSliceEditUndoStateLocked();
         persistentState.transientEditSamples.erase(persistentState.transientEditSamples.begin() + markerIndex);
+        persistentState.transientMarkersEdited = true;
+        invalidateTransientMarkerCachesLocked();
         persistentState.storedSlices.clear();
         if (persistentState.sliceMode == SampleSliceMode::Transient)
             rebuildSlicesLocked();
     }
 
+    notifyLegacyLoopRenderStateChanged();
+    sendChangeMessage();
+    return true;
+}
+
+bool SampleModeEngine::snapSlicePointsToNearestPpqGrid(double gridStepBeats, bool currentSelectionOnly)
+{
+    bool changed = false;
+    {
+        const juce::ScopedLock lock(stateLock);
+        if (loadedSample == nullptr || !(gridStepBeats > 0.0) || !std::isfinite(gridStepBeats))
+            return false;
+
+        const auto undoDepthBefore = sliceEditUndoStack.size();
+        pushSliceEditUndoStateLocked();
+        bool snapped = false;
+        switch (persistentState.sliceMode)
+        {
+            case SampleSliceMode::Uniform:
+            case SampleSliceMode::Beat:
+                return false;
+            case SampleSliceMode::Transient:
+                snapped = snapTransientMarkersToPpqGridLocked(gridStepBeats, currentSelectionOnly);
+                break;
+            case SampleSliceMode::Manual:
+                snapped = snapCuePointsToPpqGridLocked(gridStepBeats, currentSelectionOnly);
+                break;
+        }
+
+        if (!snapped)
+        {
+            if (sliceEditUndoStack.size() > undoDepthBefore)
+                sliceEditUndoStack.pop_back();
+            return false;
+        }
+
+        changed = true;
+    }
+
+    if (!changed)
+        return false;
+
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
     return true;
 }
@@ -5360,6 +6859,7 @@ bool SampleModeEngine::computeLegacyLoopWindowRangeLocked(int64_t& rangeStartSam
     rangeEndSample = 0;
 
     if (loadedSample == nullptr
+        || !persistentState.useLegacyLoopEngine
         || persistentState.legacyLoopBarSelection <= 0
         || loadedSample->sourceSampleRate <= 0.0
         || !(persistentState.analyzedTempoBpm > 0.0))
@@ -5446,53 +6946,74 @@ std::array<SampleSlice, SliceModel::VisibleSliceCount> SampleModeEngine::buildLe
 
     if (persistentState.sliceMode == SampleSliceMode::Transient)
     {
-        const int windowLength = static_cast<int>(juce::jmax<int64_t>(1, rangeEndSample - rangeStartSample));
-        juce::AudioBuffer<float> localWindow(1, windowLength);
-        localWindow.clear();
-
-        const int sourceChannels = juce::jmax(1, loadedSample->audioBuffer.getNumChannels());
-        for (int sampleIndex = 0; sampleIndex < windowLength; ++sampleIndex)
+        const auto localTransientCandidates = buildLegacyLoopWindowTransientMarkerSamplesLocked(rangeStartSample,
+                                                                                                rangeEndSample);
+        const int candidateCount = static_cast<int>(localTransientCandidates.size());
+        const int pageStart = getLegacyLoopTransientPageStartIndex(legacyLoopTransientPageStartIndex, candidateCount);
+        if (legacyLoopTransientWindowCache.valid
+            && legacyLoopTransientWindowCache.rangeStartSample == rangeStartSample
+            && legacyLoopTransientWindowCache.rangeEndSample == rangeEndSample
+            && legacyLoopTransientWindowCache.visibleSlicesValid
+            && legacyLoopTransientWindowCache.visibleSlicesPageStart == pageStart)
         {
-            const int sourceIndex = static_cast<int>(rangeStartSample) + sampleIndex;
-            float mono = 0.0f;
-            for (int ch = 0; ch < sourceChannels; ++ch)
-                mono += loadedSample->audioBuffer.getSample(ch, sourceIndex);
-            localWindow.setSample(0, sampleIndex, mono / static_cast<float>(sourceChannels));
+            return legacyLoopTransientWindowCache.visibleSlices;
         }
 
-        auto localTransientSamples = detectLoopStyleTransientSamples(localWindow,
-                                                                     loadedSample->sourceSampleRate);
-
-        const auto& sourceTransientMarkers = persistentState.transientEditSamples.empty()
-            ? loadedSample->analysis.transientSamples
-            : persistentState.transientEditSamples;
-        for (const auto marker : sourceTransientMarkers)
+        if (localTransientCandidates.empty())
         {
-            if (marker < rangeStartSample || marker >= rangeEndSample)
-                continue;
-            localTransientSamples.push_back(marker - rangeStartSample);
+            const int64_t windowLength = juce::jmax<int64_t>(1, rangeEndSample - rangeStartSample);
+            const auto localStarts = buildLoopStyleAnchorStarts(windowLength, {});
+            for (int slot = 0; slot < SliceModel::VisibleSliceCount; ++slot)
+            {
+                SampleSlice slice;
+                slice.id = slot;
+                slice.startSample = rangeStartSample + localStarts[static_cast<size_t>(slot)];
+                slice.endSample = (slot + 1 < SliceModel::VisibleSliceCount)
+                    ? juce::jmax(slice.startSample + 1,
+                                 rangeStartSample + localStarts[static_cast<size_t>(slot + 1)])
+                    : rangeEndSample;
+                slice.transientDerived = true;
+                fillSliceMetadata(slice, slot, loadedSample->sourceLengthSamples);
+                visibleSlices[static_cast<size_t>(slot)] = slice;
+            }
+
+            legacyLoopTransientWindowCache.valid = true;
+            legacyLoopTransientWindowCache.rangeStartSample = rangeStartSample;
+            legacyLoopTransientWindowCache.rangeEndSample = rangeEndSample;
+            legacyLoopTransientWindowCache.markerSamples = localTransientCandidates;
+            legacyLoopTransientWindowCache.visibleSlicesValid = true;
+            legacyLoopTransientWindowCache.visibleSlicesPageStart = pageStart;
+            legacyLoopTransientWindowCache.visibleSlices = visibleSlices;
+            return visibleSlices;
         }
 
-        std::sort(localTransientSamples.begin(), localTransientSamples.end());
-        localTransientSamples.erase(std::unique(localTransientSamples.begin(), localTransientSamples.end()),
-                                    localTransientSamples.end());
-
-        const auto localStarts = buildLoopStyleAnchorStarts(windowLength, localTransientSamples);
-
-        for (int slot = 0; slot < SliceModel::VisibleSliceCount; ++slot)
+        const int visibleSliceCount = juce::jmin(SliceModel::VisibleSliceCount,
+                                                 juce::jmax(0, candidateCount - pageStart));
+        for (int slot = 0; slot < visibleSliceCount; ++slot)
         {
+            const int candidateIndex = pageStart + slot;
             SampleSlice slice;
             slice.id = slot;
-            slice.startSample = rangeStartSample + localStarts[static_cast<size_t>(slot)];
-            slice.endSample = (slot + 1 < SliceModel::VisibleSliceCount)
-                ? juce::jmax(slice.startSample + 1,
-                             rangeStartSample + localStarts[static_cast<size_t>(slot + 1)])
+            slice.startSample = juce::jlimit<int64_t>(rangeStartSample,
+                                                      rangeEndSample - 1,
+                                                      localTransientCandidates[static_cast<size_t>(candidateIndex)]);
+            slice.endSample = (candidateIndex + 1 < candidateCount)
+                ? juce::jlimit<int64_t>(slice.startSample + 1,
+                                        rangeEndSample,
+                                        localTransientCandidates[static_cast<size_t>(candidateIndex + 1)])
                 : rangeEndSample;
             slice.transientDerived = true;
             fillSliceMetadata(slice, slot, loadedSample->sourceLengthSamples);
             visibleSlices[static_cast<size_t>(slot)] = slice;
         }
 
+        legacyLoopTransientWindowCache.valid = true;
+        legacyLoopTransientWindowCache.rangeStartSample = rangeStartSample;
+        legacyLoopTransientWindowCache.rangeEndSample = rangeEndSample;
+        legacyLoopTransientWindowCache.markerSamples = localTransientCandidates;
+        legacyLoopTransientWindowCache.visibleSlicesValid = true;
+        legacyLoopTransientWindowCache.visibleSlicesPageStart = pageStart;
+        legacyLoopTransientWindowCache.visibleSlices = visibleSlices;
         return visibleSlices;
     }
 
@@ -5605,21 +7126,18 @@ std::vector<int64_t> SampleModeEngine::buildLegacyLoopAnchorCandidatesLocked() c
     if (loadedSample == nullptr)
         return candidates;
 
+    const auto effectiveTransientMarkers = buildCanonicalTransientMarkerSamplesLocked();
     const bool preferWholeFileTransientAnchors = persistentState.legacyLoopBarSelection > 0
-        && !(persistentState.transientEditSamples.empty() && loadedSample->analysis.transientSamples.empty());
+        && !effectiveTransientMarkers.empty();
 
     if (preferWholeFileTransientAnchors)
     {
-        candidates = persistentState.transientEditSamples.empty()
-            ? loadedSample->analysis.transientSamples
-            : persistentState.transientEditSamples;
+        candidates = effectiveTransientMarkers;
     }
     else switch (persistentState.sliceMode)
     {
         case SampleSliceMode::Transient:
-            candidates = persistentState.transientEditSamples.empty()
-                ? loadedSample->analysis.transientSamples
-                : persistentState.transientEditSamples;
+            candidates = effectiveTransientMarkers;
             break;
         case SampleSliceMode::Manual:
             candidates.reserve(persistentState.cuePoints.size());
@@ -5681,6 +7199,7 @@ bool SampleModeEngine::buildLegacyLoopSyncInfoForSliceIndexLocked(int sliceIndex
         : loadedSample->analysis.estimatedTempoBpm;
     syncInfo.legacyLoopBarSelection = persistentState.legacyLoopBarSelection;
     syncInfo.sliceMode = persistentState.sliceMode;
+    syncInfo.warpMarkers = persistentState.warpMarkers;
 
     if (persistentState.sliceMode == SampleSliceMode::Transient)
     {
@@ -5690,9 +7209,7 @@ bool SampleModeEngine::buildLegacyLoopSyncInfoForSliceIndexLocked(int sliceIndex
             if (sourceIndex >= 0 && sourceIndex < static_cast<int>(allSlices.size()))
                 syncInfo.visibleSlices[static_cast<size_t>(slot)] = allSlices[static_cast<size_t>(sourceIndex)];
         }
-        syncInfo.markerSamples = persistentState.transientEditSamples.empty()
-            ? loadedSample->analysis.transientSamples
-            : persistentState.transientEditSamples;
+        syncInfo.markerSamples = buildCanonicalTransientMarkerSamplesLocked();
     }
     else if (persistentState.sliceMode == SampleSliceMode::Manual)
     {
@@ -5745,6 +7262,7 @@ void SampleModeEngine::handleLoadResult(SampleFileManager::LoadResult result)
             resetSampleSpecificStateLocked();
             loadedSample = std::move(result.loadedSample);
             persistentState.samplePath = loadedSample->sourcePath;
+            invalidateTransientMarkerCachesLocked();
             const bool restoreExistingEdits = restoredState.samplePath.isNotEmpty()
                 && restoredState.samplePath == loadedSample->sourcePath;
             const bool preserveManualTempo = restoreExistingEdits
@@ -5764,11 +7282,35 @@ void SampleModeEngine::handleLoadResult(SampleFileManager::LoadResult result)
                 : loadedSample->analysis.analysisSource;
             if (restoreExistingEdits)
             {
+                const auto restoredTransientMarkers = WarpGrid::sanitizeBeatTicks(restoredState.transientEditSamples,
+                                                                                  loadedSample->sourceLengthSamples);
+                const auto preferredTransientMarkers = buildCanonicalTransientMarkerSamples(*loadedSample,
+                                                                                            {},
+                                                                                            false);
+                const auto legacyTransientMarkers = WarpGrid::sanitizeBeatTicks(loadedSample->analysis.transientSamples,
+                                                                                loadedSample->sourceLengthSamples);
+                const bool restoredMatchesLegacyAutoMarkers = restoredState.transientMarkersEdited
+                    && !restoredTransientMarkers.empty()
+                    && !preferredTransientMarkers.empty()
+                    && !legacyTransientMarkers.empty()
+                    && restoredTransientMarkers == legacyTransientMarkers
+                    && restoredTransientMarkers != preferredTransientMarkers;
+
                 persistentState.cuePoints = restoredState.cuePoints;
-                persistentState.transientEditSamples = restoredState.transientEditSamples;
-                persistentState.storedSlices = restoredState.storedSlices;
+                persistentState.warpMarkers = sanitizePersistentWarpMarkers(restoredState.warpMarkers,
+                                                                           loadedSample->sourceLengthSamples);
+                persistentState.transientMarkersEdited = restoredState.transientMarkersEdited
+                    && !restoredTransientMarkers.empty()
+                    && !restoredMatchesLegacyAutoMarkers;
+                if (persistentState.transientMarkersEdited)
+                {
+                    persistentState.transientEditSamples = restoredTransientMarkers;
+                    invalidateTransientMarkerCachesLocked();
+                    quantizeTransientEditSamplesToGuidesLocked();
+                }
             }
             rebuildSlicesLocked();
+            [[maybe_unused]] const auto warmedCanonicalMarkers = buildCanonicalTransientMarkerSamplesLocked();
             sliceModel.setVisibleBankIndex(persistentState.visibleSliceBankIndex);
             pendingTriggerSliceValid = false;
             analysisProgress = 1.0f;
@@ -5781,6 +7323,7 @@ void SampleModeEngine::handleLoadResult(SampleFileManager::LoadResult result)
         {
             loadedSample.reset();
             sliceModel.clear();
+            invalidateTransientMarkerCachesLocked();
             pendingTriggerSliceValid = false;
             analysisProgress = 0.0f;
             statusText = result.errorMessage.isNotEmpty() ? result.errorMessage : "Sample load failed";
@@ -5798,6 +7341,7 @@ void SampleModeEngine::handleLoadResult(SampleFileManager::LoadResult result)
     if (callbackToInvoke)
         callbackToInvoke(result);
 
+    notifyLegacyLoopRenderStateChanged();
     sendChangeMessage();
 }
 
@@ -5838,13 +7382,15 @@ void SampleModeEngine::handleKeyLockCacheReady(uint64_t generation,
 
 std::shared_ptr<const StretchedSliceBuffer> SampleModeEngine::findKeyLockCacheForSlice(const SampleSlice& slice,
                                                                                         float playbackRate,
-                                                                                        float pitchSemitones) const
+                                                                                        float pitchSemitones,
+                                                                                        TimeStretchBackend backend) const
 {
     const float quantizedRate = quantizeKeyLockRate(playbackRate);
     const float quantizedPitch = quantizeKeyLockPitch(pitchSemitones);
     for (const auto& cache : keyLockCaches)
     {
-        if (cache != nullptr && matchesKeyLockRequest(*cache, slice, quantizedRate, quantizedPitch))
+        if (cache != nullptr
+            && matchesKeyLockRequest(*cache, slice, quantizedRate, quantizedPitch, backend))
             return cache;
     }
 
@@ -5853,12 +7399,17 @@ std::shared_ptr<const StretchedSliceBuffer> SampleModeEngine::findKeyLockCacheFo
 
 bool SampleModeEngine::voiceHasMatchingKeyLockCache(const SamplePlaybackVoice& voice,
                                                     float playbackRate,
-                                                    float pitchSemitones) const
+                                                    float pitchSemitones,
+                                                    TimeStretchBackend backend) const
 {
     if (const auto existing = voice.getStretchedBuffer())
-        return matchesKeyLockRequest(*existing, voice.getActiveSlice(), playbackRate, pitchSemitones);
+        return matchesKeyLockRequest(*existing,
+                                     voice.getActiveSlice(),
+                                     playbackRate,
+                                     pitchSemitones,
+                                     backend);
 
-    return findKeyLockCacheForSlice(voice.getActiveSlice(), playbackRate, pitchSemitones) != nullptr;
+    return findKeyLockCacheForSlice(voice.getActiveSlice(), playbackRate, pitchSemitones, backend) != nullptr;
 }
 
 void SampleModeEngine::rebuildSlicesLocked()
@@ -5872,7 +7423,7 @@ void SampleModeEngine::rebuildSlicesLocked()
 
     sliceModel.setSlices(analysisEngine.buildSlicesForState(*loadedSample, persistentState));
     sliceModel.setVisibleBankIndex(persistentState.visibleSliceBankIndex);
-    persistentState.storedSlices = sliceModel.getAllSlices();
+    persistentState.storedSlices.clear();
     keyLockCaches.clear();
     keyLockCacheBuildInFlight = false;
     ++keyLockCacheGeneration;
@@ -5950,7 +7501,6 @@ void SampleModeComponent::paint(juce::Graphics& g)
         tempoDoubleBounds = header.removeFromLeft(20);
         header.removeFromLeft(6);
     }
-    auto analysisHeader = header;
 
     auto drawHeaderButton = [&](juce::Rectangle<int> area, const juce::String& text, bool active)
     {
@@ -5961,8 +7511,10 @@ void SampleModeComponent::paint(juce::Graphics& g)
         g.drawFittedText(text, area, juce::Justification::centred, 1);
     };
 
+    const bool random16Enabled = stateSnapshot.visibleSliceBankCount > 1
+        && !stateSnapshot.useLegacyLoopEngine;
     drawHeaderButton(prev16Bounds, "Prev 16", stateSnapshot.canNavigateLeft);
-    drawHeaderButton(random16Bounds, "Rnd 16", stateSnapshot.visibleSliceBankCount > 1);
+    drawHeaderButton(random16Bounds, "Rnd 16", random16Enabled);
     drawHeaderButton(next16Bounds, "Next 16", stateSnapshot.canNavigateRight);
     drawHeaderButton(getTriggerModeButtonBounds(SampleTriggerMode::OneShot), "SHOT", stateSnapshot.triggerMode == SampleTriggerMode::OneShot);
     drawHeaderButton(getTriggerModeButtonBounds(SampleTriggerMode::Loop), "LOOP", stateSnapshot.triggerMode == SampleTriggerMode::Loop);
@@ -5976,45 +7528,26 @@ void SampleModeComponent::paint(juce::Graphics& g)
         drawHeaderButton(tempoHalfBounds, "1/2", stateSnapshot.estimatedTempoBpm > 20.5);
     if (!tempoDoubleBounds.isEmpty())
         drawHeaderButton(tempoDoubleBounds, "2x", stateSnapshot.estimatedTempoBpm > 0.0 && stateSnapshot.estimatedTempoBpm < 399.5);
-
-    if (analysisHeader.getWidth() > 48
-        && (stateSnapshot.isLoading
-            || stateSnapshot.estimatedTempoBpm > 0.0
-            || stateSnapshot.estimatedPitchMidi >= 0
-            || stateSnapshot.visibleSliceBankCount > 0))
+    const auto headerInfoBounds = header;
+    if (!headerInfoBounds.isEmpty() && stateSnapshot.hasSample)
     {
-        juce::String analysisText;
-        if (stateSnapshot.visibleSliceBankCount > 0)
-            analysisText << "Bank " << juce::String(stateSnapshot.visibleSliceBankIndex + 1)
-                         << "/" << juce::String(juce::jmax(1, stateSnapshot.visibleSliceBankCount));
-        if (stateSnapshot.estimatedTempoBpm > 0.0)
-        {
-            if (analysisText.isNotEmpty())
-                analysisText << "  |  ";
-            analysisText << juce::String(stateSnapshot.estimatedTempoBpm, 1) << " BPM";
-        }
-        if (stateSnapshot.estimatedPitchMidi >= 0)
-        {
-            if (analysisText.isNotEmpty())
-                analysisText << "  |  ";
-            analysisText << noteNameForMidi(stateSnapshot.estimatedPitchMidi);
-        }
-        if (stateSnapshot.analysisSource.isNotEmpty())
-        {
-            if (analysisText.isNotEmpty())
-                analysisText << "  |  ";
-            analysisText << analysisBackendDisplayText(stateSnapshot.essentiaUsed, stateSnapshot.analysisSource);
-        }
-        if (stateSnapshot.isLoading && stateSnapshot.statusText.isNotEmpty())
-        {
-            if (analysisText.isNotEmpty())
-                analysisText << "  |  ";
-            analysisText << stateSnapshot.statusText;
-        }
+        juce::StringArray infoParts;
+        infoParts.add(stateSnapshot.displayName.isNotEmpty() ? stateSnapshot.displayName : juce::String("Untitled"));
+        infoParts.add(stateSnapshot.estimatedTempoBpm > 0.0
+            ? (juce::String(stateSnapshot.estimatedTempoBpm, 2) + " BPM")
+            : juce::String("-- BPM"));
+        infoParts.add(formatDetectedKeyLabel(stateSnapshot.estimatedPitchMidi, stateSnapshot.estimatedScaleIndex));
 
-        g.setColour(juce::Colour(0xff8d9aab));
-        g.setFont(juce::FontOptions(10.0f, juce::Font::plain));
-        g.drawFittedText(analysisText, analysisHeader, juce::Justification::centredRight, 1);
+        g.setColour(juce::Colour(0xff1a2028));
+        g.fillRoundedRectangle(headerInfoBounds.toFloat(), 4.0f);
+        g.setColour(juce::Colour(0xff5a6674));
+        g.drawRoundedRectangle(headerInfoBounds.toFloat(), 4.0f, 1.0f);
+        g.setColour(juce::Colour(0xffd7dce2));
+        g.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::plain)));
+        g.drawFittedText(infoParts.joinIntoString("  |  "),
+                         headerInfoBounds.reduced(6, 0),
+                         juce::Justification::centredLeft,
+                         1);
     }
     auto progressArea = bounds.removeFromTop(stateSnapshot.isLoading ? 8 : 2);
     if (stateSnapshot.isLoading)
@@ -6033,11 +7566,7 @@ void SampleModeComponent::paint(juce::Graphics& g)
         g.fillRoundedRectangle(fill.toFloat(), 3.0f);
     }
 
-    constexpr int footerReserve = 62;
-    const int maxWaveformHeight = juce::jmax(80, bounds.getHeight() - footerReserve);
-    const int waveformHeight = juce::jmin(juce::jmax(120, maxWaveformHeight),
-                                          juce::jmax(80, bounds.getHeight() - 28));
-    waveformBounds = bounds.removeFromTop(waveformHeight);
+    waveformBounds = bounds.reduced(0, 1);
     g.setColour(juce::Colour(0xff171d25));
     g.fillRoundedRectangle(waveformBounds.toFloat(), 8.0f);
     g.setColour(juce::Colour(0xff263241));
@@ -6045,15 +7574,34 @@ void SampleModeComponent::paint(juce::Graphics& g)
 
     if (loadedSample != nullptr && !loadedSample->previewMin.empty() && !loadedSample->previewMax.empty())
     {
-        const auto visibleRange = getVisibleRange();
+        const auto visibleRange = getVisibleDisplayRange();
+        const auto stableVisibleRange = getVisibleRange();
+        const auto warpDisplayMap = buildSampleWarpDisplayMap(loadedSample.get(), stateSnapshot);
+        const auto warpLane = getWarpMarkerLaneBounds();
+        const auto sliceHandleLane = getSliceMarkerHandleBounds();
+        const int contentTop = sliceHandleLane.isEmpty()
+            ? (waveformBounds.getY() + 4)
+            : (sliceHandleLane.getBottom() + 4);
         const auto centerY = waveformBounds.getCentreY();
         const auto halfHeight = waveformBounds.getHeight() * 0.42f;
         const auto pointCount = static_cast<int>(loadedSample->previewMin.size());
         const float visibleStart = visibleRange.getStart();
         const float visibleEnd = visibleRange.getEnd();
         const float visibleWidth = juce::jmax(1.0e-5f, visibleEnd - visibleStart);
-        const int64_t visibleSampleStart = static_cast<int64_t>(std::floor(visibleStart * stateSnapshot.totalSamples));
-        const int64_t visibleSampleEnd = static_cast<int64_t>(std::ceil(visibleEnd * stateSnapshot.totalSamples));
+        const float stableVisibleStart = stableVisibleRange.getStart();
+        const float stableVisibleWidth = juce::jmax(1.0e-5f, stableVisibleRange.getLength());
+        const int64_t stableRangeStartSample = juce::jlimit<int64_t>(
+            0,
+            juce::jmax<int64_t>(0, stateSnapshot.totalSamples - 1),
+            static_cast<int64_t>(std::llround(stableVisibleStart
+                                              * static_cast<float>(juce::jmax<int64_t>(1, stateSnapshot.totalSamples - 1)))));
+        const int64_t stableRangeEndSample = juce::jlimit<int64_t>(
+            stableRangeStartSample + 1,
+            juce::jmax<int64_t>(1, stateSnapshot.totalSamples - 1),
+            static_cast<int64_t>(std::llround(stableVisibleRange.getEnd()
+                                              * static_cast<float>(juce::jmax<int64_t>(1, stateSnapshot.totalSamples - 1)))));
+        const int64_t visibleSampleStart = samplePositionFromDisplayNormalized(warpDisplayMap, visibleStart);
+        const int64_t visibleSampleEnd = samplePositionFromDisplayNormalized(warpDisplayMap, visibleEnd);
         const int64_t visibleSampleCount = juce::jmax<int64_t>(1, visibleSampleEnd - visibleSampleStart);
         const bool useDetailedWaveform = stateSnapshot.viewZoom >= kDetailedWaveformZoomThreshold
             && loadedSample->audioBuffer.getNumSamples() > 0
@@ -6067,12 +7615,14 @@ void SampleModeComponent::paint(juce::Graphics& g)
             const int waveformWidth = juce::jmax(1, waveformBounds.getWidth());
             for (int pixel = 0; pixel < waveformWidth; ++pixel)
             {
-                const float startNorm = static_cast<float>(pixel) / static_cast<float>(waveformWidth);
-                const float endNorm = static_cast<float>(pixel + 1) / static_cast<float>(waveformWidth);
-                const int64_t sampleStart = visibleSampleStart + static_cast<int64_t>(std::floor(startNorm * visibleSampleCount));
+                const float startNorm = visibleStart
+                    + ((static_cast<float>(pixel) / static_cast<float>(waveformWidth)) * visibleWidth);
+                const float endNorm = visibleStart
+                    + ((static_cast<float>(pixel + 1) / static_cast<float>(waveformWidth)) * visibleWidth);
+                const int64_t sampleStart = samplePositionFromDisplayNormalized(warpDisplayMap, startNorm);
                 const int64_t sampleEnd = juce::jmax<int64_t>(
                     sampleStart + 1,
-                    visibleSampleStart + static_cast<int64_t>(std::ceil(endNorm * visibleSampleCount)));
+                    samplePositionFromDisplayNormalized(warpDisplayMap, endNorm));
 
                 float minValue = 1.0f;
                 float maxValue = -1.0f;
@@ -6099,7 +7649,10 @@ void SampleModeComponent::paint(juce::Graphics& g)
         {
             for (int pointIndex = 0; pointIndex < pointCount; ++pointIndex)
             {
-                const float pointNorm = static_cast<float>(pointIndex) / juce::jmax(1, pointCount - 1);
+                const int64_t pointSample = static_cast<int64_t>(std::llround(
+                    (static_cast<double>(pointIndex) / juce::jmax(1, pointCount - 1))
+                    * static_cast<double>(juce::jmax<int64_t>(1, stateSnapshot.totalSamples - 1))));
+                const float pointNorm = displayNormalizedPositionForSample(warpDisplayMap, pointSample);
                 if (pointNorm < visibleStart || pointNorm > visibleEnd)
                     continue;
                 const float visibleNorm = (pointNorm - visibleStart) / visibleWidth;
@@ -6115,8 +7668,12 @@ void SampleModeComponent::paint(juce::Graphics& g)
 
         if (const auto loopRange = computeSampleLoopVisualRange(stateSnapshot))
         {
-            const float loopStartNorm = juce::jmax(loopRange->getStart(), visibleStart);
-            const float loopEndNorm = juce::jmin(loopRange->getEnd(), visibleEnd);
+            const int64_t loopStartSample = static_cast<int64_t>(std::llround(loopRange->getStart()
+                                                                              * static_cast<float>(stateSnapshot.totalSamples)));
+            const int64_t loopEndSample = static_cast<int64_t>(std::llround(loopRange->getEnd()
+                                                                            * static_cast<float>(stateSnapshot.totalSamples)));
+            const float loopStartNorm = juce::jmax(displayNormalizedPositionForSample(warpDisplayMap, loopStartSample), visibleStart);
+            const float loopEndNorm = juce::jmin(displayNormalizedPositionForSample(warpDisplayMap, loopEndSample), visibleEnd);
             if (loopEndNorm > loopStartNorm)
             {
                 const int loopX = waveformBounds.getX()
@@ -6136,14 +7693,120 @@ void SampleModeComponent::paint(juce::Graphics& g)
             }
         }
 
+        const auto warpGuideTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples,
+                                                          loadedSample->sourceLengthSamples);
+        if (!warpLane.isEmpty())
+        {
+            g.setColour(juce::Colour(0xff11161d).withAlpha(0.24f));
+            g.fillRoundedRectangle(warpLane.toFloat(), 5.0f);
+            g.setColour(juce::Colour(0xfff5c66a).withAlpha(0.2f));
+            g.drawRoundedRectangle(warpLane.toFloat(), 5.0f, 1.0f);
+            g.setColour(juce::Colour(0xfff5c66a).withAlpha(0.64f));
+            g.setFont(juce::FontOptions(9.0f, juce::Font::plain));
+            g.drawFittedText("WARP", warpLane.withWidth(34), juce::Justification::centred, 1);
+
+            if (warpGuideTicks.size() >= 2)
+            {
+                const double stableBeatStart = computeBeatTickPosition(warpGuideTicks, stableRangeStartSample);
+                const double stableBeatEnd = computeBeatTickPosition(warpGuideTicks, stableRangeEndSample);
+                if (std::isfinite(stableBeatStart)
+                    && std::isfinite(stableBeatEnd)
+                    && stableBeatEnd > stableBeatStart)
+                {
+                    const double visibleBeatSpan = stableBeatEnd - stableBeatStart;
+                    const double gridStep = choosePpqGridBeatStep(visibleBeatSpan,
+                                                                  waveformBounds.getWidth(),
+                                                                  28.0);
+                    const double firstGridBeat = std::floor(stableBeatStart / gridStep) * gridStep;
+                    const int gridTop = warpLane.getY() + 1;
+                    const int gridBottom = waveformBounds.getBottom() - 2;
+
+                    for (double beat = firstGridBeat; beat <= (stableBeatEnd + gridStep); beat += gridStep)
+                    {
+                        if (beat < (stableBeatStart - 1.0e-4)
+                            || beat > (stableBeatEnd + 1.0e-4))
+                        {
+                            continue;
+                        }
+
+                        const int64_t sampleAtBeat = samplePositionFromBeatTickPosition(warpGuideTicks,
+                                                                                         beat,
+                                                                                         stateSnapshot.totalSamples);
+                        const float stableGridNorm = safeNormalizedPosition(sampleAtBeat, stateSnapshot.totalSamples);
+                        if (stableGridNorm < stableVisibleStart
+                            || stableGridNorm > stableVisibleRange.getEnd())
+                            continue;
+
+                        const int x = waveformBounds.getX()
+                            + juce::roundToInt(((stableGridNorm - stableVisibleStart) / stableVisibleWidth)
+                                               * static_cast<float>(waveformBounds.getWidth()));
+                        const bool isBarLine = beatGridMatchesDivision(beat, 4.0);
+                        g.setColour(isBarLine
+                                        ? juce::Colour(0xff79a6ff).withAlpha(0.22f)
+                                        : juce::Colour(0xff79a6ff).withAlpha(0.1f));
+                        g.drawVerticalLine(x,
+                                           static_cast<float>(gridTop),
+                                           static_cast<float>(gridBottom));
+                    }
+                }
+            }
+
+            g.setColour(juce::Colour(0xfff5c66a).withAlpha(0.78f));
+            const auto drawAnchorHandle = [&](int x)
+            {
+                g.drawVerticalLine(x,
+                                   static_cast<float>(warpLane.getY() + 1),
+                                   static_cast<float>(waveformBounds.getBottom() - 2));
+
+                juce::Path handle;
+                const float anchorCenterY = static_cast<float>(warpLane.getCentreY());
+                handle.startNewSubPath(static_cast<float>(x), anchorCenterY - 4.0f);
+                handle.lineTo(static_cast<float>(x) - 4.0f, anchorCenterY);
+                handle.lineTo(static_cast<float>(x), anchorCenterY + 4.0f);
+                handle.lineTo(static_cast<float>(x) + 4.0f, anchorCenterY);
+                handle.closeSubPath();
+                g.fillPath(handle);
+            };
+
+            const bool showStartAnchor = visibleSampleStart <= 1;
+            const bool showEndAnchor = visibleSampleEnd >= (stateSnapshot.totalSamples - 2);
+            if (showStartAnchor)
+                drawAnchorHandle(warpLane.getX() + 1);
+            if (showEndAnchor)
+                drawAnchorHandle(warpLane.getRight() - 2);
+        }
+
+        if (!warpLane.isEmpty() && warpGuideTicks.size() >= 2)
+        {
+            g.setColour(juce::Colour(0xfff5c66a).withAlpha(0.28f));
+            for (const auto markerSample : warpGuideTicks)
+            {
+                const float markerNorm = displayNormalizedPositionForSample(warpDisplayMap, markerSample);
+                if (markerNorm < visibleStart || markerNorm > visibleEnd)
+                    continue;
+
+                const int x = waveformBounds.getX()
+                    + juce::roundToInt(((markerNorm - visibleStart) / visibleWidth)
+                                       * static_cast<float>(waveformBounds.getWidth()));
+                g.drawVerticalLine(x,
+                                   static_cast<float>(warpLane.getY()),
+                                   static_cast<float>(warpLane.getBottom() - 2));
+            }
+        }
+
         for (int sliceIndex = 0; sliceIndex < SliceModel::VisibleSliceCount; ++sliceIndex)
         {
             const auto& slice = stateSnapshot.visibleSlices[static_cast<size_t>(sliceIndex)];
-            if (slice.id < 0 || slice.normalizedEnd < visibleStart || slice.normalizedStart > visibleEnd)
+            const int64_t markerSample = getVisibleSliceMarkerSample(sliceIndex);
+            const float displaySliceStart = displayNormalizedPositionForSample(warpDisplayMap,
+                                                                               markerSample >= 0 ? markerSample
+                                                                                                 : slice.startSample);
+            const float displaySliceEnd = displayNormalizedPositionForSample(warpDisplayMap, slice.endSample);
+            if (slice.id < 0 || displaySliceEnd < visibleStart || displaySliceStart > visibleEnd)
                 continue;
 
-            const float clippedStart = juce::jmax(slice.normalizedStart, visibleStart);
-            const float clippedEnd = juce::jmin(slice.normalizedEnd, visibleEnd);
+            const float clippedStart = juce::jmax(displaySliceStart, visibleStart);
+            const float clippedEnd = juce::jmin(displaySliceEnd, visibleEnd);
             if (clippedEnd <= clippedStart)
                 continue;
 
@@ -6154,29 +7817,35 @@ void SampleModeComponent::paint(juce::Graphics& g)
                 + juce::roundToInt(((clippedEnd - visibleStart) / visibleWidth)
                                    * static_cast<float>(waveformBounds.getWidth()));
             auto sliceRect = juce::Rectangle<int>(sliceX,
-                                                  waveformBounds.getY() + 4,
+                                                  contentTop,
                                                   juce::jmax(1, sliceEndX - sliceX),
-                                                  waveformBounds.getHeight() - 8);
+                                                  juce::jmax(10, waveformBounds.getBottom() - contentTop - 4));
             const bool isPending = (stateSnapshot.pendingVisibleSliceSlot == sliceIndex);
             const bool isActive = (stateSnapshot.activeVisibleSliceSlot == sliceIndex);
             g.setColour(waveformColour.withAlpha((sliceIndex % 2) == 0 ? 0.08f : 0.04f));
             g.fillRect(sliceRect);
 
             const int markerX = waveformBounds.getX()
-                + juce::roundToInt(((slice.normalizedStart - visibleStart) / visibleWidth)
+                + juce::roundToInt(((displaySliceStart - visibleStart) / visibleWidth)
                                    * static_cast<float>(waveformBounds.getWidth()));
-            g.setColour((isPending ? juce::Colours::white : waveformColour.brighter(isActive ? 0.55f : 0.28f))
-                            .withAlpha(isActive ? 0.98f : 0.94f));
+            g.setColour(waveformColour.darker(1.9f).withAlpha(0.92f));
             g.drawVerticalLine(markerX,
-                               static_cast<float>(waveformBounds.getY() + 5),
+                               static_cast<float>(sliceHandleLane.getBottom() + 1),
+                               static_cast<float>(waveformBounds.getBottom() - 6));
+            g.setColour((isPending
+                             ? waveformColour.brighter(1.15f)
+                             : waveformColour.brighter(isActive ? 0.85f : 0.35f))
+                            .withAlpha(isActive ? 0.99f : 0.96f));
+            g.drawVerticalLine(markerX,
+                               static_cast<float>(sliceHandleLane.getBottom() + 2),
                                static_cast<float>(waveformBounds.getBottom() - 7));
 
             if (stateSnapshot.sliceMode != SampleSliceMode::Manual)
             {
                 juce::Path handle;
-                handle.startNewSubPath(static_cast<float>(markerX), static_cast<float>(waveformBounds.getY() + 2));
-                handle.lineTo(static_cast<float>(markerX - 4), static_cast<float>(waveformBounds.getY() + 8));
-                handle.lineTo(static_cast<float>(markerX + 4), static_cast<float>(waveformBounds.getY() + 8));
+                handle.startNewSubPath(static_cast<float>(markerX), static_cast<float>(sliceHandleLane.getY() + 1));
+                handle.lineTo(static_cast<float>(markerX - 4), static_cast<float>(sliceHandleLane.getBottom() - 1));
+                handle.lineTo(static_cast<float>(markerX + 4), static_cast<float>(sliceHandleLane.getBottom() - 1));
                 handle.closeSubPath();
                 g.fillPath(handle);
             }
@@ -6185,21 +7854,25 @@ void SampleModeComponent::paint(juce::Graphics& g)
         for (size_t cueIndex = 0; cueIndex < stateSnapshot.cuePoints.size(); ++cueIndex)
         {
             const auto& cue = stateSnapshot.cuePoints[cueIndex];
-            const float cueNorm = safeNormalizedPosition(cue.samplePosition, stateSnapshot.totalSamples);
+            const float cueNorm = displayNormalizedPositionForSample(warpDisplayMap, cue.samplePosition);
             if (cueNorm < visibleStart || cueNorm > visibleEnd)
                 continue;
 
             const int x = waveformBounds.getX()
                 + juce::roundToInt(((cueNorm - visibleStart) / visibleWidth) * static_cast<float>(waveformBounds.getWidth()));
             const bool selected = static_cast<int>(cueIndex) == stateSnapshot.selectedCueIndex;
-            g.setColour(selected ? juce::Colour(0xfff36f6f) : juce::Colour(0xffcfd7df));
+            g.setColour(juce::Colour(0xff0f1318).withAlpha(0.92f));
             g.drawVerticalLine(x,
-                               static_cast<float>(waveformBounds.getY() + 2),
+                               static_cast<float>(sliceHandleLane.getBottom() + 1),
                                static_cast<float>(waveformBounds.getBottom() - 2));
+            g.setColour(selected ? juce::Colour(0xffffba6a) : juce::Colour(0xfff5fbff));
+            g.drawVerticalLine(x,
+                               static_cast<float>(sliceHandleLane.getBottom() + 2),
+                               static_cast<float>(waveformBounds.getBottom() - 3));
 
             juce::Path handle;
-            const float handleTop = static_cast<float>(waveformBounds.getY() + 2);
-            const float handleBottom = static_cast<float>(waveformBounds.getY() + 9);
+            const float handleTop = static_cast<float>(sliceHandleLane.getY() + 1);
+            const float handleBottom = static_cast<float>(sliceHandleLane.getBottom());
             const float handleHalfWidth = selected ? 5.0f : 4.0f;
             handle.startNewSubPath(static_cast<float>(x), handleTop);
             handle.lineTo(static_cast<float>(x) - handleHalfWidth, handleBottom);
@@ -6208,30 +7881,47 @@ void SampleModeComponent::paint(juce::Graphics& g)
             g.fillPath(handle);
         }
 
-        if (stateSnapshot.sliceMode == SampleSliceMode::Transient)
+        if (!stateSnapshot.warpMarkers.empty())
         {
-            for (const auto marker : stateSnapshot.transientMarkers)
+            const auto actualWarpLane = getWarpMarkerLaneBounds();
+            for (size_t markerIndex = 0; markerIndex < stateSnapshot.warpMarkers.size(); ++markerIndex)
             {
-                const float markerNorm = safeNormalizedPosition(marker, stateSnapshot.totalSamples);
+                const auto& marker = stateSnapshot.warpMarkers[markerIndex];
+                const float markerNorm = displayNormalizedPositionForSample(warpDisplayMap, marker.samplePosition);
                 if (markerNorm < visibleStart || markerNorm > visibleEnd)
                     continue;
 
                 const int x = waveformBounds.getX()
                     + juce::roundToInt(((markerNorm - visibleStart) / visibleWidth)
                                        * static_cast<float>(waveformBounds.getWidth()));
-                g.setColour(juce::Colour(0xfff36f6f).withAlpha(0.78f));
+                const bool isDragging = static_cast<int>(markerIndex) == draggingWarpMarkerIndex;
+                g.setColour(juce::Colour(0xfff5c66a).withAlpha(isDragging ? 0.98f : 0.9f));
                 g.drawVerticalLine(x,
-                                   static_cast<float>(waveformBounds.getY() + 10),
-                                   static_cast<float>(waveformBounds.getBottom() - 12));
+                                   static_cast<float>(actualWarpLane.getY() + 1),
+                                   static_cast<float>(waveformBounds.getBottom() - 2));
+
+                juce::Path handle;
+                const float warpHandleCenterY = static_cast<float>(actualWarpLane.getCentreY());
+                const float halfWidth = isDragging ? 6.0f : 5.0f;
+                handle.startNewSubPath(static_cast<float>(x), warpHandleCenterY - 5.0f);
+                handle.lineTo(static_cast<float>(x) - halfWidth, warpHandleCenterY);
+                handle.lineTo(static_cast<float>(x), warpHandleCenterY + 5.0f);
+                handle.lineTo(static_cast<float>(x) + halfWidth, warpHandleCenterY);
+                handle.closeSubPath();
+                g.fillPath(handle);
             }
         }
 
         if (stateSnapshot.playbackProgress >= 0.0f)
         {
-            if (stateSnapshot.playbackProgress >= visibleStart && stateSnapshot.playbackProgress <= visibleEnd)
+            const int64_t playheadSample = static_cast<int64_t>(std::llround(
+                juce::jlimit(0.0f, 1.0f, stateSnapshot.playbackProgress)
+                * static_cast<float>(juce::jmax<int64_t>(1, stateSnapshot.totalSamples - 1))));
+            const float playheadNorm = displayNormalizedPositionForSample(warpDisplayMap, playheadSample);
+            if (playheadNorm >= visibleStart && playheadNorm <= visibleEnd)
             {
                 const int playheadX = waveformBounds.getX()
-                    + juce::roundToInt(((stateSnapshot.playbackProgress - visibleStart) / visibleWidth)
+                    + juce::roundToInt(((playheadNorm - visibleStart) / visibleWidth)
                                        * static_cast<float>(waveformBounds.getWidth()));
                 g.setColour(juce::Colour(0xff8df0b8));
                 g.drawVerticalLine(playheadX,
@@ -6252,17 +7942,31 @@ void SampleModeComponent::paint(juce::Graphics& g)
                          2);
     }
 
-    auto footer = bounds.reduced(0, 2);
-    auto modeRow = footer.removeFromTop(18);
-    sliceModeArea = modeRow.removeFromLeft(184);
-    footer.removeFromTop(2);
-    auto infoBounds = footer.removeFromTop(14);
+    if (waveformBounds.isEmpty())
+    {
+        sliceModeArea = {};
+    }
+    else
+    {
+        auto overlayArea = waveformBounds.reduced(8, 8);
+        sliceModeArea = overlayArea.removeFromBottom(16).withWidth(156);
+    }
+
+    if (!sliceModeArea.isEmpty())
+    {
+        const auto overlayBounds = sliceModeArea.expanded(4, 3);
+        g.setColour(juce::Colour(0xff0d1014).withAlpha(0.72f));
+        g.fillRoundedRectangle(overlayBounds.toFloat(), 6.0f);
+        g.setColour(juce::Colour(0xff32404f).withAlpha(0.65f));
+        g.drawRoundedRectangle(overlayBounds.toFloat(), 6.0f, 1.0f);
+    }
 
     auto drawModeButton = [&](juce::Rectangle<int> area, const juce::String& text, bool active)
     {
         g.setColour(active ? juce::Colour(0xfff6b64f) : juce::Colour(0xff202833));
         g.fillRoundedRectangle(area.toFloat(), 5.0f);
         g.setColour(active ? juce::Colour(0xff1a1f24) : juce::Colour(0xff8d9aab));
+        g.setFont(juce::Font(juce::FontOptions(10.5f, juce::Font::bold)));
         g.drawText(text, area, juce::Justification::centred);
     };
 
@@ -6272,52 +7976,153 @@ void SampleModeComponent::paint(juce::Graphics& g)
                    "B" + juce::String(stateSnapshot.beatDivision),
                    stateSnapshot.sliceMode == SampleSliceMode::Beat);
     drawModeButton(getSliceModeButtonBounds(SampleSliceMode::Manual), "M", stateSnapshot.sliceMode == SampleSliceMode::Manual);
-
-    if (stateSnapshot.hasSample)
-    {
-        juce::String infoText;
-        if (stateSnapshot.visibleSliceBankCount > 0)
-            infoText << "Bank " << juce::String(stateSnapshot.visibleSliceBankIndex + 1)
-                     << "/" << juce::String(juce::jmax(1, stateSnapshot.visibleSliceBankCount));
-        if (stateSnapshot.estimatedTempoBpm > 0.0)
-        {
-            if (infoText.isNotEmpty())
-                infoText << "  |  ";
-            infoText << juce::String(stateSnapshot.estimatedTempoBpm, 1) << " BPM";
-        }
-        if (stateSnapshot.estimatedPitchMidi >= 0)
-        {
-            if (infoText.isNotEmpty())
-                infoText << "  |  ";
-            infoText << noteNameForMidi(stateSnapshot.estimatedPitchMidi);
-        }
-        if (stateSnapshot.analysisSource.isNotEmpty())
-        {
-            if (infoText.isNotEmpty())
-                infoText << "  |  ";
-            infoText << analysisBackendDisplayText(stateSnapshot.essentiaUsed, stateSnapshot.analysisSource);
-        }
-        const auto seconds = stateSnapshot.sourceSampleRate > 0.0
-            ? static_cast<double>(stateSnapshot.totalSamples) / stateSnapshot.sourceSampleRate
-            : 0.0;
-        if (infoText.isNotEmpty())
-            infoText << "  |  ";
-        infoText << "Zoom " << juce::String(stateSnapshot.viewZoom, 1)
-                 << "x  |  " << juce::String(seconds, 2) << " s";
-        if (stateSnapshot.sliceMode == SampleSliceMode::Manual)
-            infoText << "  |  click add, drag move, shift-drag slice, option-drag MLR by transient, right-click delete";
-        else if (stateSnapshot.sliceMode == SampleSliceMode::Transient)
-            infoText << "  |  click add, drag move, shift-drag slice freely, option-drag MLR by transient, right-click delete";
-
-        g.drawFittedText(infoText,
-                         infoBounds,
-                         juce::Justification::centredLeft,
-                         1);
-    }
 }
 
 void SampleModeComponent::resized()
 {
+}
+
+void SampleModeComponent::showWarpContextMenu(const juce::Point<int>& point)
+{
+    if (engine == nullptr)
+        return;
+
+    const int clickedWarpMarker = hitTestWarpMarker(point, 8.0f);
+    juce::PopupMenu menu;
+    menu.addItem(1, "Add Warp Marker Here");
+    menu.addItem(2,
+                 "Add Warp Marker Here (Snap)",
+                 loadedSample != nullptr && loadedSample->analysis.beatTickSamples.size() >= 2);
+    menu.addItem(3, "Auto Add From Visible Transients/Ticks");
+    if (clickedWarpMarker >= 0)
+    {
+        menu.addSeparator();
+        menu.addItem(4, "Remove This Warp Marker");
+    }
+    menu.addSeparator();
+    menu.addItem(5, "Remove All Warp Markers", !stateSnapshot.warpMarkers.empty());
+    menu.addItem(6, "Keep First + Last Warp Markers", stateSnapshot.warpMarkers.size() > 2);
+
+    juce::Component::SafePointer<SampleModeComponent> safeThis(this);
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this).withMousePosition(),
+                       [safeThis, point, clickedWarpMarker](int result)
+                       {
+                           if (safeThis == nullptr || safeThis->engine == nullptr || result <= 0)
+                               return;
+
+                           switch (result)
+                           {
+                               case 1:
+                                   safeThis->engine->createWarpMarkerAtNormalizedPosition(
+                                       safeThis->normalizedPositionFromPoint(point));
+                                   break;
+                               case 2:
+                                   safeThis->engine->createWarpMarkerAtNearestGuide(
+                                       safeThis->normalizedPositionFromPoint(point));
+                                   break;
+                               case 3:
+                                   safeThis->engine->createWarpMarkersFromVisibleTransientClusters();
+                                   break;
+                               case 4:
+                                   if (clickedWarpMarker >= 0)
+                                       safeThis->engine->deleteWarpMarker(clickedWarpMarker);
+                                   break;
+                               case 5:
+                                   safeThis->engine->clearWarpMarkers();
+                                   break;
+                               case 6:
+                                   safeThis->engine->keepBoundaryWarpMarkers();
+                                   break;
+                               default:
+                                   break;
+                           }
+
+                           safeThis->refreshFromEngine();
+                       });
+}
+
+double SampleModeComponent::getCurrentPpqGridStepBeats() const
+{
+    if (loadedSample == nullptr || waveformBounds.isEmpty() || stateSnapshot.totalSamples <= 1)
+        return 0.0;
+
+    const auto beatTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples,
+                                                 loadedSample->sourceLengthSamples);
+    if (beatTicks.size() < 2)
+        return 0.0;
+
+    const auto stableVisibleRange = getVisibleRange();
+    const int64_t stableRangeStartSample = juce::jlimit<int64_t>(
+        0,
+        juce::jmax<int64_t>(0, stateSnapshot.totalSamples - 1),
+        static_cast<int64_t>(std::llround(stableVisibleRange.getStart()
+                                          * static_cast<float>(juce::jmax<int64_t>(1, stateSnapshot.totalSamples - 1)))));
+    const int64_t stableRangeEndSample = juce::jlimit<int64_t>(
+        stableRangeStartSample + 1,
+        juce::jmax<int64_t>(1, stateSnapshot.totalSamples - 1),
+        static_cast<int64_t>(std::llround(stableVisibleRange.getEnd()
+                                          * static_cast<float>(juce::jmax<int64_t>(1, stateSnapshot.totalSamples - 1)))));
+    const double stableBeatStart = computeBeatTickPosition(beatTicks, stableRangeStartSample);
+    const double stableBeatEnd = computeBeatTickPosition(beatTicks, stableRangeEndSample);
+    if (!std::isfinite(stableBeatStart)
+        || !std::isfinite(stableBeatEnd)
+        || stableBeatEnd <= stableBeatStart)
+    {
+        return 0.0;
+    }
+
+    return choosePpqGridBeatStep(stableBeatEnd - stableBeatStart,
+                                 waveformBounds.getWidth(),
+                                 28.0);
+}
+
+void SampleModeComponent::showSliceContextMenu(const juce::Point<int>& point)
+{
+    juce::ignoreUnused(point);
+    if (engine == nullptr)
+        return;
+
+    const bool editableSliceMode = stateSnapshot.sliceMode == SampleSliceMode::Transient
+        || stateSnapshot.sliceMode == SampleSliceMode::Manual;
+    if (!editableSliceMode)
+        return;
+
+    const double gridStepBeats = getCurrentPpqGridStepBeats();
+    const bool currentSelectionOnly = stateSnapshot.useLegacyLoopEngine;
+    const bool hasEditableMarkers = stateSnapshot.sliceMode == SampleSliceMode::Transient
+        ? !stateSnapshot.transientMarkers.empty()
+        : !stateSnapshot.cuePoints.empty();
+
+    juce::PopupMenu menu;
+    menu.addItem(1,
+                 currentSelectionOnly
+                     ? "Snap Current Selection to Nearest PPQ Grid"
+                     : "Snap Slice Points to Nearest PPQ Grid",
+                 hasEditableMarkers && gridStepBeats > 0.0);
+    menu.addSeparator();
+    menu.addItem(2, "Undo Slice Edit", engine->canUndoSliceEdit());
+
+    juce::Component::SafePointer<SampleModeComponent> safeThis(this);
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this).withMousePosition(),
+                       [safeThis, gridStepBeats, currentSelectionOnly](int result)
+                       {
+                           if (safeThis == nullptr || safeThis->engine == nullptr || result <= 0)
+                               return;
+
+                           switch (result)
+                           {
+                               case 1:
+                                   safeThis->engine->snapSlicePointsToNearestPpqGrid(gridStepBeats, currentSelectionOnly);
+                                   break;
+                               case 2:
+                                   safeThis->engine->undoLastSliceEdit();
+                                   break;
+                               default:
+                                   break;
+                           }
+
+                           safeThis->refreshFromEngine();
+                       });
 }
 
 void SampleModeComponent::mouseDown(const juce::MouseEvent& event)
@@ -6328,6 +8133,8 @@ void SampleModeComponent::mouseDown(const juce::MouseEvent& event)
     legacyLoopDragStepOffset = 0;
     draggingVisibleSliceSlot = -1;
     draggingCueIndex = -1;
+    draggingWarpMarkerIndex = -1;
+    draggingWarpMouseDownPoint = {};
     draggingTransientIndex = -1;
     createdCueOnMouseDown = false;
 
@@ -6393,8 +8200,12 @@ void SampleModeComponent::mouseDown(const juce::MouseEvent& event)
 
     if (random16Bounds.contains(point))
     {
-        if (engine != nullptr && stateSnapshot.visibleSliceBankCount > 1)
+        if (engine != nullptr
+            && stateSnapshot.visibleSliceBankCount > 1
+            && !stateSnapshot.useLegacyLoopEngine)
+        {
             engine->randomizeVisibleBank();
+        }
         return;
     }
 
@@ -6434,47 +8245,181 @@ void SampleModeComponent::mouseDown(const juce::MouseEvent& event)
     }
 
     if (engine != nullptr
-        && event.mods.isAltDown()
+        && loadedSample != nullptr
+        && waveformBounds.contains(point)
+        && getWarpMarkerLaneBounds().contains(point))
+    {
+        grabKeyboardFocus();
+        if (event.mods.isPopupMenu())
+        {
+            showWarpContextMenu(point);
+            return;
+        }
+
+        if (event.getNumberOfClicks() >= 2)
+        {
+            if (event.mods.isShiftDown())
+            {
+                engine->createWarpMarkersFromVisibleTransientClusters();
+            }
+            else
+            {
+                const int exactWarpMarkerIndex = hitTestExactWarpMarkerHandle(point);
+                if (exactWarpMarkerIndex >= 0)
+                    engine->deleteWarpMarker(exactWarpMarkerIndex);
+                else
+                    draggingWarpMarkerIndex = event.mods.isAltDown()
+                        ? engine->createWarpMarkerAtNearestGuide(normalizedPositionFromPoint(point))
+                        : engine->createWarpMarkerAtNormalizedPosition(normalizedPositionFromPoint(point));
+            }
+
+            refreshFromEngine();
+            return;
+        }
+
+        draggingWarpMarkerIndex = hitTestExactWarpMarkerHandle(point);
+        if (draggingWarpMarkerIndex >= 0)
+        {
+            engine->beginInteractiveWarpEdit();
+            draggingWarpMouseDownPoint = point;
+            return;
+        }
+
+        return;
+    }
+
+    if (engine != nullptr
+        && loadedSample != nullptr
+        && waveformBounds.contains(point)
+        && !getWarpMarkerLaneBounds().contains(point)
+        && event.mods.isPopupMenu()
+        && (stateSnapshot.sliceMode == SampleSliceMode::Transient
+            || stateSnapshot.sliceMode == SampleSliceMode::Manual))
+    {
+        grabKeyboardFocus();
+        showSliceContextMenu(point);
+        return;
+    }
+
+    if (engine != nullptr
+        && loadedSample != nullptr
+        && waveformBounds.contains(point)
+        && event.getNumberOfClicks() >= 2)
+    {
+        if (stateSnapshot.sliceMode == SampleSliceMode::Transient)
+        {
+            const int markerIndex = hitTestTransientMarker(point);
+            if (markerIndex >= 0)
+            {
+                engine->deleteTransientMarker(markerIndex);
+                refreshFromEngine();
+                return;
+            }
+        }
+
+        if (stateSnapshot.sliceMode == SampleSliceMode::Manual)
+        {
+            const int cueIndex = hitTestCuePoint(point);
+            if (cueIndex >= 0)
+            {
+                engine->deleteCuePoint(cueIndex);
+                refreshFromEngine();
+                return;
+            }
+        }
+    }
+
+    if (engine != nullptr
+        && event.mods.isCommandDown()
         && stateSnapshot.useLegacyLoopEngine
-        && stateSnapshot.legacyLoopBarSelection > 0
         && getVisibleLegacyLoopRangeBounds().contains(point))
     {
         grabKeyboardFocus();
+        engine->beginInteractiveLegacyLoopEdit();
         draggingLegacyLoopWindow = true;
         legacyLoopDragStartX = point.x;
         legacyLoopDragStepOffset = 0;
         return;
     }
 
+    if (engine != nullptr
+        && stateSnapshot.sliceMode == SampleSliceMode::Transient
+        && waveformBounds.contains(point)
+        && !event.mods.isShiftDown()
+        && !event.mods.isPopupMenu())
+    {
+        int visibleSliceSlot = hitTestExactVisibleSliceMarkerHandle(point);
+        if (visibleSliceSlot < 0)
+            visibleSliceSlot = hitTestVisibleSliceMarker(point);
+        if (visibleSliceSlot < 0)
+        {
+            if (const auto lane = getSliceMarkerHandleBounds(); !lane.isEmpty())
+                visibleSliceSlot = hitTestVisibleSliceMarker({ point.x, lane.getCentreY() });
+        }
+        if (visibleSliceSlot >= 0)
+        {
+            grabKeyboardFocus();
+            draggingTransientIndex = engine->resolveTransientMarkerIndexForVisibleSlot(visibleSliceSlot);
+            if (draggingTransientIndex >= 0)
+                engine->beginSliceEditGesture();
+            return;
+        }
+    }
+
     if (engine != nullptr && event.mods.isShiftDown() && waveformBounds.contains(point))
     {
         grabKeyboardFocus();
+        if (stateSnapshot.sliceMode == SampleSliceMode::Transient)
+        {
+            int visibleSliceSlot = hitTestExactVisibleSliceMarkerHandle(point);
+            if (visibleSliceSlot < 0)
+                visibleSliceSlot = hitTestVisibleSliceMarker(point);
+            if (visibleSliceSlot < 0)
+            {
+                if (const auto lane = getSliceMarkerHandleBounds(); !lane.isEmpty())
+                    visibleSliceSlot = hitTestVisibleSliceMarker({ point.x, lane.getCentreY() });
+            }
+            if (visibleSliceSlot < 0)
+                visibleSliceSlot = hitTestVisibleSlice(point);
+
+            if (visibleSliceSlot >= 0)
+            {
+                draggingVisibleSliceSlot = visibleSliceSlot;
+                engine->beginSliceEditGesture();
+            }
+            return;
+        }
+
         if (stateSnapshot.sliceMode == SampleSliceMode::Manual)
         {
             draggingCueIndex = hitTestCuePoint(point);
             if (draggingCueIndex >= 0)
             {
                 engine->selectCuePoint(draggingCueIndex);
+                engine->beginSliceEditGesture();
                 return;
             }
         }
 
-        int visibleSliceSlot = hitTestVisibleSliceMarker(point);
+        int visibleSliceSlot = hitTestExactVisibleSliceMarkerHandle(point);
+        if (visibleSliceSlot < 0)
+            visibleSliceSlot = hitTestVisibleSliceMarker(point);
+        if (visibleSliceSlot < 0)
+        {
+            if (const auto lane = getSliceMarkerHandleBounds(); !lane.isEmpty())
+                visibleSliceSlot = hitTestVisibleSliceMarker({ point.x, lane.getCentreY() });
+        }
         if (visibleSliceSlot < 0)
             visibleSliceSlot = hitTestVisibleSlice(point);
         if (visibleSliceSlot >= 0)
         {
-            if (stateSnapshot.sliceMode == SampleSliceMode::Transient)
-            {
-                draggingVisibleSliceSlot = visibleSliceSlot;
-                return;
-            }
-            else if (stateSnapshot.sliceMode == SampleSliceMode::Manual)
+            if (stateSnapshot.sliceMode == SampleSliceMode::Manual)
             {
                 draggingCueIndex = findCuePointForVisibleSlice(visibleSliceSlot);
                 if (draggingCueIndex >= 0)
                 {
                     engine->selectCuePoint(draggingCueIndex);
+                    engine->beginSliceEditGesture();
                     return;
                 }
             }
@@ -6485,20 +8430,15 @@ void SampleModeComponent::mouseDown(const juce::MouseEvent& event)
     {
         grabKeyboardFocus();
         const int markerIndex = hitTestTransientMarker(point);
-        if (event.mods.isPopupMenu())
-        {
-            if (markerIndex >= 0)
-                engine->deleteTransientMarker(markerIndex);
-            return;
-        }
-
         if (markerIndex >= 0)
         {
             draggingTransientIndex = markerIndex;
+            engine->beginSliceEditGesture();
             return;
         }
 
         draggingTransientIndex = engine->createTransientMarkerAtNormalizedPosition(normalizedPositionFromPoint(point));
+        refreshFromEngine();
         return;
     }
 
@@ -6506,28 +8446,29 @@ void SampleModeComponent::mouseDown(const juce::MouseEvent& event)
     {
         grabKeyboardFocus();
         const int cueIndex = hitTestCuePoint(point);
-        if (event.mods.isPopupMenu())
-        {
-            if (cueIndex >= 0)
-                engine->deleteCuePoint(cueIndex);
-            return;
-        }
-
         if (cueIndex >= 0)
         {
             engine->selectCuePoint(cueIndex);
             draggingCueIndex = cueIndex;
+            engine->beginSliceEditGesture();
+            refreshFromEngine();
             return;
         }
 
         draggingCueIndex = engine->createCuePointAtNormalizedPosition(normalizedPositionFromPoint(point));
         createdCueOnMouseDown = (draggingCueIndex >= 0);
+        refreshFromEngine();
         return;
     }
 
     const int visibleSlot = hitTestVisibleSlice(point);
     if (visibleSlot >= 0 && onTriggerVisibleSlice)
         onTriggerVisibleSlice(visibleSlot);
+}
+
+void SampleModeComponent::mouseDoubleClick(const juce::MouseEvent& event)
+{
+    juce::ignoreUnused(event);
 }
 
 void SampleModeComponent::mouseDrag(const juce::MouseEvent& event)
@@ -6547,32 +8488,76 @@ void SampleModeComponent::mouseDrag(const juce::MouseEvent& event)
 
     if (draggingVisibleSliceSlot >= 0 && stateSnapshot.sliceMode == SampleSliceMode::Transient)
     {
-        engine->moveVisibleSliceToPosition(draggingVisibleSliceSlot,
-                                           normalizedPositionFromPoint(event.getPosition()));
+        const float normalizedPosition = normalizedPositionFromPoint(event.getPosition());
+        if (event.mods.isAltDown())
+            engine->moveVisibleSliceToNearestTransient(draggingVisibleSliceSlot, normalizedPosition);
+        else
+            engine->moveVisibleSliceToPosition(draggingVisibleSliceSlot, normalizedPosition);
+        refreshFromEngine();
         return;
     }
 
     if (draggingTransientIndex >= 0 && stateSnapshot.sliceMode == SampleSliceMode::Transient)
     {
-        draggingTransientIndex = engine->moveTransientMarker(draggingTransientIndex,
-                                                             normalizedPositionFromPoint(event.getPosition()));
+        const float normalizedPosition = normalizedPositionFromPoint(event.getPosition());
+        if (event.mods.isAltDown())
+            draggingTransientIndex = engine->moveTransientMarkerToNearestDetectedTransient(draggingTransientIndex,
+                                                                                           normalizedPosition);
+        else
+            draggingTransientIndex = engine->moveTransientMarker(draggingTransientIndex,
+                                                                 normalizedPosition);
+        refreshFromEngine();
+        return;
+    }
+
+    if (draggingWarpMarkerIndex >= 0)
+    {
+        auto dragPoint = event.getPosition();
+        if (event.mods.isShiftDown())
+        {
+            dragPoint.x = draggingWarpMouseDownPoint.x
+                + juce::roundToInt(static_cast<float>(dragPoint.x - draggingWarpMouseDownPoint.x) * kWarpMarkerFineDragScale);
+        }
+
+        draggingWarpMarkerIndex = event.mods.isAltDown()
+            ? engine->moveWarpMarkerToNearestGuide(draggingWarpMarkerIndex,
+                                                   normalizedPositionFromPoint(dragPoint))
+            : engine->moveWarpMarker(draggingWarpMarkerIndex,
+                                     normalizedPositionFromPoint(dragPoint));
+        refreshFromEngine();
         return;
     }
 
     if (draggingCueIndex >= 0 && stateSnapshot.sliceMode == SampleSliceMode::Manual)
+    {
         draggingCueIndex = engine->moveCuePoint(draggingCueIndex,
                                                 normalizedPositionFromPoint(event.getPosition()));
+        refreshFromEngine();
+    }
 }
 
 void SampleModeComponent::mouseUp(const juce::MouseEvent&)
 {
+    const bool finishedLegacyLoopDrag = draggingLegacyLoopWindow;
+    const bool finishedWarpDrag = (draggingWarpMarkerIndex >= 0);
     draggingLegacyLoopWindow = false;
     legacyLoopDragStartX = 0;
     legacyLoopDragStepOffset = 0;
     draggingVisibleSliceSlot = -1;
     draggingCueIndex = -1;
+    draggingWarpMarkerIndex = -1;
+    draggingWarpMouseDownPoint = {};
     draggingTransientIndex = -1;
     createdCueOnMouseDown = false;
+
+    if (engine != nullptr)
+        engine->endSliceEditGesture();
+
+    if (finishedLegacyLoopDrag && engine != nullptr)
+        engine->endInteractiveLegacyLoopEdit();
+
+    if (finishedWarpDrag && engine != nullptr)
+        engine->endInteractiveWarpEdit();
 }
 
 void SampleModeComponent::mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel)
@@ -6600,8 +8585,55 @@ bool SampleModeComponent::keyPressed(const juce::KeyPress& key)
     if (engine == nullptr)
         return false;
 
+    if (key.getModifiers().isCommandDown()
+        && (key.getTextCharacter() == 'z' || key.getTextCharacter() == 'Z'))
+    {
+        return engine->undoLastSliceEdit();
+    }
+
+    if (key.getModifiers().isCommandDown())
+    {
+        if (key.getKeyCode() == juce::KeyPress::leftKey)
+        {
+            if (stateSnapshot.useLegacyLoopEngine)
+            {
+                const bool changed = engine->nudgeLegacyLoopWindowByAnchorDelta(-1);
+                if (changed)
+                    refreshFromEngine();
+                return changed;
+            }
+
+            if (onNavigateVisibleBank && stateSnapshot.canNavigateLeft)
+            {
+                onNavigateVisibleBank(-1);
+                return true;
+            }
+        }
+
+        if (key.getKeyCode() == juce::KeyPress::rightKey)
+        {
+            if (stateSnapshot.useLegacyLoopEngine)
+            {
+                const bool changed = engine->nudgeLegacyLoopWindowByAnchorDelta(1);
+                if (changed)
+                    refreshFromEngine();
+                return changed;
+            }
+
+            if (onNavigateVisibleBank && stateSnapshot.canNavigateRight)
+            {
+                onNavigateVisibleBank(1);
+                return true;
+            }
+        }
+    }
+
     if (key.getKeyCode() == juce::KeyPress::deleteKey || key.getKeyCode() == juce::KeyPress::backspaceKey)
     {
+        const int warpMarkerIndex = hitTestWarpMarker(getMouseXYRelative());
+        if (warpMarkerIndex >= 0)
+            return engine->deleteWarpMarker(warpMarkerIndex);
+
         if (stateSnapshot.sliceMode == SampleSliceMode::Manual)
             return engine->deleteCuePoint(stateSnapshot.selectedCueIndex);
 
@@ -6637,6 +8669,18 @@ void SampleModeComponent::refreshFromEngine()
     repaint();
 }
 
+int64_t SampleModeComponent::getVisibleSliceMarkerSample(int visibleSlot) const
+{
+    if (visibleSlot < 0 || visibleSlot >= SliceModel::VisibleSliceCount)
+        return -1;
+
+    const auto& slice = stateSnapshot.visibleSlices[static_cast<size_t>(visibleSlot)];
+    if (slice.id < 0 || slice.endSample <= slice.startSample)
+        return -1;
+
+    return slice.startSample;
+}
+
 int SampleModeComponent::hitTestVisibleSlice(const juce::Point<int>& point) const
 {
     if (!waveformBounds.contains(point))
@@ -6660,33 +8704,106 @@ int SampleModeComponent::hitTestVisibleSlice(const juce::Point<int>& point) cons
 
 int SampleModeComponent::hitTestVisibleSliceMarker(const juce::Point<int>& point) const
 {
-    if (!waveformBounds.contains(point) || stateSnapshot.totalSamples <= 0)
+    const auto sliceHandleLane = getSliceMarkerHandleBounds();
+    const int markerTop = sliceHandleLane.isEmpty() ? waveformBounds.getY() : sliceHandleLane.getY();
+    const auto markerBounds = juce::Rectangle<int>(waveformBounds.getX(),
+                                                   markerTop,
+                                                   waveformBounds.getWidth(),
+                                                   juce::jmax(1, waveformBounds.getBottom() - markerTop));
+    if (!markerBounds.expanded(0, 6).contains(point) || stateSnapshot.totalSamples <= 0)
         return -1;
 
-    const auto visibleRange = getVisibleRange();
+    if (const int exactHandle = hitTestExactVisibleSliceMarkerHandle(point); exactHandle >= 0)
+        return exactHandle;
+
+    const auto visibleRange = getVisibleDisplayRange();
+    const auto warpDisplayMap = buildSampleWarpDisplayMap(loadedSample.get(), stateSnapshot);
     const float visibleWidth = juce::jmax(1.0e-5f, visibleRange.getLength());
+    const float zoomAwareHitRadius = juce::jlimit(9.0f,
+                                                  24.0f,
+                                                  9.0f + (std::log2(juce::jmax(1.0f, stateSnapshot.viewZoom)) * 3.0f));
+
+    std::array<float, SliceModel::VisibleSliceCount> markerXs {};
+    std::array<bool, SliceModel::VisibleSliceCount> hasMarker {};
+    for (int slot = 0; slot < SliceModel::VisibleSliceCount; ++slot)
+    {
+        const int64_t markerSample = getVisibleSliceMarkerSample(slot);
+        if (markerSample < 0)
+            continue;
+        const float markerNorm = displayNormalizedPositionForSample(warpDisplayMap, markerSample);
+        if (markerNorm < visibleRange.getStart() || markerNorm > visibleRange.getEnd())
+            continue;
+
+        markerXs[static_cast<size_t>(slot)] = waveformBounds.getX()
+            + (((markerNorm - visibleRange.getStart()) / visibleWidth) * waveformBounds.getWidth());
+        hasMarker[static_cast<size_t>(slot)] = true;
+    }
 
     int bestSlot = -1;
     float bestDistance = std::numeric_limits<float>::max();
     for (int slot = 0; slot < SliceModel::VisibleSliceCount; ++slot)
     {
-        const auto& slice = stateSnapshot.visibleSlices[static_cast<size_t>(slot)];
-        if (slice.id < 0 || slice.endSample <= slice.startSample)
-            continue;
-        if (slice.normalizedStart < visibleRange.getStart() || slice.normalizedStart > visibleRange.getEnd())
+        if (!hasMarker[static_cast<size_t>(slot)])
             continue;
 
-        const float x = waveformBounds.getX()
-            + (((slice.normalizedStart - visibleRange.getStart()) / visibleWidth) * waveformBounds.getWidth());
-        const float distance = std::abs(x - static_cast<float>(point.x));
-        if (distance <= kVisibleSliceMarkerHitRadiusPixels && distance < bestDistance)
+        const float distance = std::abs(markerXs[static_cast<size_t>(slot)] - static_cast<float>(point.x));
+        if (distance < bestDistance)
         {
             bestDistance = distance;
             bestSlot = slot;
         }
     }
 
-    return bestSlot;
+    if (bestSlot < 0)
+        return -1;
+
+    float maxAllowedDistance = zoomAwareHitRadius;
+    if (bestSlot > 0 && hasMarker[static_cast<size_t>(bestSlot - 1)])
+    {
+        const float gap = markerXs[static_cast<size_t>(bestSlot)] - markerXs[static_cast<size_t>(bestSlot - 1)];
+        maxAllowedDistance = juce::jmin(maxAllowedDistance, juce::jmax(6.0f, gap * 0.48f));
+    }
+    if (bestSlot + 1 < SliceModel::VisibleSliceCount && hasMarker[static_cast<size_t>(bestSlot + 1)])
+    {
+        const float gap = markerXs[static_cast<size_t>(bestSlot + 1)] - markerXs[static_cast<size_t>(bestSlot)];
+        maxAllowedDistance = juce::jmin(maxAllowedDistance, juce::jmax(6.0f, gap * 0.48f));
+    }
+
+    return bestDistance <= maxAllowedDistance ? bestSlot : -1;
+}
+
+int SampleModeComponent::hitTestExactVisibleSliceMarkerHandle(const juce::Point<int>& point) const
+{
+    const auto sliceHandleLane = getSliceMarkerHandleBounds();
+    if (!sliceHandleLane.expanded(0, 4).contains(point) || stateSnapshot.totalSamples <= 0)
+        return -1;
+
+    const auto visibleRange = getVisibleDisplayRange();
+    const auto warpDisplayMap = buildSampleWarpDisplayMap(loadedSample.get(), stateSnapshot);
+    const float visibleWidth = juce::jmax(1.0e-5f, visibleRange.getLength());
+    const float handleHalfWidth = 8.0f;
+
+    for (int slot = 0; slot < SliceModel::VisibleSliceCount; ++slot)
+    {
+        const int64_t markerSample = getVisibleSliceMarkerSample(slot);
+        if (markerSample < 0)
+            continue;
+
+        const float markerNorm = displayNormalizedPositionForSample(warpDisplayMap, markerSample);
+        if (markerNorm < visibleRange.getStart() || markerNorm > visibleRange.getEnd())
+            continue;
+
+        const float x = waveformBounds.getX()
+            + (((markerNorm - visibleRange.getStart()) / visibleWidth) * waveformBounds.getWidth());
+        const auto handleBounds = juce::Rectangle<float>(x - handleHalfWidth,
+                                                         static_cast<float>(sliceHandleLane.getY()),
+                                                         handleHalfWidth * 2.0f,
+                                                         static_cast<float>(sliceHandleLane.getHeight()));
+        if (handleBounds.contains(point.toFloat()))
+            return slot;
+    }
+
+    return -1;
 }
 
 int SampleModeComponent::hitTestCuePoint(const juce::Point<int>& point) const
@@ -6694,14 +8811,16 @@ int SampleModeComponent::hitTestCuePoint(const juce::Point<int>& point) const
     if (!waveformBounds.contains(point) || stateSnapshot.totalSamples <= 0)
         return -1;
 
-    const auto visibleRange = getVisibleRange();
+    const auto visibleRange = getVisibleDisplayRange();
+    const auto warpDisplayMap = buildSampleWarpDisplayMap(loadedSample.get(), stateSnapshot);
     const float visibleWidth = juce::jmax(1.0e-5f, visibleRange.getLength());
 
     int bestIndex = -1;
     float bestDistance = std::numeric_limits<float>::max();
     for (size_t i = 0; i < stateSnapshot.cuePoints.size(); ++i)
     {
-        const float cueNorm = safeNormalizedPosition(stateSnapshot.cuePoints[i].samplePosition, stateSnapshot.totalSamples);
+        const float cueNorm = displayNormalizedPositionForSample(warpDisplayMap,
+                                                                 stateSnapshot.cuePoints[i].samplePosition);
         if (cueNorm < visibleRange.getStart() || cueNorm > visibleRange.getEnd())
             continue;
 
@@ -6709,6 +8828,149 @@ int SampleModeComponent::hitTestCuePoint(const juce::Point<int>& point) const
             + (((cueNorm - visibleRange.getStart()) / visibleWidth) * waveformBounds.getWidth());
         const float distance = std::abs(x - static_cast<float>(point.x));
         if (distance <= kCueHitRadiusPixels && distance < bestDistance)
+        {
+            bestDistance = distance;
+            bestIndex = static_cast<int>(i);
+        }
+    }
+
+    return bestIndex;
+}
+
+int SampleModeComponent::hitTestWarpMarker(const juce::Point<int>& point) const
+{
+    return hitTestWarpMarker(point, computeWarpMarkerHitRadiusForZoom(stateSnapshot.viewZoom));
+}
+
+int SampleModeComponent::hitTestWarpMarker(const juce::Point<int>& point, float hitRadius) const
+{
+    if (!getWarpMarkerLaneBounds().contains(point) || stateSnapshot.totalSamples <= 0)
+        return -1;
+
+    if (const int exactHandle = hitTestExactWarpMarkerHandle(point); exactHandle >= 0)
+        return exactHandle;
+
+    const auto visibleRange = getVisibleDisplayRange();
+    const auto warpDisplayMap = buildSampleWarpDisplayMap(loadedSample.get(), stateSnapshot);
+    const float visibleWidth = juce::jmax(1.0e-5f, visibleRange.getLength());
+    const float xNorm = juce::jlimit(0.0f,
+                                     1.0f,
+                                     static_cast<float>(point.x - waveformBounds.getX())
+                                         / juce::jmax(1.0f, static_cast<float>(waveformBounds.getWidth())));
+    const float displayNormalized = juce::jlimit(0.0f,
+                                                 1.0f,
+                                                 visibleRange.getStart() + (xNorm * visibleRange.getLength()));
+    const int64_t visibleSampleStart = samplePositionFromDisplayNormalized(warpDisplayMap, visibleRange.getStart());
+    const int64_t visibleSampleEnd = samplePositionFromDisplayNormalized(warpDisplayMap, visibleRange.getEnd());
+    const int64_t samplesPerPixel = juce::jmax<int64_t>(1,
+        static_cast<int64_t>(std::llround(static_cast<double>(juce::jmax<int64_t>(1, std::abs(visibleSampleEnd - visibleSampleStart))))
+                                          / static_cast<double>(juce::jmax(1, waveformBounds.getWidth()))));
+    const int64_t clickedSample = samplePositionFromDisplayNormalized(warpDisplayMap, displayNormalized);
+    const int64_t sampleTolerance = juce::jmax<int64_t>(1,
+        static_cast<int64_t>(std::ceil(static_cast<double>(samplesPerPixel) * std::max(1.0f, hitRadius))));
+
+    std::vector<float> visibleMarkerXs;
+    visibleMarkerXs.reserve(stateSnapshot.warpMarkers.size());
+    std::vector<int> visibleMarkerIndices;
+    visibleMarkerIndices.reserve(stateSnapshot.warpMarkers.size());
+    for (size_t i = 0; i < stateSnapshot.warpMarkers.size(); ++i)
+    {
+        const float markerNorm = displayNormalizedPositionForSample(warpDisplayMap,
+                                                                    stateSnapshot.warpMarkers[i].samplePosition);
+        if (markerNorm < visibleRange.getStart() || markerNorm > visibleRange.getEnd())
+            continue;
+
+        visibleMarkerXs.push_back(waveformBounds.getX()
+            + (((markerNorm - visibleRange.getStart()) / visibleWidth) * waveformBounds.getWidth()));
+        visibleMarkerIndices.push_back(static_cast<int>(i));
+    }
+
+    int bestIndex = -1;
+    float bestDistance = std::numeric_limits<float>::max();
+    for (size_t visibleIndex = 0; visibleIndex < visibleMarkerIndices.size(); ++visibleIndex)
+    {
+        const int markerIndex = visibleMarkerIndices[visibleIndex];
+        const float x = visibleMarkerXs[visibleIndex];
+        const float distance = std::abs(x - static_cast<float>(point.x));
+        const int64_t sampleDistance = std::abs(stateSnapshot.warpMarkers[static_cast<size_t>(markerIndex)].samplePosition - clickedSample);
+        float maxAllowedDistance = hitRadius;
+        if (visibleIndex > 0)
+            maxAllowedDistance = juce::jmin(maxAllowedDistance,
+                                            juce::jmax(1.0f, (x - visibleMarkerXs[visibleIndex - 1]) * 0.48f));
+        if (visibleIndex + 1 < visibleMarkerXs.size())
+            maxAllowedDistance = juce::jmin(maxAllowedDistance,
+                                            juce::jmax(1.0f, (visibleMarkerXs[visibleIndex + 1] - x) * 0.48f));
+
+        if (distance <= maxAllowedDistance && sampleDistance <= sampleTolerance && distance < bestDistance)
+        {
+            bestDistance = distance;
+            bestIndex = markerIndex;
+        }
+    }
+
+    return bestIndex;
+}
+
+int SampleModeComponent::hitTestExactWarpMarkerHandle(const juce::Point<int>& point) const
+{
+    const auto warpLane = getWarpMarkerLaneBounds();
+    if (!warpLane.contains(point) || stateSnapshot.totalSamples <= 0)
+        return -1;
+
+    const auto visibleRange = getVisibleDisplayRange();
+    const auto warpDisplayMap = buildSampleWarpDisplayMap(loadedSample.get(), stateSnapshot);
+    const float visibleWidth = juce::jmax(1.0e-5f, visibleRange.getLength());
+    const float handleHalfWidth = juce::jmax(5.0f,
+        computeWarpMarkerHitRadiusForZoom(stateSnapshot.viewZoom) + 2.5f);
+    const auto pointF = point.toFloat();
+
+    for (size_t markerIndex = 0; markerIndex < stateSnapshot.warpMarkers.size(); ++markerIndex)
+    {
+        const auto& marker = stateSnapshot.warpMarkers[markerIndex];
+        const float markerNorm = displayNormalizedPositionForSample(warpDisplayMap, marker.samplePosition);
+        if (markerNorm < visibleRange.getStart() || markerNorm > visibleRange.getEnd())
+            continue;
+
+        const float x = waveformBounds.getX()
+            + (((markerNorm - visibleRange.getStart()) / visibleWidth) * waveformBounds.getWidth());
+        const auto handleBounds = juce::Rectangle<float>(x - handleHalfWidth,
+                                                         static_cast<float>(warpLane.getY()),
+                                                         handleHalfWidth * 2.0f,
+                                                         static_cast<float>(warpLane.getHeight()));
+        if (handleBounds.contains(pointF))
+            return static_cast<int>(markerIndex);
+    }
+
+    return -1;
+}
+
+int SampleModeComponent::hitTestWarpGuideMarker(const juce::Point<int>& point) const
+{
+    if (loadedSample == nullptr
+        || !getWarpMarkerLaneBounds().contains(point)
+        || stateSnapshot.totalSamples <= 0)
+    {
+        return -1;
+    }
+
+    const auto visibleRange = getVisibleDisplayRange();
+    const auto warpDisplayMap = buildSampleWarpDisplayMap(loadedSample.get(), stateSnapshot);
+    const float visibleWidth = juce::jmax(1.0e-5f, visibleRange.getLength());
+    const auto sanitizedGuideTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples,
+                                                           loadedSample->sourceLengthSamples);
+
+    int bestIndex = -1;
+    float bestDistance = std::numeric_limits<float>::max();
+    for (size_t i = 0; i < sanitizedGuideTicks.size(); ++i)
+    {
+        const float markerNorm = displayNormalizedPositionForSample(warpDisplayMap, sanitizedGuideTicks[i]);
+        if (markerNorm < visibleRange.getStart() || markerNorm > visibleRange.getEnd())
+            continue;
+
+        const float x = waveformBounds.getX()
+            + (((markerNorm - visibleRange.getStart()) / visibleWidth) * waveformBounds.getWidth());
+        const float distance = std::abs(x - static_cast<float>(point.x));
+        if (distance <= kWarpMarkerHitRadiusPixels && distance < bestDistance)
         {
             bestDistance = distance;
             bestIndex = static_cast<int>(i);
@@ -6783,14 +9045,16 @@ int SampleModeComponent::hitTestTransientMarker(const juce::Point<int>& point) c
     if (!waveformBounds.contains(point) || stateSnapshot.totalSamples <= 0)
         return -1;
 
-    const auto visibleRange = getVisibleRange();
+    const auto visibleRange = getVisibleDisplayRange();
+    const auto warpDisplayMap = buildSampleWarpDisplayMap(loadedSample.get(), stateSnapshot);
     const float visibleWidth = juce::jmax(1.0e-5f, visibleRange.getLength());
 
     int bestIndex = -1;
     float bestDistance = std::numeric_limits<float>::max();
     for (size_t i = 0; i < stateSnapshot.transientMarkers.size(); ++i)
     {
-        const float markerNorm = safeNormalizedPosition(stateSnapshot.transientMarkers[i], stateSnapshot.totalSamples);
+        const float markerNorm = displayNormalizedPositionForSample(warpDisplayMap,
+                                                                    stateSnapshot.transientMarkers[i]);
         if (markerNorm < visibleRange.getStart() || markerNorm > visibleRange.getEnd())
             continue;
 
@@ -6812,12 +9076,19 @@ juce::Rectangle<int> SampleModeComponent::getVisibleLegacyLoopRangeBounds() cons
     if (stateSnapshot.totalSamples <= 0 || waveformBounds.isEmpty())
         return {};
 
-    const auto visibleRange = getVisibleRange();
+    const auto visibleRange = getVisibleDisplayRange();
+    const auto warpDisplayMap = buildSampleWarpDisplayMap(loadedSample.get(), stateSnapshot);
     const float visibleWidth = juce::jmax(1.0e-5f, visibleRange.getLength());
     if (const auto loopRange = computeSampleLoopVisualRange(stateSnapshot))
     {
-        const float loopStartNorm = juce::jmax(loopRange->getStart(), visibleRange.getStart());
-        const float loopEndNorm = juce::jmin(loopRange->getEnd(), visibleRange.getEnd());
+        const int64_t loopStartSample = static_cast<int64_t>(std::llround(loopRange->getStart()
+                                                                          * static_cast<float>(stateSnapshot.totalSamples)));
+        const int64_t loopEndSample = static_cast<int64_t>(std::llround(loopRange->getEnd()
+                                                                        * static_cast<float>(stateSnapshot.totalSamples)));
+        const float loopStartNorm = juce::jmax(displayNormalizedPositionForSample(warpDisplayMap, loopStartSample),
+                                               visibleRange.getStart());
+        const float loopEndNorm = juce::jmin(displayNormalizedPositionForSample(warpDisplayMap, loopEndSample),
+                                             visibleRange.getEnd());
         if (loopEndNorm > loopStartNorm)
         {
             const int loopX = waveformBounds.getX()
@@ -6838,13 +9109,16 @@ juce::Rectangle<int> SampleModeComponent::getVisibleLegacyLoopRangeBounds() cons
 
 float SampleModeComponent::normalizedPositionFromPoint(const juce::Point<int>& point) const
 {
-    const auto visibleRange = getVisibleRange();
+    const auto visibleRange = getVisibleDisplayRange();
+    const auto warpDisplayMap = buildSampleWarpDisplayMap(loadedSample.get(), stateSnapshot);
     const int relativeX = point.x - waveformBounds.getX();
     const float xNorm = juce::jlimit(0.0f,
                                      1.0f,
                                      static_cast<float>(relativeX)
                                          / juce::jmax(1.0f, static_cast<float>(waveformBounds.getWidth())));
-    return juce::jlimit(0.0f, 1.0f, visibleRange.getStart() + (xNorm * visibleRange.getLength()));
+    const float displayNormalized = juce::jlimit(0.0f, 1.0f, visibleRange.getStart() + (xNorm * visibleRange.getLength()));
+    const int64_t samplePosition = samplePositionFromDisplayNormalized(warpDisplayMap, displayNormalized);
+    return safeNormalizedPosition(samplePosition, stateSnapshot.totalSamples);
 }
 
 juce::Range<float> SampleModeComponent::getVisibleRange() const
@@ -6855,11 +9129,81 @@ juce::Range<float> SampleModeComponent::getVisibleRange() const
     return { start, juce::jlimit(0.0f, 1.0f, start + visibleLength) };
 }
 
+juce::Range<float> SampleModeComponent::getVisibleDisplayRange() const
+{
+    const auto sampleRange = getVisibleRange();
+    if (loadedSample == nullptr || stateSnapshot.totalSamples <= 0)
+        return sampleRange;
+
+    const auto warpDisplayMap = buildSampleWarpDisplayMap(loadedSample.get(), stateSnapshot);
+    if (!warpDisplayMap.active)
+        return sampleRange;
+
+    const int64_t totalSamples = juce::jmax<int64_t>(1, stateSnapshot.totalSamples);
+    const auto sampleFromNormalized = [totalSamples](float normalized)
+    {
+        return juce::jlimit<int64_t>(0,
+                                     totalSamples - 1,
+                                     static_cast<int64_t>(std::llround(juce::jlimit(0.0f, 1.0f, normalized)
+                                                                       * static_cast<float>(totalSamples - 1))));
+    };
+
+    const int64_t startSample = sampleFromNormalized(sampleRange.getStart());
+    const int64_t endSample = juce::jmax<int64_t>(startSample + 1,
+                                                  sampleFromNormalized(sampleRange.getEnd()));
+    float displayStart = displayNormalizedPositionForSample(warpDisplayMap, startSample);
+    float displayEnd = displayNormalizedPositionForSample(warpDisplayMap,
+                                                          juce::jlimit<int64_t>(startSample + 1,
+                                                                                totalSamples - 1,
+                                                                                endSample));
+    if (displayEnd < displayStart)
+        std::swap(displayStart, displayEnd);
+
+    if ((displayEnd - displayStart) < 1.0e-5f)
+        return sampleRange;
+
+    return { displayStart, juce::jmin(1.0f, juce::jmax(displayStart + 1.0e-5f, displayEnd)) };
+}
+
+juce::Rectangle<int> SampleModeComponent::getWarpMarkerLaneBounds() const
+{
+    if (loadedSample == nullptr || waveformBounds.isEmpty())
+        return {};
+
+    const auto sanitizedGuideTicks = sanitizeWarpBeatTicks(loadedSample->analysis.beatTickSamples,
+                                                           loadedSample->sourceLengthSamples);
+    if (sanitizedGuideTicks.size() < 2 && stateSnapshot.warpMarkers.empty())
+        return {};
+
+    return waveformBounds.withTrimmedTop(kWarpMarkerLaneTopOffset)
+        .withHeight(kWarpMarkerLaneHeight);
+}
+
+juce::Rectangle<int> SampleModeComponent::getSliceMarkerHandleBounds() const
+{
+    if (waveformBounds.isEmpty())
+        return {};
+
+    if (const auto warpLane = getWarpMarkerLaneBounds(); !warpLane.isEmpty())
+    {
+        return juce::Rectangle<int>(waveformBounds.getX(),
+                                    warpLane.getBottom() + kSliceMarkerHandleLaneGap,
+                                    waveformBounds.getWidth(),
+                                    kSliceMarkerHandleLaneHeight);
+    }
+
+    return juce::Rectangle<int>(waveformBounds.getX(),
+                                waveformBounds.getY() + 2,
+                                waveformBounds.getWidth(),
+                                kSliceMarkerHandleLaneHeight);
+}
+
 juce::Rectangle<int> SampleModeComponent::getSliceModeButtonBounds(SampleSliceMode mode) const
 {
     const int index = static_cast<int>(mode);
-    const int buttonWidth = 40;
-    return { sliceModeArea.getX() + (index * (buttonWidth + 4)),
+    const int buttonWidth = 36;
+    const int buttonGap = 4;
+    return { sliceModeArea.getX() + (index * (buttonWidth + buttonGap)),
              sliceModeArea.getY(),
              buttonWidth,
              sliceModeArea.getHeight() };
