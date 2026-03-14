@@ -5019,7 +5019,7 @@ void FXStripControl::resized()
                                          (compField.getHeight() - ((duckRowCount - 1) * duckRowGap))
                                              / juce::jmax(1, duckRowCount));
 
-    auto layoutDuckRow = [&compField, duckRowHeight](juce::Label& label, juce::Slider& slider)
+    auto layoutDuckRow = [&compField, duckRowHeight, duckRowGap](juce::Label& label, juce::Slider& slider)
     {
         if (compField.getHeight() <= 0)
         {
@@ -6719,7 +6719,7 @@ void GlobalControlPanel::resized()
     const int meterWidth = 28;
     const int knobWidth = 80;
 
-    auto layoutTallControl = [](juce::Rectangle<int> area, juce::Label& label, juce::Component& control)
+    auto layoutTallControl = [labelHeight](juce::Rectangle<int> area, juce::Label& label, juce::Component& control)
     {
         label.setBounds(area.removeFromTop(labelHeight));
         area.removeFromTop(2);
@@ -6786,7 +6786,7 @@ void GlobalControlPanel::resized()
     comboArea.removeFromTop(rowGap);
     auto musicalRow = comboArea;
 
-    auto nextComboCell = [](juce::Rectangle<int>& row, int columnsRemaining)
+    auto nextComboCell = [cellGap](juce::Rectangle<int>& row, int columnsRemaining)
     {
         if (columnsRemaining <= 1)
             return row;
