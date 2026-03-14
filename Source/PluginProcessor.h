@@ -14,6 +14,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_osc/juce_osc.h>
 #include <cstdint>
+#include "PerformanceTargets.h"
 #include "AudioEngine.h"
 #include "SampleMode.h"
 
@@ -434,49 +435,54 @@ public:
     bool presetExists(int presetIndex) const;
     bool isSceneModeEnabled() const { return sceneModeEnabled.load(std::memory_order_acquire) != 0; }
     void setSceneModeEnabled(bool enabled);
+    int getActiveSceneSlot() const { return juce::jlimit(0, SceneSlots - 1, activeSceneSlot); }
     static constexpr int SceneSlots = 4;
     static constexpr int MaxSceneRepeatCount = 16;
+    static constexpr int MaxSceneManualBars = 32;
+
+    enum class SceneLengthMode
+    {
+        LongestStrip = 0,
+        LongestPattern,
+        ManualBars,
+        AnchorStrip
+    };
+
     int getSceneRepeatCount(int sceneSlot) const;
     void setSceneRepeatCount(int sceneSlot, int repeats);
+    SceneLengthMode getSceneLengthMode(int sceneSlot) const;
+    void setSceneLengthMode(int sceneSlot, SceneLengthMode mode);
+    int getSceneManualBars(int sceneSlot) const;
+    void setSceneManualBars(int sceneSlot, int bars);
+    int getSceneAnchorStrip(int sceneSlot) const;
+    void setSceneAnchorStrip(int sceneSlot, int stripIndex);
+    double getResolvedSceneLengthBeats(int sceneSlot) const;
+    bool captureSceneSlot(int sceneSlot);
+    bool insertSceneSlot(int sceneSlot, bool insertAfter);
     uint32_t getPresetRefreshToken() const { return presetRefreshToken.load(std::memory_order_acquire); }
     static constexpr int PresetColumns = 16;
     static constexpr int PresetRows = 7;
     static constexpr int MaxPresetSlots = PresetColumns * PresetRows;
     static constexpr int MacroCount = 8;
 
-    enum class MacroTarget
-    {
-        None = 0,
-        Cutoff,
-        Resonance,
-        FilterMorph,
-        Pitch,
-        Volume,
-        Pan,
-        FilterEnable,
-        Speed,
-        SliceLength,
-        Scratch,
-        GrainSize,
-        GrainDensity,
-        GrainPitch,
-        GrainPitchJitter,
-        GrainSpread,
-        GrainJitter,
-        GrainPositionJitter,
-        GrainRandom,
-        GrainArp,
-        GrainCloud,
-        GrainEmitter,
-        GrainEnvelope,
-        GrainShape
-    };
+    using MacroTarget = PerformanceTarget;
 
     struct MacroState
     {
         int stripIndex = 0;
         bool hasTargetStrip = false;
         std::array<float, MacroCount> values{};
+    };
+
+    struct MacroLaneRecordStatus
+    {
+        bool armed = false;
+        bool recording = false;
+        int stripIndex = -1;
+        int laneSlot = 0;
+        MacroTarget target = MacroTarget::None;
+        int stepsWritten = 0;
+        int totalSteps = 0;
     };
 
     MacroState getMacroState() const;
@@ -490,7 +496,11 @@ public:
     static int getDefaultMacroMidiCc(int macroIndex);
     void setMacroTarget(int macroIndex, MacroTarget target);
     static MacroTarget getDefaultMacroTarget(int macroIndex);
+    static int getDefaultModLaneSlotForMacroTarget(MacroTarget target);
     static float getDefaultMacroNormalizedValue(MacroTarget target);
+    MacroLaneRecordStatus getMacroLaneRecordStatus(int macroIndex) const;
+    void beginMacroLaneRecording(int macroIndex, int laneSlot);
+    void cancelMacroLaneRecording(int macroIndex);
     
     // Parameters
     juce::AudioProcessorValueTreeState parameters;
@@ -557,6 +567,22 @@ private:
         bool keyLockEnabled = false;
         bool shouldBuildKeyLockCache = false;
         bool preferHighQualityKeyLock = false;
+    };
+
+    struct MacroLaneRecordState
+    {
+        std::atomic<int> armed{0};
+        std::atomic<int> recording{0};
+        std::atomic<int> stripIndex{-1};
+        std::atomic<int> macroIndex{-1};
+        std::atomic<int> laneSlot{0};
+        std::atomic<int> target{static_cast<int>(MacroTarget::None)};
+        std::atomic<float> restoreDepth{1.0f};
+        std::atomic<double> startPpq{-1.0};
+        std::atomic<double> nextStepPpq{-1.0};
+        std::atomic<int> nextStepIndex{-1};
+        std::atomic<int> stepsWritten{0};
+        std::atomic<int> totalStepsToWrite{0};
     };
 
     ResolvedPitchControl resolvePitchControl(const EnhancedAudioStrip& strip,
@@ -702,6 +728,7 @@ private:
     std::array<std::atomic<int>, MacroCount> macroMidiCcAssignments{};
     std::array<std::atomic<int>, MacroCount> macroTargetAssignments{};
     std::atomic<int> macroMidiLearnIndex{-1};
+    std::array<MacroLaneRecordState, MacroCount> macroLaneRecordStates{};
     std::array<int, 4> arcKeyHeld{};
     std::array<std::array<int, 64>, 4> arcRingCache{};
     ArcControlMode arcControlMode = ArcControlMode::SelectedStrip;
@@ -953,10 +980,12 @@ private:
     void captureMomentaryStutterMacroBaseline();
     void applyMomentaryStutterMacro(const juce::AudioPlayHead::PositionInfo& posInfo);
     void restoreMomentaryStutterMacroBaseline();
+    void updateMacroLaneRecording(const juce::AudioPlayHead::PositionInfo& posInfo, int numSamples);
     bool getHostSyncSnapshot(double& outPpq, double& outTempo) const;
     int getActiveMainPresetIndexForScenes() const;
     int getSceneStoragePresetIndex(int mainPresetIndex, int sceneSlot) const;
     bool saveSceneForMainPreset(int mainPresetIndex, int sceneSlot);
+    bool copySceneForMainPreset(int mainPresetIndex, int sourceSceneSlot, int destSceneSlot);
     bool sceneSlotExistsForMainPreset(int mainPresetIndex, int sceneSlot) const;
     void requestSceneRecallQuantized(int mainPresetIndex, int sceneSlot, bool sequenceDriven);
     double getSceneRecallIntervalBeats() const;
@@ -970,6 +999,8 @@ private:
                           int64_t hostGlobalSampleSnapshot);
     double computeCurrentSceneSequenceLengthBeats() const;
     double computeStripSceneSequenceLengthBeats(int stripIndex) const;
+    double computeLongestStripSceneSequenceLengthBeats() const;
+    double computeLongestPatternSceneSequenceLengthBeats() const;
     void armNextSceneInSequence(int mainPresetIndex, int currentSceneSlot, double sceneStartPpq);
     std::unique_ptr<juce::XmlElement> createSceneChainStateXml(int sceneSlotOverride) const;
     void applySceneChainStateXml(const juce::XmlElement* xml, int sceneSlotOverride);
@@ -984,6 +1015,10 @@ private:
     int getMacroTargetStripIndex() const;
     float getMacroNormalizedValueForTarget(const EnhancedAudioStrip& strip, MacroTarget target) const;
     void applyMacroTargetValue(EnhancedAudioStrip& strip, MacroTarget target, float normalizedValue);
+    void resetMacroLaneRecordState(int macroIndex);
+    void finishMacroLaneRecording(int macroIndex, bool activateLane);
+    bool initializeMacroLaneRecording(int macroIndex, const juce::AudioPlayHead::PositionInfo& posInfo);
+    float getMacroLaneRecordedValue(int macroIndex) const;
     void performPresetLoad(int presetIndex, double hostPpqSnapshot, double hostTempoSnapshot);
     struct PresetSaveRequest
     {
@@ -1088,6 +1123,9 @@ private:
     };
     PendingSceneRecall pendingSceneRecall;
     std::array<int, SceneSlots> sceneRepeatCounts{};
+    std::array<int, SceneSlots> sceneLengthModes{};
+    std::array<int, SceneSlots> sceneManualBars{};
+    std::array<int, SceneSlots> sceneAnchorStrips{};
     std::array<bool, SceneSlots> scenePadHeld{};
     std::array<bool, SceneSlots> scenePadHoldSaveTriggered{};
     std::array<uint32_t, SceneSlots> scenePadPressStartMs{};

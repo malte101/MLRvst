@@ -199,6 +199,7 @@ target_sources(mlrVST
     PRIVATE
         Source/PluginProcessor.cpp
         Source/PluginProcessor.h
+        Source/PluginEntry.cpp
         Source/PluginEditor.cpp
         Source/PluginEditor.h
         Source/AudioEngine.cpp

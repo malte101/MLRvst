@@ -16,6 +16,10 @@ For the GitHub project overview, start with the root README:
   - Release packaging
 - `AUDIO_ENGINE_DOCS.md`
   - Audio engine architecture and behavior
+- `SCENE_SEQUENCER_V2_SPEC.md`
+  - Scene V2 implementation plan
+  - Macro-to-mod-lane recording plan
+  - Shared scene/macro/modulation target architecture
 - `SERIALOSC_REFERENCE.md`
   - SerialOSC message reference
 - `MODERNIZATION_GUIDE.md`

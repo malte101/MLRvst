@@ -43,12 +43,7 @@ constexpr std::array<int, 5> kScalePentMinor{{0, 3, 5, 7, 10}};
 
 bool modTargetAutoDefaultBipolar(ModernAudioEngine::ModTarget target)
 {
-    return target == ModernAudioEngine::ModTarget::Pan
-        || target == ModernAudioEngine::ModTarget::Pitch
-        || target == ModernAudioEngine::ModTarget::GrainPitch
-        || target == ModernAudioEngine::ModTarget::GrainSize
-        || target == ModernAudioEngine::ModTarget::GrainShape
-        || target == ModernAudioEngine::ModTarget::FilterMorph;
+    return performanceTargetAutoDefaultBipolar(sanitizeModPerformanceTarget(target));
 }
 
 bool isGrainModTarget(ModernAudioEngine::ModTarget target)
@@ -1668,6 +1663,68 @@ void EnhancedAudioStrip::loadSample(const juce::AudioBuffer<float>& buffer, doub
 #endif
 }
 
+void EnhancedAudioStrip::loadSampleWithAnalysisCache(const juce::AudioBuffer<float>& buffer,
+                                                     double sourceRate,
+                                                     const std::array<int, 16>& transientSlices,
+                                                     const std::array<float, 128>& rmsMap,
+                                                     const std::array<int, 128>& zeroCrossMap,
+                                                     int sourceSampleCount)
+{
+    juce::ScopedLock lock(bufferLock);
+    triggerOutputBlendActive = false;
+    triggerOutputBlendSamplesRemaining = 0;
+    triggerOutputBlendTotalSamples = 0;
+    triggerOutputBlendStartL = 0.0f;
+    triggerOutputBlendStartR = 0.0f;
+    lastOutputSampleL = 0.0f;
+    lastOutputSampleR = 0.0f;
+
+    if (buffer.getNumSamples() == 0)
+    {
+        DBG("WARNING: Attempting to load empty buffer into strip");
+        return;
+    }
+
+    if (buffer.getNumChannels() == 1)
+    {
+        sampleBuffer.setSize(2, buffer.getNumSamples(), false, true, false);
+        sampleBuffer.copyFrom(0, 0, buffer, 0, 0, buffer.getNumSamples());
+        sampleBuffer.copyFrom(1, 0, buffer, 0, 0, buffer.getNumSamples());
+    }
+    else
+    {
+        sampleBuffer.setSize(buffer.getNumChannels(), buffer.getNumSamples(), false, true, false);
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+            sampleBuffer.copyFrom(ch, 0, buffer, ch, 0, buffer.getNumSamples());
+    }
+
+    this->sourceSampleRate = sourceRate;
+    sampleLength = sampleBuffer.getNumSamples();
+    playbackPosition = 0.0;
+    grainCenterSmoother.setCurrentAndTargetValue(0.0);
+    resetGrainState();
+    playing = false;
+
+    if (playMode == PlayMode::Step)
+    {
+        stepSampler.loadSampleFromBuffer(buffer, sourceRate);
+        playing = true;
+        DBG("Step sequencer loaded into sampler and ready to sync with clock");
+    }
+
+    installPreparedAnalysisCacheLocked(transientSlices,
+                                       rmsMap,
+                                       zeroCrossMap,
+                                       sourceSampleCount);
+
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
+    invalidateSoundTouchSwingCache();
+#endif
+#if MLRVST_ENABLE_BUNGEE
+    invalidateLoopTempoMatchCache();
+#endif
+}
+
 void EnhancedAudioStrip::adoptPreparedSample(juce::AudioBuffer<float>& preparedSampleBuffer,
                                              double sourceRate,
                                              juce::AudioBuffer<float>* preparedLoopTempoMatchBuffer,
@@ -1818,34 +1875,10 @@ void EnhancedAudioStrip::restoreSampleAnalysisCache(const std::array<int, 16>& t
                                                     int sourceSampleCount)
 {
     juce::ScopedLock lock(bufferLock);
-
-    const int totalSamples = sampleBuffer.getNumSamples();
-    if (totalSamples <= 0)
-        return;
-
-    const int safeSampleCount = juce::jmax(1, sourceSampleCount);
-    const float scale = static_cast<float>(totalSamples) / static_cast<float>(safeSampleCount);
-
-    for (int i = 0; i < ModernAudioEngine::MaxColumns; ++i)
-    {
-        const int src = transientSlices[static_cast<size_t>(i)];
-        const int scaled = static_cast<int>(std::round(static_cast<float>(src) * scale));
-        transientSliceSamples[static_cast<size_t>(i)] = juce::jlimit(0, totalSamples - 1, scaled);
-    }
-
-    for (size_t i = 0; i < analysisRmsMap.size(); ++i)
-        analysisRmsMap[i] = juce::jlimit(0.0f, 1.0f, std::isfinite(rmsMap[i]) ? rmsMap[i] : 0.0f);
-
-    for (size_t i = 0; i < analysisZeroCrossMap.size(); ++i)
-    {
-        const int src = zeroCrossMap[i];
-        const int scaled = static_cast<int>(std::round(static_cast<float>(src) * scale));
-        analysisZeroCrossMap[i] = juce::jlimit(0, totalSamples - 1, scaled);
-    }
-
-    analysisSampleCount = totalSamples;
-    analysisCacheValid = true;
-    transientSliceMapDirty = false;
+    installPreparedAnalysisCacheLocked(transientSlices,
+                                       rmsMap,
+                                       zeroCrossMap,
+                                       sourceSampleCount);
 }
 
 void EnhancedAudioStrip::rebuildTransientSliceMap()
@@ -2093,6 +2126,40 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
 
     transientSliceMapDirty = false;
     rebuildSampleAnalysisCacheLocked();
+}
+
+void EnhancedAudioStrip::installPreparedAnalysisCacheLocked(const std::array<int, 16>& transientSlices,
+                                                            const std::array<float, 128>& rmsMap,
+                                                            const std::array<int, 128>& zeroCrossMap,
+                                                            int sourceSampleCount)
+{
+    const int totalSamples = sampleBuffer.getNumSamples();
+    if (totalSamples <= 0)
+        return;
+
+    const int safeSampleCount = juce::jmax(1, sourceSampleCount);
+    const float scale = static_cast<float>(totalSamples) / static_cast<float>(safeSampleCount);
+
+    for (int i = 0; i < ModernAudioEngine::MaxColumns; ++i)
+    {
+        const int src = transientSlices[static_cast<size_t>(i)];
+        const int scaled = static_cast<int>(std::round(static_cast<float>(src) * scale));
+        transientSliceSamples[static_cast<size_t>(i)] = juce::jlimit(0, totalSamples - 1, scaled);
+    }
+
+    for (size_t i = 0; i < analysisRmsMap.size(); ++i)
+        analysisRmsMap[i] = juce::jlimit(0.0f, 1.0f, std::isfinite(rmsMap[i]) ? rmsMap[i] : 0.0f);
+
+    for (size_t i = 0; i < analysisZeroCrossMap.size(); ++i)
+    {
+        const int src = zeroCrossMap[i];
+        const int scaled = static_cast<int>(std::round(static_cast<float>(src) * scale));
+        analysisZeroCrossMap[i] = juce::jlimit(0, totalSamples - 1, scaled);
+    }
+
+    analysisSampleCount = totalSamples;
+    analysisCacheValid = true;
+    transientSliceMapDirty = false;
 }
 
 void EnhancedAudioStrip::rebuildSampleAnalysisCacheLocked()
@@ -9285,6 +9352,12 @@ float ModernAudioEngine::defaultModStepValueForTarget(ModTarget target)
             return 0.5f;
         case ModTarget::FilterMorph:
             return 0.5f;
+        case ModTarget::FilterEnable:
+            return 0.0f;
+        case ModTarget::SliceLength:
+            return 0.0f;
+        case ModTarget::Scratch:
+            return 0.0f;
         case ModTarget::None:
         default:
             return 0.0f;
@@ -9816,6 +9889,12 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                         strip->setGrainShape(juce::jlimit(-1.0f, 1.0f, originalGrainShape + modSigned));
                         break;
                     case ModTarget::Retrigger:
+                        break;
+                    case ModTarget::FilterEnable:
+                        break;
+                    case ModTarget::SliceLength:
+                        break;
+                    case ModTarget::Scratch:
                         break;
                     case ModTarget::None:
                     default:
@@ -11063,55 +11142,91 @@ void ModernAudioEngine::setPatternRecorderIgnoreGroups(bool ignoreGroups)
 
 bool ModernAudioEngine::modTargetSupportsBipolar(ModTarget target)
 {
-    switch (target)
-    {
-        case ModTarget::None:
-            return false;
-        case ModTarget::Volume:
-            return false;
-        case ModTarget::Pan:
-            return true;
-        case ModTarget::Pitch:
-            return true;
-        case ModTarget::Speed:
-            return false;
-        case ModTarget::Cutoff:
-            return false;
-        case ModTarget::Resonance:
-            return false;
-        case ModTarget::GrainSize:
-            return true;
-        case ModTarget::GrainDensity:
-            return true;
-        case ModTarget::GrainPitch:
-            return true;
-        case ModTarget::GrainPitchJitter:
-            return false;
-        case ModTarget::GrainSpread:
-            return true;
-        case ModTarget::GrainJitter:
-            return false;
-        case ModTarget::GrainRandom:
-            return false;
-        case ModTarget::GrainArp:
-            return false;
-        case ModTarget::GrainCloud:
-            return false;
-        case ModTarget::GrainEmitter:
-            return false;
-        case ModTarget::GrainEnvelope:
-            return false;
-        case ModTarget::Retrigger:
-            return false;
-        case ModTarget::GrainPositionJitter:
-            return true;
-        case ModTarget::GrainShape:
-            return true;
-        case ModTarget::FilterMorph:
-            return true;
-    }
+    return performanceTargetSupportsBipolar(sanitizeModPerformanceTarget(target));
+}
 
-    return false;
+void ModernAudioEngine::setModTargetOnSequencer(ModSequencer& seq, ModTarget target)
+{
+    const bool currentBipolar = seq.bipolar.load(std::memory_order_acquire) != 0;
+    const bool nextBipolar = modTargetSupportsBipolar(target) && modTargetAutoDefaultBipolar(target);
+    if (currentBipolar != nextBipolar)
+    {
+        for (auto& step : seq.steps)
+        {
+            step.store(convertModValueForBipolarMode(step.load(std::memory_order_acquire),
+                                                     currentBipolar,
+                                                     nextBipolar,
+                                                     ModBipolarToggleMode::ConvertPreserveNeutral),
+                       std::memory_order_release);
+        }
+        for (auto& stepEnd : seq.stepEndValues)
+        {
+            stepEnd.store(convertModValueForBipolarMode(stepEnd.load(std::memory_order_acquire),
+                                                        currentBipolar,
+                                                        nextBipolar,
+                                                        ModBipolarToggleMode::ConvertPreserveNeutral),
+                          std::memory_order_release);
+        }
+        seq.smoothedRaw = convertModValueForBipolarMode(seq.smoothedRaw,
+                                                        currentBipolar,
+                                                        nextBipolar,
+                                                        ModBipolarToggleMode::ConvertPreserveNeutral);
+        seq.grainDezipperedRaw = convertModValueForBipolarMode(seq.grainDezipperedRaw,
+                                                               currentBipolar,
+                                                               nextBipolar,
+                                                               ModBipolarToggleMode::ConvertPreserveNeutral);
+        seq.pitchDezipperedRaw = convertModValueForBipolarMode(seq.pitchDezipperedRaw,
+                                                               currentBipolar,
+                                                               nextBipolar,
+                                                               ModBipolarToggleMode::ConvertPreserveNeutral);
+    }
+    seq.target.store(static_cast<int>(target), std::memory_order_release);
+    seq.bipolar.store(nextBipolar ? 1 : 0, std::memory_order_release);
+
+    if (target == ModTarget::Pitch && seq.smoothingMs.load(std::memory_order_acquire) < 1.0f)
+        seq.smoothingMs.store(12.0f, std::memory_order_release);
+    else if (target == ModTarget::Speed && seq.smoothingMs.load(std::memory_order_acquire) < 1.0f)
+        seq.smoothingMs.store(20.0f, std::memory_order_release);
+}
+
+void ModernAudioEngine::setModBipolarOnSequencer(ModSequencer& seq, bool bipolar, ModBipolarToggleMode mode)
+{
+    const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
+    const bool currentBipolar = seq.bipolar.load(std::memory_order_acquire) != 0;
+    const bool nextBipolar = bipolar && modTargetSupportsBipolar(target);
+    if (currentBipolar != nextBipolar)
+    {
+        for (auto& step : seq.steps)
+        {
+            step.store(convertModValueForBipolarMode(step.load(std::memory_order_acquire),
+                                                     currentBipolar,
+                                                     nextBipolar,
+                                                     mode),
+                       std::memory_order_release);
+        }
+        for (auto& stepEnd : seq.stepEndValues)
+        {
+            stepEnd.store(convertModValueForBipolarMode(stepEnd.load(std::memory_order_acquire),
+                                                        currentBipolar,
+                                                        nextBipolar,
+                                                        mode),
+                          std::memory_order_release);
+        }
+        seq.smoothedRaw = convertModValueForBipolarMode(seq.smoothedRaw, currentBipolar, nextBipolar, mode);
+        seq.grainDezipperedRaw = convertModValueForBipolarMode(seq.grainDezipperedRaw, currentBipolar, nextBipolar, mode);
+        seq.pitchDezipperedRaw = convertModValueForBipolarMode(seq.pitchDezipperedRaw, currentBipolar, nextBipolar, mode);
+    }
+    seq.bipolar.store(nextBipolar ? 1 : 0, std::memory_order_release);
+    for (auto& step : seq.steps)
+    {
+        const float clamped = juce::jlimit(0.0f, 1.0f, step.load(std::memory_order_acquire));
+        step.store(clamped, std::memory_order_release);
+    }
+    for (auto& stepEnd : seq.stepEndValues)
+    {
+        const float clamped = juce::jlimit(0.0f, 1.0f, stepEnd.load(std::memory_order_acquire));
+        stepEnd.store(clamped, std::memory_order_release);
+    }
 }
 
 void ModernAudioEngine::setModSequencerSlot(int stripIndex, int slot)
@@ -11224,47 +11339,7 @@ void ModernAudioEngine::setModTarget(int stripIndex, ModTarget target)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    auto& seq = getActiveModSequencer(stripIndex);
-    const bool currentBipolar = seq.bipolar.load(std::memory_order_acquire) != 0;
-    const bool nextBipolar = modTargetSupportsBipolar(target) && modTargetAutoDefaultBipolar(target);
-    if (currentBipolar != nextBipolar)
-    {
-        for (auto& step : seq.steps)
-        {
-            step.store(convertModValueForBipolarMode(step.load(std::memory_order_acquire),
-                                                     currentBipolar,
-                                                     nextBipolar,
-                                                     ModBipolarToggleMode::ConvertPreserveNeutral),
-                       std::memory_order_release);
-        }
-        for (auto& stepEnd : seq.stepEndValues)
-        {
-            stepEnd.store(convertModValueForBipolarMode(stepEnd.load(std::memory_order_acquire),
-                                                        currentBipolar,
-                                                        nextBipolar,
-                                                        ModBipolarToggleMode::ConvertPreserveNeutral),
-                          std::memory_order_release);
-        }
-        seq.smoothedRaw = convertModValueForBipolarMode(seq.smoothedRaw,
-                                                        currentBipolar,
-                                                        nextBipolar,
-                                                        ModBipolarToggleMode::ConvertPreserveNeutral);
-        seq.grainDezipperedRaw = convertModValueForBipolarMode(seq.grainDezipperedRaw,
-                                                               currentBipolar,
-                                                               nextBipolar,
-                                                               ModBipolarToggleMode::ConvertPreserveNeutral);
-        seq.pitchDezipperedRaw = convertModValueForBipolarMode(seq.pitchDezipperedRaw,
-                                                               currentBipolar,
-                                                               nextBipolar,
-                                                               ModBipolarToggleMode::ConvertPreserveNeutral);
-    }
-    seq.target.store(static_cast<int>(target), std::memory_order_release);
-    seq.bipolar.store(nextBipolar ? 1 : 0, std::memory_order_release);
-
-    if (target == ModTarget::Pitch && seq.smoothingMs.load(std::memory_order_acquire) < 1.0f)
-        seq.smoothingMs.store(12.0f, std::memory_order_release);
-    else if (target == ModTarget::Speed && seq.smoothingMs.load(std::memory_order_acquire) < 1.0f)
-        seq.smoothingMs.store(20.0f, std::memory_order_release);
+    setModTargetOnSequencer(getActiveModSequencer(stripIndex), target);
 }
 
 ModernAudioEngine::ModTarget ModernAudioEngine::getModTarget(int stripIndex) const
@@ -11274,54 +11349,46 @@ ModernAudioEngine::ModTarget ModernAudioEngine::getModTarget(int stripIndex) con
     return static_cast<ModTarget>(getActiveModSequencer(stripIndex).target.load(std::memory_order_acquire));
 }
 
+void ModernAudioEngine::setModTargetForSlot(int stripIndex, int slot, ModTarget target)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    setModTargetOnSequencer(getModSequencer(stripIndex, slot), target);
+}
+
+ModernAudioEngine::ModTarget ModernAudioEngine::getModTargetForSlot(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return ModTarget::None;
+    return static_cast<ModTarget>(getModSequencer(stripIndex, slot).target.load(std::memory_order_acquire));
+}
+
 void ModernAudioEngine::setModBipolar(int stripIndex, bool bipolar, ModBipolarToggleMode mode)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    auto& seq = getActiveModSequencer(stripIndex);
-    const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
-    const bool currentBipolar = seq.bipolar.load(std::memory_order_acquire) != 0;
-    const bool nextBipolar = bipolar && modTargetSupportsBipolar(target);
-    if (currentBipolar != nextBipolar)
-    {
-        for (auto& step : seq.steps)
-        {
-            step.store(convertModValueForBipolarMode(step.load(std::memory_order_acquire),
-                                                     currentBipolar,
-                                                     nextBipolar,
-                                                     mode),
-                       std::memory_order_release);
-        }
-        for (auto& stepEnd : seq.stepEndValues)
-        {
-            stepEnd.store(convertModValueForBipolarMode(stepEnd.load(std::memory_order_acquire),
-                                                        currentBipolar,
-                                                        nextBipolar,
-                                                        mode),
-                          std::memory_order_release);
-        }
-        seq.smoothedRaw = convertModValueForBipolarMode(seq.smoothedRaw, currentBipolar, nextBipolar, mode);
-        seq.grainDezipperedRaw = convertModValueForBipolarMode(seq.grainDezipperedRaw, currentBipolar, nextBipolar, mode);
-        seq.pitchDezipperedRaw = convertModValueForBipolarMode(seq.pitchDezipperedRaw, currentBipolar, nextBipolar, mode);
-    }
-    seq.bipolar.store(nextBipolar ? 1 : 0, std::memory_order_release);
-    for (auto& step : seq.steps)
-    {
-        const float clamped = juce::jlimit(0.0f, 1.0f, step.load(std::memory_order_acquire));
-        step.store(clamped, std::memory_order_release);
-    }
-    for (auto& stepEnd : seq.stepEndValues)
-    {
-        const float clamped = juce::jlimit(0.0f, 1.0f, stepEnd.load(std::memory_order_acquire));
-        stepEnd.store(clamped, std::memory_order_release);
-    }
+    setModBipolarOnSequencer(getActiveModSequencer(stripIndex), bipolar, mode);
 }
 
 bool ModernAudioEngine::isModBipolar(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
-        return false;
+    return false;
     return getActiveModSequencer(stripIndex).bipolar.load(std::memory_order_acquire) != 0;
+}
+
+void ModernAudioEngine::setModBipolarForSlot(int stripIndex, int slot, bool bipolar, ModBipolarToggleMode mode)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    setModBipolarOnSequencer(getModSequencer(stripIndex, slot), bipolar, mode);
+}
+
+bool ModernAudioEngine::isModBipolarForSlot(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return false;
+    return getModSequencer(stripIndex, slot).bipolar.load(std::memory_order_acquire) != 0;
 }
 
 void ModernAudioEngine::setModDepth(int stripIndex, float depth)
@@ -11338,6 +11405,20 @@ float ModernAudioEngine::getModDepth(int stripIndex) const
     return getActiveModSequencer(stripIndex).depth.load(std::memory_order_acquire);
 }
 
+void ModernAudioEngine::setModDepthForSlot(int stripIndex, int slot, float depth)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    getModSequencer(stripIndex, slot).depth.store(juce::jlimit(0.0f, 1.0f, depth), std::memory_order_release);
+}
+
+float ModernAudioEngine::getModDepthForSlot(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return 1.0f;
+    return getModSequencer(stripIndex, slot).depth.load(std::memory_order_acquire);
+}
+
 void ModernAudioEngine::setModCurveMode(int stripIndex, bool curveMode)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
@@ -11352,6 +11433,20 @@ bool ModernAudioEngine::isModCurveMode(int stripIndex) const
     return getActiveModSequencer(stripIndex).curveMode.load(std::memory_order_acquire) != 0;
 }
 
+void ModernAudioEngine::setModCurveModeForSlot(int stripIndex, int slot, bool curveMode)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    getModSequencer(stripIndex, slot).curveMode.store(curveMode ? 1 : 0, std::memory_order_release);
+}
+
+bool ModernAudioEngine::isModCurveModeForSlot(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return true;
+    return getModSequencer(stripIndex, slot).curveMode.load(std::memory_order_acquire) != 0;
+}
+
 void ModernAudioEngine::setModOffset(int stripIndex, int offset)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
@@ -11364,6 +11459,13 @@ int ModernAudioEngine::getModOffset(int stripIndex) const
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 0;
     return getActiveModSequencer(stripIndex).offset.load(std::memory_order_acquire);
+}
+
+int ModernAudioEngine::getModOffsetForSlot(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return 0;
+    return getModSequencer(stripIndex, slot).offset.load(std::memory_order_acquire);
 }
 
 void ModernAudioEngine::setModStepValue(int stripIndex, int step, float value01)
@@ -11398,6 +11500,44 @@ void ModernAudioEngine::setModStepValueAbsolute(int stripIndex, int absoluteStep
     seq.stepSubdivisions[static_cast<size_t>(absoluteStep)].store(1, std::memory_order_release);
     seq.stepEndValues[static_cast<size_t>(absoluteStep)].store(clampedValue, std::memory_order_release);
     seq.stepCurveShapes[static_cast<size_t>(absoluteStep)].store(activeCurveShape, std::memory_order_release);
+}
+
+void ModernAudioEngine::writeModStepNormalized(int stripIndex, int slot, int absoluteStep, float value01)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
+        return;
+
+    auto& seq = getModSequencer(stripIndex, slot);
+    const float clampedValue = juce::jlimit(0.0f, 1.0f, value01);
+    const int activeCurveShape = juce::jlimit(
+        0,
+        static_cast<int>(ModCurveShape::Square),
+        seq.curveShape.load(std::memory_order_acquire));
+    seq.steps[static_cast<size_t>(absoluteStep)].store(clampedValue, std::memory_order_release);
+    seq.stepSubdivisions[static_cast<size_t>(absoluteStep)].store(1, std::memory_order_release);
+    seq.stepEndValues[static_cast<size_t>(absoluteStep)].store(clampedValue, std::memory_order_release);
+    seq.stepCurveShapes[static_cast<size_t>(absoluteStep)].store(activeCurveShape, std::memory_order_release);
+}
+
+void ModernAudioEngine::clearModStepsForSlot(int stripIndex, int slot, float value01)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    auto& seq = getModSequencer(stripIndex, slot);
+    const float clampedValue = juce::jlimit(0.0f, 1.0f, value01);
+    const int activeCurveShape = juce::jlimit(
+        0,
+        static_cast<int>(ModCurveShape::Square),
+        seq.curveShape.load(std::memory_order_acquire));
+    for (int step = 0; step < ModTotalSteps; ++step)
+    {
+        const auto idx = static_cast<size_t>(step);
+        seq.steps[idx].store(clampedValue, std::memory_order_release);
+        seq.stepSubdivisions[idx].store(1, std::memory_order_release);
+        seq.stepEndValues[idx].store(clampedValue, std::memory_order_release);
+        seq.stepCurveShapes[idx].store(activeCurveShape, std::memory_order_release);
+    }
 }
 
 float ModernAudioEngine::getModStepValue(int stripIndex, int step) const
@@ -11571,6 +11711,22 @@ int ModernAudioEngine::getModCurrentGlobalStep(int stripIndex) const
     return juce::jlimit(0, totalSteps - 1, seq.lastGlobalStep.load(std::memory_order_acquire));
 }
 
+int ModernAudioEngine::getModTotalActiveSteps(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return ModSteps;
+
+    const auto& seq = getModSequencer(stripIndex, slot);
+    const int lengthBars = juce::jlimit(1, MaxModBars, seq.lengthBars.load(std::memory_order_acquire));
+    return juce::jmax(ModSteps, lengthBars * ModSteps);
+}
+
+double ModernAudioEngine::getModStepLengthBeats(int stripIndex, int slot) const
+{
+    juce::ignoreUnused(stripIndex, slot);
+    return 4.0 / static_cast<double>(ModSteps);
+}
+
 void ModernAudioEngine::setModLengthBars(int stripIndex, int bars)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
@@ -11674,6 +11830,20 @@ bool ModernAudioEngine::isModPitchScaleQuantize(int stripIndex) const
     return getActiveModSequencer(stripIndex).pitchScaleQuantize.load(std::memory_order_acquire) != 0;
 }
 
+void ModernAudioEngine::setModPitchScaleQuantizeForSlot(int stripIndex, int slot, bool enabled)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    getModSequencer(stripIndex, slot).pitchScaleQuantize.store(enabled ? 1 : 0, std::memory_order_release);
+}
+
+bool ModernAudioEngine::isModPitchScaleQuantizeForSlot(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return false;
+    return getModSequencer(stripIndex, slot).pitchScaleQuantize.load(std::memory_order_acquire) != 0;
+}
+
 void ModernAudioEngine::setModPitchScale(int stripIndex, PitchScale scale)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
@@ -11689,6 +11859,25 @@ ModernAudioEngine::PitchScale ModernAudioEngine::getModPitchScale(int stripIndex
         return PitchScale::Chromatic;
     const int idx = juce::jlimit(0, static_cast<int>(PitchScale::PentatonicMinor),
                                  getActiveModSequencer(stripIndex).pitchScale.load(std::memory_order_acquire));
+    return static_cast<PitchScale>(idx);
+}
+
+void ModernAudioEngine::setModPitchScaleForSlot(int stripIndex, int slot, PitchScale scale)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    getModSequencer(stripIndex, slot).pitchScale.store(
+        juce::jlimit(0, static_cast<int>(PitchScale::PentatonicMinor), static_cast<int>(scale)),
+        std::memory_order_release);
+}
+
+ModernAudioEngine::PitchScale ModernAudioEngine::getModPitchScaleForSlot(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return PitchScale::Chromatic;
+    const int idx = juce::jlimit(0,
+                                 static_cast<int>(PitchScale::PentatonicMinor),
+                                 getModSequencer(stripIndex, slot).pitchScale.load(std::memory_order_acquire));
     return static_cast<PitchScale>(idx);
 }
 

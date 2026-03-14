@@ -1186,11 +1186,8 @@ bool loadPreset(int presetIndex,
             if (!stripXml->hasAttribute(targetKey) && stripXml->getStringAttribute(stepsKey).isEmpty())
                 continue;
 
-            const auto loadedTarget = static_cast<ModernAudioEngine::ModTarget>(clampedInt(
-                stripXml->getIntAttribute(targetKey, static_cast<int>(ModernAudioEngine::defaultModTargetForSlot(modSlot))),
-                0,
-                static_cast<int>(ModernAudioEngine::ModTarget::FilterMorph),
-                static_cast<int>(ModernAudioEngine::defaultModTargetForSlot(modSlot))));
+            const auto loadedTarget = sanitizeModPerformanceTarget(static_cast<ModernAudioEngine::ModTarget>(
+                stripXml->getIntAttribute(targetKey, static_cast<int>(ModernAudioEngine::defaultModTargetForSlot(modSlot)))));
             audioEngine->setModTarget(stripIndex, loadedTarget);
             audioEngine->setModBipolar(
                 stripIndex,
@@ -1472,6 +1469,33 @@ bool presetExists(int presetIndex)
     auto presetDir = getPresetDirectory();
     auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
     return presetFile.existsAsFile();
+}
+
+bool copyPreset(int sourcePresetIndex, int destPresetIndex)
+{
+    if (sourcePresetIndex < 0 || sourcePresetIndex >= kMaxPresetSlots
+        || destPresetIndex < 0 || destPresetIndex >= kMaxPresetSlots)
+        return false;
+
+    try
+    {
+        auto presetDir = getPresetDirectory();
+        const auto sourceFile = presetDir.getChildFile("Preset_" + juce::String(sourcePresetIndex + 1) + ".mlrpreset");
+        const auto destFile = presetDir.getChildFile("Preset_" + juce::String(destPresetIndex + 1) + ".mlrpreset");
+        if (!sourceFile.existsAsFile())
+            return false;
+
+        auto presetXml = parsePresetXmlSafely(sourceFile, kMaxPresetXmlBytes);
+        if (presetXml == nullptr)
+            return false;
+
+        presetXml->setAttribute("index", destPresetIndex);
+        return writePresetAtomically(*presetXml, destFile);
+    }
+    catch (...)
+    {
+        return false;
+    }
 }
 
 bool deletePreset(int presetIndex)

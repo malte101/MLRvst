@@ -36,5 +36,6 @@ bool loadPreset(int presetIndex,
 juce::String getPresetName(int presetIndex);
 bool setPresetName(int presetIndex, const juce::String& presetName);
 bool presetExists(int presetIndex);
+bool copyPreset(int sourcePresetIndex, int destPresetIndex);
 bool deletePreset(int presetIndex);
 } // namespace PresetStore

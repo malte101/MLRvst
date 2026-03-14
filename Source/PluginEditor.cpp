@@ -353,76 +353,23 @@ juce::String macroPitchText(float normalized)
 
 int macroTargetToComboId(MlrVSTAudioProcessor::MacroTarget target)
 {
-    return static_cast<int>(target) + 1;
+    return performanceTargetToComboId(sanitizeMacroPerformanceTarget(target));
 }
 
 MlrVSTAudioProcessor::MacroTarget comboIdToMacroTargetSelection(int comboId)
 {
-    return static_cast<MlrVSTAudioProcessor::MacroTarget>(
-        juce::jlimit(0,
-                     static_cast<int>(MlrVSTAudioProcessor::MacroTarget::GrainShape),
-                     comboId - 1));
+    return sanitizeMacroPerformanceTarget(performanceTargetFromComboId(comboId));
 }
 
 juce::String macroTargetDisplayName(MlrVSTAudioProcessor::MacroTarget target)
 {
-    switch (target)
-    {
-        case MlrVSTAudioProcessor::MacroTarget::Cutoff: return "Cutoff";
-        case MlrVSTAudioProcessor::MacroTarget::Resonance: return "Resonance";
-        case MlrVSTAudioProcessor::MacroTarget::FilterMorph: return "Filter Morph";
-        case MlrVSTAudioProcessor::MacroTarget::Pitch: return "Pitch";
-        case MlrVSTAudioProcessor::MacroTarget::Volume: return "Volume";
-        case MlrVSTAudioProcessor::MacroTarget::Pan: return "Pan";
-        case MlrVSTAudioProcessor::MacroTarget::FilterEnable: return "Filter Enable";
-        case MlrVSTAudioProcessor::MacroTarget::Speed: return "Speed";
-        case MlrVSTAudioProcessor::MacroTarget::SliceLength: return "Slice Length";
-        case MlrVSTAudioProcessor::MacroTarget::Scratch: return "Scratch";
-        case MlrVSTAudioProcessor::MacroTarget::GrainSize: return "Grain Size";
-        case MlrVSTAudioProcessor::MacroTarget::GrainDensity: return "Grain Density";
-        case MlrVSTAudioProcessor::MacroTarget::GrainPitch: return "Grain Pitch";
-        case MlrVSTAudioProcessor::MacroTarget::GrainPitchJitter: return "Grain Pitch Jitter";
-        case MlrVSTAudioProcessor::MacroTarget::GrainSpread: return "Grain Spread";
-        case MlrVSTAudioProcessor::MacroTarget::GrainJitter: return "Grain Jitter";
-        case MlrVSTAudioProcessor::MacroTarget::GrainPositionJitter: return "Grain Pos Jitter";
-        case MlrVSTAudioProcessor::MacroTarget::GrainRandom: return "Grain Random";
-        case MlrVSTAudioProcessor::MacroTarget::GrainArp: return "Grain Arp";
-        case MlrVSTAudioProcessor::MacroTarget::GrainCloud: return "Grain Cloud";
-        case MlrVSTAudioProcessor::MacroTarget::GrainEmitter: return "Grain Emitter";
-        case MlrVSTAudioProcessor::MacroTarget::GrainEnvelope: return "Grain Envelope";
-        case MlrVSTAudioProcessor::MacroTarget::GrainShape: return "Grain Shape";
-        case MlrVSTAudioProcessor::MacroTarget::None:
-        default: return "None";
-    }
+    return performanceTargetDisplayName(sanitizeMacroPerformanceTarget(target));
 }
 
 void populateMacroTargetBox(juce::ComboBox& box)
 {
-    using MacroTarget = MlrVSTAudioProcessor::MacroTarget;
-    box.addItem(macroTargetDisplayName(MacroTarget::None), macroTargetToComboId(MacroTarget::None));
-    box.addItem(macroTargetDisplayName(MacroTarget::Cutoff), macroTargetToComboId(MacroTarget::Cutoff));
-    box.addItem(macroTargetDisplayName(MacroTarget::Resonance), macroTargetToComboId(MacroTarget::Resonance));
-    box.addItem(macroTargetDisplayName(MacroTarget::FilterMorph), macroTargetToComboId(MacroTarget::FilterMorph));
-    box.addItem(macroTargetDisplayName(MacroTarget::Pitch), macroTargetToComboId(MacroTarget::Pitch));
-    box.addItem(macroTargetDisplayName(MacroTarget::Volume), macroTargetToComboId(MacroTarget::Volume));
-    box.addItem(macroTargetDisplayName(MacroTarget::Pan), macroTargetToComboId(MacroTarget::Pan));
-    box.addItem(macroTargetDisplayName(MacroTarget::FilterEnable), macroTargetToComboId(MacroTarget::FilterEnable));
-    box.addItem(macroTargetDisplayName(MacroTarget::Speed), macroTargetToComboId(MacroTarget::Speed));
-    box.addItem(macroTargetDisplayName(MacroTarget::SliceLength), macroTargetToComboId(MacroTarget::SliceLength));
-    box.addItem(macroTargetDisplayName(MacroTarget::Scratch), macroTargetToComboId(MacroTarget::Scratch));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainSize), macroTargetToComboId(MacroTarget::GrainSize));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainDensity), macroTargetToComboId(MacroTarget::GrainDensity));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainPitch), macroTargetToComboId(MacroTarget::GrainPitch));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainPitchJitter), macroTargetToComboId(MacroTarget::GrainPitchJitter));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainSpread), macroTargetToComboId(MacroTarget::GrainSpread));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainJitter), macroTargetToComboId(MacroTarget::GrainJitter));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainPositionJitter), macroTargetToComboId(MacroTarget::GrainPositionJitter));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainRandom), macroTargetToComboId(MacroTarget::GrainRandom));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainArp), macroTargetToComboId(MacroTarget::GrainArp));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainCloud), macroTargetToComboId(MacroTarget::GrainCloud));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainEmitter), macroTargetToComboId(MacroTarget::GrainEmitter));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainEnvelope), macroTargetToComboId(MacroTarget::GrainEnvelope));
-    box.addItem(macroTargetDisplayName(MacroTarget::GrainShape), macroTargetToComboId(MacroTarget::GrainShape));
+    for (auto target : kMacroPerformanceTargetOrder)
+        box.addItem(macroTargetDisplayName(target), performanceTargetToComboId(target));
 }
 
 juce::String macroCcLabelText(int ccNumber)
@@ -481,6 +428,7 @@ juce::String macroValueText(MlrVSTAudioProcessor::MacroTarget target, float norm
             return juce::String(static_cast<int>(std::round(clamped * 100.0f))) + "%";
         case MlrVSTAudioProcessor::MacroTarget::GrainShape:
             return juce::String(juce::jmap(clamped, 0.0f, 1.0f, -1.0f, 1.0f) * 100.0f, 0) + "%";
+        case MlrVSTAudioProcessor::MacroTarget::Retrigger:
         case MlrVSTAudioProcessor::MacroTarget::None:
         default:
             return "Unassigned";
@@ -489,67 +437,17 @@ juce::String macroValueText(MlrVSTAudioProcessor::MacroTarget target, float norm
 
 int modTargetToComboId(ModernAudioEngine::ModTarget target)
 {
-    switch (target)
-    {
-        case ModernAudioEngine::ModTarget::Volume: return 2;
-        case ModernAudioEngine::ModTarget::Pan: return 3;
-        case ModernAudioEngine::ModTarget::Pitch: return 4;
-        case ModernAudioEngine::ModTarget::Speed: return 5;
-        case ModernAudioEngine::ModTarget::Cutoff: return 6;
-        case ModernAudioEngine::ModTarget::Resonance: return 7;
-        case ModernAudioEngine::ModTarget::GrainSize: return 8;
-        case ModernAudioEngine::ModTarget::GrainDensity: return 9;
-        case ModernAudioEngine::ModTarget::GrainPitch: return 10;
-        case ModernAudioEngine::ModTarget::GrainPitchJitter: return 11;
-        case ModernAudioEngine::ModTarget::GrainSpread: return 12;
-        case ModernAudioEngine::ModTarget::GrainJitter: return 13;
-        case ModernAudioEngine::ModTarget::GrainRandom: return 14;
-        case ModernAudioEngine::ModTarget::GrainArp: return 15;
-        case ModernAudioEngine::ModTarget::GrainCloud: return 16;
-        case ModernAudioEngine::ModTarget::GrainEmitter: return 17;
-        case ModernAudioEngine::ModTarget::GrainEnvelope: return 18;
-        case ModernAudioEngine::ModTarget::GrainPositionJitter: return 19;
-        case ModernAudioEngine::ModTarget::GrainShape: return 20;
-        case ModernAudioEngine::ModTarget::FilterMorph: return 21;
-        case ModernAudioEngine::ModTarget::Retrigger: return 22;
-        case ModernAudioEngine::ModTarget::None:
-        default: return 1;
-    }
+    return performanceTargetToComboId(sanitizeModPerformanceTarget(target));
 }
 
 ModernAudioEngine::ModTarget comboIdToModTarget(int id)
 {
-    switch (id)
-    {
-        case 2: return ModernAudioEngine::ModTarget::Volume;
-        case 3: return ModernAudioEngine::ModTarget::Pan;
-        case 4: return ModernAudioEngine::ModTarget::Pitch;
-        case 5: return ModernAudioEngine::ModTarget::Speed;
-        case 6: return ModernAudioEngine::ModTarget::Cutoff;
-        case 7: return ModernAudioEngine::ModTarget::Resonance;
-        case 8: return ModernAudioEngine::ModTarget::GrainSize;
-        case 9: return ModernAudioEngine::ModTarget::GrainDensity;
-        case 10: return ModernAudioEngine::ModTarget::GrainPitch;
-        case 11: return ModernAudioEngine::ModTarget::GrainPitchJitter;
-        case 12: return ModernAudioEngine::ModTarget::GrainSpread;
-        case 13: return ModernAudioEngine::ModTarget::GrainJitter;
-        case 14: return ModernAudioEngine::ModTarget::GrainRandom;
-        case 15: return ModernAudioEngine::ModTarget::GrainArp;
-        case 16: return ModernAudioEngine::ModTarget::GrainCloud;
-        case 17: return ModernAudioEngine::ModTarget::GrainEmitter;
-        case 18: return ModernAudioEngine::ModTarget::GrainEnvelope;
-        case 19: return ModernAudioEngine::ModTarget::GrainPositionJitter;
-        case 20: return ModernAudioEngine::ModTarget::GrainShape;
-        case 21: return ModernAudioEngine::ModTarget::FilterMorph;
-        case 22: return ModernAudioEngine::ModTarget::Retrigger;
-        case 1:
-        default: return ModernAudioEngine::ModTarget::None;
-    }
+    return sanitizeModPerformanceTarget(performanceTargetFromComboId(id));
 }
 
 bool modTargetAllowsBipolar(ModernAudioEngine::ModTarget target)
 {
-    return ModernAudioEngine::modTargetSupportsBipolar(target);
+    return performanceTargetSupportsBipolar(sanitizeModPerformanceTarget(target));
 }
 
 juce::String retriggerDivisionLabel(float amount01)
@@ -573,32 +471,7 @@ juce::String makeRetriggerHintText(float rawStepValue01, float depth01)
 
 juce::String modTargetDisplayName(ModernAudioEngine::ModTarget target)
 {
-    switch (target)
-    {
-        case ModernAudioEngine::ModTarget::Volume: return "Volume";
-        case ModernAudioEngine::ModTarget::Pan: return "Pan";
-        case ModernAudioEngine::ModTarget::Pitch: return "Pitch";
-        case ModernAudioEngine::ModTarget::Speed: return "Speed";
-        case ModernAudioEngine::ModTarget::Cutoff: return "Cutoff";
-        case ModernAudioEngine::ModTarget::Resonance: return "Resonance";
-        case ModernAudioEngine::ModTarget::GrainSize: return "Grain Size";
-        case ModernAudioEngine::ModTarget::GrainDensity: return "Grain Density";
-        case ModernAudioEngine::ModTarget::GrainPitch: return "Grain Pitch";
-        case ModernAudioEngine::ModTarget::GrainPitchJitter: return "Grain Pitch Jitter";
-        case ModernAudioEngine::ModTarget::GrainSpread: return "Grain Spread";
-        case ModernAudioEngine::ModTarget::GrainJitter: return "Grain Jitter";
-        case ModernAudioEngine::ModTarget::GrainRandom: return "Grain Random";
-        case ModernAudioEngine::ModTarget::GrainArp: return "Grain Arp";
-        case ModernAudioEngine::ModTarget::GrainCloud: return "Grain Cloud";
-        case ModernAudioEngine::ModTarget::GrainEmitter: return "Grain Emitter";
-        case ModernAudioEngine::ModTarget::GrainEnvelope: return "Grain Envelope";
-        case ModernAudioEngine::ModTarget::Retrigger: return "Stutter";
-        case ModernAudioEngine::ModTarget::GrainPositionJitter: return "Grain Pos Jitter";
-        case ModernAudioEngine::ModTarget::GrainShape: return "Grain Shape";
-        case ModernAudioEngine::ModTarget::FilterMorph: return "Filter Morph";
-        case ModernAudioEngine::ModTarget::None:
-        default: return "None";
-    }
+    return performanceTargetDisplayName(sanitizeModPerformanceTarget(target));
 }
 
 enum class StepCellModifierGesture
@@ -2481,28 +2354,8 @@ void StripControl::setupComponents()
     modTargetLabel.setColour(juce::Label::textColourId, kTextMuted);
     addAndMakeVisible(modTargetLabel);
 
-    modTargetBox.addItem("None", 1);
-    modTargetBox.addItem("Vol", 2);
-    modTargetBox.addItem("Pan", 3);
-    modTargetBox.addItem("Pitch", 4);
-    modTargetBox.addItem("Speed", 5);
-    modTargetBox.addItem("Cutoff", 6);
-    modTargetBox.addItem("Reso", 7);
-    modTargetBox.addItem("G.Size", 8);
-    modTargetBox.addItem("G.Dens", 9);
-    modTargetBox.addItem("G.Pitch", 10);
-    modTargetBox.addItem("G.PJit", 11);
-    modTargetBox.addItem("G.Spread", 12);
-    modTargetBox.addItem("G.Jitter", 13);
-    modTargetBox.addItem("G.Random", 14);
-    modTargetBox.addItem("G.Arp", 15);
-    modTargetBox.addItem("G.Cloud", 16);
-    modTargetBox.addItem("G.Emit", 17);
-    modTargetBox.addItem("G.Env", 18);
-    modTargetBox.addItem("G.PosJ", 19);
-    modTargetBox.addItem("G.Shape", 20);
-    modTargetBox.addItem("F.Morph", 21);
-    modTargetBox.addItem("Retrig", 22);
+    for (auto target : kModPerformanceTargetOrder)
+        modTargetBox.addItem(performanceTargetDisplayName(target, true), performanceTargetToComboId(target));
     modTargetBox.setSelectedId(1, juce::dontSendNotification);
     modTargetBox.onChange = [this]()
     {
@@ -4776,6 +4629,9 @@ void StripControl::updateFromEngine()
                     case ModernAudioEngine::ModTarget::GrainShape: return &grainShapeSlider;
                     case ModernAudioEngine::ModTarget::FilterMorph: return nullptr;
                     case ModernAudioEngine::ModTarget::Retrigger: return nullptr;
+                    case ModernAudioEngine::ModTarget::FilterEnable: return nullptr;
+                    case ModernAudioEngine::ModTarget::SliceLength: return nullptr;
+                    case ModernAudioEngine::ModTarget::Scratch: return nullptr;
                     default: return nullptr;
                 }
             }();
@@ -6985,16 +6841,26 @@ void GlobalControlPanel::refreshFromProcessor()
 SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     : processor(p)
 {
+    auto configureHeaderLabel = [](juce::Label& label, const juce::String& text)
+    {
+        label.setText(text, juce::dontSendNotification);
+        label.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
+        label.setColour(juce::Label::textColourId, kTextMuted);
+        label.setJustificationType(juce::Justification::centredLeft);
+    };
+
     titleLabel.setText("SCENE CONTROLS", juce::dontSendNotification);
     titleLabel.setFont(juce::Font(juce::FontOptions(12.0f, juce::Font::bold)));
     titleLabel.setColour(juce::Label::textColourId, kTextPrimary);
+    titleLabel.setTooltip("Scene mode swaps the Groups tab for four scene/sub-preset slots. Scene timing below controls how long chained scenes stay active before the next recall.");
     addAndMakeVisible(titleLabel);
 
-    hintLabel.setText("Scene mode swaps the Groups tab for four scene/sub-preset slots. Chain repeat counts stay here.", juce::dontSendNotification);
+    hintLabel.setText("Per-scene chain timing stays here.", juce::dontSendNotification);
     hintLabel.setFont(juce::Font(juce::FontOptions(10.5f)));
     hintLabel.setColour(juce::Label::textColourId, kTextMuted);
     hintLabel.setJustificationType(juce::Justification::centredLeft);
-    addAndMakeVisible(hintLabel);
+    hintLabel.setVisible(false);
+    addChildComponent(hintLabel);
 
     sceneModeToggle.setButtonText("Scene Mode");
     sceneModeToggle.setClickingTogglesState(true);
@@ -7006,29 +6872,142 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(sceneModeToggle);
     styleUiButton(sceneModeToggle);
 
-    sceneRepeatsLabel.setText("Scene Chain Repeats", juce::dontSendNotification);
-    sceneRepeatsLabel.setJustificationType(juce::Justification::centredLeft);
+    sceneAuthoringLabel.setText("Target", juce::dontSendNotification);
+    sceneAuthoringLabel.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
+    sceneAuthoringLabel.setColour(juce::Label::textColourId, kTextMuted);
+    sceneAuthoringLabel.setJustificationType(juce::Justification::centredLeft);
+    sceneAuthoringLabel.setTooltip("Choose which scene slot the authoring buttons affect.");
+    addAndMakeVisible(sceneAuthoringLabel);
+
+    for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
+        sceneAuthoringTargetBox.addItem("S" + juce::String(sceneSlot + 1), sceneSlot + 1);
+    sceneAuthoringTargetBox.setTooltip("Select the scene slot to capture into or insert relative to.");
+    addAndMakeVisible(sceneAuthoringTargetBox);
+    styleUiCombo(sceneAuthoringTargetBox);
+
+    sceneCaptureButton.setButtonText("Capture");
+    sceneCaptureButton.setTooltip("Store the current live state into the selected scene slot.");
+    sceneCaptureButton.onClick = [this]()
+    {
+        const int selectedId = sceneAuthoringTargetBox.getSelectedId();
+        if (selectedId <= 0)
+            return;
+
+        processor.captureSceneSlot(selectedId - 1);
+        refreshFromProcessor();
+    };
+    addAndMakeVisible(sceneCaptureButton);
+    styleUiButton(sceneCaptureButton, true);
+
+    sceneInsertBeforeButton.setButtonText("Insert <");
+    sceneInsertBeforeButton.setTooltip("Shift later scenes right and capture the current live state before the selected slot.");
+    sceneInsertBeforeButton.onClick = [this]()
+    {
+        const int selectedId = sceneAuthoringTargetBox.getSelectedId();
+        if (selectedId <= 0)
+            return;
+
+        if (processor.insertSceneSlot(selectedId - 1, false))
+            sceneAuthoringTargetBox.setSelectedId(selectedId, juce::dontSendNotification);
+        refreshFromProcessor();
+    };
+    addAndMakeVisible(sceneInsertBeforeButton);
+    styleUiButton(sceneInsertBeforeButton);
+
+    sceneInsertAfterButton.setButtonText("Insert >");
+    sceneInsertAfterButton.setTooltip("Shift later scenes right and capture the current live state after the selected slot.");
+    sceneInsertAfterButton.onClick = [this]()
+    {
+        const int selectedId = sceneAuthoringTargetBox.getSelectedId();
+        if (selectedId <= 0)
+            return;
+
+        if (processor.insertSceneSlot(selectedId - 1, true))
+            sceneAuthoringTargetBox.setSelectedId(juce::jmin(MlrVSTAudioProcessor::SceneSlots, selectedId + 1),
+                                                  juce::dontSendNotification);
+        refreshFromProcessor();
+    };
+    addAndMakeVisible(sceneInsertAfterButton);
+    styleUiButton(sceneInsertAfterButton);
+
+    configureHeaderLabel(sceneRepeatsLabel, "Repeat");
+    configureHeaderLabel(sceneLengthHeaderLabel, "Length");
+    configureHeaderLabel(sceneBarsHeaderLabel, "Bars");
+    configureHeaderLabel(sceneAnchorHeaderLabel, "Anchor");
     addAndMakeVisible(sceneRepeatsLabel);
+    addAndMakeVisible(sceneLengthHeaderLabel);
+    addAndMakeVisible(sceneBarsHeaderLabel);
+    addAndMakeVisible(sceneAnchorHeaderLabel);
 
     for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
     {
         auto& slotLabel = sceneRepeatSlotLabels[static_cast<size_t>(sceneSlot)];
         auto& repeatBox = sceneRepeatBoxes[static_cast<size_t>(sceneSlot)];
+        auto& lengthModeBox = sceneLengthModeBoxes[static_cast<size_t>(sceneSlot)];
+        auto& manualBarsBox = sceneManualBarsBoxes[static_cast<size_t>(sceneSlot)];
+        auto& anchorStripBox = sceneAnchorStripBoxes[static_cast<size_t>(sceneSlot)];
 
         slotLabel.setText("S" + juce::String(sceneSlot + 1), juce::dontSendNotification);
-        slotLabel.setJustificationType(juce::Justification::centred);
+        slotLabel.setJustificationType(juce::Justification::centredLeft);
+        slotLabel.setFont(juce::Font(juce::FontOptions(10.5f, juce::Font::bold)));
         addAndMakeVisible(slotLabel);
 
         for (int repeats = 1; repeats <= MlrVSTAudioProcessor::MaxSceneRepeatCount; ++repeats)
             repeatBox.addItem(juce::String(repeats) + "x", repeats);
 
-        repeatBox.setTooltip("When scenes are chained from the top row, this scene plays its longest strip or pattern cycle this many times before switching.");
+        repeatBox.setTooltip("When scenes are chained from the top row, this scene repeats its resolved length this many times before switching.");
         repeatBox.onChange = [this, sceneSlot]()
         {
             processor.setSceneRepeatCount(sceneSlot, sceneRepeatBoxes[static_cast<size_t>(sceneSlot)].getSelectedId());
         };
         addAndMakeVisible(repeatBox);
         styleUiCombo(repeatBox);
+
+        lengthModeBox.addItem("Longest Strip", static_cast<int>(MlrVSTAudioProcessor::SceneLengthMode::LongestStrip) + 1);
+        lengthModeBox.addItem("Longest Pattern", static_cast<int>(MlrVSTAudioProcessor::SceneLengthMode::LongestPattern) + 1);
+        lengthModeBox.addItem("Manual Bars", static_cast<int>(MlrVSTAudioProcessor::SceneLengthMode::ManualBars) + 1);
+        lengthModeBox.addItem("Anchor Strip", static_cast<int>(MlrVSTAudioProcessor::SceneLengthMode::AnchorStrip) + 1);
+        lengthModeBox.setTooltip("Choose whether the scene length follows the longest strip, longest pattern, a fixed number of bars, or one anchor strip.");
+        lengthModeBox.onChange = [this, sceneSlot]()
+        {
+            const int selectedId = sceneLengthModeBoxes[static_cast<size_t>(sceneSlot)].getSelectedId();
+            if (selectedId <= 0)
+                return;
+
+            processor.setSceneLengthMode(
+                sceneSlot,
+                static_cast<MlrVSTAudioProcessor::SceneLengthMode>(selectedId - 1));
+            refreshFromProcessor();
+        };
+        addAndMakeVisible(lengthModeBox);
+        styleUiCombo(lengthModeBox);
+
+        for (int bars = 1; bars <= MlrVSTAudioProcessor::MaxSceneManualBars; ++bars)
+        {
+            const auto label = juce::String(bars) + (bars == 1 ? " bar" : " bars");
+            manualBarsBox.addItem(label, bars);
+        }
+        manualBarsBox.setTooltip("Fixed scene length in bars when Length is set to Manual Bars.");
+        manualBarsBox.onChange = [this, sceneSlot]()
+        {
+            const int selectedId = sceneManualBarsBoxes[static_cast<size_t>(sceneSlot)].getSelectedId();
+            if (selectedId > 0)
+                processor.setSceneManualBars(sceneSlot, selectedId);
+        };
+        addAndMakeVisible(manualBarsBox);
+        styleUiCombo(manualBarsBox);
+
+        for (int stripIndex = 0; stripIndex < MlrVSTAudioProcessor::MaxStrips; ++stripIndex)
+            anchorStripBox.addItem("S" + juce::String(stripIndex + 1), stripIndex + 1);
+        anchorStripBox.setTooltip("Anchor scene length to one strip. If that strip has no playable length, the scene falls back to the longest strip or pattern.");
+        anchorStripBox.onChange = [this, sceneSlot]()
+        {
+            const int selectedId = sceneAnchorStripBoxes[static_cast<size_t>(sceneSlot)].getSelectedId();
+            if (selectedId > 0)
+                processor.setSceneAnchorStrip(sceneSlot, selectedId - 1);
+        };
+        addAndMakeVisible(anchorStripBox);
+        styleUiCombo(anchorStripBox);
     }
 
     refreshFromProcessor();
@@ -7047,42 +7026,107 @@ void SceneControlPanel::resized()
     sceneModeToggle.setBounds(titleRow.removeFromRight(110));
     titleLabel.setBounds(titleRow);
 
-    bounds.removeFromTop(2);
-    hintLabel.setBounds(bounds.removeFromTop(13));
+    bounds.removeFromTop(3);
+
+    auto authoringRow = bounds.removeFromTop(22);
+    sceneAuthoringLabel.setBounds(authoringRow.removeFromLeft(38));
+    sceneAuthoringTargetBox.setBounds(authoringRow.removeFromLeft(56));
+    authoringRow.removeFromLeft(6);
+    sceneCaptureButton.setBounds(authoringRow.removeFromLeft(72));
+    authoringRow.removeFromLeft(6);
+    sceneInsertBeforeButton.setBounds(authoringRow.removeFromLeft(72));
+    authoringRow.removeFromLeft(6);
+    sceneInsertAfterButton.setBounds(authoringRow.removeFromLeft(72));
     bounds.removeFromTop(4);
 
-    auto repeatHeaderRow = bounds.removeFromTop(12);
-    sceneRepeatsLabel.setBounds(repeatHeaderRow);
+    auto layoutColumns = [](juce::Rectangle<int> row)
+    {
+        struct Columns
+        {
+            juce::Rectangle<int> scene;
+            juce::Rectangle<int> repeat;
+            juce::Rectangle<int> length;
+            juce::Rectangle<int> bars;
+            juce::Rectangle<int> anchor;
+        };
+
+        constexpr int gap = 6;
+        const int sceneWidth = 28;
+        const int repeatWidth = 58;
+        const int barsWidth = 70;
+        const int anchorWidth = 62;
+        Columns columns;
+        columns.scene = row.removeFromLeft(sceneWidth);
+        row.removeFromLeft(gap);
+        columns.repeat = row.removeFromLeft(repeatWidth);
+        row.removeFromLeft(gap);
+        columns.bars = row.removeFromRight(barsWidth);
+        row.removeFromRight(gap);
+        columns.anchor = row.removeFromRight(anchorWidth);
+        row.removeFromRight(gap);
+        columns.length = row;
+        return columns;
+    };
+
+    auto headerRow = bounds.removeFromTop(12);
+    auto headerColumns = layoutColumns(headerRow);
+    sceneRepeatsLabel.setBounds(headerColumns.repeat);
+    sceneLengthHeaderLabel.setBounds(headerColumns.length);
+    sceneBarsHeaderLabel.setBounds(headerColumns.bars);
+    sceneAnchorHeaderLabel.setBounds(headerColumns.anchor);
     bounds.removeFromTop(2);
 
-    auto repeatRow = bounds.removeFromTop(22);
-    const int repeatGap = 8;
-    const int repeatCellWidth = juce::jmax(60, (repeatRow.getWidth() - ((MlrVSTAudioProcessor::SceneSlots - 1) * repeatGap))
-                                                   / juce::jmax(1, MlrVSTAudioProcessor::SceneSlots));
+    const int rowGap = 2;
+    const int rowHeight = juce::jmax(16, (bounds.getHeight() - (rowGap * (MlrVSTAudioProcessor::SceneSlots - 1)))
+                                             / juce::jmax(1, MlrVSTAudioProcessor::SceneSlots));
     for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
     {
-        auto cell = (sceneSlot == MlrVSTAudioProcessor::SceneSlots - 1)
-            ? repeatRow
-            : repeatRow.removeFromLeft(repeatCellWidth);
+        auto row = bounds.removeFromTop(rowHeight);
         if (sceneSlot < MlrVSTAudioProcessor::SceneSlots - 1)
-            repeatRow.removeFromLeft(repeatGap);
+            bounds.removeFromTop(rowGap);
 
+        auto columns = layoutColumns(row);
         auto& slotLabel = sceneRepeatSlotLabels[static_cast<size_t>(sceneSlot)];
         auto& repeatBox = sceneRepeatBoxes[static_cast<size_t>(sceneSlot)];
-        slotLabel.setBounds(cell.removeFromTop(12));
-        cell.removeFromTop(2);
-        repeatBox.setBounds(cell);
+        auto& lengthModeBox = sceneLengthModeBoxes[static_cast<size_t>(sceneSlot)];
+        auto& manualBarsBox = sceneManualBarsBoxes[static_cast<size_t>(sceneSlot)];
+        auto& anchorStripBox = sceneAnchorStripBoxes[static_cast<size_t>(sceneSlot)];
+
+        slotLabel.setBounds(columns.scene);
+        repeatBox.setBounds(columns.repeat);
+        lengthModeBox.setBounds(columns.length);
+        manualBarsBox.setBounds(columns.bars);
+        anchorStripBox.setBounds(columns.anchor);
     }
 }
 
 void SceneControlPanel::refreshFromProcessor()
 {
     sceneModeToggle.setToggleState(processor.isSceneModeEnabled(), juce::dontSendNotification);
+    const int currentTargetId = sceneAuthoringTargetBox.getSelectedId();
+    const int fallbackTargetId = processor.getActiveSceneSlot() + 1;
+    sceneAuthoringTargetBox.setSelectedId(
+        currentTargetId >= 1 && currentTargetId <= MlrVSTAudioProcessor::SceneSlots ? currentTargetId : fallbackTargetId,
+        juce::dontSendNotification);
+    sceneInsertAfterButton.setEnabled(sceneAuthoringTargetBox.getSelectedId() < MlrVSTAudioProcessor::SceneSlots);
+
     for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
     {
-        sceneRepeatBoxes[static_cast<size_t>(sceneSlot)].setSelectedId(
-            processor.getSceneRepeatCount(sceneSlot),
-            juce::dontSendNotification);
+        const auto idx = static_cast<size_t>(sceneSlot);
+        const auto lengthMode = processor.getSceneLengthMode(sceneSlot);
+        const int manualBars = processor.getSceneManualBars(sceneSlot);
+        const int anchorStrip = processor.getSceneAnchorStrip(sceneSlot);
+        const double resolvedBeats = processor.getResolvedSceneLengthBeats(sceneSlot);
+        const juce::String resolvedTooltip = "Resolved length: " + juce::String(resolvedBeats, 2) + " beats";
+
+        sceneRepeatBoxes[idx].setSelectedId(processor.getSceneRepeatCount(sceneSlot), juce::dontSendNotification);
+        sceneLengthModeBoxes[idx].setSelectedId(static_cast<int>(lengthMode) + 1, juce::dontSendNotification);
+        sceneManualBarsBoxes[idx].setSelectedId(manualBars, juce::dontSendNotification);
+        sceneAnchorStripBoxes[idx].setSelectedId(anchorStrip + 1, juce::dontSendNotification);
+        sceneManualBarsBoxes[idx].setEnabled(lengthMode == MlrVSTAudioProcessor::SceneLengthMode::ManualBars);
+        sceneAnchorStripBoxes[idx].setEnabled(lengthMode == MlrVSTAudioProcessor::SceneLengthMode::AnchorStrip);
+        sceneRepeatSlotLabels[idx].setTooltip(resolvedTooltip);
+        sceneLengthModeBoxes[idx].setTooltip(resolvedTooltip);
     }
 }
 
@@ -7151,6 +7195,33 @@ MacroControlPanel::MacroControlPanel(MlrVSTAudioProcessor& p)
             repaint();
         };
         addAndMakeVisible(macro.targetBox);
+
+        macro.recordLaneButton.setButtonText("REC");
+        macro.recordLaneButton.setTooltip("Arm one-pass recording of this macro into a modulation lane.");
+        macro.recordLaneButton.setMouseCursor(juce::MouseCursor::PointingHandCursor);
+        macro.recordLaneButton.setTriggeredOnMouseDown(true);
+        styleUiButton(macro.recordLaneButton, true);
+        macro.recordLaneButton.onClick = [this, i]()
+        {
+            const auto status = processor.getMacroLaneRecordStatus(i);
+            if (status.armed || status.recording)
+                processor.cancelMacroLaneRecording(i);
+            else
+                processor.beginMacroLaneRecording(i,
+                                                 juce::jmax(0,
+                                                            macros[static_cast<size_t>(i)].laneBox.getSelectedId() - 1));
+
+            refreshFromProcessor();
+            repaint();
+        };
+        addAndMakeVisible(macro.recordLaneButton);
+
+        for (int lane = 0; lane < ModernAudioEngine::NumModSequencers; ++lane)
+            macro.laneBox.addItem("L" + juce::String(lane + 1), lane + 1);
+        macro.laneBox.setSelectedId(1, juce::dontSendNotification);
+        styleUiCombo(macro.laneBox);
+        macro.laneBox.setTooltip("Choose which modulation lane slot this macro writes into.");
+        addAndMakeVisible(macro.laneBox);
 
         macro.slider.setLookAndFeel(&knobLookAndFeel);
         macro.slider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
@@ -7238,10 +7309,15 @@ void MacroControlPanel::resized()
             cellHeight);
         auto& macro = macros[static_cast<size_t>(i)];
         macro.label.setBounds(column.removeFromTop(16));
-        auto assignmentRow = column.removeFromTop(24);
-        macro.ccButton.setBounds(assignmentRow.removeFromLeft(64));
+        auto assignmentRow = column.removeFromTop(22);
+        macro.ccButton.setBounds(assignmentRow.removeFromLeft(56));
         assignmentRow.removeFromLeft(6);
         macro.targetBox.setBounds(assignmentRow);
+        column.removeFromTop(4);
+        auto recordRow = column.removeFromTop(22);
+        macro.recordLaneButton.setBounds(recordRow.removeFromLeft(50));
+        recordRow.removeFromLeft(6);
+        macro.laneBox.setBounds(recordRow.removeFromLeft(52));
         column.removeFromTop(4);
         macro.slider.setBounds(column);
     }
@@ -7264,6 +7340,12 @@ void MacroControlPanel::refreshFromProcessor()
         const bool isLearning = (processor.getMacroMidiLearnIndex() == i);
         const auto target = processor.getMacroTarget(i);
         const bool hasTarget = target != MlrVSTAudioProcessor::MacroTarget::None;
+        const bool laneRecordableTarget = performanceTargetAllowsModLane(target);
+        const auto laneStatus = processor.getMacroLaneRecordStatus(i);
+        const bool laneRecordActive = laneStatus.armed || laneStatus.recording;
+        const bool laneRecordEnabled = (state.hasTargetStrip && hasTarget && laneRecordableTarget) || laneRecordActive;
+        const int linkedLaneSlot = MlrVSTAudioProcessor::getDefaultModLaneSlotForMacroTarget(target);
+        const bool laneFollowsDefault = linkedLaneSlot >= 0;
         const auto knobColour = targetColour.withMultipliedSaturation(1.0f);
         macro.label.setColour(juce::Label::textColourId, hasTarget ? targetColour : kTextMuted);
         macro.targetBox.setSelectedId(macroTargetToComboId(target), juce::dontSendNotification);
@@ -7286,6 +7368,68 @@ void MacroControlPanel::refreshFromProcessor()
                                  isLearning ? juce::Colour(0xff101214) : kTextMuted);
         macro.ccButton.setColour(juce::TextButton::textColourOnId,
                                  isLearning ? juce::Colour(0xff101214) : kTextPrimary);
+        macro.recordLaneButton.setEnabled(laneRecordEnabled);
+        if (laneRecordActive)
+            macro.laneBox.setSelectedId(laneStatus.laneSlot + 1, juce::dontSendNotification);
+        else if (laneFollowsDefault)
+            macro.laneBox.setSelectedId(linkedLaneSlot + 1, juce::dontSendNotification);
+        else if (macro.laneBox.getSelectedId() <= 0)
+            macro.laneBox.setSelectedId(1, juce::dontSendNotification);
+
+        macro.laneBox.setEnabled(laneRecordEnabled && !laneRecordActive && !laneFollowsDefault);
+        if (laneFollowsDefault)
+        {
+            macro.laneBox.setTooltip("Linked to default modulation lane L"
+                                     + juce::String(linkedLaneSlot + 1)
+                                     + " for "
+                                     + performanceTargetDisplayName(target, true)
+                                     + ".");
+        }
+        else
+        {
+            macro.laneBox.setTooltip("Choose which modulation lane slot this macro writes into.");
+        }
+        macro.recordLaneButton.setButtonText(laneStatus.recording ? "REC" : (laneStatus.armed ? "ARM" : "REC"));
+        const auto laneIdleColour = juce::Colour(0xff3b4146);
+        const auto laneArmedColour = kAccent.withAlpha(0.92f);
+        const auto laneRecordingColour = juce::Colour(0xffd16a43);
+        const auto laneColour = laneStatus.recording ? laneRecordingColour
+                                                     : (laneStatus.armed ? laneArmedColour : laneIdleColour);
+        const auto laneTextColour = (laneStatus.recording || laneStatus.armed)
+            ? juce::Colour(0xff101214)
+            : kTextPrimary;
+        macro.recordLaneButton.setColour(juce::TextButton::buttonColourId, laneColour);
+        macro.recordLaneButton.setColour(juce::TextButton::buttonOnColourId, laneColour.brighter(0.08f));
+        macro.recordLaneButton.setColour(juce::TextButton::textColourOffId, laneTextColour);
+        macro.recordLaneButton.setColour(juce::TextButton::textColourOnId, laneTextColour);
+        if (laneStatus.recording)
+        {
+            macro.recordLaneButton.setTooltip("Recording into strip "
+                                              + juce::String(laneStatus.stripIndex + 1)
+                                              + ", lane "
+                                              + juce::String(laneStatus.laneSlot + 1)
+                                              + " ("
+                                              + juce::String(laneStatus.stepsWritten)
+                                              + "/"
+                                              + juce::String(juce::jmax(1, laneStatus.totalSteps))
+                                              + " steps).");
+        }
+        else if (laneStatus.armed)
+        {
+            macro.recordLaneButton.setTooltip("Armed for strip "
+                                              + juce::String(laneStatus.stripIndex + 1)
+                                              + ", lane "
+                                              + juce::String(laneStatus.laneSlot + 1)
+                                              + ". Recording starts on the next host PPQ update.");
+        }
+        else if (!laneRecordableTarget && hasTarget)
+        {
+            macro.recordLaneButton.setTooltip("This macro target does not map to a modulation lane yet.");
+        }
+        else
+        {
+            macro.recordLaneButton.setTooltip("Arm one-pass recording of this macro into the selected modulation lane.");
+        }
     }
 
     isRefreshing = true;
@@ -7977,28 +8121,8 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
     targetLabel.setColour(juce::Label::textColourId, kTextMuted);
     addAndMakeVisible(targetLabel);
 
-    targetBox.addItem("None", 1);
-    targetBox.addItem("Volume", 2);
-    targetBox.addItem("Pan", 3);
-    targetBox.addItem("Pitch", 4);
-    targetBox.addItem("Speed", 5);
-    targetBox.addItem("Cutoff", 6);
-    targetBox.addItem("Resonance", 7);
-    targetBox.addItem("Grain Size", 8);
-    targetBox.addItem("Grain Density", 9);
-    targetBox.addItem("Grain Pitch", 10);
-    targetBox.addItem("Grain Pitch Jitter", 11);
-    targetBox.addItem("Grain Spread", 12);
-    targetBox.addItem("Grain Jitter", 13);
-    targetBox.addItem("Grain Random", 14);
-    targetBox.addItem("Grain Arp", 15);
-    targetBox.addItem("Grain Cloud", 16);
-    targetBox.addItem("Grain Emitter", 17);
-    targetBox.addItem("Grain Envelope", 18);
-    targetBox.addItem("Grain Pos Jitter", 19);
-    targetBox.addItem("Grain Shape", 20);
-    targetBox.addItem("Filter Morph", 21);
-    targetBox.addItem("Retrigger", 22);
+    for (auto target : kModPerformanceTargetOrder)
+        targetBox.addItem(performanceTargetDisplayName(target), performanceTargetToComboId(target));
     targetBox.onChange = [this]()
     {
         if (auto* engine = processor.getAudioEngine())
@@ -8867,7 +8991,8 @@ void MlrVSTAudioProcessorEditor::resized()
     // Top section: TABBED controls (Global/Presets/Monome)
     const int selectedTopTab = topTabs->getCurrentTabIndex();
     const int requestedTopBarHeight = (selectedTopTab == 1) ? 300
-        : (selectedTopTab == 0 ? 156 : 124);
+        : (selectedTopTab == 0 ? 156
+                               : (selectedTopTab == 5 ? 196 : 124));
     const int maxTopBarHeight = juce::jmax(124, bounds.getHeight() - 180);
     auto topBar = bounds.removeFromTop(juce::jmin(requestedTopBarHeight, maxTopBarHeight));
     topTabs->setBounds(topBar);

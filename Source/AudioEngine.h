@@ -33,6 +33,7 @@
 #include "StepSampler.h"
 #include "TimeStretchBackend.h"
 #include "LadderFilterBase.h"
+#include "PerformanceTargets.h"
 
 #ifndef MLRVST_ENABLE_SOUNDTOUCH
 #define MLRVST_ENABLE_SOUNDTOUCH 0
@@ -448,6 +449,12 @@ public:
     
     void prepareToPlay(double sampleRate, int maxBlockSize);
     void loadSample(const juce::AudioBuffer<float>& buffer, double sourceRate);
+    void loadSampleWithAnalysisCache(const juce::AudioBuffer<float>& buffer,
+                                     double sourceRate,
+                                     const std::array<int, 16>& transientSlices,
+                                     const std::array<float, 128>& rmsMap,
+                                     const std::array<int, 128>& zeroCrossMap,
+                                     int sourceSampleCount);
     bool loadSampleFromFile(const juce::File& file);
     void adoptPreparedSample(juce::AudioBuffer<float>& preparedSampleBuffer,
                              double sourceRate,
@@ -1253,6 +1260,10 @@ public:
     void handleLooping();
     float getPanGain(int channel) const; // 0=left, 1=right
     void rebuildTransientSliceMap();
+    void installPreparedAnalysisCacheLocked(const std::array<int, 16>& transientSlices,
+                                            const std::array<float, 128>& rmsMap,
+                                            const std::array<int, 128>& zeroCrossMap,
+                                            int sourceSampleCount);
     void rebuildSampleAnalysisCacheLocked();
 #if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     bool shouldUseSoundTouchSwingCache(double loopLength, double beatsForLoop, int loopCols,
@@ -1320,32 +1331,7 @@ public:
     static constexpr int ModTotalSteps = ModSteps * MaxModBars;
     static constexpr int ModMaxStepSubdivisions = 16;
 
-    enum class ModTarget
-    {
-        None = 0,
-        Volume,
-        Pan,
-        Pitch,
-        Speed,
-        Cutoff,
-        Resonance,
-        GrainSize,
-        GrainDensity,
-        GrainPitch,
-        GrainPitchJitter,
-        GrainSpread,
-        GrainJitter,
-        GrainRandom,
-        GrainArp,
-        GrainCloud,
-        GrainEmitter,
-        GrainEnvelope,
-        Retrigger,
-        GrainPositionJitter,
-        GrainShape,
-        FilterMorph,
-        FilterFrequency = Cutoff
-    };
+    using ModTarget = PerformanceTarget;
 
     enum class ModBipolarToggleMode
     {
@@ -1479,20 +1465,34 @@ public:
     static bool modTargetSupportsBipolar(ModTarget target);
     void setModTarget(int stripIndex, ModTarget target);
     ModTarget getModTarget(int stripIndex) const;
+    void setModTargetForSlot(int stripIndex, int slot, ModTarget target);
+    ModTarget getModTargetForSlot(int stripIndex, int slot) const;
     void setModBipolar(int stripIndex,
                        bool bipolar,
                        ModBipolarToggleMode mode = ModBipolarToggleMode::ConvertPreserveNeutral);
     bool isModBipolar(int stripIndex) const;
+    void setModBipolarForSlot(int stripIndex,
+                              int slot,
+                              bool bipolar,
+                              ModBipolarToggleMode mode = ModBipolarToggleMode::ConvertPreserveNeutral);
+    bool isModBipolarForSlot(int stripIndex, int slot) const;
     void setModDepth(int stripIndex, float depth);
     float getModDepth(int stripIndex) const;
+    void setModDepthForSlot(int stripIndex, int slot, float depth);
+    float getModDepthForSlot(int stripIndex, int slot) const;
     void setModCurveMode(int stripIndex, bool curveMode);
     bool isModCurveMode(int stripIndex) const;
+    void setModCurveModeForSlot(int stripIndex, int slot, bool curveMode);
+    bool isModCurveModeForSlot(int stripIndex, int slot) const;
     void setModOffset(int stripIndex, int offset);
     int getModOffset(int stripIndex) const;
+    int getModOffsetForSlot(int stripIndex, int slot) const;
     void setModStepValue(int stripIndex, int step, float value01);
     float getModStepValue(int stripIndex, int step) const;
     void setModStepValueAbsolute(int stripIndex, int absoluteStep, float value01);
     float getModStepValueAbsolute(int stripIndex, int absoluteStep) const;
+    void writeModStepNormalized(int stripIndex, int slot, int absoluteStep, float value01);
+    void clearModStepsForSlot(int stripIndex, int slot, float value01);
     void setModStepShape(int stripIndex, int step, int subdivisions, float endValue01);
     void setModStepShapeAbsolute(int stripIndex, int absoluteStep, int subdivisions, float endValue01);
     int getModStepSubdivisionAbsolute(int stripIndex, int absoluteStep) const;
@@ -1505,6 +1505,8 @@ public:
     int getModCurrentStep(int stripIndex) const;
     int getModCurrentPage(int stripIndex) const;
     int getModCurrentGlobalStep(int stripIndex) const;
+    int getModTotalActiveSteps(int stripIndex, int slot) const;
+    double getModStepLengthBeats(int stripIndex, int slot) const;
     void setModLengthBars(int stripIndex, int bars);
     int getModLengthBars(int stripIndex) const;
     void setModEditPage(int stripIndex, int page);
@@ -1517,8 +1519,12 @@ public:
     ModCurveShape getModCurveShape(int stripIndex) const;
     void setModPitchScaleQuantize(int stripIndex, bool enabled);
     bool isModPitchScaleQuantize(int stripIndex) const;
+    void setModPitchScaleQuantizeForSlot(int stripIndex, int slot, bool enabled);
+    bool isModPitchScaleQuantizeForSlot(int stripIndex, int slot) const;
     void setModPitchScale(int stripIndex, PitchScale scale);
     PitchScale getModPitchScale(int stripIndex) const;
+    void setModPitchScaleForSlot(int stripIndex, int slot, PitchScale scale);
+    PitchScale getModPitchScaleForSlot(int stripIndex, int slot) const;
     
     // Live recording - Continuous buffer
     void setRecordingLoopLength(int bars);  // Legacy - now per-strip
@@ -1606,6 +1612,8 @@ private:
     const ModSequencer& getActiveModSequencer(int stripIndex) const;
     ModSequencer& getModSequencer(int stripIndex, int slot);
     const ModSequencer& getModSequencer(int stripIndex, int slot) const;
+    void setModTargetOnSequencer(ModSequencer& seq, ModTarget target);
+    void setModBipolarOnSequencer(ModSequencer& seq, bool bipolar, ModBipolarToggleMode mode);
 
     std::array<std::unique_ptr<EnhancedAudioStrip>, MaxStrips> strips;
     std::array<std::unique_ptr<StripGroup>, MaxGroups> groups;

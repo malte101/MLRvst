@@ -841,6 +841,8 @@ private:
         juce::Label label;
         juce::TextButton ccButton;
         juce::ComboBox targetBox;
+        juce::TextButton recordLaneButton;
+        juce::ComboBox laneBox;
         MacroLearnSlider slider;
     };
 
@@ -1144,9 +1146,20 @@ private:
     juce::Label titleLabel;
     juce::Label hintLabel;
     juce::ToggleButton sceneModeToggle;
+    juce::Label sceneAuthoringLabel;
+    juce::ComboBox sceneAuthoringTargetBox;
+    juce::TextButton sceneCaptureButton;
+    juce::TextButton sceneInsertBeforeButton;
+    juce::TextButton sceneInsertAfterButton;
     juce::Label sceneRepeatsLabel;
+    juce::Label sceneLengthHeaderLabel;
+    juce::Label sceneBarsHeaderLabel;
+    juce::Label sceneAnchorHeaderLabel;
     std::array<juce::Label, MlrVSTAudioProcessor::SceneSlots> sceneRepeatSlotLabels;
     std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneRepeatBoxes;
+    std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneLengthModeBoxes;
+    std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneManualBarsBoxes;
+    std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneAnchorStripBoxes;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SceneControlPanel)
 };

@@ -1469,12 +1469,19 @@ FilterType stepFilterTypeFromMorphValue(float morph)
 }
 
 using MacroTarget = MlrVSTAudioProcessor::MacroTarget;
+using SceneLengthMode = MlrVSTAudioProcessor::SceneLengthMode;
 
 MacroTarget sanitizeMacroTarget(int rawTarget)
 {
-    return static_cast<MacroTarget>(juce::jlimit(0,
-                                                 static_cast<int>(MacroTarget::GrainShape),
-                                                 rawTarget));
+    return sanitizeMacroPerformanceTarget(performanceTargetFromRaw(rawTarget));
+}
+
+SceneLengthMode sanitizeSceneLengthMode(int rawMode)
+{
+    return static_cast<SceneLengthMode>(juce::jlimit(
+        0,
+        static_cast<int>(SceneLengthMode::AnchorStrip),
+        rawMode));
 }
 
 constexpr std::array<int, MlrVSTAudioProcessor::MacroCount> kAkaiMpkMiniMacroCcs {
@@ -2821,6 +2828,7 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
         macroMidiCcAssignments[static_cast<size_t>(i)].store(getDefaultMacroMidiCc(i), std::memory_order_release);
         macroTargetAssignments[static_cast<size_t>(i)].store(static_cast<int>(getDefaultMacroTarget(i)),
                                                              std::memory_order_release);
+        resetMacroLaneRecordState(i);
     }
     cacheParameterPointers();
     sceneModeEnabled.store(sceneModeParam != nullptr && sceneModeParam->load(std::memory_order_acquire) > 0.5f ? 1 : 0,
@@ -2831,6 +2839,9 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
     sceneModeGroupSnapshot.groupVolumes.fill(1.0f);
     sceneModeGroupSnapshot.groupMuted.fill(false);
     sceneRepeatCounts.fill(1);
+    sceneLengthModes.fill(static_cast<int>(SceneLengthMode::LongestStrip));
+    sceneManualBars.fill(4);
+    sceneAnchorStrips.fill(0);
     loadPersistentDefaultPaths();
     loadPersistentControlPages();
     loadPersistentGlobalControls();
@@ -3110,6 +3121,21 @@ MlrVSTAudioProcessor::MacroTarget MlrVSTAudioProcessor::getDefaultMacroTarget(in
     }
 }
 
+int MlrVSTAudioProcessor::getDefaultModLaneSlotForMacroTarget(MacroTarget target)
+{
+    const auto sanitizedTarget = sanitizeMacroPerformanceTarget(target);
+    if (!performanceTargetAllowsModLane(sanitizedTarget))
+        return -1;
+
+    for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+    {
+        if (ModernAudioEngine::defaultModTargetForSlot(slot) == sanitizedTarget)
+            return slot;
+    }
+
+    return -1;
+}
+
 MlrVSTAudioProcessor::MacroTarget MlrVSTAudioProcessor::getMacroTarget(int macroIndex) const
 {
     if (macroIndex < 0 || macroIndex >= MacroCount)
@@ -3155,9 +3181,124 @@ float MlrVSTAudioProcessor::getDefaultMacroNormalizedValue(MacroTarget target)
         case MacroTarget::GrainEmitter: return 0.0f;
         case MacroTarget::GrainEnvelope: return 0.0f;
         case MacroTarget::GrainShape: return 0.5f;
+        case MacroTarget::Retrigger: return 0.0f;
         case MacroTarget::None:
         default: return 0.0f;
     }
+}
+
+MlrVSTAudioProcessor::MacroLaneRecordStatus MlrVSTAudioProcessor::getMacroLaneRecordStatus(int macroIndex) const
+{
+    MacroLaneRecordStatus status{};
+    if (macroIndex < 0 || macroIndex >= MacroCount)
+        return status;
+
+    const auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
+    status.armed = state.armed.load(std::memory_order_acquire) != 0;
+    status.recording = state.recording.load(std::memory_order_acquire) != 0;
+    status.stripIndex = state.stripIndex.load(std::memory_order_acquire);
+    status.laneSlot = state.laneSlot.load(std::memory_order_acquire);
+    status.target = sanitizeMacroPerformanceTarget(
+        performanceTargetFromRaw(state.target.load(std::memory_order_acquire)));
+    status.stepsWritten = state.stepsWritten.load(std::memory_order_acquire);
+    status.totalSteps = state.totalStepsToWrite.load(std::memory_order_acquire);
+    return status;
+}
+
+void MlrVSTAudioProcessor::resetMacroLaneRecordState(int macroIndex)
+{
+    if (macroIndex < 0 || macroIndex >= MacroCount)
+        return;
+
+    auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
+    state.armed.store(0, std::memory_order_release);
+    state.recording.store(0, std::memory_order_release);
+    state.stripIndex.store(-1, std::memory_order_release);
+    state.macroIndex.store(-1, std::memory_order_release);
+    state.laneSlot.store(0, std::memory_order_release);
+    state.target.store(static_cast<int>(MacroTarget::None), std::memory_order_release);
+    state.restoreDepth.store(1.0f, std::memory_order_release);
+    state.startPpq.store(-1.0, std::memory_order_release);
+    state.nextStepPpq.store(-1.0, std::memory_order_release);
+    state.nextStepIndex.store(-1, std::memory_order_release);
+    state.stepsWritten.store(0, std::memory_order_release);
+    state.totalStepsToWrite.store(0, std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::finishMacroLaneRecording(int macroIndex, bool activateLane)
+{
+    if (macroIndex < 0 || macroIndex >= MacroCount)
+        return;
+
+    auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
+    const int stripIndex = state.stripIndex.load(std::memory_order_acquire);
+    const int laneSlot = state.laneSlot.load(std::memory_order_acquire);
+    const float restoreDepth = juce::jlimit(0.0f, 1.0f, state.restoreDepth.load(std::memory_order_acquire));
+    if (activateLane && audioEngine && stripIndex >= 0 && stripIndex < MaxStrips)
+        audioEngine->setModDepthForSlot(stripIndex, laneSlot, restoreDepth > 0.0f ? restoreDepth : 1.0f);
+
+    resetMacroLaneRecordState(macroIndex);
+}
+
+void MlrVSTAudioProcessor::beginMacroLaneRecording(int macroIndex, int laneSlot)
+{
+    if (!audioEngine || macroIndex < 0 || macroIndex >= MacroCount)
+        return;
+
+    const auto target = getMacroTarget(macroIndex);
+    if (target == MacroTarget::None || !performanceTargetAllowsModLane(target))
+    {
+        cancelMacroLaneRecording(macroIndex);
+        return;
+    }
+
+    const int stripIndex = getMacroTargetStripIndex();
+    if (stripIndex < 0 || stripIndex >= MaxStrips || audioEngine->getStrip(stripIndex) == nullptr)
+        return;
+
+    const int linkedLane = getDefaultModLaneSlotForMacroTarget(target);
+    const int safeLane = linkedLane >= 0
+        ? linkedLane
+        : juce::jlimit(0, ModernAudioEngine::NumModSequencers - 1, laneSlot);
+    for (int i = 0; i < MacroCount; ++i)
+    {
+        if (i == macroIndex)
+            continue;
+
+        const auto status = getMacroLaneRecordStatus(i);
+        if ((status.armed || status.recording)
+            && status.stripIndex == stripIndex
+            && status.laneSlot == safeLane)
+        {
+            cancelMacroLaneRecording(i);
+        }
+    }
+
+    resetMacroLaneRecordState(macroIndex);
+    auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
+    state.stripIndex.store(stripIndex, std::memory_order_release);
+    state.macroIndex.store(macroIndex, std::memory_order_release);
+    state.laneSlot.store(safeLane, std::memory_order_release);
+    state.target.store(static_cast<int>(target), std::memory_order_release);
+    state.armed.store(1, std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::cancelMacroLaneRecording(int macroIndex)
+{
+    if (macroIndex < 0 || macroIndex >= MacroCount)
+        return;
+
+    const auto status = getMacroLaneRecordStatus(macroIndex);
+    if (status.recording && audioEngine && status.stripIndex >= 0 && status.stripIndex < MaxStrips)
+    {
+        const auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
+        const float restoreDepth = juce::jlimit(0.0f, 1.0f, state.restoreDepth.load(std::memory_order_acquire));
+        audioEngine->setModDepthForSlot(status.stripIndex,
+                                        status.laneSlot,
+                                        restoreDepth > 0.0f ? restoreDepth : 1.0f);
+    }
+
+    resetMacroLaneRecordState(macroIndex);
 }
 
 void MlrVSTAudioProcessor::beginMacroMidiLearn(int macroIndex)
@@ -3264,6 +3405,7 @@ float MlrVSTAudioProcessor::getMacroNormalizedValueForTarget(const EnhancedAudio
             return juce::jlimit(0.0f, 1.0f, strip.getGrainEnvelope());
         case MacroTarget::GrainShape:
             return normalizeMacroLinear(strip.getGrainShape(), -1.0f, 1.0f);
+        case MacroTarget::Retrigger:
         case MacroTarget::None:
         default:
             return getDefaultMacroNormalizedValue(target);
@@ -3395,6 +3537,7 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(EnhancedAudioStrip& strip, Macr
         case MacroTarget::GrainShape:
             strip.setGrainShape(denormalizeMacroLinear(clamped, -1.0f, 1.0f));
             break;
+        case MacroTarget::Retrigger:
         case MacroTarget::None:
         default:
             break;
@@ -3431,6 +3574,182 @@ void MlrVSTAudioProcessor::setSelectedStripMacroValue(int macroIndex, float norm
         return;
 
     applyMacroTargetValue(*strip, getMacroTarget(macroIndex), normalizedValue);
+}
+
+float MlrVSTAudioProcessor::getMacroLaneRecordedValue(int macroIndex) const
+{
+    if (!audioEngine || macroIndex < 0 || macroIndex >= MacroCount)
+        return 0.0f;
+
+    const auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
+    const int stripIndex = state.stripIndex.load(std::memory_order_acquire);
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return getDefaultMacroNormalizedValue(getMacroTarget(macroIndex));
+
+    auto* strip = audioEngine->getStrip(stripIndex);
+    if (strip == nullptr)
+        return getDefaultMacroNormalizedValue(getMacroTarget(macroIndex));
+
+    const auto target = sanitizeMacroPerformanceTarget(
+        performanceTargetFromRaw(state.target.load(std::memory_order_acquire)));
+    return getMacroNormalizedValueForTarget(*strip, target);
+}
+
+bool MlrVSTAudioProcessor::initializeMacroLaneRecording(int macroIndex,
+                                                        const juce::AudioPlayHead::PositionInfo& posInfo)
+{
+    if (!audioEngine || macroIndex < 0 || macroIndex >= MacroCount || !posInfo.getIsPlaying())
+        return false;
+
+    const auto ppqOpt = posInfo.getPpqPosition();
+    if (!ppqOpt.hasValue() || !std::isfinite(*ppqOpt))
+        return false;
+
+    auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
+    const int stripIndex = state.stripIndex.load(std::memory_order_acquire);
+    const int laneSlot = state.laneSlot.load(std::memory_order_acquire);
+    const auto target = sanitizeMacroPerformanceTarget(
+        performanceTargetFromRaw(state.target.load(std::memory_order_acquire)));
+    auto* strip = audioEngine->getStrip(stripIndex);
+    if (strip == nullptr || !performanceTargetAllowsModLane(target))
+        return false;
+
+    const int totalSteps = audioEngine->getModTotalActiveSteps(stripIndex, laneSlot);
+    const double stepLengthBeats = audioEngine->getModStepLengthBeats(stripIndex, laneSlot);
+    if (totalSteps <= 0 || !std::isfinite(stepLengthBeats) || stepLengthBeats <= 0.0)
+        return false;
+
+    state.restoreDepth.store(audioEngine->getModDepthForSlot(stripIndex, laneSlot), std::memory_order_release);
+    audioEngine->setModTargetForSlot(stripIndex, laneSlot, target);
+    if (performanceTargetSupportsPitchScaleQuantize(target))
+    {
+        const int detectedScaleIndex = getLoopStripDetectedScaleIndex(stripIndex);
+        const auto resolvedScale = static_cast<ModernAudioEngine::PitchScale>(juce::jlimit(
+            0,
+            static_cast<int>(ModernAudioEngine::PitchScale::PentatonicMinor),
+            detectedScaleIndex >= 0 ? detectedScaleIndex : static_cast<int>(getGlobalPitchScale())));
+        audioEngine->setModPitchScaleQuantizeForSlot(stripIndex, laneSlot, true);
+        audioEngine->setModPitchScaleForSlot(stripIndex, laneSlot, resolvedScale);
+    }
+    else
+    {
+        audioEngine->setModPitchScaleQuantizeForSlot(stripIndex, laneSlot, false);
+    }
+    audioEngine->setModCurveModeForSlot(stripIndex, laneSlot, false);
+    audioEngine->setModDepthForSlot(stripIndex, laneSlot, 0.0f);
+    audioEngine->clearModStepsForSlot(stripIndex, laneSlot,
+                                      ModernAudioEngine::defaultModStepValueForTarget(target));
+
+    const double currentPpq = *ppqOpt;
+    const double stepsPerBeat = 1.0 / stepLengthBeats;
+    const int offset = audioEngine->getModOffsetForSlot(stripIndex, laneSlot);
+    const double stepsPos = (currentPpq * stepsPerBeat) + static_cast<double>(offset);
+    const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
+    const double wrappedPos = wrapped < 0.0 ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
+    const int currentStep = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
+    const double stepPhase = juce::jlimit(0.0, 0.999999999, wrappedPos - static_cast<double>(currentStep));
+
+    audioEngine->writeModStepNormalized(stripIndex, laneSlot, currentStep, getMacroLaneRecordedValue(macroIndex));
+
+    state.startPpq.store(currentPpq, std::memory_order_release);
+    state.stepsWritten.store(1, std::memory_order_release);
+    state.totalStepsToWrite.store(totalSteps, std::memory_order_release);
+
+    if (totalSteps <= 1)
+    {
+        finishMacroLaneRecording(macroIndex, true);
+        return true;
+    }
+
+    state.nextStepIndex.store((currentStep + 1) % totalSteps, std::memory_order_release);
+    state.nextStepPpq.store(currentPpq + ((1.0 - stepPhase) * stepLengthBeats), std::memory_order_release);
+    state.recording.store(1, std::memory_order_release);
+    return true;
+}
+
+void MlrVSTAudioProcessor::updateMacroLaneRecording(const juce::AudioPlayHead::PositionInfo& posInfo,
+                                                    int numSamples)
+{
+    if (!audioEngine)
+        return;
+
+    const auto ppqOpt = posInfo.getPpqPosition();
+    const auto bpmOpt = posInfo.getBpm();
+    const bool transportValid = posInfo.getIsPlaying()
+        && ppqOpt.hasValue()
+        && bpmOpt.hasValue()
+        && std::isfinite(*ppqOpt)
+        && std::isfinite(*bpmOpt)
+        && *bpmOpt > 0.0
+        && currentSampleRate > 0.0;
+
+    if (!transportValid)
+    {
+        for (int macroIndex = 0; macroIndex < MacroCount; ++macroIndex)
+        {
+            if (macroLaneRecordStates[static_cast<size_t>(macroIndex)].recording.load(std::memory_order_acquire) != 0)
+                finishMacroLaneRecording(macroIndex, true);
+        }
+        return;
+    }
+
+    const double currentPpq = *ppqOpt;
+    const double ppqPerSample = (*bpmOpt / 60.0) / currentSampleRate;
+    const double blockEndPpq = currentPpq + (ppqPerSample * static_cast<double>(juce::jmax(1, numSamples)));
+
+    for (int macroIndex = 0; macroIndex < MacroCount; ++macroIndex)
+    {
+        auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
+        if (state.armed.load(std::memory_order_acquire) == 0
+            && state.recording.load(std::memory_order_acquire) == 0)
+        {
+            continue;
+        }
+
+        if (state.recording.load(std::memory_order_acquire) == 0)
+        {
+            const bool initialized = initializeMacroLaneRecording(macroIndex, posInfo);
+            if (!initialized && state.armed.load(std::memory_order_acquire) != 0)
+            {
+                const auto target = performanceTargetFromRaw(state.target.load(std::memory_order_acquire));
+                const int stripIndex = state.stripIndex.load(std::memory_order_acquire);
+                if (stripIndex < 0 || stripIndex >= MaxStrips || !performanceTargetAllowsModLane(target))
+                    resetMacroLaneRecordState(macroIndex);
+            }
+            if (state.recording.load(std::memory_order_acquire) == 0)
+                continue;
+        }
+
+        const int stripIndex = state.stripIndex.load(std::memory_order_acquire);
+        const int laneSlot = state.laneSlot.load(std::memory_order_acquire);
+        const int totalSteps = juce::jmax(1, state.totalStepsToWrite.load(std::memory_order_acquire));
+        const double stepLengthBeats = audioEngine->getModStepLengthBeats(stripIndex, laneSlot);
+        int stepsWritten = state.stepsWritten.load(std::memory_order_acquire);
+        int nextStepIndex = state.nextStepIndex.load(std::memory_order_acquire);
+        double nextStepPpq = state.nextStepPpq.load(std::memory_order_acquire);
+
+        while (stepsWritten < totalSteps
+               && std::isfinite(nextStepPpq)
+               && nextStepPpq <= blockEndPpq + 1.0e-9)
+        {
+            audioEngine->writeModStepNormalized(stripIndex,
+                                                laneSlot,
+                                                nextStepIndex,
+                                                getMacroLaneRecordedValue(macroIndex));
+            ++stepsWritten;
+            state.stepsWritten.store(stepsWritten, std::memory_order_release);
+            if (stepsWritten >= totalSteps)
+                break;
+
+            nextStepIndex = (nextStepIndex + 1) % totalSteps;
+            nextStepPpq += stepLengthBeats;
+            state.nextStepIndex.store(nextStepIndex, std::memory_order_release);
+            state.nextStepPpq.store(nextStepPpq, std::memory_order_release);
+        }
+
+        if (stepsWritten >= totalSteps)
+            finishMacroLaneRecording(macroIndex, true);
+    }
 }
 
 void MlrVSTAudioProcessor::handleIncomingMacroCc(const juce::MidiBuffer& midiMessages)
@@ -3536,7 +3855,12 @@ TimeStretchBackend MlrVSTAudioProcessor::resolveLoopTempoMatchBackendForStrip(in
 
 MlrVSTAudioProcessor::FlipTempoMatchMode MlrVSTAudioProcessor::getFlipTempoMatchMode() const
 {
-    return FlipTempoMatchMode::Repitch;
+    const float rawChoice = (flipTempoMatchModeParam != nullptr)
+        ? flipTempoMatchModeParam->load(std::memory_order_acquire)
+        : 0.0f;
+    const int modeIndex = juce::jlimit(0, 1, static_cast<int>(std::round(rawChoice)));
+    return modeIndex == 1 ? FlipTempoMatchMode::MlrTs
+                          : FlipTempoMatchMode::Repitch;
 }
 
 TimeStretchBackend MlrVSTAudioProcessor::getFlipTempoMatchBackend() const
@@ -3616,6 +3940,12 @@ void MlrVSTAudioProcessor::applyResolvedPitchControl(EnhancedAudioStrip& strip,
 MlrVSTAudioProcessor::ResolvedFlipTempoMatch MlrVSTAudioProcessor::resolveFlipTempoMatch() const
 {
     ResolvedFlipTempoMatch resolved;
+    resolved.mode = getFlipTempoMatchMode();
+    if (resolved.mode == FlipTempoMatchMode::MlrTs
+        && isTimeStretchBackendAvailable(TimeStretchBackend::Bungee))
+    {
+        resolved.backend = TimeStretchBackend::Bungee;
+    }
     return resolved;
 }
 
@@ -5159,6 +5489,7 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     }
 
     handleIncomingMacroCc(midiMessages);
+    updateMacroLaneRecording(posInfo, buffer.getNumSamples());
 
     applyMomentaryStutterMacro(posInfo);
     
@@ -6071,11 +6402,12 @@ void MlrVSTAudioProcessor::applyFlipLegacyLoopRenderCacheToStrip(EnhancedAudioSt
                                                                  TimeStretchBackend backend,
                                                                  float visibleBankBeats) const
 {
-    strip.loadSample(entry.cachedBankBuffer, entry.cachedSampleRate);
-    strip.restoreSampleAnalysisCache(entry.cachedTransientSliceStarts,
-                                     entry.cachedRmsMap,
-                                     entry.cachedZeroCrossMap,
-                                     entry.cachedSourceLengthSamples);
+    strip.loadSampleWithAnalysisCache(entry.cachedBankBuffer,
+                                      entry.cachedSampleRate,
+                                      entry.cachedTransientSliceStarts,
+                                      entry.cachedRmsMap,
+                                      entry.cachedZeroCrossMap,
+                                      entry.cachedSourceLengthSamples);
     strip.setStretchBackend(backend);
     strip.setTransientSliceMode(true);
     strip.setLoop(0, MaxColumns);
@@ -6753,6 +7085,87 @@ void MlrVSTAudioProcessor::setSceneRepeatCount(int sceneSlot, int repeats)
         pendingSceneRecall.targetResolved = false;
 }
 
+MlrVSTAudioProcessor::SceneLengthMode MlrVSTAudioProcessor::getSceneLengthMode(int sceneSlot) const
+{
+    const auto idx = static_cast<size_t>(juce::jlimit(0, SceneSlots - 1, sceneSlot));
+    return sanitizeSceneLengthMode(sceneLengthModes[idx]);
+}
+
+void MlrVSTAudioProcessor::setSceneLengthMode(int sceneSlot, SceneLengthMode mode)
+{
+    const auto idx = static_cast<size_t>(juce::jlimit(0, SceneSlots - 1, sceneSlot));
+    const int clampedMode = static_cast<int>(sanitizeSceneLengthMode(static_cast<int>(mode)));
+    if (sceneLengthModes[idx] == clampedMode)
+        return;
+
+    sceneLengthModes[idx] = clampedMode;
+    if (sceneSequenceActive)
+        pendingSceneRecall.targetResolved = false;
+}
+
+int MlrVSTAudioProcessor::getSceneManualBars(int sceneSlot) const
+{
+    const auto idx = static_cast<size_t>(juce::jlimit(0, SceneSlots - 1, sceneSlot));
+    return juce::jlimit(1, MaxSceneManualBars, sceneManualBars[idx]);
+}
+
+void MlrVSTAudioProcessor::setSceneManualBars(int sceneSlot, int bars)
+{
+    const auto idx = static_cast<size_t>(juce::jlimit(0, SceneSlots - 1, sceneSlot));
+    const int clampedBars = juce::jlimit(1, MaxSceneManualBars, bars);
+    if (sceneManualBars[idx] == clampedBars)
+        return;
+
+    sceneManualBars[idx] = clampedBars;
+    if (sceneSequenceActive)
+        pendingSceneRecall.targetResolved = false;
+}
+
+int MlrVSTAudioProcessor::getSceneAnchorStrip(int sceneSlot) const
+{
+    const auto idx = static_cast<size_t>(juce::jlimit(0, SceneSlots - 1, sceneSlot));
+    return juce::jlimit(0, MaxStrips - 1, sceneAnchorStrips[idx]);
+}
+
+void MlrVSTAudioProcessor::setSceneAnchorStrip(int sceneSlot, int stripIndex)
+{
+    const auto idx = static_cast<size_t>(juce::jlimit(0, SceneSlots - 1, sceneSlot));
+    const int clampedStrip = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    if (sceneAnchorStrips[idx] == clampedStrip)
+        return;
+
+    sceneAnchorStrips[idx] = clampedStrip;
+    if (sceneSequenceActive)
+        pendingSceneRecall.targetResolved = false;
+}
+
+double MlrVSTAudioProcessor::getResolvedSceneLengthBeats(int sceneSlot) const
+{
+    const double longestStripBeats = computeLongestStripSceneSequenceLengthBeats();
+    const double longestPatternBeats = computeLongestPatternSceneSequenceLengthBeats();
+
+    double resolvedBeats = 0.0;
+    switch (getSceneLengthMode(sceneSlot))
+    {
+        case SceneLengthMode::LongestStrip:
+            resolvedBeats = longestStripBeats > 0.0 ? longestStripBeats : longestPatternBeats;
+            break;
+        case SceneLengthMode::LongestPattern:
+            resolvedBeats = longestPatternBeats > 0.0 ? longestPatternBeats : longestStripBeats;
+            break;
+        case SceneLengthMode::ManualBars:
+            resolvedBeats = static_cast<double>(getSceneManualBars(sceneSlot)) * 4.0;
+            break;
+        case SceneLengthMode::AnchorStrip:
+            resolvedBeats = computeStripSceneSequenceLengthBeats(getSceneAnchorStrip(sceneSlot));
+            if (resolvedBeats <= 0.0)
+                resolvedBeats = longestStripBeats > 0.0 ? longestStripBeats : longestPatternBeats;
+            break;
+    }
+
+    return juce::jlimit(4.0, 4096.0, resolvedBeats);
+}
+
 std::unique_ptr<juce::XmlElement> MlrVSTAudioProcessor::createSceneChainStateXml(int sceneSlotOverride) const
 {
     auto xml = std::make_unique<juce::XmlElement>("SceneChainState");
@@ -6761,11 +7174,19 @@ std::unique_ptr<juce::XmlElement> MlrVSTAudioProcessor::createSceneChainStateXml
         const int clampedSlot = juce::jlimit(0, SceneSlots - 1, sceneSlotOverride);
         xml->setAttribute("sceneSlot", clampedSlot);
         xml->setAttribute("repeatCount", getSceneRepeatCount(clampedSlot));
+        xml->setAttribute("lengthMode", static_cast<int>(getSceneLengthMode(clampedSlot)));
+        xml->setAttribute("manualBars", getSceneManualBars(clampedSlot));
+        xml->setAttribute("anchorStrip", getSceneAnchorStrip(clampedSlot));
         return xml;
     }
 
     for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
+    {
         xml->setAttribute("sceneRepeat" + juce::String(sceneSlot), getSceneRepeatCount(sceneSlot));
+        xml->setAttribute("sceneLengthMode" + juce::String(sceneSlot), static_cast<int>(getSceneLengthMode(sceneSlot)));
+        xml->setAttribute("sceneManualBars" + juce::String(sceneSlot), getSceneManualBars(sceneSlot));
+        xml->setAttribute("sceneAnchorStrip" + juce::String(sceneSlot), getSceneAnchorStrip(sceneSlot));
+    }
     return xml;
 }
 
@@ -6780,18 +7201,45 @@ void MlrVSTAudioProcessor::applySceneChainStateXml(const juce::XmlElement* xml, 
         const int repeatCount = xml->hasAttribute("repeatCount")
             ? xml->getIntAttribute("repeatCount", getSceneRepeatCount(clampedSlot))
             : xml->getIntAttribute("sceneRepeat" + juce::String(clampedSlot), getSceneRepeatCount(clampedSlot));
+        const int lengthMode = xml->hasAttribute("lengthMode")
+            ? xml->getIntAttribute("lengthMode", static_cast<int>(getSceneLengthMode(clampedSlot)))
+            : xml->getIntAttribute("sceneLengthMode" + juce::String(clampedSlot),
+                                   static_cast<int>(getSceneLengthMode(clampedSlot)));
+        const int manualBars = xml->hasAttribute("manualBars")
+            ? xml->getIntAttribute("manualBars", getSceneManualBars(clampedSlot))
+            : xml->getIntAttribute("sceneManualBars" + juce::String(clampedSlot), getSceneManualBars(clampedSlot));
+        const int anchorStrip = xml->hasAttribute("anchorStrip")
+            ? xml->getIntAttribute("anchorStrip", getSceneAnchorStrip(clampedSlot))
+            : xml->getIntAttribute("sceneAnchorStrip" + juce::String(clampedSlot), getSceneAnchorStrip(clampedSlot));
         setSceneRepeatCount(clampedSlot, repeatCount);
+        setSceneLengthMode(clampedSlot, sanitizeSceneLengthMode(lengthMode));
+        setSceneManualBars(clampedSlot, manualBars);
+        setSceneAnchorStrip(clampedSlot, anchorStrip);
         return;
     }
 
     bool anyApplied = false;
     for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
     {
-        const auto attr = "sceneRepeat" + juce::String(sceneSlot);
-        if (!xml->hasAttribute(attr))
+        const auto repeatAttr = "sceneRepeat" + juce::String(sceneSlot);
+        const auto lengthAttr = "sceneLengthMode" + juce::String(sceneSlot);
+        const auto barsAttr = "sceneManualBars" + juce::String(sceneSlot);
+        const auto anchorAttr = "sceneAnchorStrip" + juce::String(sceneSlot);
+        const bool hasSceneAttributes = xml->hasAttribute(repeatAttr)
+            || xml->hasAttribute(lengthAttr)
+            || xml->hasAttribute(barsAttr)
+            || xml->hasAttribute(anchorAttr);
+        if (!hasSceneAttributes)
             continue;
 
-        setSceneRepeatCount(sceneSlot, xml->getIntAttribute(attr, getSceneRepeatCount(sceneSlot)));
+        if (xml->hasAttribute(repeatAttr))
+            setSceneRepeatCount(sceneSlot, xml->getIntAttribute(repeatAttr, getSceneRepeatCount(sceneSlot)));
+        if (xml->hasAttribute(lengthAttr))
+            setSceneLengthMode(sceneSlot, sanitizeSceneLengthMode(xml->getIntAttribute(lengthAttr, static_cast<int>(getSceneLengthMode(sceneSlot)))));
+        if (xml->hasAttribute(barsAttr))
+            setSceneManualBars(sceneSlot, xml->getIntAttribute(barsAttr, getSceneManualBars(sceneSlot)));
+        if (xml->hasAttribute(anchorAttr))
+            setSceneAnchorStrip(sceneSlot, xml->getIntAttribute(anchorAttr, getSceneAnchorStrip(sceneSlot)));
         anyApplied = true;
     }
 
@@ -6799,6 +7247,9 @@ void MlrVSTAudioProcessor::applySceneChainStateXml(const juce::XmlElement* xml, 
     {
         const int slot = juce::jlimit(0, SceneSlots - 1, xml->getIntAttribute("sceneSlot", 0));
         setSceneRepeatCount(slot, xml->getIntAttribute("repeatCount", getSceneRepeatCount(slot)));
+        setSceneLengthMode(slot, sanitizeSceneLengthMode(xml->getIntAttribute("lengthMode", static_cast<int>(getSceneLengthMode(slot)))));
+        setSceneManualBars(slot, xml->getIntAttribute("manualBars", getSceneManualBars(slot)));
+        setSceneAnchorStrip(slot, xml->getIntAttribute("anchorStrip", getSceneAnchorStrip(slot)));
     }
 }
 
@@ -6839,15 +7290,22 @@ double MlrVSTAudioProcessor::computeStripSceneSequenceLengthBeats(int stripIndex
     return juce::jlimit(0.25, 256.0, beats);
 }
 
-double MlrVSTAudioProcessor::computeCurrentSceneSequenceLengthBeats() const
+double MlrVSTAudioProcessor::computeLongestStripSceneSequenceLengthBeats() const
+{
+    double longestBeats = 0.0;
+
+    if (audioEngine != nullptr)
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+            longestBeats = juce::jmax(longestBeats, computeStripSceneSequenceLengthBeats(stripIndex));
+    return longestBeats;
+}
+
+double MlrVSTAudioProcessor::computeLongestPatternSceneSequenceLengthBeats() const
 {
     double longestBeats = 0.0;
 
     if (audioEngine != nullptr)
     {
-        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
-            longestBeats = juce::jmax(longestBeats, computeStripSceneSequenceLengthBeats(stripIndex));
-
         for (int patternIndex = 0; patternIndex < ModernAudioEngine::MaxPatterns; ++patternIndex)
         {
             auto* pattern = audioEngine->getPattern(patternIndex);
@@ -6862,7 +7320,12 @@ double MlrVSTAudioProcessor::computeCurrentSceneSequenceLengthBeats() const
         }
     }
 
-    return juce::jmax(4.0, longestBeats);
+    return longestBeats;
+}
+
+double MlrVSTAudioProcessor::computeCurrentSceneSequenceLengthBeats() const
+{
+    return getResolvedSceneLengthBeats(activeSceneSlot);
 }
 
 void MlrVSTAudioProcessor::armNextSceneInSequence(int mainPresetIndex, int currentSceneSlot, double sceneStartPpq)
@@ -7062,6 +7525,72 @@ bool MlrVSTAudioProcessor::saveSceneForMainPreset(int mainPresetIndex, int scene
     if (saved)
         presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
     return saved;
+}
+
+bool MlrVSTAudioProcessor::copySceneForMainPreset(int mainPresetIndex, int sourceSceneSlot, int destSceneSlot)
+{
+    const int clampedMain = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
+    const int clampedSource = juce::jlimit(0, SceneSlots - 1, sourceSceneSlot);
+    const int clampedDest = juce::jlimit(0, SceneSlots - 1, destSceneSlot);
+    const int sourceStorageIndex = getSceneStoragePresetIndex(clampedMain, clampedSource);
+    const int destStorageIndex = getSceneStoragePresetIndex(clampedMain, clampedDest);
+    if (sourceStorageIndex == destStorageIndex)
+        return true;
+
+    const bool sourceExists = PresetStore::presetExists(sourceStorageIndex);
+    if (!sourceExists)
+    {
+        if (PresetStore::presetExists(destStorageIndex))
+            return PresetStore::deletePreset(destStorageIndex);
+        return true;
+    }
+
+    return PresetStore::copyPreset(sourceStorageIndex, destStorageIndex);
+}
+
+bool MlrVSTAudioProcessor::captureSceneSlot(int sceneSlot)
+{
+    const int clampedSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+    activeSceneMainPresetIndex = mainPresetIndex;
+
+    const bool saved = saveSceneForMainPreset(mainPresetIndex, clampedSlot);
+    if (saved)
+        updateMonomeLEDs();
+    return saved;
+}
+
+bool MlrVSTAudioProcessor::insertSceneSlot(int sceneSlot, bool insertAfter)
+{
+    const int selectedSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const int insertSlot = insertAfter ? (selectedSlot + 1) : selectedSlot;
+    if (insertSlot < 0 || insertSlot >= SceneSlots)
+        return false;
+
+    const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+    activeSceneMainPresetIndex = mainPresetIndex;
+
+    bool storageChanged = false;
+    for (int destSlot = SceneSlots - 1; destSlot > insertSlot; --destSlot)
+    {
+        if (!copySceneForMainPreset(mainPresetIndex, destSlot - 1, destSlot))
+            return false;
+
+        setSceneRepeatCount(destSlot, getSceneRepeatCount(destSlot - 1));
+        setSceneLengthMode(destSlot, getSceneLengthMode(destSlot - 1));
+        setSceneManualBars(destSlot, getSceneManualBars(destSlot - 1));
+        setSceneAnchorStrip(destSlot, getSceneAnchorStrip(destSlot - 1));
+        storageChanged = true;
+    }
+
+    const bool captured = captureSceneSlot(insertSlot);
+    if (!captured && storageChanged)
+    {
+        presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+        updateMonomeLEDs();
+    }
+
+    return captured;
 }
 
 void MlrVSTAudioProcessor::requestSceneRecallQuantized(int mainPresetIndex, int sceneSlot, bool sequenceDriven)
@@ -9388,6 +9917,15 @@ void MlrVSTAudioProcessor::appendSceneModeStateToState(juce::ValueTree& state) c
         sceneState.setProperty("sceneRepeat" + juce::String(sceneSlot),
                                getSceneRepeatCount(sceneSlot),
                                nullptr);
+        sceneState.setProperty("sceneLengthMode" + juce::String(sceneSlot),
+                               static_cast<int>(getSceneLengthMode(sceneSlot)),
+                               nullptr);
+        sceneState.setProperty("sceneManualBars" + juce::String(sceneSlot),
+                               getSceneManualBars(sceneSlot),
+                               nullptr);
+        sceneState.setProperty("sceneAnchorStrip" + juce::String(sceneSlot),
+                               getSceneAnchorStrip(sceneSlot),
+                               nullptr);
     }
 }
 
@@ -9398,6 +9936,9 @@ void MlrVSTAudioProcessor::loadSceneModeStateFromState(const juce::ValueTree& st
     sceneModeGroupSnapshot.groupVolumes.fill(1.0f);
     sceneModeGroupSnapshot.groupMuted.fill(false);
     sceneRepeatCounts.fill(1);
+    sceneLengthModes.fill(static_cast<int>(SceneLengthMode::LongestStrip));
+    sceneManualBars.fill(4);
+    sceneAnchorStrips.fill(0);
     activeSceneMainPresetIndex = 0;
     activeSceneSlot = 0;
 
@@ -9430,6 +9971,17 @@ void MlrVSTAudioProcessor::loadSceneModeStateFromState(const juce::ValueTree& st
         setSceneRepeatCount(
             sceneSlot,
             static_cast<int>(sceneState.getProperty("sceneRepeat" + juce::String(sceneSlot), 1)));
+        setSceneLengthMode(
+            sceneSlot,
+            sanitizeSceneLengthMode(static_cast<int>(sceneState.getProperty(
+                "sceneLengthMode" + juce::String(sceneSlot),
+                static_cast<int>(SceneLengthMode::LongestStrip)))));
+        setSceneManualBars(
+            sceneSlot,
+            static_cast<int>(sceneState.getProperty("sceneManualBars" + juce::String(sceneSlot), 4)));
+        setSceneAnchorStrip(
+            sceneSlot,
+            static_cast<int>(sceneState.getProperty("sceneAnchorStrip" + juce::String(sceneSlot), 0)));
     }
 }
 
@@ -10022,11 +10574,27 @@ void MlrVSTAudioProcessor::loadPersistentGlobalControls()
         }
 
         const auto targetAttrName = "macroTarget" + juce::String(i);
-        if (xml->hasAttribute(targetAttrName))
+        const auto targetKeyAttrName = "macroTargetKey" + juce::String(i);
+        bool restoredMacroTarget = false;
+        if (xml->hasAttribute(targetKeyAttrName))
         {
+            PerformanceTarget restoredTarget = PerformanceTarget::None;
+            if (tryParsePerformanceTargetKey(xml->getStringAttribute(targetKeyAttrName), restoredTarget))
+            {
+                macroTargetAssignments[static_cast<size_t>(i)].store(
+                    static_cast<int>(sanitizeMacroPerformanceTarget(restoredTarget)),
+                    std::memory_order_release);
+                anyRestored = true;
+                restoredMacroTarget = true;
+            }
+        }
+        if (!restoredMacroTarget && xml->hasAttribute(targetAttrName))
+        {
+            const auto restoredTarget = performanceTargetFromLegacyMacroRaw(
+                xml->getIntAttribute(targetAttrName,
+                                     legacyMacroRawFromPerformanceTarget(getDefaultMacroTarget(i))));
             macroTargetAssignments[static_cast<size_t>(i)].store(
-                static_cast<int>(sanitizeMacroTarget(xml->getIntAttribute(targetAttrName,
-                                                                          static_cast<int>(getDefaultMacroTarget(i))))),
+                static_cast<int>(sanitizeMacroPerformanceTarget(restoredTarget)),
                 std::memory_order_release);
             anyRestored = true;
         }
@@ -10141,8 +10709,10 @@ void MlrVSTAudioProcessor::savePersistentControlPages() const
         xml.setAttribute("soundTouchEnabled", getStretchBackend() != TimeStretchBackend::Resample);
     for (int i = 0; i < MacroCount; ++i)
     {
+        const auto target = getMacroTarget(i);
         xml.setAttribute("macroCc" + juce::String(i), getMacroMidiCc(i));
-        xml.setAttribute("macroTarget" + juce::String(i), static_cast<int>(getMacroTarget(i)));
+        xml.setAttribute("macroTarget" + juce::String(i), legacyMacroRawFromPerformanceTarget(target));
+        xml.setAttribute("macroTargetKey" + juce::String(i), performanceTargetKey(target));
     }
     xml.setAttribute("rootNoteMidi", globalRootNoteMidi.load(std::memory_order_acquire));
     xml.setAttribute("pitchScale", globalPitchScale.load(std::memory_order_acquire));
@@ -10404,12 +10974,6 @@ const juce::String MlrVSTAudioProcessor::getProgramName(int /*index*/)
 
 void MlrVSTAudioProcessor::changeProgramName(int /*index*/, const juce::String& /*newName*/)
 {
-}
-
-// Helper method: Update filter LED visualization based on sub-page
-juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
-{
-    return new MlrVSTAudioProcessor();
 }
 
 void MlrVSTAudioProcessor::timerCallback()
@@ -10815,6 +11379,9 @@ void MlrVSTAudioProcessor::initRuntimeStateToDefaults()
 
     resetRuntimePresetStateToDefaults();
     sceneRepeatCounts.fill(1);
+    sceneLengthModes.fill(static_cast<int>(SceneLengthMode::LongestStrip));
+    sceneManualBars.fill(4);
+    sceneAnchorStrips.fill(0);
     sceneModeGroupSnapshot.valid = false;
     resetCurrentBrowserDirectoriesToDefaultPaths(true);
     loadedPresetIndex = -1;
@@ -10871,6 +11438,9 @@ void MlrVSTAudioProcessor::performPresetLoad(int presetIndex, double hostPpqSnap
     // This guarantees no strip audio/params leak across preset transitions.
     resetRuntimePresetStateToDefaults();
     sceneRepeatCounts.fill(1);
+    sceneLengthModes.fill(static_cast<int>(SceneLengthMode::LongestStrip));
+    sceneManualBars.fill(4);
+    sceneAnchorStrips.fill(0);
     loadedPresetIndex = -1;
     activeSceneMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, presetIndex);
     activeSceneStartPpqValid = std::isfinite(hostPpqSnapshot);
