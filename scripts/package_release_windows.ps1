@@ -20,6 +20,12 @@ if (-not $bundle) {
     throw "Windows VST3 artifact not found."
 }
 
+$runtimeNames = @(
+    "libgcc_s_seh-1.dll",
+    "libstdc++-6.dll",
+    "libwinpthread-1.dll"
+)
+
 if ([string]::IsNullOrWhiteSpace($Commit)) {
     try {
         $Commit = (git rev-parse HEAD).Trim()
@@ -44,13 +50,57 @@ New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
 
 Copy-Item -Recurse -Path $bundle -Destination (Join-Path $packageDir "mlrVST.vst3")
 
+$bundleRuntimeDir = Join-Path $packageDir "mlrVST.vst3/Contents/x86_64-win"
+$sourceRuntimeDirs = @(
+    (Join-Path $bundle "Contents/x86_64-win"),
+    (Split-Path $bundle -Parent),
+    $BuildDir
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+$bundledRuntimeNames = New-Object System.Collections.Generic.List[string]
+
+foreach ($runtimeName in $runtimeNames) {
+    $alreadyBundled = Join-Path $bundleRuntimeDir $runtimeName
+    if (Test-Path $alreadyBundled) {
+        $bundledRuntimeNames.Add($runtimeName)
+        continue
+    }
+
+    $runtimeSource = $null
+    foreach ($runtimeDir in $sourceRuntimeDirs) {
+        $candidate = Join-Path $runtimeDir $runtimeName
+        if (Test-Path $candidate) {
+            $runtimeSource = $candidate
+            break
+        }
+    }
+
+    if ($runtimeSource) {
+        Copy-Item -Path $runtimeSource -Destination $alreadyBundled
+        $bundledRuntimeNames.Add($runtimeName)
+    }
+}
+
 foreach ($noticeFile in @("LICENSE", "THIRD_PARTY_NOTICES.md", "README.md")) {
     if (Test-Path $noticeFile) {
         Copy-Item -Path $noticeFile -Destination $packageDir
     }
 }
 
+$licenseDir = Join-Path $packageDir "LICENSES"
+New-Item -ItemType Directory -Path $licenseDir -Force | Out-Null
+
+foreach ($licenseSpec in @(
+    @{ Source = "third_party/signalsmith-stretch/LICENSE.txt"; Target = "signalsmith-stretch-LICENSE.txt" },
+    @{ Source = "third_party/signalsmith-linear/LICENSE.txt"; Target = "signalsmith-linear-LICENSE.txt" }
+)) {
+    if (Test-Path $licenseSpec.Source) {
+        Copy-Item -Path $licenseSpec.Source -Destination (Join-Path $licenseDir $licenseSpec.Target)
+    }
+}
+
 $workflowField = if ([string]::IsNullOrWhiteSpace($WorkflowRunUrl)) { "n/a" } else { $WorkflowRunUrl }
+$runtimeField = if ($bundledRuntimeNames.Count -gt 0) { ($bundledRuntimeNames -join ", ") } else { "none" }
 
 @"
 Product: mlrVST
@@ -58,6 +108,7 @@ Platform: Windows x64
 Format: VST3
 Commit: $Commit
 Workflow run: $workflowField
+Bundled runtimes: $runtimeField
 Built at (UTC): $((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))
 "@ | Set-Content -Path (Join-Path $packageDir "RELEASE_MANIFEST.txt")
 

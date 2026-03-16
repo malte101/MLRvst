@@ -259,7 +259,10 @@ public:
     enum class PitchControlMode
     {
         PitchShift = 0,
-        Resample = 1
+        SoundTouch,
+        Resample,
+        Signalsmith,
+        Bungee
     };
     enum class FlipTempoMatchMode
     {
@@ -272,7 +275,18 @@ public:
         Repitch,
         MlrTs
     };
+    enum class StripPitchControlMode
+    {
+        Global = 0,
+        PitchShift,
+        SoundTouch,
+        Resample,
+        Signalsmith,
+        Bungee
+    };
     PitchControlMode getPitchControlMode() const;
+    StripPitchControlMode getStripPitchControlMode(int stripIndex) const;
+    PitchControlMode resolvePitchControlModeForStrip(int stripIndex) const;
     TimeStretchBackend getStretchBackend() const;
     TimeStretchBackend getLoopTempoMatchBackend() const;
     StripTempoMatchMode getStripTempoMatchMode(int stripIndex) const;
@@ -314,10 +328,35 @@ public:
         NextLoop,
         NextBar
     };
+    enum class GatePageMode
+    {
+        Adaptive = 0,
+        Quarter,
+        Sixth,
+        Eighth,
+        Sixteenth
+    };
     LoopPitchRole getLoopPitchRole(int stripIndex) const;
+    int getLoopPitchMasterStripIndex() const;
+    bool isLoopPitchMasterActive() const { return getLoopPitchMasterStripIndex() >= 0; }
     void setLoopPitchRole(int stripIndex, LoopPitchRole role);
     LoopPitchSyncTiming getLoopPitchSyncTiming(int stripIndex) const;
     void setLoopPitchSyncTiming(int stripIndex, LoopPitchSyncTiming timing);
+    GatePageMode getGatePageMode() const
+    {
+        return static_cast<GatePageMode>(juce::jlimit(
+            0,
+            static_cast<int>(GatePageMode::Sixteenth),
+            gatePageMode.load(std::memory_order_acquire)));
+    }
+    void setGatePageMode(GatePageMode mode)
+    {
+        gatePageMode.store(
+            juce::jlimit(0,
+                         static_cast<int>(GatePageMode::Sixteenth),
+                         static_cast<int>(mode)),
+            std::memory_order_release);
+    }
     int getLoopStripAssignedPitchMidi(int stripIndex) const;
     float getLoopStripPitchSyncCorrectionSemitones(int stripIndex) const;
     void setLoopStripAssignedPitchMidi(int stripIndex, int midiNote, bool manualOverride = true);
@@ -357,6 +396,36 @@ public:
         double preparedTempoMatchHostTempo = -1.0;
         TimeStretchBackend preparedTempoMatchBackend = TimeStretchBackend::Resample;
         juce::String errorMessage;
+    };
+    struct SoundTouchPitchCacheResult
+    {
+        int stripIndex = -1;
+        int requestId = 0;
+        bool success = false;
+        float semitones = 0.0f;
+        double sourceSampleRate = 44100.0;
+        uint64_t sourceVersion = 0;
+        juce::AudioBuffer<float> renderedBuffer;
+    };
+    struct BungeePitchCacheResult
+    {
+        int stripIndex = -1;
+        int requestId = 0;
+        bool success = false;
+        float semitones = 0.0f;
+        double sourceSampleRate = 44100.0;
+        uint64_t sourceVersion = 0;
+        juce::AudioBuffer<float> renderedBuffer;
+    };
+    struct SignalsmithPitchCacheResult
+    {
+        int stripIndex = -1;
+        int requestId = 0;
+        bool success = false;
+        float semitones = 0.0f;
+        double sourceSampleRate = 44100.0;
+        uint64_t sourceVersion = 0;
+        juce::AudioBuffer<float> renderedBuffer;
     };
     
     // Control mode (for GUI to check if level/pan/etc controls are active)
@@ -437,7 +506,7 @@ public:
     void setSceneModeEnabled(bool enabled);
     int getActiveSceneSlot() const { return juce::jlimit(0, SceneSlots - 1, activeSceneSlot); }
     static constexpr int SceneSlots = 4;
-    static constexpr int MaxSceneRepeatCount = 16;
+    static constexpr int MaxSceneRepeatCount = 32;
     static constexpr int MaxSceneManualBars = 32;
 
     enum class SceneLengthMode
@@ -448,15 +517,32 @@ public:
         AnchorStrip
     };
 
+    enum class SceneRecallMode
+    {
+        QuantizeGrid = 0,
+        PatternEnd,
+        SceneEnd,
+        Manual
+    };
+
     int getSceneRepeatCount(int sceneSlot) const;
     void setSceneRepeatCount(int sceneSlot, int repeats);
     SceneLengthMode getSceneLengthMode(int sceneSlot) const;
     void setSceneLengthMode(int sceneSlot, SceneLengthMode mode);
+    SceneRecallMode getSceneRecallMode() const;
+    void setSceneRecallMode(SceneRecallMode mode);
     int getSceneManualBars(int sceneSlot) const;
     void setSceneManualBars(int sceneSlot, int bars);
     int getSceneAnchorStrip(int sceneSlot) const;
     void setSceneAnchorStrip(int sceneSlot, int stripIndex);
+    int getSceneLengthCount(int sceneSlot) const;
+    void setSceneLengthCount(int sceneSlot, int count);
     double getResolvedSceneLengthBeats(int sceneSlot) const;
+    double getSceneAdvanceLengthBeats(int sceneSlot) const;
+    bool persistSceneTimingForSlot(int sceneSlot);
+    int getSceneSequenceStepIndex(int sceneSlot) const;
+    int getQueuedSceneSlot() const;
+    juce::String getSceneSequenceSummaryText() const;
     bool captureSceneSlot(int sceneSlot);
     bool insertSceneSlot(int sceneSlot, bool insertAfter);
     uint32_t getPresetRefreshToken() const { return presetRefreshToken.load(std::memory_order_acquire); }
@@ -500,6 +586,7 @@ public:
     static float getDefaultMacroNormalizedValue(MacroTarget target);
     MacroLaneRecordStatus getMacroLaneRecordStatus(int macroIndex) const;
     void beginMacroLaneRecording(int macroIndex, int laneSlot);
+    void stopMacroLaneRecording(int macroIndex);
     void cancelMacroLaneRecording(int macroIndex);
     
     // Parameters
@@ -545,6 +632,8 @@ private:
         float quantizedSemitones = 0.0f;
         float resampleRatio = 1.0f;
         float stepSamplerRatio = 1.0f;
+        EnhancedAudioStrip::PitchShiftAlgorithm pitchAlgorithm =
+            EnhancedAudioStrip::PitchShiftAlgorithm::Standard;
         bool updatesStepSampler = false;
         bool useResamplePitch = false;
     };
@@ -587,7 +676,8 @@ private:
 
     ResolvedPitchControl resolvePitchControl(const EnhancedAudioStrip& strip,
                                              float semitones,
-                                             int referenceRootMidi) const;
+                                             int referenceRootMidi,
+                                             PitchControlMode controlMode) const;
     void applyResolvedPitchControl(EnhancedAudioStrip& strip,
                                    const ResolvedPitchControl& resolved) const;
     ResolvedFlipTempoMatch resolveFlipTempoMatch() const;
@@ -615,8 +705,8 @@ private:
     struct PendingBarChange
     {
         bool active = false;
-        int recordingBars = 1;
-        float beatsPerLoop = 4.0f;
+        int recordingBars = 2;
+        float beatsPerLoop = 8.0f;
         bool quantized = false;
         double targetPpq = 0.0;
         int quantizeDivision = 8;
@@ -639,11 +729,14 @@ private:
     std::atomic<float>* flipTempoMatchModeParam = nullptr;
     std::atomic<float>* soundTouchEnabledParam = nullptr;
     std::atomic<float>* masterDuckTriggerStripParam = nullptr;
+    std::atomic<float>* sceneRecallModeParam = nullptr;
     std::array<std::atomic<float>*, MaxStrips> stripVolumeParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripTrimDbParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPanParams{};
     std::array<std::atomic<float>*, MaxStrips> stripSpeedParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPitchParams{};
     std::array<std::atomic<float>*, MaxStrips> stripSliceLengthParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripPitchControlModeParams{};
     std::array<std::atomic<float>*, MaxStrips> stripTempoMatchModeParams{};
     std::array<std::atomic<float>*, MaxStrips> stripDuckEnabledParams{};
     std::array<std::atomic<float>*, MaxStrips> stripDuckSourceParams{};
@@ -660,6 +753,7 @@ private:
     std::array<bool, MaxStrips> pendingBarLengthApply{};
     
     double currentSampleRate = 44100.0;
+    int lastReportedLatencySamples = 0;
     ControlMode currentControlMode = ControlMode::Normal;
     bool controlModeActive = false;  // True when control button is held
     FilterSubPage filterSubPage = FilterSubPage::Frequency;  // Current filter sub-page
@@ -694,6 +788,7 @@ private:
     static constexpr uint32_t stepEditVelocityGestureLatchMs = 180;
     std::atomic<bool> controlPageMomentary{true};
     std::atomic<int> swingDivisionSelection{1}; // 0=1/4,1=1/8,2=1/16,3=1/8T,4=1/2,5=1/32,6=1/16T
+    std::atomic<int> gatePageMode{0};
     int lastAppliedStretchBackend = -1; // -1 = force initial sync on first process block
     int lastAppliedLoopTempoMatchBackend = -1;
     
@@ -734,8 +829,10 @@ private:
     ArcControlMode arcControlMode = ArcControlMode::SelectedStrip;
     int arcSelectedModStep = 0;
     juce::int64 lastGridLedUpdateTimeMs = 0;
+    std::atomic<int> lastHostTransportPlaying{0};
     static constexpr int kGridRefreshMs = 33;
     static constexpr int kArcRefreshMs = 33;
+    static constexpr int kSceneRecallRefreshMs = 1;
     static constexpr uint32_t browserFavoriteHoldSaveMs = 3000;
     static constexpr uint32_t browserFavoriteSaveBurstDurationMs = 320;
     static constexpr uint32_t browserFavoriteMissingBurstDurationMs = 260;
@@ -745,6 +842,7 @@ private:
     std::array<juce::File, MaxStrips> pendingLoopStripFiles;
     std::array<std::unique_ptr<SampleModeEngine>, MaxStrips> sampleModeEngines;
     std::array<juce::AudioBuffer<float>, MaxStrips> sampleModeScratchBuffers;
+    std::array<bool, MaxStrips> sampleModeRenderedLastBlock{};
     std::array<std::atomic<int>, MaxStrips> sampleModeHeldVisibleSliceSlots{};
     std::array<std::atomic<int>, MaxStrips> loopStripLoadRequestIds{};
     std::array<std::atomic<int>, MaxStrips> loopStripLoadInFlight{};
@@ -767,6 +865,9 @@ private:
     std::atomic<int> globalPitchScale{static_cast<int>(ModernAudioEngine::PitchScale::Chromatic)};
     juce::ThreadPool loopStripLoadThreadPool{1};
     juce::ThreadPool loopPitchAnalysisThreadPool{1};
+    juce::ThreadPool soundTouchPitchCacheThreadPool{1};
+    juce::ThreadPool bungeePitchCacheThreadPool{1};
+    juce::ThreadPool signalsmithPitchCacheThreadPool{1};
     mutable juce::CriticalSection loopStripLoadStatusLock;
     std::array<juce::String, MaxStrips> loopStripLoadStatusTexts;
     mutable juce::CriticalSection loopPitchAnalysisStatusLock;
@@ -775,6 +876,24 @@ private:
     std::vector<LoopStripLoadResult> loopStripLoadResults;
     juce::CriticalSection loopPitchAnalysisResultLock;
     std::vector<LoopPitchAnalysisResult> loopPitchAnalysisResults;
+    juce::CriticalSection soundTouchPitchCacheResultLock;
+    std::vector<SoundTouchPitchCacheResult> soundTouchPitchCacheResults;
+    std::array<std::atomic<int>, MaxStrips> soundTouchPitchCacheRequestIds{};
+    std::array<std::atomic<int>, MaxStrips> soundTouchPitchCacheInFlight{};
+    std::array<float, MaxStrips> soundTouchPitchCacheObservedTargets{};
+    std::array<int, MaxStrips> soundTouchPitchCacheStableTicks{};
+    juce::CriticalSection bungeePitchCacheResultLock;
+    std::vector<BungeePitchCacheResult> bungeePitchCacheResults;
+    std::array<std::atomic<int>, MaxStrips> bungeePitchCacheRequestIds{};
+    std::array<std::atomic<int>, MaxStrips> bungeePitchCacheInFlight{};
+    std::array<float, MaxStrips> bungeePitchCacheObservedTargets{};
+    std::array<int, MaxStrips> bungeePitchCacheStableTicks{};
+    juce::CriticalSection signalsmithPitchCacheResultLock;
+    std::vector<SignalsmithPitchCacheResult> signalsmithPitchCacheResults;
+    std::array<std::atomic<int>, MaxStrips> signalsmithPitchCacheRequestIds{};
+    std::array<std::atomic<int>, MaxStrips> signalsmithPitchCacheInFlight{};
+    std::array<float, MaxStrips> signalsmithPitchCacheObservedTargets{};
+    std::array<int, MaxStrips> signalsmithPitchCacheStableTicks{};
     std::array<int, MaxStrips> loopPitchLastObservedColumns{};
     int loopPitchLastObservedHostBar = -1;
     struct FlipLegacyLoopSyncCache
@@ -829,6 +948,9 @@ private:
         SampleModeEngine::LegacyLoopSyncInfo syncInfo;
         bool isMomentaryStutter = false;
     };
+    class SoundTouchPitchCacheJob;
+    class BungeePitchCacheJob;
+    class SignalsmithPitchCacheJob;
     class FlipLegacyLoopRenderJob;
     std::array<FlipLegacyLoopSyncCache, MaxStrips> flipLegacyLoopSyncCache{};
     std::array<FlipLegacyLoopSyncInfoCacheEntry, MaxStrips> flipLegacyLoopSyncInfoCache{};
@@ -903,15 +1025,27 @@ private:
     void applyCompletedLoopPitchAnalyses();
     void queueLoopStripLoadResult(LoopStripLoadResult result);
     void applyCompletedLoopStripLoads();
+    void queueSoundTouchPitchCacheResult(SoundTouchPitchCacheResult result);
+    void applyCompletedSoundTouchPitchCaches();
+    void refreshPendingSoundTouchPitchCaches();
+    void queueBungeePitchCacheResult(BungeePitchCacheResult result);
+    void applyCompletedBungeePitchCaches();
+    void refreshPendingBungeePitchCaches();
+    void queueSignalsmithPitchCacheResult(SignalsmithPitchCacheResult result);
+    void applyCompletedSignalsmithPitchCaches();
+    void refreshPendingSignalsmithPitchCaches();
     bool beginLoopStripPitchAnalysis(int stripIndex, bool setDetectedAsRoot);
     void updateLoopPitchAnalysisProgress(int stripIndex, int requestId, float progress, const juce::String& statusText);
     void resetLoopPitchAnalysisProgress(int stripIndex);
     void updateLoopStripLoadProgress(int stripIndex, int requestId, float progress, const juce::String& statusText);
     void resetLoopStripLoadProgress(int stripIndex);
+    float getStoredStripPitchSemitones(int stripIndex) const;
+    void applyStoredPitchControlToStrip(int stripIndex);
     void applyLoopStripPitchSemitones(int stripIndex, float semitones);
     void normalizeLoopPitchMasterRoles();
     int getEffectiveLoopPitchMasterRootMidi(int stripIndex) const;
     void applyLoopPitchRoleStateToStrip(int stripIndex);
+    void reapplyGlobalPitchQuantizationToAllStrips();
     void applyLoopPitchSyncToAllStrips();
     int getPitchQuantizeReferenceRootMidiForStrip(int stripIndex) const;
     float getLoopPitchTempoMatchOffsetSemitones(int stripIndex) const;
@@ -981,11 +1115,14 @@ private:
     void applyMomentaryStutterMacro(const juce::AudioPlayHead::PositionInfo& posInfo);
     void restoreMomentaryStutterMacroBaseline();
     void updateMacroLaneRecording(const juce::AudioPlayHead::PositionInfo& posInfo, int numSamples);
+    bool isHostTransportPlaying() const;
     bool getHostSyncSnapshot(double& outPpq, double& outTempo) const;
+    void refreshUtilityTimerCadence();
     int getActiveMainPresetIndexForScenes() const;
     int getSceneStoragePresetIndex(int mainPresetIndex, int sceneSlot) const;
     bool saveSceneForMainPreset(int mainPresetIndex, int sceneSlot);
     bool copySceneForMainPreset(int mainPresetIndex, int sourceSceneSlot, int destSceneSlot);
+    bool deleteSceneForMainPreset(int mainPresetIndex, int sceneSlot);
     bool sceneSlotExistsForMainPreset(int mainPresetIndex, int sceneSlot) const;
     void requestSceneRecallQuantized(int mainPresetIndex, int sceneSlot, bool sequenceDriven);
     double getSceneRecallIntervalBeats() const;
@@ -997,6 +1134,10 @@ private:
                           double hostPpqSnapshot,
                           double hostTempoSnapshot,
                           int64_t hostGlobalSampleSnapshot);
+    double computeNextScenePatternEndPpq(int sceneSlot,
+                                         double currentPpq,
+                                         double cycleBeats,
+                                         uint64_t* outPhaseSignature = nullptr) const;
     double computeCurrentSceneSequenceLengthBeats() const;
     double computeStripSceneSequenceLengthBeats(int stripIndex) const;
     double computeLongestStripSceneSequenceLengthBeats() const;
@@ -1014,9 +1155,10 @@ private:
     void handleIncomingMacroCc(const juce::MidiBuffer& midiMessages);
     int getMacroTargetStripIndex() const;
     float getMacroNormalizedValueForTarget(const EnhancedAudioStrip& strip, MacroTarget target) const;
-    void applyMacroTargetValue(EnhancedAudioStrip& strip, MacroTarget target, float normalizedValue);
+    void applyMacroTargetValue(int stripIndex, EnhancedAudioStrip& strip, MacroTarget target, float normalizedValue);
     void resetMacroLaneRecordState(int macroIndex);
     void finishMacroLaneRecording(int macroIndex, bool activateLane);
+    static int snapMacroLaneRecordingLengthBars(double recordedBeats);
     bool initializeMacroLaneRecording(int macroIndex, const juce::AudioPlayHead::PositionInfo& posInfo);
     float getMacroLaneRecordedValue(int macroIndex) const;
     void performPresetLoad(int presetIndex, double hostPpqSnapshot, double hostTempoSnapshot);
@@ -1116,10 +1258,12 @@ private:
         bool active = false;
         bool sequenceDriven = false;
         bool targetResolved = false;
+        bool patternEndPhaseSignatureValid = false;
         int mainPresetIndex = 0;
         int sceneSlot = 0;
         double targetPpq = 0.0;
         double intervalBeats = 4.0;
+        uint64_t patternEndPhaseSignature = 0;
     };
     PendingSceneRecall pendingSceneRecall;
     std::array<int, SceneSlots> sceneRepeatCounts{};
@@ -1127,9 +1271,12 @@ private:
     std::array<int, SceneSlots> sceneManualBars{};
     std::array<int, SceneSlots> sceneAnchorStrips{};
     std::array<bool, SceneSlots> scenePadHeld{};
-    std::array<bool, SceneSlots> scenePadHoldSaveTriggered{};
+    std::array<bool, SceneSlots> scenePadHoldDeleteTriggered{};
     std::array<uint32_t, SceneSlots> scenePadPressStartMs{};
-    std::array<uint32_t, SceneSlots> scenePadSaveBurstUntilMs{};
+    std::array<uint32_t, SceneSlots> scenePadActionBurstUntilMs{};
+    std::array<uint32_t, SceneSlots> scenePadLastTapMs{};
+    int sceneCopySourceSlot = -1;
+    int sceneCopyMainPresetIndex = 0;
     std::vector<int> sceneSequenceSlots;
     bool sceneSequenceActive = false;
     bool activeSceneStartPpqValid = false;
@@ -1142,10 +1289,19 @@ private:
     std::atomic<double> pendingSceneApplyTargetPpq{-1.0};
     std::atomic<double> pendingSceneApplyTargetTempo{120.0};
     std::atomic<int64_t> pendingSceneApplyTargetSample{-1};
+    static constexpr int kSceneRecallBlendMaxChannels = 32;
+    std::array<float, kSceneRecallBlendMaxChannels> sceneRecallBlendStartSamples{};
+    std::array<float, kSceneRecallBlendMaxChannels> lastRenderedOutputSamples{};
+    int sceneRecallBlendSamplesRemaining = 0;
+    int sceneRecallBlendTotalSamples = 0;
     static constexpr uint32_t presetHoldSaveMs = 3000;
     static constexpr uint32_t presetDoubleTapMs = 350;
     static constexpr uint32_t presetSaveBurstDurationMs = 260;
     static constexpr uint32_t presetSaveBurstIntervalMs = 55;
+    static constexpr uint32_t sceneHoldDeleteMs = 3000;
+    static constexpr uint32_t sceneDoubleTapMs = 350;
+    static constexpr uint32_t sceneActionBurstDurationMs = 260;
+    static constexpr uint32_t sceneActionBurstIntervalMs = 55;
     std::atomic<int> pendingPresetLoadIndex{-1};
     juce::ThreadPool presetSaveThreadPool{1};
     juce::CriticalSection presetSaveResultLock;

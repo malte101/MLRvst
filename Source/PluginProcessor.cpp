@@ -14,6 +14,8 @@
 #include "WarpGrid.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <utility>
 
@@ -24,13 +26,16 @@
 namespace
 {
 constexpr bool kEnableTriggerDebugLogging = false;
+constexpr bool kEnableSignalsmithLoopDebugLogging = true;
+constexpr const char* kSignalsmithLoopDebugLogPath = "/tmp/mlrvst-signalsmith-loop-debug.log";
+constexpr int kPitchControlModeSchemaVersion = 3;
 constexpr const char* kEmbeddedFlipSampleAttr = "embeddedSampleWavBase64";
 constexpr size_t kMaxEmbeddedFlipWavBytes = 48 * 1024 * 1024;
 constexpr int kMaxEmbeddedFlipBase64Chars = 64 * 1024 * 1024;
 struct BarSelection
 {
-    int recordingBars = 1;
-    float beatsPerLoop = 4.0f;
+    int recordingBars = 2;
+    float beatsPerLoop = 8.0f;
 };
 
 BarSelection decodeBarSelection(int value)
@@ -48,8 +53,108 @@ BarSelection decodeBarSelection(int value)
         case 2:   return { 2, 8.0f };
         case 4:   return { 4, 16.0f };
         case 8:   return { 8, 32.0f };
-        default:  return { 1, 4.0f };
+        default:  return { 2, 8.0f };
     }
+}
+
+int migrateLegacyPitchControlModeIndex(int storedIndex) noexcept
+{
+    switch (storedIndex)
+    {
+        case 1: return 3; // Legacy HQ Pitch -> Signalsmith
+        case 2: return 1; // Legacy SoundTouch -> SoundTouch
+        case 3: return 2; // Legacy Resample -> Resample
+        case 4: return 3; // Legacy Signalsmith -> Signalsmith
+        case 0:
+        default:
+            return 0;
+    }
+}
+
+int sanitizePitchControlModeIndex(int storedIndex) noexcept
+{
+    return juce::jlimit(0, 4, storedIndex);
+}
+
+int sanitizeStripPitchControlModeIndex(int storedIndex) noexcept
+{
+    return juce::jlimit(0, 5, storedIndex);
+}
+
+float snapSoundTouchPitchCacheSemitones(float semitones) noexcept
+{
+    constexpr float step = 0.25f;
+    return juce::jlimit(-24.0f,
+                        24.0f,
+                        std::round(semitones / step) * step);
+}
+
+float snapSignalsmithPitchCacheSemitones(float semitones) noexcept
+{
+    constexpr float step = 0.01f;
+    return juce::jlimit(-24.0f,
+                        24.0f,
+                        std::round(semitones / step) * step);
+}
+
+float snapBungeePitchCacheSemitones(float semitones) noexcept
+{
+    constexpr float step = 0.01f;
+    return juce::jlimit(-24.0f,
+                        24.0f,
+                        std::round(semitones / step) * step);
+}
+
+constexpr int kSoundTouchPitchCacheStableTimerTicks = 6;
+// Keep the internal Signalsmith alignment delay, but avoid host-facing latency
+// restarts for now. Some VST3 hosts can stall if latency changes during or
+// just after project/plugin restoration.
+constexpr bool kReportRealtimeSignalsmithLatencyToHost = false;
+
+juce::File restoreStoredAbsolutePath(const juce::String& rawPath)
+{
+    const auto path = rawPath.trim();
+    if (path.isEmpty() || !juce::File::isAbsolutePath(path))
+        return {};
+    return juce::File(path);
+}
+
+bool pathUsesMissingVolumeMount(const juce::String& rawPath)
+{
+    static constexpr const char* kVolumesPrefix = "/Volumes/";
+    auto path = rawPath.trim();
+    if (!path.startsWith(kVolumesPrefix))
+        return false;
+
+    path = path.fromFirstOccurrenceOf(kVolumesPrefix, false, false);
+    const int slashIndex = path.indexOfChar('/');
+    const auto volumeName = (slashIndex >= 0 ? path.substring(0, slashIndex) : path).trim();
+    if (volumeName.isEmpty())
+        return false;
+
+    return !juce::File("/Volumes").getChildFile(volumeName).exists();
+}
+
+bool canSafelyProbeFilesystemPath(const juce::File& file)
+{
+    if (file == juce::File())
+        return false;
+
+    const auto path = file.getFullPathName().trim();
+    if (path.isEmpty() || !juce::File::isAbsolutePath(path))
+        return false;
+
+    return !pathUsesMissingVolumeMount(path);
+}
+
+bool safeFileExistsAsFile(const juce::File& file)
+{
+    return canSafelyProbeFilesystemPath(file) && file.existsAsFile();
+}
+
+bool safeFileIsDirectory(const juce::File& file)
+{
+    return canSafelyProbeFilesystemPath(file) && file.exists() && file.isDirectory();
 }
 
 juce::String controlModeToKey(MlrVSTAudioProcessor::ControlMode mode)
@@ -157,6 +262,28 @@ float denormalizeMacroResonance(float normalized)
     return juce::jmap(juce::jlimit(0.0f, 1.0f, normalized), 0.0f, 1.0f, 0.1f, 10.0f);
 }
 
+float computeNearestPitchClassCorrectionSemitones(float sourceMidi, int targetRootMidi) noexcept
+{
+    if (!std::isfinite(sourceMidi))
+        return 0.0f;
+
+    const float normalizedSourcePitchClass = [] (float midi)
+    {
+        float pitchClass = std::fmod(midi, 12.0f);
+        if (pitchClass < 0.0f)
+            pitchClass += 12.0f;
+        return pitchClass;
+    }(sourceMidi);
+
+    const float targetPitchClass = static_cast<float>(((targetRootMidi % 12) + 12) % 12);
+    float delta = targetPitchClass - normalizedSourcePitchClass;
+    while (delta > 6.0f)
+        delta -= 12.0f;
+    while (delta < -6.0f)
+        delta += 12.0f;
+    return juce::jlimit(-12.0f, 12.0f, delta);
+}
+
 float normalizeMacroPitch(float semitones)
 {
     return juce::jlimit(0.0f, 1.0f, juce::jmap(juce::jlimit(-24.0f, 24.0f, semitones), -24.0f, 24.0f, 0.0f, 1.0f));
@@ -255,7 +382,7 @@ bool decodeLoopStripFileToStereoBuffer(const juce::File& file,
                                        double& sourceSampleRate,
                                        juce::String& errorMessage)
 {
-    if (!file.existsAsFile())
+    if (!safeFileExistsAsFile(file))
     {
         errorMessage = "Missing file";
         return false;
@@ -1470,6 +1597,7 @@ FilterType stepFilterTypeFromMorphValue(float morph)
 
 using MacroTarget = MlrVSTAudioProcessor::MacroTarget;
 using SceneLengthMode = MlrVSTAudioProcessor::SceneLengthMode;
+using SceneRecallMode = MlrVSTAudioProcessor::SceneRecallMode;
 
 MacroTarget sanitizeMacroTarget(int rawTarget)
 {
@@ -1481,6 +1609,14 @@ SceneLengthMode sanitizeSceneLengthMode(int rawMode)
     return static_cast<SceneLengthMode>(juce::jlimit(
         0,
         static_cast<int>(SceneLengthMode::AnchorStrip),
+        rawMode));
+}
+
+SceneRecallMode sanitizeSceneRecallMode(int rawMode)
+{
+    return static_cast<SceneRecallMode>(juce::jlimit(
+        0,
+        static_cast<int>(SceneRecallMode::Manual),
         rawMode));
 }
 
@@ -2664,7 +2800,12 @@ public:
 
         if (tempoMatchBackend == TimeStretchBackend::Bungee)
         {
-            owner.updateLoopStripLoadProgress(stripIndex, requestId, 0.72f, "Stretching with MLR TS...");
+            owner.updateLoopStripLoadProgress(stripIndex,
+                                              requestId,
+                                              0.72f,
+                                              juce::String("Stretching with ")
+                                                  + timeStretchBackendName(tempoMatchBackend)
+                                                  + "...");
             const int targetFrames = computeLoopTempoMatchTargetFrames(result.sourceSampleRate,
                                                                        result.detectedBeatsForLoop,
                                                                        hostTempoSnapshot);
@@ -2701,6 +2842,172 @@ private:
     juce::File sourceFile;
     double hostTempoSnapshot = 120.0;
     TimeStretchBackend tempoMatchBackend = TimeStretchBackend::Resample;
+};
+
+class MlrVSTAudioProcessor::SoundTouchPitchCacheJob final : public juce::ThreadPoolJob
+{
+public:
+    SoundTouchPitchCacheJob(MlrVSTAudioProcessor& ownerIn,
+                            int stripIndexIn,
+                            int requestIdIn,
+                            juce::AudioBuffer<float> sourceBufferIn,
+                            double sourceSampleRateIn,
+                            uint64_t sourceVersionIn,
+                            float semitonesIn)
+        : juce::ThreadPoolJob("mlrVSTSoundTouchPitch_" + juce::String(stripIndexIn + 1)),
+          owner(ownerIn),
+          stripIndex(stripIndexIn),
+          requestId(requestIdIn),
+          sourceBuffer(std::move(sourceBufferIn)),
+          sourceSampleRate(sourceSampleRateIn),
+          sourceVersion(sourceVersionIn),
+          semitones(semitonesIn)
+    {
+    }
+
+    JobStatus runJob() override
+    {
+        SoundTouchPitchCacheResult result;
+        result.stripIndex = stripIndex;
+        result.requestId = requestId;
+        result.semitones = semitones;
+        result.sourceSampleRate = sourceSampleRate;
+        result.sourceVersion = sourceVersion;
+
+        if (shouldExit() || sourceBuffer.getNumSamples() <= 0 || !(sourceSampleRate > 0.0))
+        {
+            owner.queueSoundTouchPitchCacheResult(std::move(result));
+            return jobHasFinished;
+        }
+
+        result.success = renderTimeStretchedBuffer(sourceBuffer,
+                                                   sourceSampleRate,
+                                                   sourceBuffer.getNumSamples(),
+                                                   semitones,
+                                                   TimeStretchBackend::SoundTouch,
+                                                   result.renderedBuffer);
+        owner.queueSoundTouchPitchCacheResult(std::move(result));
+        return jobHasFinished;
+    }
+
+private:
+    MlrVSTAudioProcessor& owner;
+    int stripIndex = -1;
+    int requestId = 0;
+    juce::AudioBuffer<float> sourceBuffer;
+    double sourceSampleRate = 44100.0;
+    uint64_t sourceVersion = 0;
+    float semitones = 0.0f;
+};
+
+class MlrVSTAudioProcessor::BungeePitchCacheJob final : public juce::ThreadPoolJob
+{
+public:
+    BungeePitchCacheJob(MlrVSTAudioProcessor& ownerIn,
+                        int stripIndexIn,
+                        int requestIdIn,
+                        juce::AudioBuffer<float> sourceBufferIn,
+                        double sourceSampleRateIn,
+                        uint64_t sourceVersionIn,
+                        float semitonesIn)
+        : juce::ThreadPoolJob("mlrVSTBungeePitch_" + juce::String(stripIndexIn + 1)),
+          owner(ownerIn),
+          stripIndex(stripIndexIn),
+          requestId(requestIdIn),
+          sourceBuffer(std::move(sourceBufferIn)),
+          sourceSampleRate(sourceSampleRateIn),
+          sourceVersion(sourceVersionIn),
+          semitones(semitonesIn)
+    {
+    }
+
+    JobStatus runJob() override
+    {
+        BungeePitchCacheResult result;
+        result.stripIndex = stripIndex;
+        result.requestId = requestId;
+        result.semitones = semitones;
+        result.sourceSampleRate = sourceSampleRate;
+        result.sourceVersion = sourceVersion;
+
+        if (shouldExit() || sourceBuffer.getNumSamples() <= 0 || !(sourceSampleRate > 0.0))
+        {
+            owner.queueBungeePitchCacheResult(std::move(result));
+            return jobHasFinished;
+        }
+
+        result.success = renderTimeStretchedBuffer(sourceBuffer,
+                                                   sourceSampleRate,
+                                                   sourceBuffer.getNumSamples(),
+                                                   semitones,
+                                                   TimeStretchBackend::Bungee,
+                                                   result.renderedBuffer);
+        owner.queueBungeePitchCacheResult(std::move(result));
+        return jobHasFinished;
+    }
+
+private:
+    MlrVSTAudioProcessor& owner;
+    int stripIndex = -1;
+    int requestId = 0;
+    juce::AudioBuffer<float> sourceBuffer;
+    double sourceSampleRate = 44100.0;
+    uint64_t sourceVersion = 0;
+    float semitones = 0.0f;
+};
+
+class MlrVSTAudioProcessor::SignalsmithPitchCacheJob final : public juce::ThreadPoolJob
+{
+public:
+    SignalsmithPitchCacheJob(MlrVSTAudioProcessor& ownerIn,
+                             int stripIndexIn,
+                             int requestIdIn,
+                             juce::AudioBuffer<float> sourceBufferIn,
+                             double sourceSampleRateIn,
+                             uint64_t sourceVersionIn,
+                             float semitonesIn)
+        : juce::ThreadPoolJob("mlrVSTSignalsmithPitch_" + juce::String(stripIndexIn + 1)),
+          owner(ownerIn),
+          stripIndex(stripIndexIn),
+          requestId(requestIdIn),
+          sourceBuffer(std::move(sourceBufferIn)),
+          sourceSampleRate(sourceSampleRateIn),
+          sourceVersion(sourceVersionIn),
+          semitones(semitonesIn)
+    {
+    }
+
+    JobStatus runJob() override
+    {
+        SignalsmithPitchCacheResult result;
+        result.stripIndex = stripIndex;
+        result.requestId = requestId;
+        result.semitones = semitones;
+        result.sourceSampleRate = sourceSampleRate;
+        result.sourceVersion = sourceVersion;
+
+        if (shouldExit() || sourceBuffer.getNumSamples() <= 0 || !(sourceSampleRate > 0.0))
+        {
+            owner.queueSignalsmithPitchCacheResult(std::move(result));
+            return jobHasFinished;
+        }
+
+        result.success = renderSignalsmithPitchBuffer(sourceBuffer,
+                                                      sourceSampleRate,
+                                                      semitones,
+                                                      result.renderedBuffer);
+        owner.queueSignalsmithPitchCacheResult(std::move(result));
+        return jobHasFinished;
+    }
+
+private:
+    MlrVSTAudioProcessor& owner;
+    int stripIndex = -1;
+    int requestId = 0;
+    juce::AudioBuffer<float> sourceBuffer;
+    double sourceSampleRate = 44100.0;
+    uint64_t sourceVersion = 0;
+    float semitones = 0.0f;
 };
 
 class MlrVSTAudioProcessor::FlipLegacyLoopRenderJob final : public juce::ThreadPoolJob
@@ -2974,14 +3281,17 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
     soundTouchEnabledParam = parameters.getRawParameterValue("soundTouchEnabled");
     masterDuckTriggerStripParam = parameters.getRawParameterValue("masterDuckTriggerStrip");
     sceneModeParam = parameters.getRawParameterValue("sceneMode");
+    sceneRecallModeParam = parameters.getRawParameterValue("sceneRecallMode");
 
     for (int i = 0; i < MaxStrips; ++i)
     {
         stripVolumeParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripVolume" + juce::String(i));
+        stripTrimDbParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripTrimDb" + juce::String(i));
         stripPanParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripPan" + juce::String(i));
         stripSpeedParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripSpeed" + juce::String(i));
         stripPitchParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripPitch" + juce::String(i));
         stripSliceLengthParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripSliceLength" + juce::String(i));
+        stripPitchControlModeParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripPitchControlMode" + juce::String(i));
         stripTempoMatchModeParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripTempoMatchMode" + juce::String(i));
         stripDuckEnabledParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckEnabled" + juce::String(i));
         stripDuckSourceParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckSource" + juce::String(i));
@@ -3035,6 +3345,9 @@ MlrVSTAudioProcessor::~MlrVSTAudioProcessor()
     presetSaveThreadPool.removeAllJobs(true, 4000);
     loopStripLoadThreadPool.removeAllJobs(true, 4000);
     loopPitchAnalysisThreadPool.removeAllJobs(true, 4000);
+    soundTouchPitchCacheThreadPool.removeAllJobs(true, 4000);
+    bungeePitchCacheThreadPool.removeAllJobs(true, 4000);
+    signalsmithPitchCacheThreadPool.removeAllJobs(true, 4000);
     flipLegacyLoopRenderThreadPool.removeAllJobs(true, 4000);
     stopTimer();
     monomeConnection.disconnect();
@@ -3225,6 +3538,19 @@ void MlrVSTAudioProcessor::resetMacroLaneRecordState(int macroIndex)
     state.totalStepsToWrite.store(0, std::memory_order_release);
 }
 
+int MlrVSTAudioProcessor::snapMacroLaneRecordingLengthBars(double recordedBeats)
+{
+    const double safeBeats = juce::jmax(0.0, recordedBeats);
+    const double recordedBars = safeBeats / 4.0;
+    if (recordedBars <= 1.0)
+        return 1;
+    if (recordedBars <= 2.0)
+        return 2;
+    if (recordedBars <= 4.0)
+        return 4;
+    return 8;
+}
+
 void MlrVSTAudioProcessor::finishMacroLaneRecording(int macroIndex, bool activateLane)
 {
     if (macroIndex < 0 || macroIndex >= MacroCount)
@@ -3234,8 +3560,24 @@ void MlrVSTAudioProcessor::finishMacroLaneRecording(int macroIndex, bool activat
     const int stripIndex = state.stripIndex.load(std::memory_order_acquire);
     const int laneSlot = state.laneSlot.load(std::memory_order_acquire);
     const float restoreDepth = juce::jlimit(0.0f, 1.0f, state.restoreDepth.load(std::memory_order_acquire));
-    if (activateLane && audioEngine && stripIndex >= 0 && stripIndex < MaxStrips)
-        audioEngine->setModDepthForSlot(stripIndex, laneSlot, restoreDepth > 0.0f ? restoreDepth : 1.0f);
+    if (audioEngine && stripIndex >= 0 && stripIndex < MaxStrips)
+    {
+        const double stepLengthBeats = audioEngine->getModStepLengthBeats(stripIndex, laneSlot);
+        const int stepsWritten = juce::jmax(0, state.stepsWritten.load(std::memory_order_acquire));
+        double recordedBeats = static_cast<double>(stepsWritten) * juce::jmax(0.0, stepLengthBeats);
+
+        const double startPpq = state.startPpq.load(std::memory_order_acquire);
+        const double endPpq = audioEngine->getTimelineBeat();
+        if (std::isfinite(startPpq) && std::isfinite(endPpq))
+            recordedBeats = juce::jmax(recordedBeats, juce::jmax(stepLengthBeats, endPpq - startPpq));
+
+        audioEngine->setModLengthBarsForSlot(stripIndex,
+                                             laneSlot,
+                                             snapMacroLaneRecordingLengthBars(recordedBeats));
+
+        if (activateLane)
+            audioEngine->setModDepthForSlot(stripIndex, laneSlot, restoreDepth > 0.0f ? restoreDepth : 1.0f);
+    }
 
     resetMacroLaneRecordState(macroIndex);
 }
@@ -3270,7 +3612,10 @@ void MlrVSTAudioProcessor::beginMacroLaneRecording(int macroIndex, int laneSlot)
             && status.stripIndex == stripIndex
             && status.laneSlot == safeLane)
         {
-            cancelMacroLaneRecording(i);
+            if (status.recording)
+                stopMacroLaneRecording(i);
+            else
+                cancelMacroLaneRecording(i);
         }
     }
 
@@ -3281,6 +3626,21 @@ void MlrVSTAudioProcessor::beginMacroLaneRecording(int macroIndex, int laneSlot)
     state.laneSlot.store(safeLane, std::memory_order_release);
     state.target.store(static_cast<int>(target), std::memory_order_release);
     state.armed.store(1, std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::stopMacroLaneRecording(int macroIndex)
+{
+    if (macroIndex < 0 || macroIndex >= MacroCount)
+        return;
+
+    const auto status = getMacroLaneRecordStatus(macroIndex);
+    if (status.recording)
+    {
+        finishMacroLaneRecording(macroIndex, true);
+        return;
+    }
+
+    cancelMacroLaneRecording(macroIndex);
 }
 
 void MlrVSTAudioProcessor::cancelMacroLaneRecording(int macroIndex)
@@ -3412,7 +3772,10 @@ float MlrVSTAudioProcessor::getMacroNormalizedValueForTarget(const EnhancedAudio
     }
 }
 
-void MlrVSTAudioProcessor::applyMacroTargetValue(EnhancedAudioStrip& strip, MacroTarget target, float normalizedValue)
+void MlrVSTAudioProcessor::applyMacroTargetValue(int stripIndex,
+                                                 EnhancedAudioStrip& strip,
+                                                 MacroTarget target,
+                                                 float normalizedValue)
 {
     const float clamped = juce::jlimit(0.0f, 1.0f, normalizedValue);
     const bool isStepMode = (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
@@ -3458,7 +3821,7 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(EnhancedAudioStrip& strip, Macr
         }
         case MacroTarget::Pitch:
         {
-            applyPitchControlToStrip(strip, denormalizeMacroPitch(clamped));
+            applyPitchControlToStrip(stripIndex, strip, denormalizeMacroPitch(clamped));
             break;
         }
         case MacroTarget::Volume:
@@ -3569,11 +3932,12 @@ void MlrVSTAudioProcessor::setSelectedStripMacroValue(int macroIndex, float norm
     if (!audioEngine || macroIndex < 0 || macroIndex >= MacroCount)
         return;
 
-    auto* strip = audioEngine->getStrip(getMacroTargetStripIndex());
+    const int stripIndex = getMacroTargetStripIndex();
+    auto* strip = audioEngine->getStrip(stripIndex);
     if (strip == nullptr)
         return;
 
-    applyMacroTargetValue(*strip, getMacroTarget(macroIndex), normalizedValue);
+    applyMacroTargetValue(stripIndex, *strip, getMacroTarget(macroIndex), normalizedValue);
 }
 
 float MlrVSTAudioProcessor::getMacroLaneRecordedValue(int macroIndex) const
@@ -3614,7 +3978,7 @@ bool MlrVSTAudioProcessor::initializeMacroLaneRecording(int macroIndex,
     if (strip == nullptr || !performanceTargetAllowsModLane(target))
         return false;
 
-    const int totalSteps = audioEngine->getModTotalActiveSteps(stripIndex, laneSlot);
+    const int totalSteps = ModernAudioEngine::ModTotalSteps;
     const double stepLengthBeats = audioEngine->getModStepLengthBeats(stripIndex, laneSlot);
     if (totalSteps <= 0 || !std::isfinite(stepLengthBeats) || stepLengthBeats <= 0.0)
         return false;
@@ -3642,12 +4006,16 @@ bool MlrVSTAudioProcessor::initializeMacroLaneRecording(int macroIndex,
 
     const double currentPpq = *ppqOpt;
     const double stepsPerBeat = 1.0 / stepLengthBeats;
-    const int offset = audioEngine->getModOffsetForSlot(stripIndex, laneSlot);
-    const double stepsPos = (currentPpq * stepsPerBeat) + static_cast<double>(offset);
+    const int absoluteStepNow = juce::jmax(0, static_cast<int>(std::floor(currentPpq * stepsPerBeat)));
+    const int stepIndexNow = absoluteStepNow % totalSteps;
+    const int recordOffset = -stepIndexNow;
+    audioEngine->setModOffsetForSlot(stripIndex, laneSlot, recordOffset);
+
+    const double stepsPos = (currentPpq * stepsPerBeat) + static_cast<double>(recordOffset);
     const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
     const double wrappedPos = wrapped < 0.0 ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
-    const int currentStep = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
-    const double stepPhase = juce::jlimit(0.0, 0.999999999, wrappedPos - static_cast<double>(currentStep));
+    const double stepPhase = juce::jlimit(0.0, 0.999999999, wrappedPos);
+    const int currentStep = 0;
 
     audioEngine->writeModStepNormalized(stripIndex, laneSlot, currentStep, getMacroLaneRecordedValue(macroIndex));
 
@@ -3789,8 +4157,56 @@ MlrVSTAudioProcessor::PitchControlMode MlrVSTAudioProcessor::getPitchControlMode
     const float rawChoice = (pitchControlModeParam != nullptr)
         ? pitchControlModeParam->load(std::memory_order_acquire)
         : 0.0f;
-    const int modeIndex = juce::jlimit(0, 1, static_cast<int>(std::round(rawChoice)));
-    return (modeIndex == 1) ? PitchControlMode::Resample : PitchControlMode::PitchShift;
+    const int modeIndex = sanitizePitchControlModeIndex(static_cast<int>(std::round(rawChoice)));
+    switch (modeIndex)
+    {
+        case 1: return PitchControlMode::SoundTouch;
+        case 2: return PitchControlMode::Resample;
+        case 3: return PitchControlMode::Signalsmith;
+        case 4: return PitchControlMode::Bungee;
+        case 0:
+        default: return PitchControlMode::PitchShift;
+    }
+}
+
+MlrVSTAudioProcessor::StripPitchControlMode MlrVSTAudioProcessor::getStripPitchControlMode(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return StripPitchControlMode::Global;
+
+    const auto* param = stripPitchControlModeParams[static_cast<size_t>(stripIndex)];
+    const float rawChoice = param != nullptr ? param->load(std::memory_order_acquire) : 0.0f;
+    const int modeIndex = sanitizeStripPitchControlModeIndex(static_cast<int>(std::round(rawChoice)));
+    switch (modeIndex)
+    {
+        case 1: return StripPitchControlMode::PitchShift;
+        case 2: return StripPitchControlMode::SoundTouch;
+        case 3: return StripPitchControlMode::Resample;
+        case 4: return StripPitchControlMode::Signalsmith;
+        case 5: return StripPitchControlMode::Bungee;
+        case 0:
+        default: return StripPitchControlMode::Global;
+    }
+}
+
+MlrVSTAudioProcessor::PitchControlMode MlrVSTAudioProcessor::resolvePitchControlModeForStrip(int stripIndex) const
+{
+    switch (getStripPitchControlMode(stripIndex))
+    {
+        case StripPitchControlMode::PitchShift:
+            return PitchControlMode::PitchShift;
+        case StripPitchControlMode::SoundTouch:
+            return PitchControlMode::SoundTouch;
+        case StripPitchControlMode::Resample:
+            return PitchControlMode::Resample;
+        case StripPitchControlMode::Signalsmith:
+            return PitchControlMode::Signalsmith;
+        case StripPitchControlMode::Bungee:
+            return PitchControlMode::Bungee;
+        case StripPitchControlMode::Global:
+        default:
+            return getPitchControlMode();
+    }
 }
 
 TimeStretchBackend MlrVSTAudioProcessor::getStretchBackend() const
@@ -3814,8 +4230,13 @@ TimeStretchBackend MlrVSTAudioProcessor::getLoopTempoMatchBackend() const
         ? flipTempoMatchModeParam->load(std::memory_order_acquire)
         : 0.0f;
     const int modeIndex = juce::jlimit(0, 1, static_cast<int>(std::round(rawChoice)));
-    if (modeIndex == 1 && isTimeStretchBackendAvailable(TimeStretchBackend::Bungee))
-        return TimeStretchBackend::Bungee;
+    if (modeIndex == 1)
+    {
+        const auto backend = getStretchBackend();
+        return isTimeStretchBackendAvailable(backend)
+            ? backend
+            : TimeStretchBackend::Resample;
+    }
 
     return TimeStretchBackend::Resample;
 }
@@ -3844,9 +4265,12 @@ TimeStretchBackend MlrVSTAudioProcessor::resolveLoopTempoMatchBackendForStrip(in
         case StripTempoMatchMode::Repitch:
             return TimeStretchBackend::Resample;
         case StripTempoMatchMode::MlrTs:
-            return isTimeStretchBackendAvailable(TimeStretchBackend::Bungee)
-                ? TimeStretchBackend::Bungee
+        {
+            const auto backend = getStretchBackend();
+            return isTimeStretchBackendAvailable(backend)
+                ? backend
                 : TimeStretchBackend::Resample;
+        }
         case StripTempoMatchMode::Global:
         default:
             return getLoopTempoMatchBackend();
@@ -3871,7 +4295,8 @@ TimeStretchBackend MlrVSTAudioProcessor::getFlipTempoMatchBackend() const
 MlrVSTAudioProcessor::ResolvedPitchControl MlrVSTAudioProcessor::resolvePitchControl(
     const EnhancedAudioStrip& strip,
     float semitones,
-    int referenceRootMidi) const
+    int referenceRootMidi,
+    PitchControlMode controlMode) const
 {
     ResolvedPitchControl resolved;
     const float clampedSemitones = juce::jlimit(-24.0f, 24.0f, semitones);
@@ -3892,12 +4317,30 @@ MlrVSTAudioProcessor::ResolvedPitchControl MlrVSTAudioProcessor::resolvePitchCon
         return resolved;
     }
 
-    if (getPitchControlMode() == PitchControlMode::Resample)
-    {
-        if (strip.isPlaying() && strip.isPpqTimelineAnchored())
-            return resolved;
+    const bool sampleModeDisallowsSignalsmith =
+        (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Sample);
 
-        resolved.useResamplePitch = true;
+    switch (controlMode)
+    {
+        case PitchControlMode::PitchShift:
+            resolved.pitchAlgorithm = EnhancedAudioStrip::PitchShiftAlgorithm::Standard;
+            break;
+        case PitchControlMode::SoundTouch:
+            resolved.pitchAlgorithm = EnhancedAudioStrip::PitchShiftAlgorithm::SoundTouch;
+            break;
+        case PitchControlMode::Resample:
+            resolved.useResamplePitch = true;
+            break;
+        case PitchControlMode::Signalsmith:
+            // Sample mode keeps the low-latency local shifter path instead of
+            // enabling realtime Signalsmith.
+            resolved.pitchAlgorithm = sampleModeDisallowsSignalsmith
+                ? EnhancedAudioStrip::PitchShiftAlgorithm::Standard
+                : EnhancedAudioStrip::PitchShiftAlgorithm::Signalsmith;
+            break;
+        case PitchControlMode::Bungee:
+            resolved.pitchAlgorithm = EnhancedAudioStrip::PitchShiftAlgorithm::Bungee;
+            break;
     }
 
     return resolved;
@@ -3907,6 +4350,8 @@ void MlrVSTAudioProcessor::applyResolvedPitchControl(EnhancedAudioStrip& strip,
                                                      const ResolvedPitchControl& resolved) const
 {
     strip.setGlobalPitchContext(resolved.globalRootMidi, static_cast<int>(resolved.globalScale));
+    strip.setSignalsmithLiveMode(false);
+    strip.setPitchShiftAlgorithm(resolved.pitchAlgorithm);
 
     if (resolved.updatesStepSampler)
     {
@@ -3941,11 +4386,8 @@ MlrVSTAudioProcessor::ResolvedFlipTempoMatch MlrVSTAudioProcessor::resolveFlipTe
 {
     ResolvedFlipTempoMatch resolved;
     resolved.mode = getFlipTempoMatchMode();
-    if (resolved.mode == FlipTempoMatchMode::MlrTs
-        && isTimeStretchBackendAvailable(TimeStretchBackend::Bungee))
-    {
-        resolved.backend = TimeStretchBackend::Bungee;
-    }
+    if (resolved.mode == FlipTempoMatchMode::MlrTs)
+        resolved.backend = getLoopTempoMatchBackend();
     return resolved;
 }
 
@@ -3983,7 +4425,11 @@ MlrVSTAudioProcessor::ResolvedFlipPlaybackState MlrVSTAudioProcessor::resolveFli
 
 void MlrVSTAudioProcessor::applyPitchControlToStrip(EnhancedAudioStrip& strip, float semitones)
 {
-    applyResolvedPitchControl(strip, resolvePitchControl(strip, semitones, getGlobalRootNoteMidi()));
+    applyResolvedPitchControl(strip,
+                              resolvePitchControl(strip,
+                                                  semitones,
+                                                  getGlobalRootNoteMidi(),
+                                                  getPitchControlMode()));
 }
 
 void MlrVSTAudioProcessor::applyPitchControlToStrip(int stripIndex, EnhancedAudioStrip& strip, float semitones)
@@ -3991,7 +4437,39 @@ void MlrVSTAudioProcessor::applyPitchControlToStrip(int stripIndex, EnhancedAudi
     applyResolvedPitchControl(strip,
                               resolvePitchControl(strip,
                                                   semitones,
-                                                  getPitchQuantizeReferenceRootMidiForStrip(stripIndex)));
+                                                  getPitchQuantizeReferenceRootMidiForStrip(stripIndex),
+                                                  resolvePitchControlModeForStrip(stripIndex)));
+}
+
+float MlrVSTAudioProcessor::getStoredStripPitchSemitones(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return 0.0f;
+
+    if (const auto* rawParam = stripPitchParams[static_cast<size_t>(stripIndex)])
+        return rawParam->load(std::memory_order_acquire);
+
+    if (audioEngine != nullptr)
+    {
+        if (const auto* strip = audioEngine->getStrip(stripIndex))
+            return getPitchSemitonesForDisplay(*strip);
+    }
+
+    return 0.0f;
+}
+
+void MlrVSTAudioProcessor::applyStoredPitchControlToStrip(int stripIndex)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || audioEngine == nullptr)
+        return;
+
+    auto* strip = audioEngine->getStrip(stripIndex);
+    if (strip == nullptr)
+        return;
+
+    const float storedSemitones = quantizePitchSemitonesForStripControl(stripIndex,
+                                                                        getStoredStripPitchSemitones(stripIndex));
+    applyPitchControlToStrip(stripIndex, *strip, storedSemitones);
 }
 
 void MlrVSTAudioProcessor::applyUserPitchControlToStrip(int stripIndex, float semitones)
@@ -4013,8 +4491,13 @@ void MlrVSTAudioProcessor::applyUserPitchControlToStrip(int stripIndex, float se
 
     if (auto* strip = audioEngine->getStrip(stripIndex))
     {
-        applyPitchControlToStrip(stripIndex, *strip, quantizedSemitones);
-        if (getLoopPitchRole(stripIndex) == LoopPitchRole::Master)
+        const auto loopPitchRole = getLoopPitchRole(stripIndex);
+        if (loopPitchRole == LoopPitchRole::Sync)
+            requestLoopPitchRoleStateUpdate(stripIndex);
+        else
+            applyPitchControlToStrip(stripIndex, *strip, quantizedSemitones);
+
+        if (loopPitchRole == LoopPitchRole::Master)
             updateGlobalRootFromLoopPitchMaster(stripIndex, true);
     }
 }
@@ -4024,11 +4507,8 @@ float MlrVSTAudioProcessor::getPitchSemitonesForDisplay(const EnhancedAudioStrip
     if (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
         return juce::jlimit(-24.0f, 24.0f, strip.getPitchShift());
 
-    if (getPitchControlMode() == PitchControlMode::Resample)
+    if (strip.isResamplePitchEnabled())
     {
-        if (!strip.isResamplePitchEnabled())
-            return juce::jlimit(-24.0f, 24.0f, strip.getPitchShift());
-
         const float ratio = juce::jlimit(0.125f, 8.0f, strip.getResamplePitchRatio());
         const float semitones = 12.0f * std::log2(ratio);
         return juce::jlimit(-24.0f, 24.0f, semitones);
@@ -4161,6 +4641,20 @@ MlrVSTAudioProcessor::LoopPitchRole MlrVSTAudioProcessor::getLoopPitchRole(int s
     return sanitizeLoopPitchRole(loopPitchRoles[static_cast<size_t>(stripIndex)].load(std::memory_order_acquire));
 }
 
+int MlrVSTAudioProcessor::getLoopPitchMasterStripIndex() const
+{
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        if (sanitizeLoopPitchRole(loopPitchRoles[static_cast<size_t>(i)].load(std::memory_order_acquire))
+            == LoopPitchRole::Master)
+        {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
 MlrVSTAudioProcessor::LoopPitchSyncTiming MlrVSTAudioProcessor::getLoopPitchSyncTiming(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
@@ -4173,6 +4667,7 @@ void MlrVSTAudioProcessor::setLoopPitchRole(int stripIndex, LoopPitchRole role)
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
 
+    const auto previousRole = getLoopPitchRole(stripIndex);
     const auto clampedRole = sanitizeLoopPitchRole(static_cast<int>(role));
     loopPitchPendingRetune[static_cast<size_t>(stripIndex)].store(0, std::memory_order_release);
     if (clampedRole == LoopPitchRole::Master)
@@ -4190,6 +4685,9 @@ void MlrVSTAudioProcessor::setLoopPitchRole(int stripIndex, LoopPitchRole role)
     }
 
     loopPitchRoles[static_cast<size_t>(stripIndex)].store(static_cast<int>(clampedRole), std::memory_order_release);
+
+    if (previousRole == LoopPitchRole::Sync && clampedRole != LoopPitchRole::Sync)
+        applyStoredPitchControlToStrip(stripIndex);
 
     if (clampedRole == LoopPitchRole::Master)
     {
@@ -4239,9 +4737,7 @@ float MlrVSTAudioProcessor::getLoopStripPitchSyncCorrectionSemitones(int stripIn
     if (sourceMidi < 0.0f)
         return 0.0f;
 
-    return juce::jlimit(-24.0f,
-                        24.0f,
-                        static_cast<float>(getGlobalRootNoteMidi()) - sourceMidi);
+    return computeNearestPitchClassCorrectionSemitones(sourceMidi, getGlobalRootNoteMidi());
 }
 
 void MlrVSTAudioProcessor::setLoopStripAssignedPitchMidi(int stripIndex, int midiNote, bool manualOverride)
@@ -4286,11 +4782,21 @@ void MlrVSTAudioProcessor::setGlobalRootNoteMidi(int midiNote, bool markPersiste
     if (markPersistent)
         markPersistentGlobalUserChange();
     if (previous != clamped)
+    {
+        reapplyGlobalPitchQuantizationToAllStrips();
         applyLoopPitchSyncToAllStrips();
+    }
 }
 
 void MlrVSTAudioProcessor::setGlobalRootNotePitchClass(int pitchClass)
 {
+    const int masterStripIndex = getLoopPitchMasterStripIndex();
+    if (masterStripIndex >= 0)
+    {
+        updateGlobalRootFromLoopPitchMaster(masterStripIndex, true);
+        return;
+    }
+
     const int clampedPitchClass = ((pitchClass % 12) + 12) % 12;
     const int currentMidi = getGlobalRootNoteMidi();
     const int octave = juce::jlimit(0, 10, currentMidi / 12);
@@ -4310,12 +4816,12 @@ ModernAudioEngine::PitchScale MlrVSTAudioProcessor::getGlobalPitchScale() const
 
 void MlrVSTAudioProcessor::setGlobalPitchScale(ModernAudioEngine::PitchScale scale)
 {
-    globalPitchScale.store(
-        juce::jlimit(0,
-                     static_cast<int>(ModernAudioEngine::PitchScale::PentatonicMinor),
-                     static_cast<int>(scale)),
-        std::memory_order_release);
+    const int clamped = juce::jlimit(0,
+                                     static_cast<int>(ModernAudioEngine::PitchScale::PentatonicMinor),
+                                     static_cast<int>(scale));
+    globalPitchScale.store(clamped, std::memory_order_release);
     markPersistentGlobalUserChange();
+    reapplyGlobalPitchQuantizationToAllStrips();
     applyLoopPitchSyncToAllStrips();
 }
 
@@ -4324,6 +4830,45 @@ float MlrVSTAudioProcessor::quantizePitchSemitonesToGlobalScale(float semitones)
     return ModernAudioEngine::quantizePitchSemitonesToScale(semitones,
                                                             getGlobalRootNoteMidi(),
                                                             getGlobalPitchScale());
+}
+
+void MlrVSTAudioProcessor::reapplyGlobalPitchQuantizationToAllStrips()
+{
+    if (audioEngine == nullptr)
+        return;
+
+    const int globalRootMidi = getGlobalRootNoteMidi();
+    const auto globalScale = getGlobalPitchScale();
+
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        auto* strip = audioEngine->getStrip(stripIndex);
+        if (strip == nullptr)
+            continue;
+
+        strip->setGlobalPitchContext(globalRootMidi, static_cast<int>(globalScale));
+
+        float semitones = strip->getPitchShift();
+        if (auto* rawParam = stripPitchParams[static_cast<size_t>(stripIndex)])
+            semitones = rawParam->load(std::memory_order_acquire);
+
+        const float quantizedSemitones = quantizePitchSemitonesForStripControl(stripIndex, semitones);
+        if (auto* parameter = parameters.getParameter("stripPitch" + juce::String(stripIndex)))
+        {
+            const float normalized = juce::jlimit(0.0f, 1.0f, parameter->convertTo0to1(quantizedSemitones));
+            const float currentNormalized = juce::jlimit(0.0f, 1.0f, parameter->convertTo0to1(semitones));
+            if (std::abs(currentNormalized - normalized) > 1.0e-5f)
+                parameter->setValueNotifyingHost(normalized);
+        }
+
+        if (getLoopPitchRole(stripIndex) == LoopPitchRole::Sync)
+        {
+            applyPitchControlToStrip(stripIndex, *strip, getPitchSemitonesForDisplay(*strip));
+            continue;
+        }
+
+        applyPitchControlToStrip(stripIndex, *strip, quantizedSemitones);
+    }
 }
 
 bool MlrVSTAudioProcessor::beginLoopStripPitchAnalysis(int stripIndex, bool setDetectedAsRoot)
@@ -4359,7 +4904,7 @@ bool MlrVSTAudioProcessor::beginLoopStripPitchAnalysis(int stripIndex, bool setD
                                                       requestId,
                                                       std::move(analysisBuffer),
                                                       strip->getSourceSampleRate(),
-                                                      sourceFile.existsAsFile() ? sourceFile : juce::File(),
+                                                      safeFileExistsAsFile(sourceFile) ? sourceFile : juce::File(),
                                                       setDetectedAsRoot);
     loopPitchAnalysisThreadPool.addJob(job.release(), true);
     return true;
@@ -4375,6 +4920,12 @@ void MlrVSTAudioProcessor::queueLoopStripLoadResult(LoopStripLoadResult result)
 {
     const juce::ScopedLock lock(loopStripLoadResultLock);
     loopStripLoadResults.push_back(std::move(result));
+}
+
+void MlrVSTAudioProcessor::queueSoundTouchPitchCacheResult(SoundTouchPitchCacheResult result)
+{
+    const juce::ScopedLock lock(soundTouchPitchCacheResultLock);
+    soundTouchPitchCacheResults.push_back(std::move(result));
 }
 
 void MlrVSTAudioProcessor::updateLoopStripLoadProgress(int stripIndex,
@@ -4625,17 +5176,386 @@ void MlrVSTAudioProcessor::applyCompletedLoopStripLoads()
     }
 }
 
+void MlrVSTAudioProcessor::applyCompletedSoundTouchPitchCaches()
+{
+    std::vector<SoundTouchPitchCacheResult> results;
+    {
+        const juce::ScopedLock lock(soundTouchPitchCacheResultLock);
+        if (soundTouchPitchCacheResults.empty())
+            return;
+        results.swap(soundTouchPitchCacheResults);
+    }
+
+    for (auto& result : results)
+    {
+        if (result.stripIndex < 0 || result.stripIndex >= MaxStrips || audioEngine == nullptr)
+            continue;
+
+        const auto idx = static_cast<size_t>(result.stripIndex);
+        if (result.requestId != soundTouchPitchCacheRequestIds[idx].load(std::memory_order_acquire))
+        {
+            soundTouchPitchCacheInFlight[idx].store(0, std::memory_order_release);
+            continue;
+        }
+
+        soundTouchPitchCacheInFlight[idx].store(0, std::memory_order_release);
+
+        auto* strip = audioEngine->getStrip(result.stripIndex);
+        if (strip == nullptr || !result.success)
+            continue;
+
+        if (strip->getPitchShiftAlgorithm() != EnhancedAudioStrip::PitchShiftAlgorithm::SoundTouch
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain
+            || strip->isResamplePitchEnabled())
+        {
+            continue;
+        }
+
+        const float currentTargetSemitones = snapSoundTouchPitchCacheSemitones(strip->getPitchShift());
+        if (std::abs(currentTargetSemitones - result.semitones) > 0.01f)
+            continue;
+
+        strip->installSoundTouchPitchCache(std::move(result.renderedBuffer),
+                                           result.sourceSampleRate,
+                                           result.semitones,
+                                           result.sourceVersion);
+    }
+}
+
+void MlrVSTAudioProcessor::refreshPendingSoundTouchPitchCaches()
+{
+    if (audioEngine == nullptr || !isTimeStretchBackendAvailable(TimeStretchBackend::SoundTouch))
+        return;
+
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        auto* strip = audioEngine->getStrip(stripIndex);
+        if (strip == nullptr)
+            continue;
+
+        const auto idx = static_cast<size_t>(stripIndex);
+
+        if (strip->getPitchShiftAlgorithm() != EnhancedAudioStrip::PitchShiftAlgorithm::SoundTouch
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain
+            || strip->isResamplePitchEnabled()
+            || !strip->hasAudio())
+        {
+            soundTouchPitchCacheObservedTargets[idx] = 0.0f;
+            soundTouchPitchCacheStableTicks[idx] = 0;
+            continue;
+        }
+
+        const float semitones = snapSoundTouchPitchCacheSemitones(strip->getPitchShift());
+        if (std::abs(semitones - soundTouchPitchCacheObservedTargets[idx]) > 0.01f)
+        {
+            if (soundTouchPitchCacheInFlight[idx].load(std::memory_order_acquire) != 0)
+                soundTouchPitchCacheRequestIds[idx].fetch_add(1, std::memory_order_acq_rel);
+            soundTouchPitchCacheObservedTargets[idx] = semitones;
+            soundTouchPitchCacheStableTicks[idx] = 0;
+        }
+        else if (soundTouchPitchCacheStableTicks[idx] < kSoundTouchPitchCacheStableTimerTicks)
+        {
+            ++soundTouchPitchCacheStableTicks[idx];
+        }
+
+        if (std::abs(semitones) <= 0.01f)
+        {
+            soundTouchPitchCacheStableTicks[idx] = 0;
+            continue;
+        }
+
+        if (strip->hasMatchingSoundTouchPitchCache(semitones))
+            continue;
+
+        if (soundTouchPitchCacheStableTicks[idx] < kSoundTouchPitchCacheStableTimerTicks)
+            continue;
+
+        if (soundTouchPitchCacheInFlight[idx].load(std::memory_order_acquire) != 0)
+            continue;
+
+        juce::AudioBuffer<float> sourceBuffer;
+        double sourceSampleRate = 0.0;
+        uint64_t sourceVersion = 0;
+        if (!strip->copySoundTouchPitchSourceBuffer(sourceBuffer, sourceSampleRate, sourceVersion))
+            continue;
+
+        const int requestId = soundTouchPitchCacheRequestIds[idx].fetch_add(1, std::memory_order_acq_rel) + 1;
+        soundTouchPitchCacheInFlight[idx].store(1, std::memory_order_release);
+        auto job = std::make_unique<SoundTouchPitchCacheJob>(*this,
+                                                             stripIndex,
+                                                             requestId,
+                                                             std::move(sourceBuffer),
+                                                             sourceSampleRate,
+                                                             sourceVersion,
+                                                             semitones);
+        soundTouchPitchCacheThreadPool.addJob(job.release(), true);
+    }
+}
+
+void MlrVSTAudioProcessor::queueBungeePitchCacheResult(BungeePitchCacheResult result)
+{
+    const juce::ScopedLock lock(bungeePitchCacheResultLock);
+    bungeePitchCacheResults.push_back(std::move(result));
+}
+
+void MlrVSTAudioProcessor::applyCompletedBungeePitchCaches()
+{
+    std::vector<BungeePitchCacheResult> results;
+    {
+        const juce::ScopedLock lock(bungeePitchCacheResultLock);
+        if (bungeePitchCacheResults.empty())
+            return;
+        results.swap(bungeePitchCacheResults);
+    }
+
+    for (auto& result : results)
+    {
+        if (result.stripIndex < 0 || result.stripIndex >= MaxStrips || audioEngine == nullptr)
+            continue;
+
+        const auto idx = static_cast<size_t>(result.stripIndex);
+        if (result.requestId != bungeePitchCacheRequestIds[idx].load(std::memory_order_acquire))
+        {
+            bungeePitchCacheInFlight[idx].store(0, std::memory_order_release);
+            continue;
+        }
+
+        bungeePitchCacheInFlight[idx].store(0, std::memory_order_release);
+
+        auto* strip = audioEngine->getStrip(result.stripIndex);
+        if (strip == nullptr || !result.success)
+            continue;
+
+        if (strip->getPitchShiftAlgorithm() != EnhancedAudioStrip::PitchShiftAlgorithm::Bungee
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain
+            || strip->isResamplePitchEnabled())
+        {
+            continue;
+        }
+
+        const float currentTargetSemitones = snapBungeePitchCacheSemitones(strip->getPitchShift());
+        if (std::abs(currentTargetSemitones - result.semitones) > 0.01f)
+            continue;
+
+        strip->installBungeePitchCache(std::move(result.renderedBuffer),
+                                       result.sourceSampleRate,
+                                       result.semitones,
+                                       result.sourceVersion);
+    }
+}
+
+void MlrVSTAudioProcessor::refreshPendingBungeePitchCaches()
+{
+    if (audioEngine == nullptr || !isTimeStretchBackendAvailable(TimeStretchBackend::Bungee))
+        return;
+
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        auto* strip = audioEngine->getStrip(stripIndex);
+        if (strip == nullptr)
+            continue;
+
+        const auto idx = static_cast<size_t>(stripIndex);
+
+        if (strip->getPitchShiftAlgorithm() != EnhancedAudioStrip::PitchShiftAlgorithm::Bungee
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain
+            || strip->isResamplePitchEnabled()
+            || !strip->hasAudio())
+        {
+            bungeePitchCacheObservedTargets[idx] = 0.0f;
+            bungeePitchCacheStableTicks[idx] = 0;
+            continue;
+        }
+
+        const float semitones = snapBungeePitchCacheSemitones(strip->getPitchShift());
+        if (std::abs(semitones - bungeePitchCacheObservedTargets[idx]) > 0.01f)
+        {
+            if (bungeePitchCacheInFlight[idx].load(std::memory_order_acquire) != 0)
+                bungeePitchCacheRequestIds[idx].fetch_add(1, std::memory_order_acq_rel);
+            bungeePitchCacheObservedTargets[idx] = semitones;
+            bungeePitchCacheStableTicks[idx] = 0;
+        }
+        else if (bungeePitchCacheStableTicks[idx] < kSoundTouchPitchCacheStableTimerTicks)
+        {
+            ++bungeePitchCacheStableTicks[idx];
+        }
+
+        if (std::abs(semitones) <= 0.01f)
+        {
+            bungeePitchCacheStableTicks[idx] = 0;
+            continue;
+        }
+
+        if (strip->hasMatchingBungeePitchCache(semitones))
+            continue;
+
+        if (bungeePitchCacheStableTicks[idx] < kSoundTouchPitchCacheStableTimerTicks)
+            continue;
+
+        if (bungeePitchCacheInFlight[idx].load(std::memory_order_acquire) != 0)
+            continue;
+
+        juce::AudioBuffer<float> sourceBuffer;
+        double sourceSampleRate = 0.0;
+        uint64_t sourceVersion = 0;
+        if (!strip->copySoundTouchPitchSourceBuffer(sourceBuffer, sourceSampleRate, sourceVersion))
+            continue;
+
+        const int requestId = bungeePitchCacheRequestIds[idx].fetch_add(1, std::memory_order_acq_rel) + 1;
+        bungeePitchCacheInFlight[idx].store(1, std::memory_order_release);
+        auto job = std::make_unique<BungeePitchCacheJob>(*this,
+                                                         stripIndex,
+                                                         requestId,
+                                                         std::move(sourceBuffer),
+                                                         sourceSampleRate,
+                                                         sourceVersion,
+                                                         semitones);
+        bungeePitchCacheThreadPool.addJob(job.release(), true);
+    }
+}
+
+void MlrVSTAudioProcessor::queueSignalsmithPitchCacheResult(SignalsmithPitchCacheResult result)
+{
+    const juce::ScopedLock lock(signalsmithPitchCacheResultLock);
+    signalsmithPitchCacheResults.push_back(std::move(result));
+}
+
+void MlrVSTAudioProcessor::applyCompletedSignalsmithPitchCaches()
+{
+    std::vector<SignalsmithPitchCacheResult> results;
+    {
+        const juce::ScopedLock lock(signalsmithPitchCacheResultLock);
+        if (signalsmithPitchCacheResults.empty())
+            return;
+        results.swap(signalsmithPitchCacheResults);
+    }
+
+    for (auto& result : results)
+    {
+        if (result.stripIndex < 0 || result.stripIndex >= MaxStrips || audioEngine == nullptr)
+            continue;
+
+        const auto idx = static_cast<size_t>(result.stripIndex);
+        if (result.requestId != signalsmithPitchCacheRequestIds[idx].load(std::memory_order_acquire))
+        {
+            signalsmithPitchCacheInFlight[idx].store(0, std::memory_order_release);
+            continue;
+        }
+
+        signalsmithPitchCacheInFlight[idx].store(0, std::memory_order_release);
+
+        auto* strip = audioEngine->getStrip(result.stripIndex);
+        if (strip == nullptr || !result.success)
+            continue;
+
+        if (strip->getPitchShiftAlgorithm() != EnhancedAudioStrip::PitchShiftAlgorithm::Signalsmith
+            || strip->isSignalsmithLiveMode()
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample
+            || strip->isResamplePitchEnabled())
+        {
+            continue;
+        }
+
+        const float currentTargetSemitones = snapSignalsmithPitchCacheSemitones(strip->getPitchShift());
+        if (std::abs(currentTargetSemitones - result.semitones) > 0.01f)
+            continue;
+
+        strip->installSignalsmithPitchCache(std::move(result.renderedBuffer),
+                                            result.sourceSampleRate,
+                                            result.semitones,
+                                            result.sourceVersion);
+    }
+}
+
+void MlrVSTAudioProcessor::refreshPendingSignalsmithPitchCaches()
+{
+    if (audioEngine == nullptr)
+        return;
+
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        const auto idx = static_cast<size_t>(stripIndex);
+        auto* strip = audioEngine->getStrip(stripIndex);
+        if (strip == nullptr)
+            continue;
+
+        if (strip->getPitchShiftAlgorithm() != EnhancedAudioStrip::PitchShiftAlgorithm::Signalsmith
+            || strip->isSignalsmithLiveMode()
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain
+            || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample
+            || strip->isResamplePitchEnabled()
+            || !strip->hasAudio())
+        {
+            signalsmithPitchCacheObservedTargets[idx] = 0.0f;
+            signalsmithPitchCacheStableTicks[idx] = 0;
+            continue;
+        }
+
+        const float semitones = snapSignalsmithPitchCacheSemitones(strip->getPitchShift());
+        if (std::abs(semitones - signalsmithPitchCacheObservedTargets[idx]) > 0.01f)
+        {
+            if (signalsmithPitchCacheInFlight[idx].load(std::memory_order_acquire) != 0)
+                signalsmithPitchCacheRequestIds[idx].fetch_add(1, std::memory_order_acq_rel);
+            signalsmithPitchCacheObservedTargets[idx] = semitones;
+            signalsmithPitchCacheStableTicks[idx] = 0;
+        }
+        else if (signalsmithPitchCacheStableTicks[idx] < kSoundTouchPitchCacheStableTimerTicks)
+        {
+            ++signalsmithPitchCacheStableTicks[idx];
+        }
+
+        if (std::abs(semitones) <= 0.01f)
+        {
+            signalsmithPitchCacheStableTicks[idx] = 0;
+            continue;
+        }
+
+        if (strip->hasMatchingSignalsmithPitchCache(semitones))
+            continue;
+
+        if (signalsmithPitchCacheStableTicks[idx] < kSoundTouchPitchCacheStableTimerTicks)
+            continue;
+
+        if (signalsmithPitchCacheInFlight[idx].load(std::memory_order_acquire) != 0)
+            continue;
+
+        juce::AudioBuffer<float> sourceBuffer;
+        double sourceSampleRate = 0.0;
+        uint64_t sourceVersion = 0;
+        if (!strip->copySoundTouchPitchSourceBuffer(sourceBuffer, sourceSampleRate, sourceVersion))
+            continue;
+
+        const int requestId = signalsmithPitchCacheRequestIds[idx].fetch_add(1, std::memory_order_acq_rel) + 1;
+        signalsmithPitchCacheInFlight[idx].store(1, std::memory_order_release);
+        auto job = std::make_unique<SignalsmithPitchCacheJob>(*this,
+                                                              stripIndex,
+                                                              requestId,
+                                                              std::move(sourceBuffer),
+                                                              sourceSampleRate,
+                                                              sourceVersion,
+                                                              semitones);
+        signalsmithPitchCacheThreadPool.addJob(job.release(), true);
+    }
+}
+
 void MlrVSTAudioProcessor::applyLoopStripPitchSemitones(int stripIndex, float semitones)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips || audioEngine == nullptr)
         return;
 
+    const float storedSemitones = quantizePitchSemitonesForStripControl(stripIndex,
+                                                                        getStoredStripPitchSemitones(stripIndex));
     const float clamped = quantizePitchSemitonesForStripControl(stripIndex,
-                                                                juce::jlimit(-24.0f, 24.0f, semitones));
-    if (auto* parameter = parameters.getParameter("stripPitch" + juce::String(stripIndex)))
-    {
-        parameter->setValueNotifyingHost(parameter->convertTo0to1(clamped));
-    }
+                                                                juce::jlimit(-24.0f,
+                                                                             24.0f,
+                                                                             storedSemitones + semitones));
 
     if (auto* strip = audioEngine->getStrip(stripIndex))
         applyPitchControlToStrip(stripIndex, *strip, clamped);
@@ -4783,13 +5703,13 @@ void MlrVSTAudioProcessor::applyLoopPitchRoleStateToStrip(int stripIndex)
     if (sourceMidi < 0.0f)
     {
         loopPitchPendingRetune[static_cast<size_t>(stripIndex)].store(0, std::memory_order_release);
+        applyStoredPitchControlToStrip(stripIndex);
         return;
     }
 
-    const float rootNote = static_cast<float>(getGlobalRootNoteMidi());
-    const float deltaSemitones = juce::jlimit(-24.0f,
-                                              24.0f,
-                                              rootNote - sourceMidi);
+    const float deltaSemitones = computeNearestPitchClassCorrectionSemitones(
+        sourceMidi,
+        getGlobalRootNoteMidi());
 
     loopPitchPendingRetune[static_cast<size_t>(stripIndex)].store(0, std::memory_order_release);
     applyLoopStripPitchSemitones(stripIndex, deltaSemitones);
@@ -5032,7 +5952,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
     
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "quality",
-        "Grain Quality",
+        "Grain Q",
         juce::StringArray{"Linear", "Cubic", "Sinc", "Sinc HQ"},
         1,
         globalChoiceAttrs));
@@ -5086,20 +6006,20 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "pitchControlMode",
         "Pitch Control Mode",
-        juce::StringArray{"Pitch Shift", "Resample"},
+        juce::StringArray{"Pitch Shift", "SoundTouch", "Resample", "Signalsmith", "Bungee"},
         0,
         globalChoiceAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "flipTempoMatchMode",
         "Tempo Match Mode",
-        juce::StringArray{"Repitch", "MLR TS"},
+        juce::StringArray{"Repitch", "Stretch"},
         0,
         globalChoiceAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "stretchBackend",
-        "Stretch Backend",
+        "Stretch",
         juce::StringArray{"Resample", "SoundTouch", "Bungee"},
         1,
         globalChoiceAttrs));
@@ -5109,6 +6029,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         "Scene Mode",
         false,
         globalBoolAttrs));
+
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "sceneRecallMode",
+        "Scene Change",
+        juce::StringArray{"Grid", "Pattern End", "Scene End", "Manual"},
+        0,
+        globalChoiceAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterBool>(
         "soundTouchEnabled",
@@ -5123,6 +6050,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
             "Strip " + juce::String(i + 1) + " Volume",
             juce::NormalisableRange<float>(0.0f, 1.0f),
             1.0f));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripTrimDb" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Trim",
+            juce::NormalisableRange<float>(-36.0f, 36.0f, 0.1f),
+            0.0f));
             
         layout.add(std::make_unique<juce::AudioParameterFloat>(
             "stripPan" + juce::String(i),
@@ -5149,9 +6082,16 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
             1.0f));
 
         layout.add(std::make_unique<juce::AudioParameterChoice>(
+            "stripPitchControlMode" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Pitch Control Mode",
+            juce::StringArray{"Global", "Pitch Shift", "SoundTouch", "Resample", "Signalsmith", "Bungee"},
+            0,
+            globalChoiceAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterChoice>(
             "stripTempoMatchMode" + juce::String(i),
             "Strip " + juce::String(i + 1) + " Tempo Match Mode",
-            juce::StringArray{"Global", "Repitch", "MLR TS"},
+            juce::StringArray{"Global", "Repitch", "Stretch"},
             0,
             globalChoiceAttrs));
 
@@ -5224,6 +6164,7 @@ void MlrVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     audioEngine->prepareToPlay(sampleRate, samplesPerBlock);
     for (auto& scratch : sampleModeScratchBuffers)
         scratch.setSize(2, samplesPerBlock, false, false, true);
+    sampleModeRenderedLastBlock.fill(false);
     for (auto& engine : sampleModeEngines)
     {
         if (engine != nullptr)
@@ -5274,10 +6215,24 @@ void MlrVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     pendingPersistentGlobalControlsRestore.store(1, std::memory_order_release);
     pendingPersistentGlobalControlsRestoreMs = juce::Time::currentTimeMillis() + 250;
     pendingPersistentGlobalControlsRestoreRemaining = 5;
+    if constexpr (kReportRealtimeSignalsmithLatencyToHost)
+    {
+        lastReportedLatencySamples = audioEngine != nullptr
+            ? audioEngine->getRealtimeSignalsmithAlignmentLatencySamples()
+            : 0;
+        setLatencySamples(lastReportedLatencySamples);
+    }
+    else
+    {
+        lastReportedLatencySamples = 0;
+    }
 }
 
 void MlrVSTAudioProcessor::releaseResources()
 {
+    if constexpr (kReportRealtimeSignalsmithLatencyToHost)
+        setLatencySamples(0);
+    lastReportedLatencySamples = 0;
     stopTimer();
     monomeConnection.disconnect();
 }
@@ -5341,6 +6296,8 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         // No playhead - assume playing  
         posInfo.setIsPlaying(true);
     }
+
+    lastHostTransportPlaying.store(posInfo.getIsPlaying() ? 1 : 0, std::memory_order_release);
     
     // Set tempo FIRST: use host tempo if available, otherwise fallback default.
     if (!posInfo.getBpm().hasValue() || *posInfo.getBpm() <= 0.0)
@@ -5422,6 +6379,8 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     // Update strip parameters
     const int globalRootMidi = getGlobalRootNoteMidi();
     const auto globalScale = getGlobalPitchScale();
+    const auto currentPpq = posInfo.getPpqPosition();
+    const int64_t currentGlobalSample = audioEngine != nullptr ? audioEngine->getGlobalSampleCount() : -1;
     for (int i = 0; i < MaxStrips; ++i)
     {
         auto* strip = audioEngine->getStrip(i);
@@ -5431,6 +6390,10 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
             auto* volumeParam = stripVolumeParams[static_cast<size_t>(i)];
             if (volumeParam)
                 strip->setVolume(*volumeParam);
+
+            auto* trimParam = stripTrimDbParams[static_cast<size_t>(i)];
+            if (trimParam)
+                strip->setTrimDb(trimParam->load(std::memory_order_acquire));
             
             auto* panParam = stripPanParams[static_cast<size_t>(i)];
             if (panParam)
@@ -5446,13 +6409,62 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
 
             auto* pitchParam = stripPitchParams[static_cast<size_t>(i)];
             if (pitchParam)
-                applyPitchControlToStrip(i, *strip, pitchParam->load(std::memory_order_acquire));
+            {
+                const bool hadResamplePitch = strip->isResamplePitchEnabled();
+                const float previousResampleRatio = strip->getResamplePitchRatio();
+                const bool syncRoleActive = getLoopPitchRole(i) == LoopPitchRole::Sync;
+                const bool syncRetunePending =
+                    loopPitchPendingRetune[static_cast<size_t>(i)].load(std::memory_order_acquire) != 0;
+
+                if (syncRoleActive)
+                {
+                    if (syncRetunePending)
+                        applyPitchControlToStrip(i, *strip, getPitchSemitonesForDisplay(*strip));
+                    else
+                        applyLoopPitchRoleStateToStrip(i);
+                }
+                else
+                {
+                    applyPitchControlToStrip(i, *strip, pitchParam->load(std::memory_order_acquire));
+                }
+
+                const bool hasResamplePitch = strip->isResamplePitchEnabled();
+                const float currentResampleRatio = strip->getResamplePitchRatio();
+                const bool resamplePitchStateChanged = hadResamplePitch != hasResamplePitch
+                    || ((hadResamplePitch || hasResamplePitch)
+                        && std::abs(previousResampleRatio - currentResampleRatio) > 1.0e-5f);
+
+                // When a running loop strip switches its resample pitch path, rebuild the
+                // trigger/fallback references from the current PPQ anchor immediately so
+                // the strip stays locked to the same musical phase.
+                if (resamplePitchStateChanged
+                    && strip->isPlaying()
+                    && strip->isPpqTimelineAnchored()
+                    && currentPpq.hasValue()
+                    && std::isfinite(*currentPpq)
+                    && currentGlobalSample >= 0)
+                {
+                    strip->realignToPpqAnchor(*currentPpq, currentGlobalSample);
+                }
+            }
 
             auto* sliceLengthParam = stripSliceLengthParams[static_cast<size_t>(i)];
             if (sliceLengthParam)
                 strip->setLoopSliceLength(sliceLengthParam->load(std::memory_order_acquire));
 
-            strip->setTempoMatchBackend(resolveLoopTempoMatchBackendForStrip(i));
+            const auto previousTempoMatchBackend = strip->getTempoMatchBackend();
+            const auto resolvedTempoMatchBackend = resolveLoopTempoMatchBackendForStrip(i);
+            strip->setTempoMatchBackend(resolvedTempoMatchBackend);
+
+            if (previousTempoMatchBackend != resolvedTempoMatchBackend
+                && strip->isPlaying()
+                && strip->isPpqTimelineAnchored()
+                && currentPpq.hasValue()
+                && std::isfinite(*currentPpq)
+                && currentGlobalSample >= 0)
+            {
+                strip->realignToPpqAnchor(*currentPpq, currentGlobalSample);
+            }
 
             auto* duckEnabledParam = stripDuckEnabledParams[static_cast<size_t>(i)];
             if (duckEnabledParam)
@@ -5540,6 +6552,45 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         // Process audio
         audioEngine->processBlock(buffer, midiMessages, posInfo, nullptr);
     }
+
+    if (sceneRecallBlendSamplesRemaining > 0 && sceneRecallBlendTotalSamples > 0)
+    {
+        const int blendChannels = juce::jmin(buffer.getNumChannels(), kSceneRecallBlendMaxChannels);
+        for (int sample = 0;
+             sample < buffer.getNumSamples() && sceneRecallBlendSamplesRemaining > 0;
+             ++sample)
+        {
+            const float progress = 1.0f
+                - (static_cast<float>(sceneRecallBlendSamplesRemaining)
+                   / static_cast<float>(sceneRecallBlendTotalSamples));
+            const float t = juce::jlimit(0.0f, 1.0f, progress);
+            const float smoothT = t * t * (3.0f - (2.0f * t));
+
+            for (int channel = 0; channel < blendChannels; ++channel)
+            {
+                const float in = buffer.getSample(channel, sample);
+                const float start = sceneRecallBlendStartSamples[static_cast<size_t>(channel)];
+                buffer.setSample(channel, sample, (start * (1.0f - smoothT)) + (in * smoothT));
+            }
+
+            --sceneRecallBlendSamplesRemaining;
+        }
+
+        if (sceneRecallBlendSamplesRemaining <= 0)
+        {
+            sceneRecallBlendSamplesRemaining = 0;
+            sceneRecallBlendTotalSamples = 0;
+        }
+    }
+
+    lastRenderedOutputSamples.fill(0.0f);
+    if (buffer.getNumSamples() > 0)
+    {
+        const int lastSample = buffer.getNumSamples() - 1;
+        const int captureChannels = juce::jmin(buffer.getNumChannels(), kSceneRecallBlendMaxChannels);
+        for (int channel = 0; channel < captureChannels; ++channel)
+            lastRenderedOutputSamples[static_cast<size_t>(channel)] = buffer.getSample(channel, lastSample);
+    }
 }
 
 //==============================================================================
@@ -5621,7 +6672,7 @@ void MlrVSTAudioProcessor::stripPersistentGlobalControlsFromState(juce::ValueTre
 //==============================================================================
 bool MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& file)
 {
-    if (file.existsAsFile() && stripIndex >= 0 && stripIndex < MaxStrips)
+    if (safeFileExistsAsFile(file) && stripIndex >= 0 && stripIndex < MaxStrips)
     {
         const auto idx = static_cast<size_t>(stripIndex);
         loopStripLoadRequestIds[idx].fetch_add(1, std::memory_order_acq_rel);
@@ -5668,7 +6719,7 @@ bool MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& f
 
 bool MlrVSTAudioProcessor::loadSampleToStripPreservingPlaybackState(int stripIndex, const juce::File& file)
 {
-    if (stripIndex < 0 || stripIndex >= MaxStrips || !file.existsAsFile() || audioEngine == nullptr)
+    if (stripIndex < 0 || stripIndex >= MaxStrips || !safeFileExistsAsFile(file) || audioEngine == nullptr)
         return false;
 
     auto* strip = audioEngine->getStrip(stripIndex);
@@ -5770,7 +6821,7 @@ bool MlrVSTAudioProcessor::loadSampleToStripPreservingPlaybackState(int stripInd
 
 bool MlrVSTAudioProcessor::loadSampleToSampleModeStrip(int stripIndex, const juce::File& file)
 {
-    if (!file.existsAsFile() || stripIndex < 0 || stripIndex >= MaxStrips)
+    if (!safeFileExistsAsFile(file) || stripIndex < 0 || stripIndex >= MaxStrips)
         return false;
 
     const auto idx = static_cast<size_t>(stripIndex);
@@ -6037,7 +7088,7 @@ juce::String MlrVSTAudioProcessor::createEmbeddedFlipSampleData(int stripIndex) 
         return {};
 
     const auto storedPath = currentStripFiles[static_cast<size_t>(stripIndex)].getFullPathName().trim();
-    if (storedPath.isNotEmpty() && juce::File(storedPath).existsAsFile())
+    if (storedPath.isNotEmpty() && safeFileExistsAsFile(juce::File(storedPath)))
         return {};
 
     auto* engine = const_cast<MlrVSTAudioProcessor*>(this)->getSampleModeEngine(stripIndex, false);
@@ -6047,7 +7098,7 @@ juce::String MlrVSTAudioProcessor::createEmbeddedFlipSampleData(int stripIndex) 
     const auto sample = engine->getLoadedSample();
     if (sample == nullptr || sample->audioBuffer.getNumSamples() <= 0)
         return {};
-    if (sample->sourcePath.isNotEmpty() && juce::File(sample->sourcePath).existsAsFile())
+    if (sample->sourcePath.isNotEmpty() && safeFileExistsAsFile(juce::File(sample->sourcePath)))
         return {};
 
     juce::String embeddedSample;
@@ -6105,6 +7156,7 @@ void MlrVSTAudioProcessor::renderSampleModeStrip(int stripIndex,
 
     if (!positionInfo.getIsPlaying())
     {
+        sampleModeRenderedLastBlock[static_cast<size_t>(stripIndex)] = false;
         engine->stop(true);
         strip->stop(true);
         engine->clearLegacyLoopMonitorState();
@@ -6232,7 +7284,11 @@ void MlrVSTAudioProcessor::renderSampleModeStrip(int stripIndex,
                                                      fadeSamples,
                                                      internalPitchSemitones,
                                                      preferHighQualityKeyLock);
-    if (renderResult.renderedAnything)
+    auto& renderedLastBlock = sampleModeRenderedLastBlock[static_cast<size_t>(stripIndex)];
+    if (!renderResult.renderedAnything && renderedLastBlock)
+        strip->armRealtimeSignalsmithAlignmentTail();
+
+    if (renderResult.renderedAnything || strip->hasPendingRealtimeSignalsmithAlignmentTail())
     {
         strip->processExternalOutputBuffer(scratch,
                                            0,
@@ -6243,6 +7299,8 @@ void MlrVSTAudioProcessor::renderSampleModeStrip(int stripIndex,
         output.addFrom(0, startSample, scratch, 0, 0, numSamples);
         output.addFrom(1, startSample, scratch, 1, 0, numSamples);
     }
+
+    renderedLastBlock = renderResult.renderedAnything;
 }
 
 void MlrVSTAudioProcessor::triggerSampleModeStripAtSample(int stripIndex,
@@ -6891,6 +7949,8 @@ void MlrVSTAudioProcessor::stopSampleModeStrip(int stripIndex, bool immediateSto
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
 
+    sampleModeRenderedLastBlock[static_cast<size_t>(stripIndex)] = false;
+
     auto* strip = audioEngine != nullptr ? audioEngine->getStrip(stripIndex) : nullptr;
     bool usedLegacyLoopEngine = false;
     if (auto* engine = getSampleModeEngine(stripIndex, false))
@@ -7081,7 +8141,8 @@ void MlrVSTAudioProcessor::setSceneRepeatCount(int sceneSlot, int repeats)
         return;
 
     sceneRepeatCounts[idx] = clampedRepeats;
-    if (sceneSequenceActive)
+    if (sceneSequenceActive
+        || (pendingSceneRecall.active && getSceneRecallMode() != SceneRecallMode::QuantizeGrid))
         pendingSceneRecall.targetResolved = false;
 }
 
@@ -7094,13 +8155,50 @@ MlrVSTAudioProcessor::SceneLengthMode MlrVSTAudioProcessor::getSceneLengthMode(i
 void MlrVSTAudioProcessor::setSceneLengthMode(int sceneSlot, SceneLengthMode mode)
 {
     const auto idx = static_cast<size_t>(juce::jlimit(0, SceneSlots - 1, sceneSlot));
+    const auto previousMode = sanitizeSceneLengthMode(sceneLengthModes[idx]);
     const int clampedMode = static_cast<int>(sanitizeSceneLengthMode(static_cast<int>(mode)));
     if (sceneLengthModes[idx] == clampedMode)
         return;
 
     sceneLengthModes[idx] = clampedMode;
-    if (sceneSequenceActive)
+    const auto newMode = sanitizeSceneLengthMode(clampedMode);
+    if (newMode == SceneLengthMode::ManualBars)
+        setSceneRepeatCount(sceneSlot, 1);
+    else if (previousMode == SceneLengthMode::ManualBars)
+        setSceneRepeatCount(sceneSlot, getSceneManualBars(sceneSlot));
+    if (sceneSequenceActive
+        || (pendingSceneRecall.active && getSceneRecallMode() != SceneRecallMode::QuantizeGrid))
         pendingSceneRecall.targetResolved = false;
+}
+
+MlrVSTAudioProcessor::SceneRecallMode MlrVSTAudioProcessor::getSceneRecallMode() const
+{
+    const int rawMode = sceneRecallModeParam != nullptr
+        ? static_cast<int>(sceneRecallModeParam->load(std::memory_order_acquire))
+        : 0;
+    return sanitizeSceneRecallMode(rawMode);
+}
+
+void MlrVSTAudioProcessor::setSceneRecallMode(SceneRecallMode mode)
+{
+    const int clampedMode = static_cast<int>(sanitizeSceneRecallMode(static_cast<int>(mode)));
+    bool changed = false;
+    if (auto* parameter = parameters.getParameter("sceneRecallMode"))
+    {
+        const float currentNormalized = parameter->getValue();
+        const float targetNormalized = parameter->convertTo0to1(static_cast<float>(clampedMode));
+        if (std::abs(currentNormalized - targetNormalized) > 1.0e-6f)
+        {
+            parameter->setValueNotifyingHost(targetNormalized);
+            changed = true;
+        }
+    }
+
+    if (pendingSceneRecall.active)
+        pendingSceneRecall.targetResolved = false;
+
+    if (changed)
+        markPersistentGlobalUserChange();
 }
 
 int MlrVSTAudioProcessor::getSceneManualBars(int sceneSlot) const
@@ -7117,7 +8215,8 @@ void MlrVSTAudioProcessor::setSceneManualBars(int sceneSlot, int bars)
         return;
 
     sceneManualBars[idx] = clampedBars;
-    if (sceneSequenceActive)
+    if (sceneSequenceActive
+        || (pendingSceneRecall.active && getSceneRecallMode() != SceneRecallMode::QuantizeGrid))
         pendingSceneRecall.targetResolved = false;
 }
 
@@ -7135,8 +8234,28 @@ void MlrVSTAudioProcessor::setSceneAnchorStrip(int sceneSlot, int stripIndex)
         return;
 
     sceneAnchorStrips[idx] = clampedStrip;
-    if (sceneSequenceActive)
+    if (sceneSequenceActive
+        || (pendingSceneRecall.active && getSceneRecallMode() != SceneRecallMode::QuantizeGrid))
         pendingSceneRecall.targetResolved = false;
+}
+
+int MlrVSTAudioProcessor::getSceneLengthCount(int sceneSlot) const
+{
+    return getSceneLengthMode(sceneSlot) == SceneLengthMode::ManualBars
+        ? getSceneManualBars(sceneSlot)
+        : getSceneRepeatCount(sceneSlot);
+}
+
+void MlrVSTAudioProcessor::setSceneLengthCount(int sceneSlot, int count)
+{
+    if (getSceneLengthMode(sceneSlot) == SceneLengthMode::ManualBars)
+    {
+        setSceneManualBars(sceneSlot, count);
+        setSceneRepeatCount(sceneSlot, 1);
+        return;
+    }
+
+    setSceneRepeatCount(sceneSlot, count);
 }
 
 double MlrVSTAudioProcessor::getResolvedSceneLengthBeats(int sceneSlot) const
@@ -7164,6 +8283,92 @@ double MlrVSTAudioProcessor::getResolvedSceneLengthBeats(int sceneSlot) const
     }
 
     return juce::jlimit(4.0, 4096.0, resolvedBeats);
+}
+
+double MlrVSTAudioProcessor::getSceneAdvanceLengthBeats(int sceneSlot) const
+{
+    const int clampedSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const double baseBeats = getResolvedSceneLengthBeats(clampedSlot);
+    if (getSceneLengthMode(clampedSlot) == SceneLengthMode::ManualBars)
+        return baseBeats;
+
+    return juce::jlimit(
+        1.0,
+        4096.0,
+        baseBeats * static_cast<double>(getSceneRepeatCount(clampedSlot)));
+}
+
+bool MlrVSTAudioProcessor::persistSceneTimingForSlot(int sceneSlot)
+{
+    const int clampedSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+    const int storageIndex = getSceneStoragePresetIndex(mainPresetIndex, clampedSlot);
+    if (!PresetStore::presetExists(storageIndex))
+        return false;
+
+    const bool updated = PresetStore::updatePresetAuxState(
+        storageIndex,
+        [this, clampedSlot]()
+        {
+            return createSceneChainStateXml(clampedSlot);
+        });
+    if (updated)
+        presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+    return updated;
+}
+
+int MlrVSTAudioProcessor::getSceneSequenceStepIndex(int sceneSlot) const
+{
+    const int clampedSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    for (size_t i = 0; i < sceneSequenceSlots.size(); ++i)
+        if (sceneSequenceSlots[i] == clampedSlot)
+            return static_cast<int>(i);
+    return -1;
+}
+
+int MlrVSTAudioProcessor::getQueuedSceneSlot() const
+{
+    const int queuedApplySlot = pendingSceneApplySlot.load(std::memory_order_acquire);
+    if (queuedApplySlot >= 0)
+        return juce::jlimit(0, SceneSlots - 1, queuedApplySlot);
+    if (pendingSceneRecall.active)
+        return juce::jlimit(0, SceneSlots - 1, pendingSceneRecall.sceneSlot);
+    return -1;
+}
+
+juce::String MlrVSTAudioProcessor::getSceneSequenceSummaryText() const
+{
+    const int activeSlot = getActiveSceneSlot();
+    const int queuedSlot = getQueuedSceneSlot();
+    juce::String changeModeLabel;
+    switch (getSceneRecallMode())
+    {
+        case SceneRecallMode::QuantizeGrid: changeModeLabel = "Grid"; break;
+        case SceneRecallMode::PatternEnd:   changeModeLabel = "Pattern End"; break;
+        case SceneRecallMode::SceneEnd:     changeModeLabel = "Scene End"; break;
+        case SceneRecallMode::Manual:       changeModeLabel = "Manual"; break;
+    }
+    if (!sceneSequenceActive || sceneSequenceSlots.size() < 2)
+    {
+        juce::String summary = "Chain: off | Change: " + changeModeLabel
+            + " | Active: S" + juce::String(activeSlot + 1);
+        if (queuedSlot >= 0)
+            summary << " | Next: S" << juce::String(queuedSlot + 1);
+        return summary;
+    }
+
+    juce::String summary = "Chain: ";
+    for (size_t i = 0; i < sceneSequenceSlots.size(); ++i)
+    {
+        if (i > 0)
+            summary << " -> ";
+        summary << "S" << juce::String(sceneSequenceSlots[i] + 1);
+    }
+    summary << " | Change: " << changeModeLabel;
+    summary << " | Active: S" << juce::String(activeSlot + 1);
+    if (queuedSlot >= 0)
+        summary << " | Next: S" << juce::String(queuedSlot + 1);
+    return summary;
 }
 
 std::unique_ptr<juce::XmlElement> MlrVSTAudioProcessor::createSceneChainStateXml(int sceneSlotOverride) const
@@ -7325,7 +8530,98 @@ double MlrVSTAudioProcessor::computeLongestPatternSceneSequenceLengthBeats() con
 
 double MlrVSTAudioProcessor::computeCurrentSceneSequenceLengthBeats() const
 {
-    return getResolvedSceneLengthBeats(activeSceneSlot);
+    return getSceneAdvanceLengthBeats(activeSceneSlot);
+}
+
+double MlrVSTAudioProcessor::computeNextScenePatternEndPpq(int sceneSlot,
+                                                           double currentPpq,
+                                                           double cycleBeats,
+                                                           uint64_t* outPhaseSignature) const
+{
+    if (audioEngine == nullptr
+        || !std::isfinite(currentPpq)
+        || !std::isfinite(cycleBeats)
+        || cycleBeats <= 0.0)
+    {
+        if (outPhaseSignature != nullptr)
+            *outPhaseSignature = 0;
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    const int clampedSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const auto lengthMode = getSceneLengthMode(clampedSceneSlot);
+    const int anchorStrip = juce::jlimit(0, MaxStrips - 1, getSceneAnchorStrip(clampedSceneSlot));
+
+    bool foundCandidate = false;
+    double nextPatternEndPpq = std::numeric_limits<double>::quiet_NaN();
+    uint64_t phaseSignature = 0xcbf29ce484222325ull;
+
+    auto combineSignature = [&phaseSignature](uint64_t value)
+    {
+        phaseSignature ^= value + 0x9e3779b97f4a7c15ull + (phaseSignature << 6) + (phaseSignature >> 2);
+    };
+
+    auto accumulateStripBoundary = [&](int stripIndex)
+    {
+        if (stripIndex < 0 || stripIndex >= MaxStrips)
+            return;
+
+        auto* strip = audioEngine->getStrip(stripIndex);
+        if (strip == nullptr || !strip->isPlaying())
+            return;
+
+        const auto playMode = strip->getPlayMode();
+        if (playMode == EnhancedAudioStrip::PlayMode::Step)
+            return;
+
+        const bool hasStripAudio = playMode == EnhancedAudioStrip::PlayMode::Sample
+            ? hasSampleModeAudio(stripIndex)
+            : strip->hasAudio();
+        if (!hasStripAudio)
+            return;
+
+        const double triggerPpq = strip->getLastTriggerPPQ();
+        if (!std::isfinite(triggerPpq) || triggerPpq < 0.0)
+            return;
+
+        uint64_t triggerBits = 0;
+        static_assert(sizeof(triggerBits) == sizeof(triggerPpq), "Unexpected double size");
+        std::memcpy(&triggerBits, &triggerPpq, sizeof(triggerBits));
+        combineSignature(static_cast<uint64_t>(stripIndex + 1));
+        combineSignature(static_cast<uint64_t>(playMode));
+        combineSignature(triggerBits);
+
+        const double stripCycleBeats = juce::jmax(
+            cycleBeats,
+            computeStripSceneSequenceLengthBeats(stripIndex));
+        if (!std::isfinite(stripCycleBeats) || stripCycleBeats <= 0.0)
+            return;
+
+        double nextBoundary = triggerPpq + stripCycleBeats;
+        if (nextBoundary <= currentPpq + 1.0e-9)
+        {
+            const double elapsed = juce::jmax(0.0, currentPpq - triggerPpq);
+            const double completedCycles = std::floor(elapsed / juce::jmax(1.0e-9, stripCycleBeats));
+            nextBoundary = triggerPpq + ((completedCycles + 1.0) * stripCycleBeats);
+        }
+
+        nextPatternEndPpq = foundCandidate ? juce::jmax(nextPatternEndPpq, nextBoundary) : nextBoundary;
+        foundCandidate = true;
+    };
+
+    if (lengthMode == SceneLengthMode::AnchorStrip)
+        accumulateStripBoundary(anchorStrip);
+
+    if (!foundCandidate)
+    {
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+            accumulateStripBoundary(stripIndex);
+    }
+
+    if (outPhaseSignature != nullptr)
+        *outPhaseSignature = foundCandidate ? phaseSignature : 0;
+
+    return foundCandidate ? nextPatternEndPpq : std::numeric_limits<double>::quiet_NaN();
 }
 
 void MlrVSTAudioProcessor::armNextSceneInSequence(int mainPresetIndex, int currentSceneSlot, double sceneStartPpq)
@@ -7366,6 +8662,8 @@ void MlrVSTAudioProcessor::armNextSceneInSequence(int mainPresetIndex, int curre
     pendingSceneRecall.sceneSlot = nextSlot;
     pendingSceneRecall.targetPpq = 0.0;
     pendingSceneRecall.intervalBeats = 0.0;
+    pendingSceneRecall.patternEndPhaseSignatureValid = false;
+    pendingSceneRecall.patternEndPhaseSignature = 0;
 
     if (!isTimerRunning())
         startTimer(kGridRefreshMs);
@@ -7480,9 +8778,12 @@ void MlrVSTAudioProcessor::applySceneModeState(bool enabled)
     pendingSceneApplyTargetTempo.store(120.0, std::memory_order_release);
     pendingSceneApplyTargetSample.store(-1, std::memory_order_release);
     scenePadHeld.fill(false);
-    scenePadHoldSaveTriggered.fill(false);
+    scenePadHoldDeleteTriggered.fill(false);
     scenePadPressStartMs.fill(0);
-    scenePadSaveBurstUntilMs.fill(0);
+    scenePadActionBurstUntilMs.fill(0);
+    scenePadLastTapMs.fill(0);
+    sceneCopySourceSlot = -1;
+    sceneCopyMainPresetIndex = 0;
 
     updateMonomeLEDs();
     presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
@@ -7541,11 +8842,31 @@ bool MlrVSTAudioProcessor::copySceneForMainPreset(int mainPresetIndex, int sourc
     if (!sourceExists)
     {
         if (PresetStore::presetExists(destStorageIndex))
-            return PresetStore::deletePreset(destStorageIndex);
+        {
+            const bool deleted = PresetStore::deletePreset(destStorageIndex);
+            if (deleted)
+                presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+            return deleted;
+        }
         return true;
     }
 
-    return PresetStore::copyPreset(sourceStorageIndex, destStorageIndex);
+    const bool copied = PresetStore::copyPreset(sourceStorageIndex, destStorageIndex);
+    if (copied)
+        presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+    return copied;
+}
+
+bool MlrVSTAudioProcessor::deleteSceneForMainPreset(int mainPresetIndex, int sceneSlot)
+{
+    const int storageIndex = getSceneStoragePresetIndex(mainPresetIndex, sceneSlot);
+    if (!PresetStore::presetExists(storageIndex))
+        return true;
+
+    const bool deleted = PresetStore::deletePreset(storageIndex);
+    if (deleted)
+        presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+    return deleted;
 }
 
 bool MlrVSTAudioProcessor::captureSceneSlot(int sceneSlot)
@@ -7599,18 +8920,37 @@ void MlrVSTAudioProcessor::requestSceneRecallQuantized(int mainPresetIndex, int 
         return;
 
     activeSceneMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
-    pendingSceneRecall.active = true;
+    const int clampedSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const bool directManualRecall = !sequenceDriven && getSceneRecallMode() == SceneRecallMode::Manual;
+    const bool hostTransportPlaying = isHostTransportPlaying();
+    const bool immediateRecall = !sequenceDriven && (!hostTransportPlaying || directManualRecall);
+
+    pendingSceneRecall.active = !immediateRecall;
     pendingSceneRecall.sequenceDriven = sequenceDriven;
     pendingSceneRecall.targetResolved = false;
     pendingSceneRecall.mainPresetIndex = activeSceneMainPresetIndex;
-    pendingSceneRecall.sceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    pendingSceneRecall.sceneSlot = clampedSceneSlot;
     pendingSceneRecall.targetPpq = 0.0;
     pendingSceneRecall.intervalBeats = 4.0;
+    pendingSceneRecall.patternEndPhaseSignatureValid = false;
+    pendingSceneRecall.patternEndPhaseSignature = 0;
     if (!sequenceDriven)
         sceneSequenceStartPpqValid = false;
 
-    if (!isTimerRunning())
-        startTimer(kGridRefreshMs);
+    if (immediateRecall)
+    {
+        double hostPpqSnapshot = std::numeric_limits<double>::quiet_NaN();
+        double hostTempoSnapshot = std::numeric_limits<double>::quiet_NaN();
+        const bool hasHostSync = getHostSyncSnapshot(hostPpqSnapshot, hostTempoSnapshot);
+        pendingSceneApplyTargetPpq.store(hasHostSync ? hostPpqSnapshot : -1.0, std::memory_order_release);
+        pendingSceneApplyTargetTempo.store(hasHostSync ? hostTempoSnapshot : 120.0, std::memory_order_release);
+        pendingSceneApplyTargetSample.store(audioEngine->getGlobalSampleCount(), std::memory_order_release);
+        pendingSceneApplyMainPreset.store(activeSceneMainPresetIndex, std::memory_order_release);
+        pendingSceneApplySlot.store(clampedSceneSlot, std::memory_order_release);
+        pendingSceneApplySequenceDriven.store(0, std::memory_order_release);
+    }
+
+    refreshUtilityTimerCadence();
 }
 
 double MlrVSTAudioProcessor::getSceneRecallIntervalBeats() const
@@ -7636,6 +8976,14 @@ void MlrVSTAudioProcessor::updateSceneQuantizedRecall(
     if (pendingSceneApplySlot.load(std::memory_order_acquire) >= 0)
         return;
 
+    if (!posInfo.getIsPlaying())
+    {
+        pendingSceneRecall.targetResolved = false;
+        pendingSceneRecall.patternEndPhaseSignatureValid = false;
+        pendingSceneRecall.patternEndPhaseSignature = 0;
+        return;
+    }
+
     const auto ppqOpt = posInfo.getPpqPosition();
     const auto bpmOpt = posInfo.getBpm();
     if (!ppqOpt.hasValue() || !bpmOpt.hasValue()
@@ -7646,19 +8994,36 @@ void MlrVSTAudioProcessor::updateSceneQuantizedRecall(
     }
 
     const double currentPpq = *ppqOpt;
-    const bool sequenceTimingReady = pendingSceneRecall.sequenceDriven
+    const auto sceneRecallMode = getSceneRecallMode();
+    const bool patternEndEnabled = sceneRecallMode == SceneRecallMode::PatternEnd;
+    const bool sceneEndEnabled = sceneRecallMode == SceneRecallMode::SceneEnd;
+    const bool manualSceneChange = sceneRecallMode == SceneRecallMode::Manual;
+    const int currentSceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    const double currentSceneDurationBeats = juce::jlimit(
+        0.25,
+        4096.0,
+        computeCurrentSceneSequenceLengthBeats());
+    uint64_t phaseAlignedPatternEndSignature = 0;
+    const double phaseAlignedPatternEndPpq = patternEndEnabled
+        ? computeNextScenePatternEndPpq(
+              currentSceneSlot,
+              currentPpq,
+              currentSceneDurationBeats,
+              &phaseAlignedPatternEndSignature)
+        : std::numeric_limits<double>::quiet_NaN();
+    const bool phaseAlignedTimingReady = patternEndEnabled && std::isfinite(phaseAlignedPatternEndPpq);
+    const bool sequenceTimingReady = sceneEndEnabled
+        && pendingSceneRecall.sequenceDriven
         && sceneSequenceStartPpqValid
         && std::isfinite(sceneSequenceStartPpq);
+    const bool manualSceneEndTimingReady = sceneEndEnabled
+        && !pendingSceneRecall.sequenceDriven
+        && activeSceneStartPpqValid
+        && std::isfinite(activeSceneStartPpq);
+    const bool useSceneDurationTiming = phaseAlignedTimingReady || sequenceTimingReady || manualSceneEndTimingReady;
     double intervalBeatsNow = getSceneRecallIntervalBeats();
-    if (sequenceTimingReady)
-    {
-        const int currentSceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
-        intervalBeatsNow = juce::jlimit(
-            0.25,
-            4096.0,
-            computeCurrentSceneSequenceLengthBeats()
-                * static_cast<double>(getSceneRepeatCount(currentSceneSlot)));
-    }
+    if (useSceneDurationTiming)
+        intervalBeatsNow = currentSceneDurationBeats;
 
     if (pendingSceneRecall.targetResolved
         && std::abs(intervalBeatsNow - pendingSceneRecall.intervalBeats) > 1.0e-9)
@@ -7667,17 +9032,61 @@ void MlrVSTAudioProcessor::updateSceneQuantizedRecall(
         pendingSceneRecall.targetPpq = 0.0;
     }
 
+    if (patternEndEnabled)
+    {
+        if (phaseAlignedTimingReady)
+        {
+            if (!pendingSceneRecall.patternEndPhaseSignatureValid
+                || pendingSceneRecall.patternEndPhaseSignature != phaseAlignedPatternEndSignature)
+            {
+                pendingSceneRecall.targetResolved = false;
+                pendingSceneRecall.targetPpq = 0.0;
+            }
+
+            pendingSceneRecall.patternEndPhaseSignatureValid = true;
+            pendingSceneRecall.patternEndPhaseSignature = phaseAlignedPatternEndSignature;
+        }
+        else if (pendingSceneRecall.patternEndPhaseSignatureValid)
+        {
+            pendingSceneRecall.patternEndPhaseSignatureValid = false;
+            pendingSceneRecall.patternEndPhaseSignature = 0;
+            pendingSceneRecall.targetResolved = false;
+            pendingSceneRecall.targetPpq = 0.0;
+        }
+    }
+    else if (pendingSceneRecall.patternEndPhaseSignatureValid)
+    {
+        pendingSceneRecall.patternEndPhaseSignatureValid = false;
+        pendingSceneRecall.patternEndPhaseSignature = 0;
+    }
+
+    if (manualSceneChange && pendingSceneRecall.sequenceDriven)
+    {
+        pendingSceneRecall.active = false;
+        pendingSceneRecall.targetResolved = false;
+        return;
+    }
+
     if (!pendingSceneRecall.targetResolved)
     {
         pendingSceneRecall.intervalBeats = intervalBeatsNow;
-        if (sequenceTimingReady)
+        if (manualSceneChange)
         {
-            double nextTarget = sceneSequenceStartPpq + intervalBeatsNow;
+            pendingSceneRecall.targetPpq = currentPpq;
+        }
+        else if (phaseAlignedTimingReady)
+        {
+            pendingSceneRecall.targetPpq = phaseAlignedPatternEndPpq;
+        }
+        else if (useSceneDurationTiming)
+        {
+            const double sceneStartReference = sequenceTimingReady ? sceneSequenceStartPpq : activeSceneStartPpq;
+            double nextTarget = sceneStartReference + intervalBeatsNow;
             if (nextTarget <= currentPpq + 1.0e-9)
             {
-                const double elapsed = juce::jmax(0.0, currentPpq - sceneSequenceStartPpq);
+                const double elapsed = juce::jmax(0.0, currentPpq - sceneStartReference);
                 const double completedCycles = std::floor(elapsed / juce::jmax(1.0e-9, intervalBeatsNow));
-                nextTarget = sceneSequenceStartPpq + ((completedCycles + 1.0) * intervalBeatsNow);
+                nextTarget = sceneStartReference + ((completedCycles + 1.0) * intervalBeatsNow);
             }
             pendingSceneRecall.targetPpq = nextTarget;
         }
@@ -7735,18 +9144,27 @@ void MlrVSTAudioProcessor::processPendingSceneApply()
         && std::isfinite(queuedTargetTempo)
         && queuedTargetPpq >= 0.0
         && queuedTargetTempo > 0.0;
+    const bool preserveSceneSequence = sceneSequenceActive && sceneSequenceSlots.size() >= 2;
+    const bool effectiveSequenceDriven = queuedSequenceDriven || preserveSceneSequence;
+    const auto preservedSceneSequenceSlots = preserveSceneSequence ? sceneSequenceSlots : std::vector<int>{};
+    const bool hostTransportPlaying = isHostTransportPlaying();
+    auto requeuePendingApply = [&]()
+    {
+        pendingSceneApplyMainPreset.store(clampedMain, std::memory_order_release);
+        pendingSceneApplySlot.store(clampedSlot, std::memory_order_release);
+        pendingSceneApplySequenceDriven.store(effectiveSequenceDriven ? 1 : 0, std::memory_order_release);
+        pendingSceneApplyTargetPpq.store(queuedTargetPpq, std::memory_order_release);
+        pendingSceneApplyTargetTempo.store(queuedTargetTempo, std::memory_order_release);
+        pendingSceneApplyTargetSample.store(queuedTargetSample, std::memory_order_release);
+    };
 
     const int64_t currentGlobalSample = audioEngine != nullptr ? audioEngine->getGlobalSampleCount() : -1;
     if (queuedTargetSample >= 0
         && currentGlobalSample >= 0
+        && (hostTransportPlaying || effectiveSequenceDriven)
         && currentGlobalSample + 1 < queuedTargetSample)
     {
-        pendingSceneApplyMainPreset.store(clampedMain, std::memory_order_release);
-        pendingSceneApplySlot.store(clampedSlot, std::memory_order_release);
-        pendingSceneApplySequenceDriven.store(queuedSequenceDriven ? 1 : 0, std::memory_order_release);
-        pendingSceneApplyTargetPpq.store(queuedTargetPpq, std::memory_order_release);
-        pendingSceneApplyTargetTempo.store(queuedTargetTempo, std::memory_order_release);
-        pendingSceneApplyTargetSample.store(queuedTargetSample, std::memory_order_release);
+        requeuePendingApply();
         return;
     }
 
@@ -7757,39 +9175,56 @@ void MlrVSTAudioProcessor::processPendingSceneApply()
         && std::isfinite(hostTempoSnapshot)
         && hostTempoSnapshot > 0.0;
 
-    if (!queuedTimingValid && !hasHostSync)
+    if (effectiveSequenceDriven && !hostTransportPlaying)
     {
-        pendingSceneApplyMainPreset.store(clampedMain, std::memory_order_release);
-        pendingSceneApplySlot.store(clampedSlot, std::memory_order_release);
-        pendingSceneApplySequenceDriven.store(queuedSequenceDriven ? 1 : 0, std::memory_order_release);
-        pendingSceneApplyTargetPpq.store(queuedTargetPpq, std::memory_order_release);
-        pendingSceneApplyTargetTempo.store(queuedTargetTempo, std::memory_order_release);
-        pendingSceneApplyTargetSample.store(queuedTargetSample, std::memory_order_release);
+        requeuePendingApply();
         return;
     }
+
+    if (!queuedTimingValid && !hasHostSync && effectiveSequenceDriven)
+    {
+        requeuePendingApply();
+        return;
+    }
+
+    const double appliedPpq = queuedTimingValid
+        ? queuedTargetPpq
+        : (hasHostSync ? hostPpqSnapshot : std::numeric_limits<double>::quiet_NaN());
+    const double appliedTempo = queuedTimingValid
+        ? queuedTargetTempo
+        : (hasHostSync ? hostTempoSnapshot : std::numeric_limits<double>::quiet_NaN());
+    const int64_t appliedGlobalSample = queuedTargetSample >= 0
+        ? queuedTargetSample
+        : (audioEngine != nullptr ? audioEngine->getGlobalSampleCount() : -1);
 
     if (sceneSlotExistsForMainPreset(clampedMain, clampedSlot))
     {
         performSceneLoad(clampedMain,
                          clampedSlot,
-                         queuedTimingValid ? queuedTargetPpq : hostPpqSnapshot,
-                         queuedTimingValid ? queuedTargetTempo : hostTempoSnapshot,
-                         queuedTargetSample);
+                         appliedPpq,
+                         appliedTempo,
+                         appliedGlobalSample);
     }
     else
     {
         performEmptySceneLoad();
     }
 
+    if (preserveSceneSequence)
+    {
+        sceneSequenceActive = true;
+        sceneSequenceSlots = preservedSceneSequenceSlots;
+    }
+
     activeSceneMainPresetIndex = clampedMain;
     activeSceneSlot = clampedSlot;
-    const double appliedSceneStartPpq = queuedTimingValid ? queuedTargetPpq : hostPpqSnapshot;
+    const double appliedSceneStartPpq = appliedPpq;
     activeSceneStartPpqValid = std::isfinite(appliedSceneStartPpq);
     activeSceneStartPpq = activeSceneStartPpqValid ? appliedSceneStartPpq : 0.0;
     if (PresetStore::presetExists(clampedMain))
         loadedPresetIndex = clampedMain;
-    if (queuedSequenceDriven)
-        armNextSceneInSequence(clampedMain, clampedSlot, queuedTimingValid ? queuedTargetPpq : hostPpqSnapshot);
+    if (effectiveSequenceDriven && getSceneRecallMode() != SceneRecallMode::Manual)
+        armNextSceneInSequence(clampedMain, clampedSlot, appliedPpq);
     else
         sceneSequenceStartPpqValid = false;
     presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
@@ -7805,9 +9240,29 @@ void MlrVSTAudioProcessor::performEmptySceneLoad()
         MlrVSTAudioProcessor& processor;
     } scopedSuspend(*this);
 
+    const auto preservedScenePadHeld = scenePadHeld;
+    const auto preservedScenePadHoldDeleteTriggered = scenePadHoldDeleteTriggered;
+    const auto preservedScenePadPressStartMs = scenePadPressStartMs;
+    const auto preservedScenePadActionBurstUntilMs = scenePadActionBurstUntilMs;
+    const auto preservedScenePadLastTapMs = scenePadLastTapMs;
+    const int preservedSceneCopySourceSlot = sceneCopySourceSlot;
+    const int preservedSceneCopyMainPresetIndex = sceneCopyMainPresetIndex;
+
     resetRuntimePresetStateToDefaults();
+    scenePadHeld = preservedScenePadHeld;
+    scenePadHoldDeleteTriggered = preservedScenePadHoldDeleteTriggered;
+    scenePadPressStartMs = preservedScenePadPressStartMs;
+    scenePadActionBurstUntilMs = preservedScenePadActionBurstUntilMs;
+    scenePadLastTapMs = preservedScenePadLastTapMs;
+    sceneCopySourceSlot = preservedSceneCopySourceSlot;
+    sceneCopyMainPresetIndex = preservedSceneCopyMainPresetIndex;
     for (auto& f : currentStripFiles)
         f = juce::File();
+
+    const int blendSamples = juce::jmax(12, static_cast<int>(std::round(currentSampleRate * 0.00035)));
+    sceneRecallBlendStartSamples = lastRenderedOutputSamples;
+    sceneRecallBlendTotalSamples = blendSamples;
+    sceneRecallBlendSamplesRemaining = blendSamples;
 
     syncSceneModeFromParameters();
     if (isSceneModeEnabled())
@@ -7834,7 +9289,22 @@ void MlrVSTAudioProcessor::performSceneLoad(int mainPresetIndex,
         MlrVSTAudioProcessor& processor;
     } scopedSuspend(*this);
 
+    const auto preservedScenePadHeld = scenePadHeld;
+    const auto preservedScenePadHoldDeleteTriggered = scenePadHoldDeleteTriggered;
+    const auto preservedScenePadPressStartMs = scenePadPressStartMs;
+    const auto preservedScenePadActionBurstUntilMs = scenePadActionBurstUntilMs;
+    const auto preservedScenePadLastTapMs = scenePadLastTapMs;
+    const int preservedSceneCopySourceSlot = sceneCopySourceSlot;
+    const int preservedSceneCopyMainPresetIndex = sceneCopyMainPresetIndex;
+
     resetRuntimePresetStateToDefaults();
+    scenePadHeld = preservedScenePadHeld;
+    scenePadHoldDeleteTriggered = preservedScenePadHoldDeleteTriggered;
+    scenePadPressStartMs = preservedScenePadPressStartMs;
+    scenePadActionBurstUntilMs = preservedScenePadActionBurstUntilMs;
+    scenePadLastTapMs = preservedScenePadLastTapMs;
+    sceneCopySourceSlot = preservedSceneCopySourceSlot;
+    sceneCopyMainPresetIndex = preservedSceneCopyMainPresetIndex;
     for (auto& f : currentStripFiles)
         f = juce::File();
 
@@ -7874,13 +9344,62 @@ void MlrVSTAudioProcessor::performSceneLoad(int mainPresetIndex,
         },
         hostPpqSnapshot,
         hostTempoSnapshot,
-        false,
+        true,
         hostGlobalSampleSnapshot);
 
     if (loadSucceeded)
     {
         normalizeLoopPitchMasterRoles();
         applyLoopPitchSyncToAllStrips();
+
+        if (std::isfinite(hostPpqSnapshot) && std::isfinite(hostTempoSnapshot) && hostTempoSnapshot > 0.0)
+        {
+            const int64_t recallSample = hostGlobalSampleSnapshot >= 0
+                ? hostGlobalSampleSnapshot
+                : audioEngine->getGlobalSampleCount();
+
+            // Scene recalls should start from bar 1 on the handoff beat rather than
+            // restoring whatever mid-loop phase happened to be saved.
+            for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+            {
+                auto* strip = audioEngine->getStrip(stripIndex);
+                if (strip == nullptr || !strip->isPlaying() || !strip->isPpqTimelineAnchored())
+                    continue;
+
+                if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+                    continue;
+
+                const bool hasStripAudio = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
+                    ? hasSampleModeAudio(stripIndex)
+                    : strip->hasAudio();
+                if (!hasStripAudio)
+                    continue;
+
+                const float manualBeats = strip->getBeatsPerLoop();
+                const double beatsForLoop = (manualBeats >= 0.0f)
+                    ? static_cast<double>(manualBeats)
+                    : static_cast<double>(juce::jmax(1, strip->getRecordingBars()) * 4);
+                if (!std::isfinite(beatsForLoop) || beatsForLoop <= 0.0)
+                    continue;
+
+                double alignedOffsetBeats = std::fmod(-hostPpqSnapshot, beatsForLoop);
+                if (alignedOffsetBeats < 0.0)
+                    alignedOffsetBeats += beatsForLoop;
+
+                strip->restorePresetPpqState(true,
+                                             true,
+                                             alignedOffsetBeats,
+                                             strip->getLoopStart(),
+                                             hostTempoSnapshot,
+                                             hostPpqSnapshot,
+                                             recallSample);
+            }
+        }
+
+        const int blendSamples = juce::jmax(12, static_cast<int>(std::round(currentSampleRate * 0.00035)));
+        sceneRecallBlendStartSamples = lastRenderedOutputSamples;
+        sceneRecallBlendTotalSamples = blendSamples;
+        sceneRecallBlendSamplesRemaining = blendSamples;
     }
 
     syncSceneModeFromParameters();
@@ -8467,7 +9986,9 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
     const bool applySpeedMacro = (bitCount >= 2);
     const bool threeButton = (bitCount == 3);
     const bool hardStepMode = (variant >= 4);
-    auto restoreSavedState = [this](EnhancedAudioStrip& strip, const MomentaryStutterSavedStripState& saved)
+    auto restoreSavedState = [this](int stripIndex,
+                                    EnhancedAudioStrip& strip,
+                                    const MomentaryStutterSavedStripState& saved)
     {
         strip.setPan(saved.pan);
         strip.setPlaybackSpeedImmediate(saved.playbackSpeed);
@@ -8475,7 +9996,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
 
         if (saved.stepMode)
         {
-            applyPitchControlToStrip(strip, saved.pitchSemitones);
+            applyPitchControlToStrip(stripIndex, strip, saved.pitchSemitones);
             if (auto* stepSampler = strip.getStepSampler())
             {
                 stepSampler->setPan(saved.pan);
@@ -8487,7 +10008,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         }
             else
             {
-                applyPitchControlToStrip(strip, saved.pitchShift);
+                applyPitchControlToStrip(stripIndex, strip, saved.pitchShift);
             }
 
         strip.setFilterAlgorithm(saved.filterAlgorithm);
@@ -8518,7 +10039,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
             if (!strip || !hasPlayableContent || !strip->isPlaying())
                 continue;
 
-            restoreSavedState(*strip, saved);
+            restoreSavedState(i, *strip, saved);
         }
 
         momentaryStutterLastComboMask = comboMask;
@@ -9310,10 +10831,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
             targetPitch = juce::jlimit(-12.0f, 12.0f, pitchBase + pitchOffsetBase + stripPitchSpread);
         }
 
-        if (stepMode)
-            applyPitchControlToStrip(*strip, targetPitch);
-        else
-            applyPitchControlToStrip(*strip, targetPitch);
+        applyPitchControlToStrip(i, *strip, targetPitch);
 
         if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Loop)
         {
@@ -9401,7 +10919,7 @@ void MlrVSTAudioProcessor::restoreMomentaryStutterMacroBaseline()
             strip->setLoopSliceLength(saved.loopSliceLength);
             if (saved.stepMode)
             {
-                applyPitchControlToStrip(*strip, saved.pitchSemitones);
+                applyPitchControlToStrip(i, *strip, saved.pitchSemitones);
                 if (auto* stepSampler = strip->getStepSampler())
                 {
                     stepSampler->setPan(saved.pan);
@@ -9413,7 +10931,7 @@ void MlrVSTAudioProcessor::restoreMomentaryStutterMacroBaseline()
             }
             else
             {
-                applyPitchControlToStrip(*strip, saved.pitchShift);
+                applyPitchControlToStrip(i, *strip, saved.pitchShift);
             }
             strip->setFilterAlgorithm(saved.filterAlgorithm);
             strip->setFilterFrequency(saved.filterFrequency);
@@ -9510,7 +11028,7 @@ void MlrVSTAudioProcessor::setRecentSampleDirectory(int stripIndex,
             break;
     }
 
-    if (normalizedDirectory.exists() && normalizedDirectory.isDirectory())
+    if (safeFileIsDirectory(normalizedDirectory))
         lastSampleFolder = normalizedDirectory;
 
     if (persist)
@@ -9529,7 +11047,7 @@ juce::File MlrVSTAudioProcessor::getCurrentBrowserDirectoryForStrip(int stripInd
 
     const auto isValidDir = [](const juce::File& dir)
     {
-        return dir != juce::File() && dir.exists() && dir.isDirectory();
+        return safeFileIsDirectory(dir);
     };
 
     const auto recentDir = getRecentSampleDirectory(stripIndex, mode);
@@ -9714,7 +11232,7 @@ void MlrVSTAudioProcessor::setDefaultSampleDirectory(int stripIndex, SamplePathM
         return;
     }
 
-    if (!directory.exists() || !directory.isDirectory())
+    if (!safeFileIsDirectory(directory))
         return;
 
     if (mode == SamplePathMode::Step)
@@ -9740,7 +11258,7 @@ bool MlrVSTAudioProcessor::saveBrowserFavoriteDirectoryFromStrip(int stripIndex,
         return false;
 
     const auto directory = getCurrentBrowserDirectoryForStrip(stripIndex);
-    if (!directory.exists() || !directory.isDirectory())
+    if (!safeFileIsDirectory(directory))
         return false;
 
     const auto mode = getSamplePathModeForStrip(stripIndex);
@@ -9762,7 +11280,7 @@ bool MlrVSTAudioProcessor::recallBrowserFavoriteDirectoryForStrip(int stripIndex
     const auto directory = (mode == SamplePathMode::Flip)
         ? browserFlipFavoriteDirectories[slotIdx]
         : browserFavoriteDirectories[slotIdx];
-    if (!directory.exists() || !directory.isDirectory())
+    if (!safeFileIsDirectory(directory))
     {
         if (mode == SamplePathMode::Flip)
             browserFlipFavoriteDirectories[slotIdx] = juce::File();
@@ -9778,7 +11296,7 @@ bool MlrVSTAudioProcessor::recallBrowserFavoriteDirectoryForStrip(int stripIndex
 
 bool MlrVSTAudioProcessor::isAudioFileSupported(const juce::File& file) const
 {
-    if (!file.existsAsFile())
+    if (!safeFileExistsAsFile(file))
         return false;
 
     return file.hasFileExtension(".wav")
@@ -10014,7 +11532,7 @@ void MlrVSTAudioProcessor::loadFlipStatesFromState(const juce::ValueTree& state)
                 const juce::File sampleFile(persistentState.samplePath);
                 if (persistentState.samplePath.isNotEmpty())
                     rememberLoadedSamplePathForStripMode(stripIndex, sampleFile, SamplePathMode::Flip, false);
-                if (sampleFile.existsAsFile())
+                if (safeFileExistsAsFile(sampleFile))
                 {
                     engine->applyPersistentState(persistentState);
                     loadSampleToSampleModeStrip(stripIndex, sampleFile);
@@ -10233,14 +11751,6 @@ void MlrVSTAudioProcessor::loadDefaultPathsFromState(const juce::ValueTree& stat
     if (!paths.isValid())
         return;
 
-    const auto restoreStoredDirectory = [](const juce::var& value) -> juce::File
-    {
-        const auto rawPath = value.toString().trim();
-        if (rawPath.isEmpty() || !juce::File::isAbsolutePath(rawPath))
-            return {};
-        return juce::File(rawPath);
-    };
-
     for (int i = 0; i < MaxStrips; ++i)
     {
         const auto idx = static_cast<size_t>(i);
@@ -10251,31 +11761,24 @@ void MlrVSTAudioProcessor::loadDefaultPathsFromState(const juce::ValueTree& stat
         const auto recentStepKey = "recentStepDir" + juce::String(i);
         const auto recentFlipKey = "recentFlipDir" + juce::String(i);
 
-        defaultLoopDirectories[idx] = restoreStoredDirectory(paths.getProperty(loopKey));
-        defaultStepDirectories[idx] = restoreStoredDirectory(paths.getProperty(stepKey));
-        defaultFlipDirectories[idx] = restoreStoredDirectory(paths.getProperty(flipKey));
-        recentLoopDirectories[idx] = restoreStoredDirectory(paths.getProperty(recentLoopKey));
-        recentStepDirectories[idx] = restoreStoredDirectory(paths.getProperty(recentStepKey));
-        recentFlipDirectories[idx] = restoreStoredDirectory(paths.getProperty(recentFlipKey));
+        defaultLoopDirectories[idx] = restoreStoredAbsolutePath(paths.getProperty(loopKey).toString());
+        defaultStepDirectories[idx] = restoreStoredAbsolutePath(paths.getProperty(stepKey).toString());
+        defaultFlipDirectories[idx] = restoreStoredAbsolutePath(paths.getProperty(flipKey).toString());
+        recentLoopDirectories[idx] = restoreStoredAbsolutePath(paths.getProperty(recentLoopKey).toString());
+        recentStepDirectories[idx] = restoreStoredAbsolutePath(paths.getProperty(recentStepKey).toString());
+        recentFlipDirectories[idx] = restoreStoredAbsolutePath(paths.getProperty(recentFlipKey).toString());
     }
 
-    lastSampleFolder = restoreStoredDirectory(paths.getProperty("lastSampleFolder"));
+    lastSampleFolder = restoreStoredAbsolutePath(paths.getProperty("lastSampleFolder").toString());
 
     for (int slot = 0; slot < BrowserFavoriteSlots; ++slot)
     {
         const auto key = "favoriteDir" + juce::String(slot);
         const auto flipKey = "favoriteFlipDir" + juce::String(slot);
-        juce::File favoriteDir(paths.getProperty(key).toString());
-        juce::File favoriteFlipDir(paths.getProperty(flipKey).toString());
-        if (favoriteDir.exists() && favoriteDir.isDirectory())
-            browserFavoriteDirectories[static_cast<size_t>(slot)] = favoriteDir;
-        else
-            browserFavoriteDirectories[static_cast<size_t>(slot)] = juce::File();
-
-        if (favoriteFlipDir.exists() && favoriteFlipDir.isDirectory())
-            browserFlipFavoriteDirectories[static_cast<size_t>(slot)] = favoriteFlipDir;
-        else
-            browserFlipFavoriteDirectories[static_cast<size_t>(slot)] = juce::File();
+        browserFavoriteDirectories[static_cast<size_t>(slot)] =
+            restoreStoredAbsolutePath(paths.getProperty(key).toString());
+        browserFlipFavoriteDirectories[static_cast<size_t>(slot)] =
+            restoreStoredAbsolutePath(paths.getProperty(flipKey).toString());
     }
 
     savePersistentDefaultPaths();
@@ -10383,40 +11886,25 @@ void MlrVSTAudioProcessor::loadPersistentDefaultPaths()
         return;
     }
 
-    const auto restoreStoredDirectory = [](const juce::String& rawPath) -> juce::File
-    {
-        const auto path = rawPath.trim();
-        if (path.isEmpty() || !juce::File::isAbsolutePath(path))
-            return {};
-        return juce::File(path);
-    };
-
     for (int i = 0; i < MaxStrips; ++i)
     {
         const auto idx = static_cast<size_t>(i);
-        defaultLoopDirectories[idx] = restoreStoredDirectory(xml->getStringAttribute("loopDir" + juce::String(i)));
-        defaultStepDirectories[idx] = restoreStoredDirectory(xml->getStringAttribute("stepDir" + juce::String(i)));
-        defaultFlipDirectories[idx] = restoreStoredDirectory(xml->getStringAttribute("flipDir" + juce::String(i)));
-        recentLoopDirectories[idx] = restoreStoredDirectory(xml->getStringAttribute("recentLoopDir" + juce::String(i)));
-        recentStepDirectories[idx] = restoreStoredDirectory(xml->getStringAttribute("recentStepDir" + juce::String(i)));
-        recentFlipDirectories[idx] = restoreStoredDirectory(xml->getStringAttribute("recentFlipDir" + juce::String(i)));
+        defaultLoopDirectories[idx] = restoreStoredAbsolutePath(xml->getStringAttribute("loopDir" + juce::String(i)));
+        defaultStepDirectories[idx] = restoreStoredAbsolutePath(xml->getStringAttribute("stepDir" + juce::String(i)));
+        defaultFlipDirectories[idx] = restoreStoredAbsolutePath(xml->getStringAttribute("flipDir" + juce::String(i)));
+        recentLoopDirectories[idx] = restoreStoredAbsolutePath(xml->getStringAttribute("recentLoopDir" + juce::String(i)));
+        recentStepDirectories[idx] = restoreStoredAbsolutePath(xml->getStringAttribute("recentStepDir" + juce::String(i)));
+        recentFlipDirectories[idx] = restoreStoredAbsolutePath(xml->getStringAttribute("recentFlipDir" + juce::String(i)));
     }
 
-    lastSampleFolder = restoreStoredDirectory(xml->getStringAttribute("lastSampleFolder"));
+    lastSampleFolder = restoreStoredAbsolutePath(xml->getStringAttribute("lastSampleFolder"));
 
     for (int slot = 0; slot < BrowserFavoriteSlots; ++slot)
     {
-        juce::File favoriteDir(xml->getStringAttribute("favoriteDir" + juce::String(slot)));
-        juce::File favoriteFlipDir(xml->getStringAttribute("favoriteFlipDir" + juce::String(slot)));
-        if (favoriteDir.exists() && favoriteDir.isDirectory())
-            browserFavoriteDirectories[static_cast<size_t>(slot)] = favoriteDir;
-        else
-            browserFavoriteDirectories[static_cast<size_t>(slot)] = juce::File();
-
-        if (favoriteFlipDir.exists() && favoriteFlipDir.isDirectory())
-            browserFlipFavoriteDirectories[static_cast<size_t>(slot)] = favoriteFlipDir;
-        else
-            browserFlipFavoriteDirectories[static_cast<size_t>(slot)] = juce::File();
+        browserFavoriteDirectories[static_cast<size_t>(slot)] =
+            restoreStoredAbsolutePath(xml->getStringAttribute("favoriteDir" + juce::String(slot)));
+        browserFlipFavoriteDirectories[static_cast<size_t>(slot)] =
+            restoreStoredAbsolutePath(xml->getStringAttribute("favoriteFlipDir" + juce::String(slot)));
     }
 
     resetCurrentBrowserDirectoriesToDefaultPaths(false);
@@ -10424,14 +11912,15 @@ void MlrVSTAudioProcessor::loadPersistentDefaultPaths()
 
 void MlrVSTAudioProcessor::resetCurrentBrowserDirectoriesToDefaultPaths(bool persist)
 {
-    juce::File firstValidDefault;
-    auto copyDefaultDirectory = [&firstValidDefault](const juce::File& directory) -> juce::File
+    juce::File firstStoredDefault;
+    auto copyDefaultDirectory = [&firstStoredDefault](const juce::File& directory) -> juce::File
     {
-        if (!directory.exists() || !directory.isDirectory())
+        const auto restored = restoreStoredAbsolutePath(directory.getFullPathName());
+        if (restored == juce::File())
             return {};
-        if (firstValidDefault == juce::File())
-            firstValidDefault = directory;
-        return directory;
+        if (firstStoredDefault == juce::File())
+            firstStoredDefault = restored;
+        return restored;
     };
 
     for (int i = 0; i < MaxStrips; ++i)
@@ -10442,7 +11931,7 @@ void MlrVSTAudioProcessor::resetCurrentBrowserDirectoriesToDefaultPaths(bool per
         recentFlipDirectories[idx] = copyDefaultDirectory(defaultFlipDirectories[idx]);
     }
 
-    lastSampleFolder = firstValidDefault;
+    lastSampleFolder = firstStoredDefault;
 
     if (persist)
         savePersistentDefaultPaths();
@@ -10549,6 +12038,24 @@ void MlrVSTAudioProcessor::loadPersistentGlobalControls()
         return true;
     };
 
+    auto restorePitchControlModeParam = [this, &xml]() -> bool
+    {
+        if (!xml->hasAttribute("pitchControlMode"))
+            return false;
+
+        auto* param = parameters.getParameter("pitchControlMode");
+        if (param == nullptr)
+            return false;
+
+        int restored = xml->getIntAttribute("pitchControlMode");
+        if (xml->getIntAttribute("pitchControlModeSchemaVersion", 0) < kPitchControlModeSchemaVersion)
+            restored = migrateLegacyPitchControlModeIndex(restored);
+
+        restored = sanitizePitchControlModeIndex(restored);
+        param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(restored)));
+        return true;
+    };
+
     auto restoreBoolParam = [this, &xml](const char* attrName, const char* paramId) -> bool
     {
         if (!xml->hasAttribute(attrName))
@@ -10628,9 +12135,10 @@ void MlrVSTAudioProcessor::loadPersistentGlobalControls()
     anyRestored = restoreFloatParam("crossfadeLength", "crossfadeLength", 1.0, 50.0) || anyRestored;
     anyRestored = restoreFloatParam("triggerFadeIn", "triggerFadeIn", 0.1, 120.0) || anyRestored;
     anyRestored = restoreChoiceParam("outputRouting", "outputRouting", 0, 1) || anyRestored;
-    anyRestored = restoreChoiceParam("pitchControlMode", "pitchControlMode", 0, 1) || anyRestored;
+    anyRestored = restorePitchControlModeParam() || anyRestored;
     anyRestored = restoreChoiceParam("flipTempoMatchMode", "flipTempoMatchMode", 0, 1) || anyRestored;
     bool stretchBackendRestored = restoreChoiceParam("stretchBackend", "stretchBackend", 0, 2);
+    anyRestored = restoreChoiceParam("sceneRecallMode", "sceneRecallMode", 0, 3) || anyRestored;
     if (!stretchBackendRestored && xml->hasAttribute("soundTouchEnabled"))
     {
         auto* param = parameters.getParameter("stretchBackend");
@@ -10700,11 +12208,18 @@ void MlrVSTAudioProcessor::savePersistentControlPages() const
     if (outputRoutingParam)
         xml.setAttribute("outputRouting", static_cast<int>(outputRoutingParam->load(std::memory_order_acquire)));
     if (pitchControlModeParam)
-        xml.setAttribute("pitchControlMode", static_cast<int>(pitchControlModeParam->load(std::memory_order_acquire)));
+    {
+        const int storedMode = sanitizePitchControlModeIndex(
+            static_cast<int>(std::round(pitchControlModeParam->load(std::memory_order_acquire))));
+        xml.setAttribute("pitchControlMode", storedMode);
+        xml.setAttribute("pitchControlModeSchemaVersion", kPitchControlModeSchemaVersion);
+    }
     if (flipTempoMatchModeParam)
         xml.setAttribute("flipTempoMatchMode", static_cast<int>(flipTempoMatchModeParam->load(std::memory_order_acquire)));
     if (stretchBackendParam)
         xml.setAttribute("stretchBackend", static_cast<int>(stretchBackendParam->load(std::memory_order_acquire)));
+    if (sceneRecallModeParam)
+        xml.setAttribute("sceneRecallMode", static_cast<int>(sceneRecallModeParam->load(std::memory_order_acquire)));
     if (soundTouchEnabledParam)
         xml.setAttribute("soundTouchEnabled", getStretchBackend() != TimeStretchBackend::Resample);
     for (int i = 0; i < MacroCount; ++i)
@@ -10980,14 +12495,110 @@ void MlrVSTAudioProcessor::timerCallback()
 {
     syncSceneModeFromParameters();
     processPendingSceneApply();
+    refreshUtilityTimerCadence();
 
     applyCompletedPresetSaves();
     applyCompletedLoopStripLoads();
     applyCompletedFlipLegacyLoopRenders();
     applyCompletedLoopPitchAnalyses();
+    applyCompletedSoundTouchPitchCaches();
+    applyCompletedBungeePitchCaches();
+    applyCompletedSignalsmithPitchCaches();
 
     applyPendingLoopPitchRetunes();
     prewarmFlipLegacyLoopRenders();
+    refreshPendingSoundTouchPitchCaches();
+    refreshPendingBungeePitchCaches();
+    refreshPendingSignalsmithPitchCaches();
+
+    if constexpr (kReportRealtimeSignalsmithLatencyToHost)
+    {
+        if (audioEngine != nullptr)
+        {
+            const int requiredLatencySamples = audioEngine->getRealtimeSignalsmithAlignmentLatencySamples();
+            if (requiredLatencySamples != lastReportedLatencySamples)
+            {
+                setLatencySamples(requiredLatencySamples);
+                lastReportedLatencySamples = requiredLatencySamples;
+            }
+        }
+    }
+
+    if constexpr (kEnableSignalsmithLoopDebugLogging)
+    {
+        static bool logInitialised = false;
+        static std::ofstream logStream;
+        static std::array<uint64_t, MaxStrips> lastSequences{};
+        static std::array<bool, MaxStrips> lastRelevantStates{};
+
+        if (!logInitialised)
+        {
+            logStream.open(kSignalsmithLoopDebugLogPath, std::ios::out | std::ios::trunc);
+            logInitialised = true;
+        }
+
+        if (audioEngine != nullptr && logStream.is_open())
+        {
+            const auto nowMs = juce::Time::currentTimeMillis();
+            for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+            {
+                const auto arrayIndex = static_cast<size_t>(stripIndex);
+                auto* strip = audioEngine->getStrip(stripIndex);
+                if (strip == nullptr)
+                    continue;
+
+                const auto snapshot = strip->getSignalsmithLoopDebugSnapshot();
+                const auto* rawPitchParam = stripPitchParams[arrayIndex];
+                const float rawPitchSemitones = rawPitchParam != nullptr
+                    ? rawPitchParam->load(std::memory_order_acquire)
+                    : 0.0f;
+                const auto loopPitchRole = getLoopPitchRole(stripIndex);
+                const auto loopPitchTiming = getLoopPitchSyncTiming(stripIndex);
+                const bool relevant = snapshot.playMode == static_cast<int>(EnhancedAudioStrip::PlayMode::Loop)
+                    && snapshot.pitchAlgorithm == static_cast<int>(EnhancedAudioStrip::PitchShiftAlgorithm::Signalsmith)
+                    && snapshot.signalsmithLiveMode;
+
+                if (snapshot.sequence == lastSequences[arrayIndex]
+                    && relevant == lastRelevantStates[arrayIndex])
+                {
+                    continue;
+                }
+
+                if (!relevant && !lastRelevantStates[arrayIndex])
+                {
+                    lastSequences[arrayIndex] = snapshot.sequence;
+                    continue;
+                }
+
+                juce::String line;
+                line << juce::String(nowMs)
+                     << " strip=" << stripIndex
+                     << " relevant=" << (relevant ? 1 : 0)
+                     << " playing=" << (snapshot.playing ? 1 : 0)
+                     << " maintain=" << (snapshot.maintainRealtimeStream ? 1 : 0)
+                     << " use_rt=" << (snapshot.useRealtimeSignalsmith ? 1 : 0)
+                     << " use_align=" << (snapshot.useRealtimeAlignmentDelay ? 1 : 0)
+                     << " primed=" << (snapshot.streamPrimed ? 1 : 0)
+                     << " processed=" << (snapshot.streamProcessedThisBlock ? 1 : 0)
+                     << " rendered=" << snapshot.renderedSamples
+                     << " delay=" << snapshot.alignmentDelaySamples
+                     << " history=" << snapshot.historySamples
+                     << " raw_pitch=" << juce::String(rawPitchSemitones, 3)
+                     << " role=" << static_cast<int>(loopPitchRole)
+                     << " sync_timing=" << static_cast<int>(loopPitchTiming)
+                     << " target_st=" << juce::String(snapshot.targetSemitones, 3)
+                     << " smooth_st=" << juce::String(snapshot.smoothedSemitones, 3)
+                     << " pre_rms=" << juce::String(snapshot.preRms, 6)
+                     << " wet_rms=" << juce::String(snapshot.wetRms, 6)
+                     << " final_rms=" << juce::String(snapshot.finalRms, 6);
+                logStream << line << '\n';
+
+                lastSequences[arrayIndex] = snapshot.sequence;
+                lastRelevantStates[arrayIndex] = relevant;
+            }
+            logStream.flush();
+        }
+    }
 
     if (persistentGlobalControlsDirty.load(std::memory_order_acquire) != 0)
     {
@@ -11087,7 +12698,7 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
 
     // Determine folder to browse from strip-specific browser path context.
     juce::File folderToUse = getCurrentBrowserDirectoryForStrip(stripIndex);
-    if (!folderToUse.exists() || !folderToUse.isDirectory())
+    if (!safeFileIsDirectory(folderToUse))
         return;
     
     // Get all audio files in folder
@@ -11115,7 +12726,7 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
     
     // Find current file index
     int currentIndex = -1;
-    if (currentFile.existsAsFile())
+    if (safeFileExistsAsFile(currentFile))
     {
         for (int i = 0; i < audioFiles.size(); ++i)
         {
@@ -11143,7 +12754,7 @@ void MlrVSTAudioProcessor::loadAdjacentFile(int stripIndex, int direction)
         fileToLoad = audioFiles[newIndex];
     }
     
-    if (!fileToLoad.existsAsFile())
+    if (!safeFileExistsAsFile(fileToLoad))
     {
         return;
     }
@@ -11174,9 +12785,12 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
     activeSceneStartPpq = 0.0;
     sceneSequenceStartPpqValid = false;
     scenePadHeld.fill(false);
-    scenePadHoldSaveTriggered.fill(false);
+    scenePadHoldDeleteTriggered.fill(false);
     scenePadPressStartMs.fill(0);
-    scenePadSaveBurstUntilMs.fill(0);
+    scenePadActionBurstUntilMs.fill(0);
+    scenePadLastTapMs.fill(0);
+    sceneCopySourceSlot = -1;
+    sceneCopyMainPresetIndex = 0;
 
     {
         const juce::ScopedLock lock(pendingLoopChangeLock);
@@ -11280,6 +12894,7 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
             strip->setDirectionMode(EnhancedAudioStrip::DirectionMode::Normal);
             strip->setReverse(false);
             strip->setVolume(1.0f);
+            strip->setTrimDb(0.0f);
             strip->setPan(0.0f);
             strip->setPlaybackSpeed(1.0f);
             strip->setBeatsPerLoop(-1.0f);
@@ -11289,7 +12904,7 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
             strip->setResamplePitchEnabled(false);
             strip->setResamplePitchRatio(1.0f);
             strip->setPitchShift(0.0f);
-            strip->setRecordingBars(1);
+            strip->setRecordingBars(2);
             strip->setFilterFrequency(20000.0f);
             strip->setFilterResonance(0.707f);
             strip->setFilterMorph(0.0f);
@@ -11337,6 +12952,8 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
 
         if (auto* param = parameters.getParameter("stripVolume" + juce::String(i)))
             param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripTrimDb" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
         if (auto* param = parameters.getParameter("stripPan" + juce::String(i)))
             param->setValueNotifyingHost(param->getDefaultValue());
         if (auto* param = parameters.getParameter("stripSpeed" + juce::String(i)))
@@ -11344,6 +12961,8 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
         if (auto* param = parameters.getParameter("stripPitch" + juce::String(i)))
             param->setValueNotifyingHost(param->getDefaultValue());
         if (auto* param = parameters.getParameter("stripSliceLength" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripPitchControlMode" + juce::String(i)))
             param->setValueNotifyingHost(param->getDefaultValue());
         if (auto* param = parameters.getParameter("stripTempoMatchMode" + juce::String(i)))
             param->setValueNotifyingHost(param->getDefaultValue());
@@ -11389,13 +13008,26 @@ void MlrVSTAudioProcessor::initRuntimeStateToDefaults()
     presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
 }
 
-bool MlrVSTAudioProcessor::getHostSyncSnapshot(double& outPpq, double& outTempo) const
+bool MlrVSTAudioProcessor::isHostTransportPlaying() const
 {
     if (auto* playHead = getPlayHead())
     {
         if (auto position = playHead->getPosition())
+            return position->getIsPlaying();
+    }
+
+    return lastHostTransportPlaying.load(std::memory_order_acquire) != 0;
+}
+
+bool MlrVSTAudioProcessor::getHostSyncSnapshot(double& outPpq, double& outTempo) const
+{
+    const bool hostTransportPlaying = isHostTransportPlaying();
+    if (auto* playHead = getPlayHead())
+    {
+        if (auto position = playHead->getPosition())
         {
-            if (position->getPpqPosition().hasValue()
+            if (position->getIsPlaying()
+                && position->getPpqPosition().hasValue()
                 && position->getBpm().hasValue()
                 && std::isfinite(*position->getPpqPosition())
                 && std::isfinite(*position->getBpm())
@@ -11412,7 +13044,8 @@ bool MlrVSTAudioProcessor::getHostSyncSnapshot(double& outPpq, double& outTempo)
     {
         const double fallbackPpq = audioEngine->getTimelineBeat();
         const double fallbackTempo = audioEngine->getCurrentTempo();
-        if (std::isfinite(fallbackPpq)
+        if (hostTransportPlaying
+            && std::isfinite(fallbackPpq)
             && std::isfinite(fallbackTempo)
             && fallbackTempo > 0.0)
         {
@@ -11423,6 +13056,20 @@ bool MlrVSTAudioProcessor::getHostSyncSnapshot(double& outPpq, double& outTempo)
     }
 
     return false;
+}
+
+void MlrVSTAudioProcessor::refreshUtilityTimerCadence()
+{
+    const bool queuedSceneApplyActive = pendingSceneApplySlot.load(std::memory_order_acquire) >= 0;
+    const bool queuedSequenceDriven = pendingSceneApplySequenceDriven.load(std::memory_order_acquire) != 0;
+    const bool needsFastScenePolling = pendingSceneRecall.active
+        || (queuedSceneApplyActive && (!queuedSequenceDriven || isHostTransportPlaying()));
+    const int desiredIntervalMs = needsFastScenePolling
+        ? kSceneRecallRefreshMs
+        : (monomeConnection.supportsArc() ? kArcRefreshMs : kGridRefreshMs);
+
+    if (!isTimerRunning() || getTimerInterval() != desiredIntervalMs)
+        startTimer(desiredIntervalMs);
 }
 
 void MlrVSTAudioProcessor::performPresetLoad(int presetIndex, double hostPpqSnapshot, double hostTempoSnapshot)
@@ -11740,7 +13387,12 @@ bool MlrVSTAudioProcessor::isMidiEffect() const
 
 double MlrVSTAudioProcessor::getTailLengthSeconds() const
 {
-    return 0.0;
+    if constexpr (!kReportRealtimeSignalsmithLatencyToHost)
+        return 0.0;
+
+    return (currentSampleRate > 0.0)
+        ? (static_cast<double>(juce::jmax(0, lastReportedLatencySamples)) / currentSampleRate)
+        : 0.0;
 }
 
 int MlrVSTAudioProcessor::getNumPrograms()

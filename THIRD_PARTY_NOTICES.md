@@ -86,6 +86,26 @@ This document is an engineering notice, not legal advice.
   - Current macOS builds on this machine link Homebrew's `libSoundTouch` when available.
   - Preserve `/third_party/licenses/SOUNDTOUCH-NOTICE.md` and the copied `SoundTouch-COPYING.TXT` notice in redistributed archives that link SoundTouch.
 
+### Signalsmith Stretch
+
+- Upstream: https://github.com/Signalsmith-Audio/signalsmith-stretch
+- Path: `/third_party/signalsmith-stretch`
+- Role: vendored header-only pitch-shift backend used by the global `Signalsmith` pitch mode.
+- License model: MIT.
+- Notes:
+  - The vendored header includes `signalsmith-linear/stft.h`, which is also shipped in this repository.
+  - Preserve `/third_party/signalsmith-stretch/LICENSE.txt` and `/third_party/signalsmith-linear/LICENSE.txt` with redistributions that include the `Signalsmith` pitch mode.
+
+### Signalsmith Linear
+
+- Upstream: https://github.com/Signalsmith-Audio/linear
+- Path: `/third_party/signalsmith-linear`
+- Role: vendored DSP support headers required by `signalsmith-stretch`.
+- License model: MIT.
+- Notes:
+  - This dependency is consumed through the vendored `signalsmith-stretch` integration rather than as a standalone backend.
+  - Preserve `/third_party/signalsmith-linear/LICENSE.txt` with redistributions that include the `Signalsmith` pitch mode.
+
 ### LibPyin
 
 - Upstream: https://github.com/xstreck1/LibPyin
@@ -147,6 +167,8 @@ Release archives should include:
    - `/third_party/licenses/EIGEN-NOTICE.md`
    - `/third_party/licenses/PFFFT-NOTICE.txt`
    - `/third_party/licenses/SOUNDTOUCH-NOTICE.md`
+   - `/third_party/signalsmith-stretch/LICENSE.txt`
+   - `/third_party/signalsmith-linear/LICENSE.txt`
    - `SoundTouch-COPYING.TXT` when a packaged binary links `libSoundTouch`
 
 The script `/scripts/package_release_macos.sh` follows this policy and preserves the original `hemmer/mlrVST` attribution in packaged releases.

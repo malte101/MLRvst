@@ -36,6 +36,7 @@ Release artifacts are written to `release/`.
 
 - JUCE 8 does not support MinGW for this project.
 - Build Windows binaries with MSVC (`Visual Studio 2022`, `-A x64`) or run the GitHub Actions Windows workflow.
+- Windows release builds statically link the MSVC runtime by default, so packaged `VST3` bundles do not need extra compiler DLLs beside the plugin.
 
 ## macOS Signing + Notarization
 

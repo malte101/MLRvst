@@ -264,6 +264,11 @@ public:
         // Volume 0.0 to 1.0
         this->volume = juce::jlimit(0.0f, 1.0f, vol);
     }
+
+    void setTrimGain(float gain)
+    {
+        trimGain = juce::jlimit(0.0f, juce::Decibels::decibelsToGain(36.0f), gain);
+    }
     
     void setPan(float panValue)
     {
@@ -393,7 +398,7 @@ public:
                 rightGain = pan >= 0.0f ? 1.0f : (1.0f + pan);
             }
             
-            float gain = volume * (channel == 0 ? leftGain : rightGain);
+            float gain = volume * trimGain * (channel == 0 ? leftGain : rightGain);
             
             // Add to output buffer
             output.addFrom(channel, startSample, tempBuffer, channel, 0, numSamples, gain);
@@ -420,6 +425,7 @@ private:
     
     // Volume and pan (connected to strip controls)
     float volume = 1.0f;
+    float trimGain = 1.0f;
     float pan = 0.0f;
     int rootMidi = 60;
     int pitchOffset = 0;  // Semitone offset for speed/pitch control

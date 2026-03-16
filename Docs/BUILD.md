@@ -14,6 +14,7 @@ Notes:
 
 - Windows builds must use `MSVC` or `clang-cl` with the Windows SDK.
 - `MinGW` and `MSYS2` are not supported by the current `JUCE 8` build path.
+- Windows release builds statically link the MSVC runtime by default, so shipped `VST3` bundles do not require extra compiler sidecar DLLs.
 - Plugin bundles are written to `Build/mlrVST_artefacts/<Config>/...`.
 - Copying into system or user plugin folders is a separate explicit step.
 
@@ -105,6 +106,7 @@ The project can build without all optional analysis and stretch backends.
 - `SoundTouch`: enabled only if headers and libraries are found
 - `Bungee`: enabled only if headers and libraries are found
 - `LibPyin`: enabled only if `third_party/LibPyin` is present
+- `signalsmith-stretch`: vendored header-only dependency used by the `Signalsmith` global pitch mode
 - Native `Essentia`: enabled only if the configured prefix contains the library
 - `Huovilainen`: disabled by default and opt-in only
 
@@ -230,6 +232,11 @@ cmake -S . -B Build -G "Visual Studio 17 2022" -A x64
 cmake --build Build --config Release
 ```
 
+Notes:
+
+- `Release` builds use the static MSVC runtime by default via `MLRVST_WINDOWS_STATIC_RUNTIME=ON`.
+- If you intentionally want the dynamic MSVC runtime, configure with `-DMLRVST_WINDOWS_STATIC_RUNTIME=OFF`.
+
 Manual install:
 
 - Copy `Build\mlrVST_artefacts\Release\VST3\mlrVST.vst3`
@@ -244,6 +251,7 @@ Package a distributable zip:
 Important:
 
 - `MinGW` and `MSYS2` are not supported.
+- The Windows packager only bundles extra runtime DLLs when they actually exist in the build output, which is mainly for legacy unsupported MinGW cross-builds.
 - There is no repo-specific Windows plugin install target; copy the built `.vst3` bundle manually.
 
 ## Makefile Shortcuts

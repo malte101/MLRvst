@@ -51,6 +51,7 @@ public:
                          bool transientModeActive);
     void setLoopPitchOverlay(bool enabled, const juce::String& lineA, const juce::String& lineB);
     void setWaveformColor(juce::Colour color);
+    void setVisualGainDb(float trimDb);
     bool hasLoadedAudio() const noexcept { return hasAudio; }
     void clear();
     
@@ -82,6 +83,7 @@ private:
     bool loopPitchOverlayEnabled = false;
     juce::String loopPitchOverlayLineA;
     juce::String loopPitchOverlayLineB;
+    float visualGain = 1.0f;
     
     void generateThumbnail(const juce::AudioBuffer<float>& buffer);
     
@@ -448,6 +450,35 @@ public:
         juce::Point<int> dragStartPos;
         int dragStartValue = 16;
     };
+
+    class ValueReadoutSlider : public juce::Slider
+    {
+    public:
+        ValueReadoutSlider()
+        {
+            setMouseCursor(juce::MouseCursor::UpDownResizeCursor);
+        }
+
+        void paint(juce::Graphics& g) override
+        {
+            auto bounds = getLocalBounds().toFloat().reduced(0.5f);
+            const auto background = findColour(juce::Slider::backgroundColourId);
+            const auto outline = findColour(juce::Slider::textBoxOutlineColourId);
+            const auto text = findColour(juce::Slider::textBoxTextColourId);
+            const auto accent = findColour(juce::Slider::trackColourId);
+            const float radius = juce::jmin(6.0f, bounds.getHeight() * 0.45f);
+
+            g.setColour(background);
+            g.fillRoundedRectangle(bounds, radius);
+
+            g.setColour((isMouseOverOrDragging() ? accent : outline).withAlpha(isEnabled() ? 0.95f : 0.45f));
+            g.drawRoundedRectangle(bounds, radius, 1.0f);
+
+            g.setColour(text.withAlpha(isEnabled() ? 1.0f : 0.55f));
+            g.setFont(juce::Font(juce::FontOptions(8.6f, juce::Font::bold)));
+            g.drawText(getTextFromValue(getValue()), getLocalBounds(), juce::Justification::centred);
+        }
+    };
     
 private:
     int stripIndex;
@@ -490,6 +521,7 @@ private:
     juce::ComboBox recordBarsBox;   // Selects input recording buffer bars for this strip
     juce::TextButton recordButton;  // Captures recent input into this strip
     juce::ComboBox tempoMatchOverrideBox; // Per-strip loop tempo match override
+    juce::ComboBox pitchControlOverrideBox; // Per-strip pitch backend override
     juce::Label recordBarsLabel;    // Label above recording bars selector
     juce::Label recordLengthLabel;  // Shows input recording buffer length for this strip
     juce::Label volumeLabel;        // Label below knob
@@ -575,14 +607,17 @@ private:
     juce::ComboBox groupSelector;   // Compact
     juce::Label stripLabel;         // Small
     juce::Label stripSampleNameLabel;
+    ValueReadoutSlider trimSlider;
     
     // Attachments
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> volumeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> trimAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> panAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> pitchAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> speedAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> sliceLengthAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> tempoMatchOverrideAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> pitchControlOverrideAttachment;
     
     void setupComponents();
     void loadSample();
@@ -1141,22 +1176,37 @@ public:
     void refreshFromProcessor();
 
 private:
+    class SceneComboLookAndFeel : public juce::LookAndFeel_V4
+    {
+    public:
+        juce::Font getComboBoxFont(juce::ComboBox&) override
+        {
+            return juce::Font(juce::FontOptions(13.75f, juce::Font::bold));
+        }
+
+        juce::Font getPopupMenuFont() override
+        {
+            return juce::Font(juce::FontOptions(16.5f, juce::Font::bold));
+        }
+    };
+
     MlrVSTAudioProcessor& processor;
+    SceneComboLookAndFeel sceneComboLookAndFeel;
 
     juce::Label titleLabel;
     juce::Label hintLabel;
     juce::ToggleButton sceneModeToggle;
+    juce::Label sceneChangeModeLabel;
+    juce::ComboBox sceneChangeModeBox;
     juce::Label sceneAuthoringLabel;
     juce::ComboBox sceneAuthoringTargetBox;
     juce::TextButton sceneCaptureButton;
     juce::TextButton sceneInsertBeforeButton;
     juce::TextButton sceneInsertAfterButton;
-    juce::Label sceneRepeatsLabel;
     juce::Label sceneLengthHeaderLabel;
     juce::Label sceneBarsHeaderLabel;
     juce::Label sceneAnchorHeaderLabel;
     std::array<juce::Label, MlrVSTAudioProcessor::SceneSlots> sceneRepeatSlotLabels;
-    std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneRepeatBoxes;
     std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneLengthModeBoxes;
     std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneManualBarsBoxes;
     std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneAnchorStripBoxes;

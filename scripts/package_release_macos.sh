@@ -92,6 +92,8 @@ for required in \
     "${REPO_ROOT}/third_party/licenses/EIGEN-NOTICE.md" \
     "${REPO_ROOT}/third_party/licenses/PFFFT-NOTICE.txt" \
     "${REPO_ROOT}/third_party/licenses/SOUNDTOUCH-NOTICE.md" \
+    "${REPO_ROOT}/third_party/signalsmith-stretch/LICENSE.txt" \
+    "${REPO_ROOT}/third_party/signalsmith-linear/LICENSE.txt" \
     "${REPO_ROOT}/third_party/MoogLadders-main/LICENSE" \
     "${REPO_ROOT}/third_party/LibPyin/LICENSE" \
     "${REPO_ROOT}/third_party/LibPyin/source/LICENSE_PYIN" \
@@ -144,6 +146,10 @@ copy_common_notices() {
        "${target_dir}/LICENSES/PFFFT-NOTICE.txt"
     cp "${REPO_ROOT}/third_party/licenses/SOUNDTOUCH-NOTICE.md" \
        "${target_dir}/LICENSES/SOUNDTOUCH-NOTICE.md"
+    cp "${REPO_ROOT}/third_party/signalsmith-stretch/LICENSE.txt" \
+       "${target_dir}/LICENSES/signalsmith-stretch-LICENSE.txt"
+    cp "${REPO_ROOT}/third_party/signalsmith-linear/LICENSE.txt" \
+       "${target_dir}/LICENSES/signalsmith-linear-LICENSE.txt"
     cp "${REPO_ROOT}/JUCE/LICENSE.md" "${target_dir}/LICENSES/JUCE-LICENSE.md"
 }
 

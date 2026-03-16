@@ -35,6 +35,8 @@ bool loadPreset(int presetIndex,
                 int64_t hostGlobalSampleSnapshot = -1);
 juce::String getPresetName(int presetIndex);
 bool setPresetName(int presetIndex, const juce::String& presetName);
+bool updatePresetAuxState(int presetIndex,
+                          const std::function<std::unique_ptr<juce::XmlElement>()>& createAuxStateXml);
 bool presetExists(int presetIndex);
 bool copyPreset(int sourcePresetIndex, int destPresetIndex);
 bool deletePreset(int presetIndex);

@@ -1,4 +1,5 @@
 #include "TimeStretchBackend.h"
+#include "signalsmith-stretch/signalsmith-stretch.h"
 
 #include <algorithm>
 #include <array>
@@ -121,8 +122,11 @@ bool renderWithSoundTouch(const juce::AudioBuffer<float>& sourceBuffer,
     stretcher.setRate(1.0f);
     stretcher.setPitchSemiTones(pitchSemitones);
     stretcher.setSetting(SETTING_USE_AA_FILTER, isShortBuffer ? 0 : 1);
-    stretcher.setSetting(SETTING_AA_FILTER_LENGTH, 32);
-    stretcher.setSetting(SETTING_USE_QUICKSEEK, isShortBuffer ? 0 : 1);
+    stretcher.setSetting(SETTING_AA_FILTER_LENGTH, isShortBuffer ? 16 : 32);
+    stretcher.setSetting(SETTING_USE_QUICKSEEK, 1);
+    stretcher.setSetting(SETTING_SEQUENCE_MS, isShortBuffer ? 24 : 40);
+    stretcher.setSetting(SETTING_SEEKWINDOW_MS, isShortBuffer ? 12 : 22);
+    stretcher.setSetting(SETTING_OVERLAP_MS, isShortBuffer ? 6 : 10);
 
     std::vector<float> interleaved(static_cast<size_t>(sourceFrames) * 2u, 0.0f);
     const float* left = stereoBuffer.getReadPointer(0);
@@ -287,6 +291,82 @@ bool renderWithBungee(const juce::AudioBuffer<float>& sourceBuffer,
     return true;
 }
 #endif
+
+bool renderWithSignalsmithPitch(const juce::AudioBuffer<float>& sourceBuffer,
+                                double sourceSampleRate,
+                                float pitchSemitones,
+                                juce::AudioBuffer<float>& outputBuffer)
+{
+    const int sourceFrames = sourceBuffer.getNumSamples();
+    if (sourceFrames <= 0 || sourceSampleRate <= 0.0)
+        return false;
+
+    const auto stereoBuffer = buildStereoSourceBuffer(sourceBuffer);
+    outputBuffer.setSize(2, sourceFrames, false, false, true);
+    outputBuffer.clear();
+
+    if (std::abs(pitchSemitones) <= 0.01f)
+    {
+        outputBuffer.makeCopyOf(stereoBuffer, true);
+        return true;
+    }
+
+    if (sourceFrames < 96)
+        return false;
+
+    std::array<const float*, 2> inputs{
+        stereoBuffer.getReadPointer(0),
+        stereoBuffer.getReadPointer(1)
+    };
+    std::array<float*, 2> outputs{
+        outputBuffer.getWritePointer(0),
+        outputBuffer.getWritePointer(1)
+    };
+
+    auto tryExactRender = [&](int blockSamples, int intervalSamples, bool splitComputation)
+    {
+        const int maxBlockSamples = juce::jmax(64, sourceFrames - 1);
+        blockSamples = juce::jlimit(64, maxBlockSamples, blockSamples);
+        intervalSamples = juce::jlimit(16, juce::jmax(16, blockSamples / 8), intervalSamples);
+        if (intervalSamples >= blockSamples)
+            intervalSamples = juce::jmax(16, blockSamples / 4);
+        if (intervalSamples >= blockSamples)
+            return false;
+
+        signalsmith::stretch::SignalsmithStretch<float> stretch;
+        stretch.configure(2, blockSamples, intervalSamples, splitComputation);
+        stretch.setTransposeSemitones(pitchSemitones);
+
+        if (sourceFrames < stretch.outputSeekLength(1.0f))
+            return false;
+
+        outputBuffer.clear();
+        return stretch.exact(inputs, sourceFrames, outputs, sourceFrames);
+    };
+
+    const int sr = juce::jmax(1, static_cast<int>(std::lround(sourceSampleRate)));
+    const int defaultBlock = juce::jmin(sourceFrames - 1, juce::jmax(128, static_cast<int>(sr * 0.12)));
+    const int defaultInterval = juce::jmin(juce::jmax(32, defaultBlock / 4),
+                                           juce::jmax(16, static_cast<int>(sr * 0.03)));
+    if (tryExactRender(defaultBlock, defaultInterval, true))
+        return true;
+
+    const std::array<std::pair<int, int>, 5> fallbackConfigs{{
+        {juce::jmax(128, sourceFrames / 2), juce::jmax(32, sourceFrames / 8)},
+        {juce::jmax(128, sourceFrames / 3), juce::jmax(32, sourceFrames / 10)},
+        {512, 128},
+        {256, 64},
+        {128, 32}
+    }};
+
+    for (const auto& [blockSamples, intervalSamples] : fallbackConfigs)
+    {
+        if (tryExactRender(blockSamples, intervalSamples, true))
+            return true;
+    }
+
+    return false;
+}
 } // namespace
 
 TimeStretchBackend sanitizeTimeStretchBackend(int rawBackend) noexcept
@@ -359,16 +439,14 @@ bool renderTimeStretchedBuffer(const juce::AudioBuffer<float>& sourceBuffer,
 
         case TimeStretchBackend::SoundTouch:
 #if MLRVST_ENABLE_SOUNDTOUCH
-            if (sourceFrames < kMinSoundTouchSafeFrames || targetFrames < kMinSoundTouchSafeFrames)
-            {
-#if MLRVST_ENABLE_BUNGEE
-                return renderWithBungee(sourceBuffer, sourceSampleRate, targetFrames, pitchSemitones, outputBuffer);
-#else
-                resampleBufferToLength(buildStereoSourceBuffer(sourceBuffer), targetFrames, outputBuffer);
+            if (renderWithSoundTouch(sourceBuffer, sourceSampleRate, targetFrames, pitchSemitones, outputBuffer))
                 return true;
+#if MLRVST_ENABLE_BUNGEE
+            return renderWithBungee(sourceBuffer, sourceSampleRate, targetFrames, pitchSemitones, outputBuffer);
+#else
+            resampleBufferToLength(buildStereoSourceBuffer(sourceBuffer), targetFrames, outputBuffer);
+            return true;
 #endif
-            }
-            return renderWithSoundTouch(sourceBuffer, sourceSampleRate, targetFrames, pitchSemitones, outputBuffer);
 #else
             return false;
 #endif
@@ -404,4 +482,15 @@ bool renderTimeStretchedBufferForRate(const juce::AudioBuffer<float>& sourceBuff
                                      pitchSemitones,
                                      backend,
                                      outputBuffer);
+}
+
+bool renderSignalsmithPitchBuffer(const juce::AudioBuffer<float>& sourceBuffer,
+                                  double sourceSampleRate,
+                                  float pitchSemitones,
+                                  juce::AudioBuffer<float>& outputBuffer)
+{
+    return renderWithSignalsmithPitch(sourceBuffer,
+                                      sourceSampleRate,
+                                      pitchSemitones,
+                                      outputBuffer);
 }

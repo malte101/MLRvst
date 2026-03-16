@@ -27,6 +27,7 @@ For install steps, packaging, and platform-specific notes, see `Docs/BUILD.md`.
 - serialosc (optional, for monome hardware use)
 - Native Essentia and Bungee installs are optional and can live under `third_party/_native`
 - Vendored LibPyin in `third_party/LibPyin` is optional and only needed for that analysis path
+- Vendored `signalsmith-stretch` + `signalsmith-linear` headers are included in `third_party/` for the `Signalsmith` pitch mode
 
 Bootstrap the repo-local native dependencies on macOS if you want those backends available:
 
@@ -83,6 +84,7 @@ Artifacts are written to `release/`.
 - Third-party terms and redistribution notes: `THIRD_PARTY_NOTICES.md`
 - Native dependency layout and rebuild instructions: `third_party/_native/README.md`
 - Vendored LibPyin licenses: `third_party/LibPyin/LICENSE`, `third_party/LibPyin/source/LICENSE_PYIN`, `third_party/LibPyin/source/LICENSE_VAMP`
+- Vendored Signalsmith licenses: `third_party/signalsmith-stretch/LICENSE.txt`, `third_party/signalsmith-linear/LICENSE.txt`
 
 If you redistribute binaries, include the relevant notice files and do not remove the preserved upstream attribution notices.
 

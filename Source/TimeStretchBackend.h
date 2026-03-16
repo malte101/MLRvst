@@ -27,3 +27,8 @@ bool renderTimeStretchedBufferForRate(const juce::AudioBuffer<float>& sourceBuff
                                       float pitchSemitones,
                                       TimeStretchBackend backend,
                                       juce::AudioBuffer<float>& outputBuffer);
+
+bool renderSignalsmithPitchBuffer(const juce::AudioBuffer<float>& sourceBuffer,
+                                  double sourceSampleRate,
+                                  float pitchSemitones,
+                                  juce::AudioBuffer<float>& outputBuffer);

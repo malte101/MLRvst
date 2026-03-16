@@ -18,6 +18,9 @@ option(MLRVST_ENABLE_ESSENTIA_NATIVE "Enable native Essentia analysis backend wh
 option(MLRVST_ALLOW_UNSUPPORTED_MINGW_WINDOWS
     "Allow unsupported MinGW Windows builds for local cross-build packaging"
     OFF)
+option(MLRVST_WINDOWS_STATIC_RUNTIME
+    "Statically link the MSVC runtime for Windows builds"
+    ON)
 set(MLRVST_NATIVE_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/_native" CACHE PATH
     "Path to persistent repo-local native dependency prefixes")
 set(MLRVST_DEFAULT_ESSENTIA_PREFIX "${MLRVST_NATIVE_DEPS_DIR}/essentia-prefix")
@@ -86,6 +89,10 @@ endif()
 
 # Export compile commands for IDE support
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(WIN32 AND MSVC AND MLRVST_WINDOWS_STATIC_RUNTIME)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 # JUCE source tree. Prefer a repo-local checkout, but allow overriding from the
 # command line and fall back to the sibling step-vsthost workspace on this machine.
@@ -455,7 +462,11 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND MLRVST_ALLOW_UNSUPPORTED_M
     set(MLRVST_MINGW_DLL_HINTS
         "${MLRVST_MINGW_BIN_DIR}"
         "${MLRVST_MINGW_ROOT_DIR}/bin"
-        "${MLRVST_MINGW_ROOT_DIR}/lib")
+        "${MLRVST_MINGW_ROOT_DIR}/lib"
+        "${MLRVST_MINGW_ROOT_DIR}/x86_64-w64-mingw32/bin"
+        "${MLRVST_MINGW_ROOT_DIR}/x86_64-w64-mingw32/lib"
+        "${MLRVST_MINGW_ROOT_DIR}/mingw/bin"
+        "${MLRVST_MINGW_ROOT_DIR}/mingw/lib")
 
     find_file(MLRVST_MINGW_LIBGCC_DLL
         NAMES libgcc_s_seh-1.dll
@@ -545,6 +556,7 @@ add_dependencies(mlrVST mlrVST_build_info)
 # vendor warnings as project warnings.
 target_include_directories(mlrVST
     SYSTEM PRIVATE
+        third_party
         third_party/MoogLadders-main/src
 )
 

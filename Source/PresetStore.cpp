@@ -37,6 +37,9 @@ struct GlobalParameterSnapshot
     float triggerFadeInMs = 12.0f;
     float outputRouting = 0.0f;
     float pitchControlMode = 0.0f;
+    float flipTempoMatchMode = 0.0f;
+    float stretchBackend = 1.0f;
+    float sceneRecallMode = 0.0f;
     float sceneMode = 0.0f;
 };
 
@@ -133,6 +136,12 @@ GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeSta
         snapshot.outputRouting = *p;
     if (auto* p = parameters.getRawParameterValue("pitchControlMode"))
         snapshot.pitchControlMode = *p;
+    if (auto* p = parameters.getRawParameterValue("flipTempoMatchMode"))
+        snapshot.flipTempoMatchMode = *p;
+    if (auto* p = parameters.getRawParameterValue("stretchBackend"))
+        snapshot.stretchBackend = *p;
+    if (auto* p = parameters.getRawParameterValue("sceneRecallMode"))
+        snapshot.sceneRecallMode = *p;
     if (auto* p = parameters.getRawParameterValue("sceneMode"))
         snapshot.sceneMode = *p;
     return snapshot;
@@ -168,7 +177,33 @@ void restoreGlobalParameters(juce::AudioProcessorValueTreeState& parameters, con
             param->setValueNotifyingHost(snapshot.outputRouting > 0.5f ? 1.0f : 0.0f);
     }
     if (auto* param = parameters.getParameter("pitchControlMode"))
-        param->setValueNotifyingHost(snapshot.pitchControlMode > 0.5f ? 1.0f : 0.0f);
+    {
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(param))
+            param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(snapshot.pitchControlMode)));
+        else
+            param->setValueNotifyingHost(snapshot.pitchControlMode > 0.5f ? 1.0f : 0.0f);
+    }
+    if (auto* param = parameters.getParameter("flipTempoMatchMode"))
+    {
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(param))
+            param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(snapshot.flipTempoMatchMode)));
+        else
+            param->setValueNotifyingHost(snapshot.flipTempoMatchMode > 0.5f ? 1.0f : 0.0f);
+    }
+    if (auto* param = parameters.getParameter("stretchBackend"))
+    {
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(param))
+            param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(snapshot.stretchBackend)));
+        else
+            param->setValueNotifyingHost(snapshot.stretchBackend > 0.5f ? 1.0f : 0.0f);
+    }
+    if (auto* param = parameters.getParameter("sceneRecallMode"))
+    {
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(param))
+            param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(snapshot.sceneRecallMode)));
+        else
+            param->setValueNotifyingHost(snapshot.sceneRecallMode > 0.5f ? 1.0f : 0.0f);
+    }
     if (auto* param = parameters.getParameter("sceneMode"))
         param->setValueNotifyingHost(snapshot.sceneMode > 0.5f ? 1.0f : 0.0f);
 }
@@ -217,7 +252,7 @@ void resetStripToDefaultState(int stripIndex,
     strip.setResamplePitchEnabled(false);
     strip.setResamplePitchRatio(1.0f);
     strip.setPitchShift(0.0f);
-    strip.setRecordingBars(1);
+    strip.setRecordingBars(2);
     strip.setFilterFrequency(20000.0f);
     strip.setFilterResonance(0.707f);
     strip.setFilterMorph(0.0f);
@@ -1024,7 +1059,7 @@ bool loadPreset(int presetIndex,
         int groupId = stripXml->getIntAttribute("group", -1);
         audioEngine->assignStripToGroup(stripIndex, groupId);
 
-        const int savedRecordingBars = clampedInt(stripXml->getIntAttribute("recordingBars", 1), 1, 8, 1);
+        const int savedRecordingBars = clampedInt(stripXml->getIntAttribute("recordingBars", 2), 1, 8, 2);
         const float savedBeatsPerLoop = finiteFloat(stripXml->getDoubleAttribute("beatsPerLoop", -1.0), -1.0f);
         strip->setRecordingBars(savedRecordingBars);
         strip->setBeatsPerLoop(savedBeatsPerLoop);
@@ -1453,6 +1488,44 @@ bool setPresetName(int presetIndex, const juce::String& presetName)
         else
             preset->removeAttribute("name");
 
+        return writePresetAtomically(*preset, presetFile);
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+bool updatePresetAuxState(int presetIndex,
+                          const std::function<std::unique_ptr<juce::XmlElement>()>& createAuxStateXml)
+{
+    if (presetIndex < 0 || presetIndex >= kMaxPresetSlots || !createAuxStateXml)
+        return false;
+
+    try
+    {
+        auto presetDir = getPresetDirectory();
+        const auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+        if (!presetFile.existsAsFile())
+            return false;
+
+        auto preset = parsePresetXmlSafely(presetFile, kMaxPresetXmlBytes);
+        if (preset == nullptr)
+            return false;
+
+        auto auxStateXml = createAuxStateXml();
+        if (auxStateXml == nullptr)
+            return false;
+
+        const auto auxTag = auxStateXml->getTagName();
+        for (int childIndex = preset->getNumChildElements(); --childIndex >= 0;)
+        {
+            if (auto* child = preset->getChildElement(childIndex))
+                if (child->hasTagName(auxTag))
+                    preset->removeChildElement(child, true);
+        }
+
+        preset->addChildElement(auxStateXml.release());
         return writePresetAtomically(*preset, presetFile);
     }
     catch (...)

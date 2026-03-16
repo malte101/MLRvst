@@ -18,6 +18,12 @@ This manual covers day-to-day use of the current `mlrVST` build (GUI + monome wo
 - `Monome Device`: monome connection and device status
 - `Paths`: default per-strip sample folders for Loop mode and Step mode
 
+### Global Pitch Modes
+- `Pitch Shift`: low-latency internal pitch shifter
+- `SoundTouch`: cached pitch-shift mode using the optional SoundTouch backend
+- `Signalsmith`: cached pitch-shift mode using vendored `signalsmith-stretch`
+- `Resample`: playback-rate pitch change (speed and pitch move together)
+
 ### Main Tabs
 - `Play`: all strip controls and waveform/step editing
 - `FX`: per-strip filter and gate shaping controls

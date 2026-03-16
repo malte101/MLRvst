@@ -132,6 +132,33 @@ int findNearestGrainSizeColumn(float sizeMs)
 
     return best;
 }
+
+int gateSlicesPerLoop(MlrVSTAudioProcessor::GatePageMode mode)
+{
+    switch (mode)
+    {
+        case MlrVSTAudioProcessor::GatePageMode::Quarter: return 4;
+        case MlrVSTAudioProcessor::GatePageMode::Sixth: return 6;
+        case MlrVSTAudioProcessor::GatePageMode::Eighth: return 8;
+        case MlrVSTAudioProcessor::GatePageMode::Sixteenth: return 16;
+        case MlrVSTAudioProcessor::GatePageMode::Adaptive:
+        default: return 0;
+    }
+}
+
+float adaptiveGateSpeedForStrip(const EnhancedAudioStrip& strip,
+                                MlrVSTAudioProcessor::GatePageMode mode)
+{
+    const int slicesPerLoop = gateSlicesPerLoop(mode);
+    if (slicesPerLoop <= 0)
+        return strip.getGateSpeed();
+
+    float beatsPerLoop = strip.getBeatsPerLoop();
+    if (!(beatsPerLoop > 0.0f))
+        beatsPerLoop = 4.0f;
+
+    return juce::jlimit(0.25f, 8.0f, static_cast<float>(slicesPerLoop) / beatsPerLoop);
+}
 }
 
 void handleButtonPress(MlrVSTAudioProcessor& processor,
@@ -201,10 +228,22 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
         }
         else
         {
-            const float sliceLength = sliceLengthFromColumn(clampedColumn);
-            strip.setLoopSliceLength(sliceLength);
-            if (auto* param = processor.parameters.getParameter("stripSliceLength" + juce::String(stripIndex)))
-                param->setValueNotifyingHost(param->convertTo0to1(sliceLength));
+            const auto gatePageMode = processor.getGatePageMode();
+            if (gatePageMode == MlrVSTAudioProcessor::GatePageMode::Adaptive)
+            {
+                const float sliceLength = sliceLengthFromColumn(clampedColumn);
+                strip.setLoopSliceLength(sliceLength);
+                strip.setGateAmount(0.0f);
+                if (auto* param = processor.parameters.getParameter("stripSliceLength" + juce::String(stripIndex)))
+                    param->setValueNotifyingHost(param->convertTo0to1(sliceLength));
+            }
+            else
+            {
+                const float openness = unitFromColumn(clampedColumn);
+                strip.setGateSpeed(adaptiveGateSpeedForStrip(strip, gatePageMode));
+                strip.setGateShape(openness);
+                strip.setGateAmount(1.0f - openness);
+            }
         }
     }
 }
@@ -302,9 +341,22 @@ void renderRow(const EnhancedAudioStrip& strip,
     }
     else if (mode == gateMode)
     {
-        const int activeCol = isStepMode
-            ? findNearestStepDecayColumn(strip.getStepEnvelopeDecayMs())
-            : findNearestSliceLengthColumn(strip.getLoopSliceLength());
+        int activeCol = 0;
+        if (isStepMode)
+        {
+            activeCol = findNearestStepDecayColumn(strip.getStepEnvelopeDecayMs());
+        }
+        else if (processor.getGatePageMode() == MlrVSTAudioProcessor::GatePageMode::Adaptive)
+        {
+            activeCol = findNearestSliceLengthColumn(strip.getLoopSliceLength());
+        }
+        else
+        {
+            activeCol = (strip.getGateAmount() <= 0.01f)
+                ? 15
+                : findNearestColumn(strip.getGateShape(), 0.0f, 1.0f);
+        }
+
         for (int x = 0; x < 16; ++x)
             newLedState[x][y] = (x <= activeCol) ? (x == activeCol ? 15 : 8) : 2;
     }

@@ -21,6 +21,7 @@
 #include <cmath>
 #include <algorithm>
 #include <vector>
+#include <numeric>
 
 namespace
 {
@@ -33,13 +34,54 @@ constexpr float kGrainMinSizeMs = 5.0f;
 constexpr float kGrainMaxSizeMs = 2400.0f;
 constexpr float kGrainMinDensity = 0.05f;
 constexpr float kGrainMaxDensity = 0.9f;
-
 constexpr int kModScaleSize = 12;
 constexpr std::array<int, kModScaleSize> kScaleChromatic{{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}};
 constexpr std::array<int, 7> kScaleMajor{{0, 2, 4, 5, 7, 9, 11}};
 constexpr std::array<int, 7> kScaleMinor{{0, 2, 3, 5, 7, 8, 10}};
 constexpr std::array<int, 7> kScaleDorian{{0, 2, 3, 5, 7, 9, 10}};
 constexpr std::array<int, 5> kScalePentMinor{{0, 3, 5, 7, 10}};
+
+float pitchSmoothingSecondsForAlgorithm(EnhancedAudioStrip::PitchShiftAlgorithm algorithm) noexcept
+{
+    switch (algorithm)
+    {
+        case EnhancedAudioStrip::PitchShiftAlgorithm::SoundTouch:
+            return 0.08f;
+        case EnhancedAudioStrip::PitchShiftAlgorithm::Signalsmith:
+        case EnhancedAudioStrip::PitchShiftAlgorithm::Bungee:
+            return 0.08f;
+        case EnhancedAudioStrip::PitchShiftAlgorithm::Standard:
+        default:
+            return 0.02f;
+    }
+}
+
+void ensureStereoScratchBuffer(juce::AudioBuffer<float>& buffer, int requiredSamples)
+{
+    if (requiredSamples <= 0)
+        return;
+
+    if (buffer.getNumChannels() != 2 || buffer.getNumSamples() < requiredSamples)
+        buffer.setSize(2, requiredSamples, false, false, true);
+}
+
+float computeStereoBufferRms(const juce::AudioBuffer<float>& buffer, int startSample, int numSamples)
+{
+    if (numSamples <= 0 || buffer.getNumChannels() < 2)
+        return 0.0f;
+
+    const auto* left = buffer.getReadPointer(0, startSample);
+    const auto* right = buffer.getReadPointer(1, startSample);
+    double sumSquares = 0.0;
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const double sampleL = left[i];
+        const double sampleR = right[i];
+        sumSquares += (sampleL * sampleL) + (sampleR * sampleR);
+    }
+
+    return static_cast<float>(std::sqrt(sumSquares / static_cast<double>(numSamples * 2)));
+}
 
 bool modTargetAutoDefaultBipolar(ModernAudioEngine::ModTarget target)
 {
@@ -194,6 +236,106 @@ std::vector<int> refineOnsetSamplesToLeadingEdges(const std::vector<float>& mono
     std::sort(refined.begin(), refined.end());
     refined.erase(std::unique(refined.begin(), refined.end()), refined.end());
     return refined;
+}
+
+std::vector<int> collectAdaptiveTransientOnsetSamples(const std::vector<float>& monoSamples,
+                                                      const std::vector<float>& novelty,
+                                                      const std::vector<float>& energyDiff,
+                                                      int frameSize,
+                                                      int hopSize,
+                                                      int totalSamples,
+                                                      int minPeakSpacingFrames,
+                                                      int targetCount)
+{
+    auto collectPeakFrames = [minPeakSpacingFrames](const std::vector<float>& values,
+                                                    float minPeakLevel)
+    {
+        std::vector<std::pair<int, float>> peakFrames;
+        const int frameCount = static_cast<int>(values.size());
+        peakFrames.reserve(static_cast<size_t>(frameCount));
+
+        for (int i = 1; i < (frameCount - 1); ++i)
+        {
+            const float center = values[static_cast<size_t>(i)];
+            if (center < minPeakLevel)
+                continue;
+            if (center < values[static_cast<size_t>(i - 1)] || center < values[static_cast<size_t>(i + 1)])
+                continue;
+
+            if (!peakFrames.empty() && (i - peakFrames.back().first) < minPeakSpacingFrames)
+            {
+                if (center > peakFrames.back().second)
+                    peakFrames.back() = { i, center };
+                continue;
+            }
+
+            peakFrames.emplace_back(i, center);
+        }
+
+        return peakFrames;
+    };
+
+    auto framesToSamples = [&](const std::vector<std::pair<int, float>>& onsetFrames)
+    {
+        std::vector<int> onsetSamples;
+        onsetSamples.reserve(onsetFrames.size());
+
+        for (const auto& onset : onsetFrames)
+        {
+            const int centered = (onset.first * hopSize) + (frameSize / 2);
+            onsetSamples.push_back(juce::jlimit(0, totalSamples - 1, centered));
+        }
+
+        std::sort(onsetSamples.begin(), onsetSamples.end());
+        onsetSamples.erase(std::unique(onsetSamples.begin(), onsetSamples.end()), onsetSamples.end());
+
+        if (const auto refined = refineOnsetSamplesToLeadingEdges(monoSamples, onsetSamples, frameSize, hopSize);
+            !refined.empty())
+        {
+            onsetSamples = refined;
+        }
+
+        return onsetSamples;
+    };
+
+    auto collectWithRelaxedThreshold = [&](const std::vector<float>& values,
+                                           float baseMinPeakLevel)
+    {
+        static constexpr std::array<float, 8> kThresholdScales{{ 1.0f, 0.82f, 0.67f, 0.54f,
+                                                                 0.42f, 0.31f, 0.22f, 0.14f }};
+        std::vector<int> bestSamples;
+
+        for (const float scale : kThresholdScales)
+        {
+            const float minPeakLevel = juce::jmax(1.0e-6f, baseMinPeakLevel * scale);
+            auto onsetSamples = framesToSamples(collectPeakFrames(values, minPeakLevel));
+            if (onsetSamples.size() > bestSamples.size())
+                bestSamples = std::move(onsetSamples);
+            if (static_cast<int>(bestSamples.size()) >= targetCount)
+                break;
+        }
+
+        return bestSamples;
+    };
+
+    const float noveltyMean = std::accumulate(novelty.begin(), novelty.end(), 0.0f)
+        / static_cast<float>(juce::jmax(1, static_cast<int>(novelty.size())));
+    const float noveltyMax = novelty.empty() ? 0.0f : *std::max_element(novelty.begin(), novelty.end());
+    const float noveltyMinPeakLevel = juce::jmax(1.0e-6f,
+                                                 juce::jmax(noveltyMean * 0.35f, noveltyMax * 0.10f));
+
+    auto onsetSamples = collectWithRelaxedThreshold(novelty, noveltyMinPeakLevel);
+
+    if (static_cast<int>(onsetSamples.size()) < targetCount)
+    {
+        const float energyMax = energyDiff.empty() ? 0.0f : *std::max_element(energyDiff.begin(), energyDiff.end());
+        const float energyMinPeakLevel = juce::jmax(1.0e-6f, energyMax * 0.18f);
+        auto energyOnsetSamples = collectWithRelaxedThreshold(energyDiff, energyMinPeakLevel);
+        if (energyOnsetSamples.size() > onsetSamples.size())
+            onsetSamples = std::move(energyOnsetSamples);
+    }
+
+    return onsetSamples;
 }
 
 float smoothingCoeffFromMs(float ms, double sampleRate)
@@ -1441,7 +1583,7 @@ void StripGroup::setMuted(bool mute)
 //==============================================================================
 
 EnhancedAudioStrip::EnhancedAudioStrip(int newStripIndex)
-    : recordingBars(1), stripIndex(newStripIndex)
+    : recordingBars(2), stripIndex(newStripIndex)
 {
     const auto stripSeed = static_cast<uint32_t>(newStripIndex + 1);
     const auto seed = static_cast<uint32_t>(juce::Time::currentTimeMillis())
@@ -1465,6 +1607,11 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     triggerOutputBlendTotalSamples = 0;
     triggerOutputBlendStartL = 0.0f;
     triggerOutputBlendStartR = 0.0f;
+    pitchCacheOutputBlendActive = false;
+    pitchCacheOutputBlendSamplesRemaining = 0;
+    pitchCacheOutputBlendTotalSamples = 0;
+    pitchCacheOutputBlendStartL = 0.0f;
+    pitchCacheOutputBlendStartR = 0.0f;
     lastOutputSampleL = 0.0f;
     lastOutputSampleR = 0.0f;
     
@@ -1473,12 +1620,14 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     stepSampler.setAmpAttackMs(stepEnvelopeAttackMs.load(std::memory_order_acquire));
     stepSampler.setAmpDecayMs(stepEnvelopeDecayMs.load(std::memory_order_acquire));
     stepSampler.setAmpReleaseMs(stepEnvelopeReleaseMs.load(std::memory_order_acquire));
+    stepSampler.setTrimGain(juce::Decibels::decibelsToGain(trimDb.load(std::memory_order_acquire)));
     
     // Initialize smoothed parameters (50ms ramp time)
     smoothedVolume.reset(sampleRate, 0.05);
+    smoothedTrimGain.reset(sampleRate, 0.02);
     smoothedPan.reset(sampleRate, 0.05);
     smoothedSpeed.reset(sampleRate, 0.05);
-    smoothedPitchShift.reset(sampleRate, 0.02);
+    smoothedPitchShift.reset(sampleRate, pitchSmoothingSecondsForAlgorithm(getPitchShiftAlgorithm()));
     smoothedFilterFrequency.reset(sampleRate, 0.01);
     smoothedFilterResonance.reset(sampleRate, 0.01);
     smoothedFilterMorph.reset(sampleRate, 0.01);
@@ -1492,6 +1641,8 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     grainFreezeBlendSmoother.reset(sampleRate, 0.08);
     
     smoothedVolume.setCurrentAndTargetValue(volume.load());
+    smoothedTrimGain.setCurrentAndTargetValue(
+        juce::Decibels::decibelsToGain(trimDb.load(std::memory_order_acquire)));
     smoothedPan.setCurrentAndTargetValue(pan.load());
     smoothedSpeed.setCurrentAndTargetValue(static_cast<float>(playbackSpeed.load()));
     smoothedPitchShift.setCurrentAndTargetValue(pitchShiftSemitones.load(std::memory_order_acquire));
@@ -1507,6 +1658,7 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     grainPitchSmoother.setCurrentAndTargetValue(grainParams.pitchSemitones);
     grainPitchJitterSmoother.setCurrentAndTargetValue(grainParams.pitchJitterSemitones);
     grainFreezeBlendSmoother.setCurrentAndTargetValue(0.0f);
+    resetSignalsmithRealtimeAlignmentState();
     // Precompute a fixed Blackman-Harris table once; per-voice envelope uses normalized lookup.
     const int windowTableSize = static_cast<int>(grainWindow.size());
     for (int i = 0; i < windowTableSize; ++i)
@@ -1607,6 +1759,11 @@ void EnhancedAudioStrip::loadSample(const juce::AudioBuffer<float>& buffer, doub
     triggerOutputBlendTotalSamples = 0;
     triggerOutputBlendStartL = 0.0f;
     triggerOutputBlendStartR = 0.0f;
+    pitchCacheOutputBlendActive = false;
+    pitchCacheOutputBlendSamplesRemaining = 0;
+    pitchCacheOutputBlendTotalSamples = 0;
+    pitchCacheOutputBlendStartL = 0.0f;
+    pitchCacheOutputBlendStartR = 0.0f;
     lastOutputSampleL = 0.0f;
     lastOutputSampleR = 0.0f;
     
@@ -1635,6 +1792,7 @@ void EnhancedAudioStrip::loadSample(const juce::AudioBuffer<float>& buffer, doub
     }
     
     this->sourceSampleRate = sourceRate;
+    pitchSourceVersion.fetch_add(1, std::memory_order_acq_rel);
     sampleLength = sampleBuffer.getNumSamples();
     playbackPosition = 0.0;
     grainCenterSmoother.setCurrentAndTargetValue(0.0);
@@ -1676,6 +1834,11 @@ void EnhancedAudioStrip::loadSampleWithAnalysisCache(const juce::AudioBuffer<flo
     triggerOutputBlendTotalSamples = 0;
     triggerOutputBlendStartL = 0.0f;
     triggerOutputBlendStartR = 0.0f;
+    pitchCacheOutputBlendActive = false;
+    pitchCacheOutputBlendSamplesRemaining = 0;
+    pitchCacheOutputBlendTotalSamples = 0;
+    pitchCacheOutputBlendStartL = 0.0f;
+    pitchCacheOutputBlendStartR = 0.0f;
     lastOutputSampleL = 0.0f;
     lastOutputSampleR = 0.0f;
 
@@ -1699,6 +1862,7 @@ void EnhancedAudioStrip::loadSampleWithAnalysisCache(const juce::AudioBuffer<flo
     }
 
     this->sourceSampleRate = sourceRate;
+    pitchSourceVersion.fetch_add(1, std::memory_order_acq_rel);
     sampleLength = sampleBuffer.getNumSamples();
     playbackPosition = 0.0;
     grainCenterSmoother.setCurrentAndTargetValue(0.0);
@@ -1739,6 +1903,11 @@ void EnhancedAudioStrip::adoptPreparedSample(juce::AudioBuffer<float>& preparedS
     triggerOutputBlendTotalSamples = 0;
     triggerOutputBlendStartL = 0.0f;
     triggerOutputBlendStartR = 0.0f;
+    pitchCacheOutputBlendActive = false;
+    pitchCacheOutputBlendSamplesRemaining = 0;
+    pitchCacheOutputBlendTotalSamples = 0;
+    pitchCacheOutputBlendStartL = 0.0f;
+    pitchCacheOutputBlendStartR = 0.0f;
     lastOutputSampleL = 0.0f;
     lastOutputSampleR = 0.0f;
 
@@ -1756,6 +1925,7 @@ void EnhancedAudioStrip::adoptPreparedSample(juce::AudioBuffer<float>& preparedS
 
     sampleBuffer = std::move(preparedSampleBuffer);
     sourceSampleRate = sourceRate;
+    pitchSourceVersion.fetch_add(1, std::memory_order_acq_rel);
     sampleLength = static_cast<double>(sampleBuffer.getNumSamples());
     playbackPosition = juce::jlimit(0.0, juce::jmax(0.0, sampleLength - 1.0), savedNormalizedPosition * sampleLength);
 
@@ -1994,7 +2164,6 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
     };
 
     std::vector<float> novelty(static_cast<size_t>(frames), 0.0f);
-    float noveltySum = 0.0f;
     for (int i = 0; i < frames; ++i)
     {
         const int a = juce::jmax(0, i - 8);
@@ -2003,75 +2172,20 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
         const float peakPart = juce::jmax(0.0f, smoothedFlux[static_cast<size_t>(i)] - adaptive);
         const float mixed = peakPart + (0.25f * energyDiff[static_cast<size_t>(i)]);
         novelty[static_cast<size_t>(i)] = mixed;
-        noveltySum += mixed;
     }
 
-    const float noveltyMean = noveltySum / static_cast<float>(juce::jmax(1, frames));
-    const float noveltyMax = *std::max_element(novelty.begin(), novelty.end());
-    const float minPeakLevel = juce::jmax(1.0e-6f,
-                                          juce::jmax(noveltyMean * 0.35f, noveltyMax * 0.10f));
     const double analysisSampleRate = (sourceSampleRate > 1000.0)
         ? sourceSampleRate
         : juce::jmax(1.0, currentSampleRate);
     const int minPeakSpacingFrames = juce::jmax(1, static_cast<int>((0.015 * analysisSampleRate) / static_cast<double>(hop))); // 15ms
-
-    std::vector<std::pair<int, float>> onsetFrames;
-    onsetFrames.reserve(static_cast<size_t>(frames));
-
-    for (int i = 1; i < (frames - 1); ++i)
-    {
-        const float center = novelty[static_cast<size_t>(i)];
-        if (center < minPeakLevel)
-            continue;
-        if (center < novelty[static_cast<size_t>(i - 1)] || center < novelty[static_cast<size_t>(i + 1)])
-            continue;
-
-        if (!onsetFrames.empty() && (i - onsetFrames.back().first) < minPeakSpacingFrames)
-        {
-            if (center > onsetFrames.back().second)
-                onsetFrames.back() = { i, center };
-            continue;
-        }
-
-        onsetFrames.emplace_back(i, center);
-    }
-
-    if (onsetFrames.empty())
-    {
-        const float energyMax = *std::max_element(energyDiff.begin(), energyDiff.end());
-        const float energyMinPeak = juce::jmax(1.0e-6f, energyMax * 0.18f);
-        for (int i = 1; i < (frames - 1); ++i)
-        {
-            const float center = energyDiff[static_cast<size_t>(i)];
-            if (center < energyMinPeak)
-                continue;
-            if (center < energyDiff[static_cast<size_t>(i - 1)] || center < energyDiff[static_cast<size_t>(i + 1)])
-                continue;
-
-            if (!onsetFrames.empty() && (i - onsetFrames.back().first) < minPeakSpacingFrames)
-                continue;
-
-            onsetFrames.emplace_back(i, center);
-        }
-    }
-
-    std::vector<int> onsetSamples;
-    onsetSamples.reserve(onsetFrames.size());
-    for (const auto& onset : onsetFrames)
-    {
-        // Frame index marks the analysis frame start; shift to frame center so
-        // markers land on the transient hit rather than a few ms early.
-        const int centered = (onset.first * hop) + (frameSize / 2);
-        onsetSamples.push_back(juce::jlimit(0, totalSamples - 1, centered));
-    }
-
-    std::sort(onsetSamples.begin(), onsetSamples.end());
-    onsetSamples.erase(std::unique(onsetSamples.begin(), onsetSamples.end()), onsetSamples.end());
-    if (const auto refined = refineOnsetSamplesToLeadingEdges(monoSamples, onsetSamples, frameSize, hop);
-        !refined.empty())
-    {
-        onsetSamples = refined;
-    }
+    auto onsetSamples = collectAdaptiveTransientOnsetSamples(monoSamples,
+                                                             novelty,
+                                                             energyDiff,
+                                                             frameSize,
+                                                             hop,
+                                                             totalSamples,
+                                                             minPeakSpacingFrames,
+                                                             ModernAudioEngine::MaxColumns);
     if (onsetSamples.empty())
     {
         fillUniform();
@@ -3927,6 +4041,7 @@ bool EnhancedAudioStrip::loadSampleFromFile(const juce::File& file)
 
         sampleBuffer.makeCopyOf(newSampleBuffer, true);
         sourceSampleRate = reader->sampleRate;
+        pitchSourceVersion.fetch_add(1, std::memory_order_acq_rel);
         sampleLength = static_cast<double>(sampleBuffer.getNumSamples());
         playbackPosition = juce::jlimit(0.0, juce::jmax(0.0, sampleLength - 1.0), savedNormalizedPosition * sampleLength);
 
@@ -3975,10 +4090,16 @@ void EnhancedAudioStrip::clearSample()
     sampleBuffer.setSize(0, 0, false, true, false);
     sampleLength = 0.0;
     sourceSampleRate = currentSampleRate;
+    pitchSourceVersion.fetch_add(1, std::memory_order_acq_rel);
     playbackPosition = 0.0;
     playheadTraversalRatioAtLastCalc = -1.0;
     playheadTraversalPhaseOffsetSlices = 0.0;
     playheadTraversalSliceCountAtLastCalc = -1;
+    const float requestedTraversalRatio = playheadSpeedRatio.load(std::memory_order_acquire);
+    appliedPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
+    pendingPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
+    pendingPlayheadSpeedChange.store(0, std::memory_order_release);
+    pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
     triggerSample = 0;
     triggerColumn = 0;
     triggerOffsetRatio = 0.0;
@@ -4084,7 +4205,6 @@ bool EnhancedAudioStrip::rebuildLoopTempoMatchCache(double hostTempo, double bea
     const bool cacheMatches = loopTempoMatchCacheValid
         && loopTempoMatchCacheBackend == backend
         && loopTempoMatchCacheSourceSamples == sourceSamples
-        && std::abs(loopTempoMatchCacheHostTempo - hostTempo) <= 1.0e-4
         && std::abs(loopTempoMatchCacheBeatsForLoop - beatsForLoop) <= 1.0e-6
         && std::abs(loopTempoMatchCacheSourceSampleRate - sourceSampleRate) <= 1.0e-4
         && loopTempoMatchCacheBuffer.getNumSamples() == targetFrames;
@@ -4579,18 +4699,63 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         wasPlayingBeforeStop = false;
     }
     
-    if (!playing)
+    const bool currentlyPlaying = playing.load(std::memory_order_acquire);
+    if (!currentlyPlaying
+        && signalsmithRealtimeWasPlaying
+        && signalsmithRealtimeAlignmentDelaySamples > 0)
+    {
+        signalsmithRealtimeAlignmentTailSamplesRemaining = juce::jmax(
+            signalsmithRealtimeAlignmentTailSamplesRemaining,
+            signalsmithRealtimeAlignmentDelaySamples);
+    }
+    signalsmithRealtimeWasPlaying = currentlyPlaying;
+
+    const bool shouldFlushSignalsmithAlignmentTail = !currentlyPlaying
+        && signalsmithRealtimeAlignmentTailSamplesRemaining > 0;
+    if (!currentlyPlaying && !shouldFlushSignalsmithAlignmentTail)
         return;
     
     // Step mode needs to run even without sample (for step indicator)
     bool hasAudio = (sampleBuffer.getNumSamples() > 0);
     
-    // Early exit only for non-step modes when no audio
-    if (!hasAudio && playMode != PlayMode::Step)
+    // Early exit only for non-step modes when no audio.
+    if (!hasAudio && playMode != PlayMode::Step && !shouldFlushSignalsmithAlignmentTail)
         return;
+
+    if (shouldFlushSignalsmithAlignmentTail)
+    {
+        ensureStereoScratchBuffer(signalsmithRealtimeRenderBuffer, numSamples);
+        signalsmithRealtimeRenderBuffer.clear(0, 0, numSamples);
+        signalsmithRealtimeRenderBuffer.clear(1, 0, numSamples);
+
+        if (shouldUseRealtimeSignalsmithAtCurrentPitch())
+        {
+            processSignalsmithRealtimePitchBufferInPlace(signalsmithRealtimeRenderBuffer,
+                                                         0,
+                                                         numSamples,
+                                                         signalsmithRealtimeCurrentSemitones,
+                                                         signalsmithRealtimeCurrentSemitones);
+        }
+        else
+        {
+            processSignalsmithRealtimeAlignmentDelayBufferInPlace(signalsmithRealtimeRenderBuffer, 0, numSamples);
+        }
+
+        output.addFrom(0, startSample, signalsmithRealtimeRenderBuffer, 0, 0, numSamples);
+        output.addFrom(1, startSample, signalsmithRealtimeRenderBuffer, 1, 0, numSamples);
+
+        signalsmithRealtimeAlignmentTailSamplesRemaining = juce::jmax(
+            0,
+            signalsmithRealtimeAlignmentTailSamplesRemaining - numSamples);
+        lastOutputSampleL = signalsmithRealtimeRenderBuffer.getSample(0, numSamples - 1);
+        lastOutputSampleR = signalsmithRealtimeRenderBuffer.getSample(1, numSamples - 1);
+        return;
+    }
     
     // Update smoothed targets
     smoothedVolume.setTargetValue(volume.load());
+    smoothedTrimGain.setTargetValue(
+        juce::Decibels::decibelsToGain(trimDb.load(std::memory_order_acquire)));
     smoothedPan.setTargetValue(pan.load());
     smoothedSpeed.setTargetValue(static_cast<float>(playbackSpeed.load()));
     smoothedFilterFrequency.setTargetValue(filterFrequency.load(std::memory_order_acquire));
@@ -4623,9 +4788,16 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     }
 
     double beatsForLoop = 4.0;
-    const double playheadTraversalRatio = juce::jmax(
+    double playheadTraversalRatio = juce::jmax(
         0.125,
-        static_cast<double>(playheadSpeedRatio.load(std::memory_order_acquire)));
+        static_cast<double>(appliedPlayheadSpeedRatio.load(std::memory_order_acquire)));
+    if (!(playheadTraversalRatio > 0.0))
+    {
+        playheadTraversalRatio = juce::jmax(
+            0.125,
+            static_cast<double>(playheadSpeedRatio.load(std::memory_order_acquire)));
+        appliedPlayheadSpeedRatio.store(static_cast<float>(playheadTraversalRatio), std::memory_order_release);
+    }
 
     auto mapLoopPositionForMode = [&](double rawPositionInLoop) -> double
     {
@@ -4913,6 +5085,68 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         if (wrapped < 0.0)
             wrapped += loopLenSafe;
 
+        const bool quantizedLoopTraversalSpeed = (playMode == PlayMode::Loop
+            && positionInfo.getPpqPosition().hasValue()
+            && !scrubActive
+            && !tapeStopActive
+            && !scratchGestureActive);
+        const float requestedTraversalRatio = juce::jlimit(
+            0.125f,
+            4.0f,
+            playheadSpeedRatio.load(std::memory_order_acquire));
+        const int musicalTraversalSlices = juce::jmax(1, loopCols);
+        const double musicalSliceLength = loopLenSafe / static_cast<double>(musicalTraversalSlices);
+        const int currentMusicalSlice = (musicalSliceLength > 1.0e-9)
+            ? static_cast<int>(std::floor(wrapped / musicalSliceLength))
+            : 0;
+        bool quantizedTraversalHandoffThisSample = false;
+
+        if (quantizedLoopTraversalSpeed)
+        {
+            if (std::abs(static_cast<float>(playheadTraversalRatio) - requestedTraversalRatio) > 1.0e-6f)
+            {
+                const bool hadPending = (pendingPlayheadSpeedChange.load(std::memory_order_acquire) != 0);
+                const float pendingRatio = pendingPlayheadSpeedRatio.load(std::memory_order_acquire);
+                if (!hadPending || std::abs(pendingRatio - requestedTraversalRatio) > 1.0e-6f)
+                {
+                    pendingPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
+                    pendingPlayheadSpeedBaseSlice.store(currentMusicalSlice, std::memory_order_release);
+                    pendingPlayheadSpeedChange.store(1, std::memory_order_release);
+                }
+            }
+
+            if (pendingPlayheadSpeedChange.load(std::memory_order_acquire) != 0)
+            {
+                const int armedSlice = pendingPlayheadSpeedBaseSlice.load(std::memory_order_acquire);
+                if (armedSlice < 0)
+                {
+                    pendingPlayheadSpeedBaseSlice.store(currentMusicalSlice, std::memory_order_release);
+                }
+                else if (currentMusicalSlice != armedSlice)
+                {
+                    playheadTraversalRatio = juce::jmax(
+                        0.125,
+                        static_cast<double>(pendingPlayheadSpeedRatio.load(std::memory_order_acquire)));
+                    appliedPlayheadSpeedRatio.store(static_cast<float>(playheadTraversalRatio), std::memory_order_release);
+                    pendingPlayheadSpeedRatio.store(static_cast<float>(playheadTraversalRatio), std::memory_order_release);
+                    pendingPlayheadSpeedChange.store(0, std::memory_order_release);
+                    pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
+                    playheadTraversalRatioAtLastCalc = playheadTraversalRatio;
+                    playheadTraversalPhaseOffsetSlices = 0.0;
+                    playheadTraversalSliceCountAtLastCalc = -1;
+                    quantizedTraversalHandoffThisSample = true;
+                }
+            }
+        }
+        else if (std::abs(static_cast<float>(playheadTraversalRatio) - requestedTraversalRatio) > 1.0e-6f)
+        {
+            playheadTraversalRatio = requestedTraversalRatio;
+            appliedPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
+            pendingPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
+            pendingPlayheadSpeedChange.store(0, std::memory_order_release);
+            pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
+        }
+
         const double slicePos = wrapped / sliceLength;
         const double unswungBaseSlice = std::floor(slicePos);
         double baseSliceForTraversal = unswungBaseSlice;
@@ -4950,6 +5184,12 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         {
             playheadTraversalRatioAtLastCalc = playheadTraversalRatio;
         }
+        else if (quantizedTraversalHandoffThisSample)
+        {
+            playheadTraversalSliceCountAtLastCalc = traversalSlices;
+            playheadTraversalRatioAtLastCalc = playheadTraversalRatio;
+            playheadTraversalPhaseOffsetSlices = 0.0;
+        }
         else if (std::abs(playheadTraversalRatio - playheadTraversalRatioAtLastCalc) > 1.0e-6)
         {
             // Preserve the currently audible traversal slice when speed changes.
@@ -4959,7 +5199,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             playheadTraversalRatioAtLastCalc = playheadTraversalRatio;
         }
 
-        const double intraSlice = slicePos - unswungBaseSlice;
+        const double intraSlice = quantizedTraversalHandoffThisSample ? 0.0 : (slicePos - unswungBaseSlice);
         double traversedSlice = std::floor((baseSliceForTraversal * playheadTraversalRatio) + playheadTraversalPhaseOffsetSlices);
         traversedSlice = std::fmod(traversedSlice, static_cast<double>(traversalSlices));
         if (traversedSlice < 0.0)
@@ -5216,6 +5456,18 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     // STEP SEQUENCER MODE - handle entirely separately (before main loop)
     if (playMode == PlayMode::Step)
     {
+        const bool stepNeedsAlignmentDelay = (signalsmithRealtimeAlignmentDelaySamples > 0);
+        juce::AudioBuffer<float>* stepOutputBuffer = &output;
+        int stepOutputStartSample = startSample;
+        if (stepNeedsAlignmentDelay)
+        {
+            ensureStereoScratchBuffer(signalsmithRealtimeRenderBuffer, numSamples);
+            signalsmithRealtimeRenderBuffer.clear(0, 0, numSamples);
+            signalsmithRealtimeRenderBuffer.clear(1, 0, numSamples);
+            stepOutputBuffer = &signalsmithRealtimeRenderBuffer;
+            stepOutputStartSample = 0;
+        }
+
         stepSampler.setAmpAttackMs(stepEnvelopeAttackMs.load(std::memory_order_acquire));
         stepSampler.setAmpDecayMs(stepEnvelopeDecayMs.load(std::memory_order_acquire));
         stepSampler.setAmpReleaseMs(stepEnvelopeReleaseMs.load(std::memory_order_acquire));
@@ -5418,7 +5670,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     segmentSamples = juce::jmin(segmentSamples, juce::jmax(1, untilBoundary));
                 }
 
-                stepSampler.process(output, startSample + processed, segmentSamples);
+                stepSampler.process(*stepOutputBuffer, stepOutputStartSample + processed, segmentSamples);
                 processed += segmentSamples;
 
                 if (processed < numSamples
@@ -5473,7 +5725,16 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         }
         else
         {
-            stepSampler.process(output, startSample, numSamples);
+            stepSampler.process(*stepOutputBuffer, stepOutputStartSample, numSamples);
+        }
+
+        if (stepNeedsAlignmentDelay)
+        {
+            processSignalsmithRealtimeAlignmentDelayBufferInPlace(signalsmithRealtimeRenderBuffer, 0, numSamples);
+            output.addFrom(0, startSample, signalsmithRealtimeRenderBuffer, 0, 0, numSamples);
+            output.addFrom(1, startSample, signalsmithRealtimeRenderBuffer, 1, 0, numSamples);
+            lastOutputSampleL = signalsmithRealtimeRenderBuffer.getSample(0, numSamples - 1);
+            lastOutputSampleR = signalsmithRealtimeRenderBuffer.getSample(1, numSamples - 1);
         }
         
         // Done - return early, don't process normal audio
@@ -5620,6 +5881,104 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         playbackPosition = loopStartSamples + positionInLoop;
     }
     
+    juce::AudioBuffer<float>* renderOutputBuffer = &output;
+    int renderOutputStartSample = startSample;
+    int renderedSamples = 0;
+    bool soundTouchPitchCacheActive = false;
+    float soundTouchPitchCacheBaseSemitones = 0.0f;
+    bool bungeePitchCacheActive = false;
+    float bungeePitchCacheBaseSemitones = 0.0f;
+    bool signalsmithPitchCacheActive = false;
+    float signalsmithPitchCacheBaseSemitones = 0.0f;
+    const auto pitchAlgorithm = getPitchShiftAlgorithm();
+    const bool trackSignalsmithHistory = shouldTrackRealtimeSignalsmithHistory();
+    const bool maintainRealtimeSignalsmithStream = shouldMaintainRealtimeSignalsmithStream();
+    const bool allowSignalsmithPitchCache = !smoothedPitchShift.isSmoothing();
+#if MLRVST_ENABLE_SOUNDTOUCH
+    if (playMode != PlayMode::Step
+        && playMode != PlayMode::Grain
+        && !isResamplePitchEnabled()
+        && pitchAlgorithm == PitchShiftAlgorithm::SoundTouch)
+    {
+        const float targetSemitones = pitchShiftSemitones.load(std::memory_order_acquire);
+        if (std::abs(targetSemitones) > 0.01f
+            && isPitchCachePlaybackSourceEligible(playbackSourceBuffer)
+            && getReusableSoundTouchPitchCacheSemitones(soundTouchPitchCacheBaseSemitones))
+        {
+            playbackSourceBuffer = &soundTouchPitchCacheBuffer;
+            soundTouchPitchCacheActive = true;
+        }
+    }
+#endif
+    if (playMode != PlayMode::Step
+        && playMode != PlayMode::Grain
+        && !isResamplePitchEnabled()
+        && pitchAlgorithm == PitchShiftAlgorithm::Bungee)
+    {
+        const float targetSemitones = pitchShiftSemitones.load(std::memory_order_acquire);
+        if (std::abs(targetSemitones) > 0.01f
+            && isPitchCachePlaybackSourceEligible(playbackSourceBuffer)
+            && getReusableBungeePitchCacheSemitones(bungeePitchCacheBaseSemitones))
+        {
+            playbackSourceBuffer = &bungeePitchCacheBuffer;
+            bungeePitchCacheActive = true;
+        }
+    }
+    if (playMode != PlayMode::Step
+        && playMode != PlayMode::Grain
+        && !isResamplePitchEnabled()
+        && pitchAlgorithm == PitchShiftAlgorithm::Signalsmith
+        && !maintainRealtimeSignalsmithStream
+        && allowSignalsmithPitchCache)
+    {
+        const float targetSemitones = pitchShiftSemitones.load(std::memory_order_acquire);
+        if (std::abs(targetSemitones) > 0.01f
+            && isPitchCachePlaybackSourceEligible(playbackSourceBuffer)
+            && getReusableSignalsmithPitchCacheSemitones(signalsmithPitchCacheBaseSemitones)
+            && std::abs(targetSemitones - signalsmithPitchCacheBaseSemitones) <= 0.01f)
+        {
+            playbackSourceBuffer = &signalsmithPitchCacheBuffer;
+            signalsmithPitchCacheActive = true;
+        }
+    }
+    if (signalsmithPitchCacheActive
+        && (!signalsmithPitchCacheActiveLastBlock
+            || std::abs(signalsmithPitchCacheActiveBaseSemitones - signalsmithPitchCacheBaseSemitones) > 0.01f))
+    {
+        startPitchCacheOutputBlendLocked();
+    }
+    bool useRealtimeSignalsmith = shouldUseRealtimeSignalsmithAtCurrentPitch();
+    if (useRealtimeSignalsmith && !signalsmithRealtimeStreamPrimed)
+    {
+        const float activationSemitones = juce::jlimit(
+            -24.0f,
+            24.0f,
+            pitchShiftSemitones.load(std::memory_order_acquire));
+        signalsmithRealtimeStreamPrimed = primeSignalsmithRealtimePitchFromHistoryLocked(activationSemitones);
+        if (!signalsmithRealtimeStreamPrimed)
+            useRealtimeSignalsmith = false;
+    }
+    const bool useRealtimeAlignmentDelay = maintainRealtimeSignalsmithStream
+        && !useRealtimeSignalsmith
+        && (signalsmithRealtimeAlignmentDelaySamples > 0);
+    const bool renderSignalsmithLiveFallback =
+        useRealtimeSignalsmith && isSignalsmithLiveMode() && playMode == PlayMode::Loop;
+    auto signalsmithLiveFallbackPitch = smoothedPitchShift;
+    if (maintainRealtimeSignalsmithStream || useRealtimeAlignmentDelay)
+    {
+        ensureStereoScratchBuffer(signalsmithRealtimeRenderBuffer, numSamples);
+        signalsmithRealtimeRenderBuffer.clear(0, 0, numSamples);
+        signalsmithRealtimeRenderBuffer.clear(1, 0, numSamples);
+        renderOutputBuffer = &signalsmithRealtimeRenderBuffer;
+        renderOutputStartSample = 0;
+    }
+    if (useRealtimeSignalsmith)
+    {
+        ensureStereoScratchBuffer(signalsmithRealtimeWetBuffer, numSamples);
+        signalsmithRealtimeWetBuffer.clear(0, 0, numSamples);
+        signalsmithRealtimeWetBuffer.clear(1, 0, numSamples);
+    }
+
     const int playbackNumChannels = juce::jmin(output.getNumChannels(), playbackSourceBuffer->getNumChannels());
 
     for (int i = 0; i < numSamples; ++i)
@@ -5628,7 +5987,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             break;
         
         // Get smoothed values for this sample
-        float currentVol = smoothedVolume.getNextValue();
         float currentPan = smoothedPan.getNextValue();
         float currentSpeed = smoothedSpeed.getNextValue();
         
@@ -6392,16 +6750,53 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             rightSample *= loopSegmentEnvelopeGain;
         }
 
-        // Apply volume and crossfade
+        const float currentTrimGain = smoothedTrimGain.getNextValue();
+        leftSample *= currentTrimGain;
+        rightSample *= currentTrimGain;
+
+        const float signalsmithInputL = leftSample * fadeValue;
+        const float signalsmithInputR = rightSample * fadeValue;
+        if (trackSignalsmithHistory)
+            pushSignalsmithRealtimeHistorySampleLocked(signalsmithInputL, signalsmithInputR);
+
+        if (useRealtimeSignalsmith)
+        {
+            float wetInL = signalsmithInputL;
+            float wetInR = signalsmithInputR;
+            if (!std::isfinite(wetInL)) wetInL = 0.0f;
+            if (!std::isfinite(wetInR)) wetInR = 0.0f;
+            signalsmithRealtimeWetBuffer.setSample(0, i, wetInL);
+            signalsmithRealtimeWetBuffer.setSample(1, i, wetInR);
+        }
+
+        // Pitch shift is tempo-preserving and should be bypassed when a strip is
+        // using the resample-based pitch path instead.
+        if (playMode != PlayMode::Step
+            && !isResamplePitchEnabled()
+            && (pitchAlgorithm != PitchShiftAlgorithm::Signalsmith
+                || !maintainRealtimeSignalsmithStream
+                || renderSignalsmithLiveFallback))
+        {
+            const float semitonesNow = renderSignalsmithLiveFallback
+                ? signalsmithLiveFallbackPitch.getNextValue()
+                : smoothedPitchShift.getNextValue();
+            const float effectiveSemitones = soundTouchPitchCacheActive
+                ? (semitonesNow - soundTouchPitchCacheBaseSemitones)
+                : (bungeePitchCacheActive
+                    ? (semitonesNow - bungeePitchCacheBaseSemitones)
+                : (signalsmithPitchCacheActive
+                    ? 0.0f
+                    : semitonesNow));
+            processPitchShift(leftSample,
+                              rightSample,
+                              effectiveSemitones,
+                              readSamplePosition,
+                              playbackSourceBuffer == &sampleBuffer);
+        }
+
+        const float currentVol = smoothedVolume.getNextValue();
         float finalGainLeft = currentVol * fadeValue;
         float finalGainRight = currentVol * fadeValue;
-
-        // Pitch shift is tempo-preserving and independent from playback speed control.
-        if (playMode != PlayMode::Step)
-        {
-            const float semitonesNow = smoothedPitchShift.getNextValue();
-            processPitchShift(leftSample, rightSample, semitonesNow);
-        }
         
         // Apply filter if enabled
         if (filterEnabled)
@@ -6450,14 +6845,141 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             }
         }
 
+        if (pitchCacheOutputBlendActive
+            && pitchCacheOutputBlendSamplesRemaining > 0
+            && pitchCacheOutputBlendTotalSamples > 0)
+        {
+            const float progress = 1.0f - (static_cast<float>(pitchCacheOutputBlendSamplesRemaining)
+                                           / static_cast<float>(pitchCacheOutputBlendTotalSamples));
+            const float t = juce::jlimit(0.0f, 1.0f, progress);
+            outL = (pitchCacheOutputBlendStartL * (1.0f - t)) + (outL * t);
+            outR = (pitchCacheOutputBlendStartR * (1.0f - t)) + (outR * t);
+
+            --pitchCacheOutputBlendSamplesRemaining;
+            if (pitchCacheOutputBlendSamplesRemaining <= 0)
+            {
+                pitchCacheOutputBlendActive = false;
+                pitchCacheOutputBlendSamplesRemaining = 0;
+                pitchCacheOutputBlendTotalSamples = 0;
+            }
+        }
+
         if (!std::isfinite(outL)) outL = 0.0f;
         if (!std::isfinite(outR)) outR = 0.0f;
 
-        output.addSample(0, startSample + i, outL);
-        output.addSample(1, startSample + i, outR);
-        lastOutputSampleL = outL;
-        lastOutputSampleR = outR;
+        renderOutputBuffer->addSample(0, renderOutputStartSample + i, outL);
+        renderOutputBuffer->addSample(1, renderOutputStartSample + i, outR);
+        renderedSamples = i + 1;
+        if (!useRealtimeAlignmentDelay)
+        {
+            lastOutputSampleL = outL;
+            lastOutputSampleR = outR;
+        }
     }
+
+    float signalsmithLoopDebugPreRmsValue = 0.0f;
+    float signalsmithLoopDebugWetRmsValue = 0.0f;
+    float signalsmithLoopDebugFinalRmsValue = 0.0f;
+    bool signalsmithRealtimeStreamProcessedThisBlock = false;
+    if (maintainRealtimeSignalsmithStream && renderedSamples > 0)
+    {
+        signalsmithLoopDebugPreRmsValue = computeStereoBufferRms(signalsmithRealtimeRenderBuffer, 0, renderedSamples);
+        float startSemitones = 0.0f;
+        float endSemitones = 0.0f;
+        computeSignalsmithRealtimePitchWindow(renderedSamples, startSemitones, endSemitones);
+        smoothedPitchShift.skip(renderedSamples);
+        if (!signalsmithRealtimeStreamPrimed)
+            signalsmithRealtimeStreamPrimed = primeSignalsmithRealtimePitchFromHistoryLocked(endSemitones);
+
+        if (signalsmithRealtimeStreamPrimed)
+        {
+            if (!useRealtimeSignalsmith)
+            {
+                ensureStereoScratchBuffer(signalsmithRealtimeWetBuffer, renderedSamples);
+                signalsmithRealtimeWetBuffer.copyFrom(0, 0, signalsmithRealtimeRenderBuffer, 0, 0, renderedSamples);
+                signalsmithRealtimeWetBuffer.copyFrom(1, 0, signalsmithRealtimeRenderBuffer, 1, 0, renderedSamples);
+            }
+
+            const bool processedWet = processSignalsmithRealtimePitchBufferInPlace(signalsmithRealtimeWetBuffer,
+                                                                                   0,
+                                                                                   renderedSamples,
+                                                                                   startSemitones,
+                                                                                   endSemitones);
+            signalsmithRealtimeStreamProcessedThisBlock = processedWet;
+            signalsmithLoopDebugWetRmsValue = computeStereoBufferRms(signalsmithRealtimeWetBuffer, 0, renderedSamples);
+            const bool shouldActivateWetOutput = processedWet
+                && (signalsmithRealtimeOutputActive
+                    || signalsmithLoopDebugWetRmsValue > 1.0e-5f
+                    || signalsmithLoopDebugPreRmsValue <= 1.0e-6f);
+            if (!signalsmithRealtimeOutputActive && shouldActivateWetOutput)
+            {
+                signalsmithRealtimeOutputActive = true;
+                startPitchCacheOutputBlendLocked();
+            }
+
+            if (useRealtimeSignalsmith && signalsmithRealtimeOutputActive && shouldActivateWetOutput)
+            {
+                applySignalsmithRealtimePostPitchBufferInPlace(signalsmithRealtimeWetBuffer,
+                                                               0,
+                                                               renderedSamples,
+                                                               positionInfo,
+                                                               tempo);
+                signalsmithLoopDebugWetRmsValue = computeStereoBufferRms(signalsmithRealtimeWetBuffer, 0, renderedSamples);
+                signalsmithLoopDebugFinalRmsValue = signalsmithLoopDebugWetRmsValue;
+                output.addFrom(0, startSample, signalsmithRealtimeWetBuffer, 0, 0, renderedSamples);
+                output.addFrom(1, startSample, signalsmithRealtimeWetBuffer, 1, 0, renderedSamples);
+                lastOutputSampleL = signalsmithRealtimeWetBuffer.getSample(0, renderedSamples - 1);
+                lastOutputSampleR = signalsmithRealtimeWetBuffer.getSample(1, renderedSamples - 1);
+            }
+            else
+            {
+                if (useRealtimeAlignmentDelay)
+                    processSignalsmithRealtimeAlignmentDelayBufferInPlace(signalsmithRealtimeRenderBuffer, 0, renderedSamples);
+
+                signalsmithLoopDebugFinalRmsValue = computeStereoBufferRms(signalsmithRealtimeRenderBuffer, 0, renderedSamples);
+                output.addFrom(0, startSample, signalsmithRealtimeRenderBuffer, 0, 0, renderedSamples);
+                output.addFrom(1, startSample, signalsmithRealtimeRenderBuffer, 1, 0, renderedSamples);
+                lastOutputSampleL = signalsmithRealtimeRenderBuffer.getSample(0, renderedSamples - 1);
+                lastOutputSampleR = signalsmithRealtimeRenderBuffer.getSample(1, renderedSamples - 1);
+            }
+        }
+        else
+        {
+            if (useRealtimeAlignmentDelay)
+                processSignalsmithRealtimeAlignmentDelayBufferInPlace(signalsmithRealtimeRenderBuffer, 0, renderedSamples);
+
+            signalsmithLoopDebugFinalRmsValue = computeStereoBufferRms(signalsmithRealtimeRenderBuffer, 0, renderedSamples);
+            output.addFrom(0, startSample, signalsmithRealtimeRenderBuffer, 0, 0, renderedSamples);
+            output.addFrom(1, startSample, signalsmithRealtimeRenderBuffer, 1, 0, renderedSamples);
+            lastOutputSampleL = signalsmithRealtimeRenderBuffer.getSample(0, renderedSamples - 1);
+            lastOutputSampleR = signalsmithRealtimeRenderBuffer.getSample(1, renderedSamples - 1);
+        }
+    }
+    else
+    {
+        signalsmithRealtimeOutputActive = false;
+    }
+
+    signalsmithRealtimeStreamProcessedLastBlock = signalsmithRealtimeStreamProcessedThisBlock;
+    signalsmithPitchCacheActiveLastBlock = signalsmithPitchCacheActive;
+    if (signalsmithPitchCacheActive)
+        signalsmithPitchCacheActiveBaseSemitones = signalsmithPitchCacheBaseSemitones;
+
+    if (!playing.load(std::memory_order_acquire) && signalsmithRealtimeAlignmentDelaySamples > 0)
+    {
+        signalsmithRealtimeAlignmentTailSamplesRemaining = juce::jmax(
+            signalsmithRealtimeAlignmentTailSamplesRemaining,
+            signalsmithRealtimeAlignmentDelaySamples);
+    }
+
+    publishSignalsmithLoopDebugSnapshot(renderedSamples,
+                                        maintainRealtimeSignalsmithStream,
+                                        useRealtimeSignalsmith,
+                                        useRealtimeAlignmentDelay,
+                                        signalsmithRealtimeStreamProcessedThisBlock,
+                                        signalsmithLoopDebugPreRmsValue,
+                                        signalsmithLoopDebugWetRmsValue,
+                                        signalsmithLoopDebugFinalRmsValue);
 }
 }  // Extra closing brace to fix imbalance
 
@@ -6474,17 +6996,74 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
         return;
 
     smoothedVolume.setTargetValue(volume.load(std::memory_order_acquire));
+    smoothedTrimGain.setTargetValue(
+        juce::Decibels::decibelsToGain(trimDb.load(std::memory_order_acquire)));
     smoothedPan.setTargetValue(pan.load(std::memory_order_acquire));
     smoothedFilterFrequency.setTargetValue(filterFrequency.load(std::memory_order_acquire));
     smoothedFilterResonance.setTargetValue(filterResonance.load(std::memory_order_acquire));
     smoothedFilterMorph.setTargetValue(filterMorph.load(std::memory_order_acquire));
 
+    const auto pitchAlgorithm = getPitchShiftAlgorithm();
+    const bool trackSignalsmithHistory = applyPitchShift
+        && !isResamplePitchEnabled()
+        && pitchAlgorithm == PitchShiftAlgorithm::Signalsmith;
+    bool useRealtimeSignalsmith = applyPitchShift
+        && shouldUseRealtimeSignalsmithAtCurrentPitch();
+    if (useRealtimeSignalsmith && !signalsmithRealtimeStreamProcessedLastBlock)
+    {
+        const float activationSemitones = juce::jlimit(
+            -24.0f,
+            24.0f,
+            pitchShiftSemitones.load(std::memory_order_acquire));
+        if (!primeSignalsmithRealtimePitchFromHistoryLocked(activationSemitones))
+            useRealtimeSignalsmith = false;
+    }
+    const bool useRealtimeAlignmentDelay = !useRealtimeSignalsmith
+        && (signalsmithRealtimeAlignmentDelaySamples > 0);
+    const bool flushingAlignmentTail = signalsmithRealtimeAlignmentTailSamplesRemaining > 0;
     const bool hasPpq = positionInfo.getPpqPosition().hasValue() && tempo > 0.0;
     const double basePpq = hasPpq ? *positionInfo.getPpqPosition() : 0.0;
     const double samplesPerBeatLocal = hasPpq
         ? ((60.0 / tempo) * currentSampleRate)
         : 0.0;
     const float pi = 3.14159265359f;
+    if (useRealtimeSignalsmith)
+    {
+        for (int i = 0; i < numSamples; ++i)
+        {
+            float leftSample = output.getSample(0, startSample + i);
+            float rightSample = output.getSample(1, startSample + i);
+
+            const float currentPan = smoothedPan.getNextValue();
+            const float panAngle = (currentPan + 1.0f) * 0.5f * pi * 0.5f;
+            leftSample *= std::cos(panAngle);
+            rightSample *= std::sin(panAngle);
+            const float currentTrimGain = smoothedTrimGain.getNextValue();
+            leftSample *= currentTrimGain;
+            rightSample *= currentTrimGain;
+            if (trackSignalsmithHistory)
+                pushSignalsmithRealtimeHistorySampleLocked(leftSample, rightSample);
+
+            output.setSample(0, startSample + i, leftSample);
+            output.setSample(1, startSample + i, rightSample);
+        }
+
+        float startSemitones = 0.0f;
+        float endSemitones = 0.0f;
+        computeSignalsmithRealtimePitchWindow(numSamples, startSemitones, endSemitones);
+        smoothedPitchShift.skip(numSamples);
+        processSignalsmithRealtimePitchBufferInPlace(output, startSample, numSamples, startSemitones, endSemitones);
+        applySignalsmithRealtimePostPitchBufferInPlace(output, startSample, numSamples, positionInfo, tempo);
+        lastOutputSampleL = output.getSample(0, startSample + numSamples - 1);
+        lastOutputSampleR = output.getSample(1, startSample + numSamples - 1);
+        signalsmithRealtimeStreamProcessedLastBlock = true;
+    }
+    else
+    {
+        if (useRealtimeAlignmentDelay)
+        {
+            processSignalsmithRealtimeAlignmentDelayBufferInPlace(output, startSample, numSamples);
+        }
 
     for (int i = 0; i < numSamples; ++i)
     {
@@ -6495,11 +7074,18 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
         const float panAngle = (currentPan + 1.0f) * 0.5f * pi * 0.5f;
         leftSample *= std::cos(panAngle);
         rightSample *= std::sin(panAngle);
+        const float currentTrimGain = smoothedTrimGain.getNextValue();
+        leftSample *= currentTrimGain;
+        rightSample *= currentTrimGain;
+        if (trackSignalsmithHistory)
+            pushSignalsmithRealtimeHistorySampleLocked(leftSample, rightSample);
 
-        if (applyPitchShift && !isResamplePitchEnabled())
+        if (applyPitchShift
+            && !isResamplePitchEnabled()
+            && pitchAlgorithm != PitchShiftAlgorithm::Signalsmith)
         {
             const float semitonesNow = smoothedPitchShift.getNextValue();
-            processPitchShift(leftSample, rightSample, semitonesNow);
+            processPitchShift(leftSample, rightSample, semitonesNow, -1.0, false);
         }
 
         if (filterEnabled)
@@ -6530,6 +7116,17 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
         lastOutputSampleL = leftSample;
         lastOutputSampleR = rightSample;
     }
+
+        signalsmithRealtimeStreamProcessedLastBlock = false;
+    }
+
+    if (flushingAlignmentTail)
+    {
+        signalsmithRealtimeAlignmentTailSamplesRemaining = juce::jmax(
+            0,
+            signalsmithRealtimeAlignmentTailSamplesRemaining - numSamples);
+    }
+
 }
 
 void EnhancedAudioStrip::trigger(int column, double tempo, bool quantized)
@@ -6545,9 +7142,19 @@ void EnhancedAudioStrip::trigger(int column, double tempo, bool quantized)
         return;  // Step mode doesn't use this method
     }
 
+    if (!wasPlaying)
+        resetSignalsmithRealtimeAlignmentState();
+
     playheadTraversalRatioAtLastCalc = -1.0;
     playheadTraversalPhaseOffsetSlices = 0.0;
     playheadTraversalSliceCountAtLastCalc = -1;
+    {
+        const float requestedTraversalRatio = playheadSpeedRatio.load(std::memory_order_acquire);
+        appliedPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
+        pendingPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
+        pendingPlayheadSpeedChange.store(0, std::memory_order_release);
+        pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
+    }
     
     triggerColumn = column;
     triggerSample = 0;  // Unknown global sample
@@ -6642,9 +7249,19 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         return;
     }
 
+    if (!wasPlaying)
+        resetSignalsmithRealtimeAlignmentState();
+
     playheadTraversalRatioAtLastCalc = -1.0;
     playheadTraversalPhaseOffsetSlices = 0.0;
     playheadTraversalSliceCountAtLastCalc = -1;
+    {
+        const float requestedTraversalRatio = playheadSpeedRatio.load(std::memory_order_acquire);
+        appliedPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
+        pendingPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
+        pendingPlayheadSpeedChange.store(0, std::memory_order_release);
+        pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
+    }
     
     // Calculate loop length in samples
     int loopCols = loopEnd - loopStart;
@@ -7748,6 +8365,9 @@ void EnhancedAudioStrip::stop(bool immediate)
     triggerOutputBlendActive = false;
     triggerOutputBlendSamplesRemaining = 0;
     triggerOutputBlendTotalSamples = 0;
+    pitchCacheOutputBlendActive = false;
+    pitchCacheOutputBlendSamplesRemaining = 0;
+    pitchCacheOutputBlendTotalSamples = 0;
     scrubActive = false;
     tapeStopActive = false;
     scratchGestureActive = false;
@@ -7762,9 +8382,12 @@ void EnhancedAudioStrip::stop(bool immediate)
         stopAfterFade = false;
         playing = false;
         playbackPosition = 0.0;
+        pitchCacheOutputBlendStartL = 0.0f;
+        pitchCacheOutputBlendStartR = 0.0f;
         lastOutputSampleL = 0.0f;
         lastOutputSampleR = 0.0f;
         resetGrainState();
+        resetSignalsmithRealtimeAlignmentState();
     }
     else
     {
@@ -8036,6 +8659,19 @@ void EnhancedAudioStrip::setVolume(float vol)
     smoothedVolume.setTargetValue(vol);
 }
 
+void EnhancedAudioStrip::setTrimDb(float trimAmountDb)
+{
+    trimAmountDb = juce::jlimit(-36.0f, 36.0f, trimAmountDb);
+    const float current = trimDb.load(std::memory_order_acquire);
+    if (std::abs(current - trimAmountDb) <= 1.0e-6f)
+        return;
+
+    trimDb.store(trimAmountDb, std::memory_order_release);
+    const float linearGain = juce::Decibels::decibelsToGain(trimAmountDb);
+    smoothedTrimGain.setTargetValue(linearGain);
+    stepSampler.setTrimGain(linearGain);
+}
+
 void EnhancedAudioStrip::setPan(float panValue)
 {
     panValue = juce::jlimit(-1.0f, 1.0f, panValue);
@@ -8078,15 +8714,361 @@ void EnhancedAudioStrip::setPitchShift(float semitones)
     smoothedPitchShift.setTargetValue(clamped);
 }
 
+void EnhancedAudioStrip::setPitchShiftAlgorithm(PitchShiftAlgorithm algorithm)
+{
+    const int newValue = juce::jlimit(
+        0,
+        static_cast<int>(PitchShiftAlgorithm::Bungee),
+        static_cast<int>(algorithm));
+    const int previous = pitchShiftAlgorithm.exchange(newValue, std::memory_order_acq_rel);
+    if (previous == newValue)
+        return;
+
+    const float currentSmoothed = smoothedPitchShift.getCurrentValue();
+    smoothedPitchShift.reset(currentSampleRate, pitchSmoothingSecondsForAlgorithm(algorithm));
+    smoothedPitchShift.setCurrentAndTargetValue(currentSmoothed);
+    smoothedPitchShift.setTargetValue(pitchShiftSemitones.load(std::memory_order_acquire));
+    resetPitchShifter();
+}
+
+void EnhancedAudioStrip::setSignalsmithLiveMode(bool enabled)
+{
+    const int newValue = enabled ? 1 : 0;
+    const int previous = signalsmithLiveMode.exchange(newValue, std::memory_order_acq_rel);
+    if (previous == newValue)
+        return;
+
+    resetSignalsmithRealtimeAlignmentState();
+}
+
+bool EnhancedAudioStrip::copySoundTouchPitchSourceBuffer(juce::AudioBuffer<float>& outBuffer,
+                                                         double& outSourceSampleRate,
+                                                         uint64_t& outSourceVersion) const
+{
+    juce::ScopedLock lock(bufferLock);
+    const juce::AudioBuffer<float>* sourceBuffer = nullptr;
+    if (!getPitchCacheSourceLocked(sourceBuffer, outSourceSampleRate, outSourceVersion)
+        || sourceBuffer == nullptr)
+    {
+        return false;
+    }
+
+    outBuffer.makeCopyOf(*sourceBuffer, true);
+    return outBuffer.getNumSamples() > 0;
+}
+
+bool EnhancedAudioStrip::getPitchCacheSourceLocked(const juce::AudioBuffer<float>*& outSourceBuffer,
+                                                   double& outSourceSampleRate,
+                                                   uint64_t& outSourceVersion) const
+{
+    outSourceBuffer = nullptr;
+    outSourceSampleRate = 0.0;
+    outSourceVersion = 0;
+
+    if (!(sourceSampleRate > 0.0))
+        return false;
+
+    const auto* sourceBuffer = &sampleBuffer;
+    uint64_t sourceVersion = pitchSourceVersion.load(std::memory_order_acquire);
+
+#if MLRVST_ENABLE_BUNGEE
+    const bool preferLoopTempoMatchCache = !isScratchActive()
+        && loopTempoMatchCacheValid
+        && getTempoMatchBackend() == TimeStretchBackend::Bungee
+        && (playMode == PlayMode::Loop
+            || playMode == PlayMode::Gate
+            || playMode == PlayMode::OneShot
+            || playMode == PlayMode::Grain)
+        && loopTempoMatchCacheBuffer.getNumSamples() > 0
+        && loopTempoMatchCacheBuffer.getNumChannels() > 0;
+    if (preferLoopTempoMatchCache)
+    {
+        sourceBuffer = &loopTempoMatchCacheBuffer;
+        sourceVersion = hashMix64(sourceVersion, static_cast<uint64_t>(loopTempoMatchCacheBackend) + 1ULL);
+        sourceVersion = hashMix64(sourceVersion, static_cast<uint64_t>(loopTempoMatchCacheSourceSamples) + 1ULL);
+        sourceVersion = hashMix64(sourceVersion, static_cast<uint64_t>(loopTempoMatchCacheBuffer.getNumSamples()) + 1ULL);
+        sourceVersion = hashMix64(
+            sourceVersion,
+            static_cast<uint64_t>(std::llround(juce::jmax(0.0, loopTempoMatchCacheHostTempo) * 1000.0)) + 1ULL);
+        sourceVersion = hashMix64(
+            sourceVersion,
+            static_cast<uint64_t>(std::llround(juce::jmax(0.0, loopTempoMatchCacheBeatsForLoop) * 1000.0)) + 1ULL);
+        sourceVersion = hashMix64(
+            sourceVersion,
+            static_cast<uint64_t>(std::llround(juce::jmax(0.0, loopTempoMatchCachePositionScale) * 1000000.0)) + 1ULL);
+    }
+#endif
+
+    if (sourceBuffer->getNumSamples() <= 0 || sourceBuffer->getNumChannels() <= 0)
+        return false;
+
+    outSourceBuffer = sourceBuffer;
+    outSourceSampleRate = sourceSampleRate;
+    outSourceVersion = sourceVersion;
+    return true;
+}
+
+bool EnhancedAudioStrip::isPitchCachePlaybackSourceEligible(const juce::AudioBuffer<float>* sourceBuffer) const
+{
+    if (sourceBuffer == &sampleBuffer)
+        return true;
+
+#if MLRVST_ENABLE_BUNGEE
+    if (sourceBuffer == &loopTempoMatchCacheBuffer)
+        return true;
+#endif
+
+    return false;
+}
+
+bool EnhancedAudioStrip::hasMatchingSoundTouchPitchCache(float semitones) const
+{
+#if MLRVST_ENABLE_SOUNDTOUCH
+    juce::ScopedLock lock(bufferLock);
+    if (!soundTouchPitchCacheValid)
+        return false;
+
+    const juce::AudioBuffer<float>* sourceBuffer = nullptr;
+    double currentSourceRate = 0.0;
+    uint64_t currentSourceVersion = 0;
+    if (!getPitchCacheSourceLocked(sourceBuffer, currentSourceRate, currentSourceVersion)
+        || sourceBuffer == nullptr)
+    {
+        return false;
+    }
+
+    const float clampedSemitones = juce::jlimit(-24.0f, 24.0f, semitones);
+    return soundTouchPitchCacheSourceSamples == sourceBuffer->getNumSamples()
+        && std::abs(soundTouchPitchCacheSemitones - clampedSemitones) <= 0.01f
+        && std::abs(soundTouchPitchCacheSourceRate - currentSourceRate) <= 1.0e-6
+        && soundTouchPitchCacheSourceVersion == currentSourceVersion;
+#else
+    juce::ignoreUnused(semitones);
+    return false;
+#endif
+}
+
+bool EnhancedAudioStrip::getReusableSoundTouchPitchCacheSemitones(float& cachedSemitones) const
+{
+#if MLRVST_ENABLE_SOUNDTOUCH
+    juce::ScopedLock lock(bufferLock);
+    if (!soundTouchPitchCacheValid)
+        return false;
+
+    const juce::AudioBuffer<float>* sourceBuffer = nullptr;
+    double currentSourceRate = 0.0;
+    uint64_t currentSourceVersion = 0;
+    if (!getPitchCacheSourceLocked(sourceBuffer, currentSourceRate, currentSourceVersion)
+        || sourceBuffer == nullptr)
+    {
+        return false;
+    }
+
+    if (soundTouchPitchCacheSourceSamples != sourceBuffer->getNumSamples()
+        || std::abs(soundTouchPitchCacheSourceRate - currentSourceRate) > 1.0e-6
+        || soundTouchPitchCacheSourceVersion != currentSourceVersion)
+    {
+        return false;
+    }
+
+    cachedSemitones = soundTouchPitchCacheSemitones;
+    return true;
+#else
+    juce::ignoreUnused(cachedSemitones);
+    return false;
+#endif
+}
+
+void EnhancedAudioStrip::installSoundTouchPitchCache(juce::AudioBuffer<float>&& renderedBuffer,
+                                                     double sourceRate,
+                                                     float semitones,
+                                                     uint64_t sourceVersion)
+{
+#if MLRVST_ENABLE_SOUNDTOUCH
+    juce::ScopedLock lock(bufferLock);
+    const juce::AudioBuffer<float>* sourceBuffer = nullptr;
+    double currentSourceRate = 0.0;
+    uint64_t currentSourceVersion = 0;
+    if (!getPitchCacheSourceLocked(sourceBuffer, currentSourceRate, currentSourceVersion)
+        || sourceBuffer == nullptr
+        || sourceVersion != currentSourceVersion
+        || renderedBuffer.getNumSamples() != sourceBuffer->getNumSamples()
+        || std::abs(sourceRate - currentSourceRate) > 1.0e-6)
+    {
+        return;
+    }
+
+    soundTouchPitchCacheBuffer = std::move(renderedBuffer);
+    soundTouchPitchCacheValid = soundTouchPitchCacheBuffer.getNumSamples() == sourceBuffer->getNumSamples();
+    soundTouchPitchCacheSourceSamples = sourceBuffer->getNumSamples();
+    soundTouchPitchCacheSemitones = juce::jlimit(-24.0f, 24.0f, semitones);
+    soundTouchPitchCacheSourceRate = currentSourceRate;
+    soundTouchPitchCacheSourceVersion = sourceVersion;
+    startPitchCacheOutputBlendLocked();
+#else
+    juce::ignoreUnused(renderedBuffer, sourceRate, semitones, sourceVersion);
+#endif
+}
+
+bool EnhancedAudioStrip::hasMatchingBungeePitchCache(float semitones) const
+{
+    juce::ScopedLock lock(bufferLock);
+    if (!bungeePitchCacheValid)
+        return false;
+
+    const juce::AudioBuffer<float>* sourceBuffer = nullptr;
+    double currentSourceRate = 0.0;
+    uint64_t currentSourceVersion = 0;
+    if (!getPitchCacheSourceLocked(sourceBuffer, currentSourceRate, currentSourceVersion)
+        || sourceBuffer == nullptr)
+    {
+        return false;
+    }
+
+    const float clampedSemitones = juce::jlimit(-24.0f, 24.0f, semitones);
+    return bungeePitchCacheSourceSamples == sourceBuffer->getNumSamples()
+        && std::abs(bungeePitchCacheSemitones - clampedSemitones) <= 0.01f
+        && std::abs(bungeePitchCacheSourceRate - currentSourceRate) <= 1.0e-6
+        && bungeePitchCacheSourceVersion == currentSourceVersion;
+}
+
+bool EnhancedAudioStrip::getReusableBungeePitchCacheSemitones(float& cachedSemitones) const
+{
+    juce::ScopedLock lock(bufferLock);
+    if (!bungeePitchCacheValid)
+        return false;
+
+    const juce::AudioBuffer<float>* sourceBuffer = nullptr;
+    double currentSourceRate = 0.0;
+    uint64_t currentSourceVersion = 0;
+    if (!getPitchCacheSourceLocked(sourceBuffer, currentSourceRate, currentSourceVersion)
+        || sourceBuffer == nullptr)
+    {
+        return false;
+    }
+
+    if (bungeePitchCacheSourceSamples != sourceBuffer->getNumSamples()
+        || std::abs(bungeePitchCacheSourceRate - currentSourceRate) > 1.0e-6
+        || bungeePitchCacheSourceVersion != currentSourceVersion)
+    {
+        return false;
+    }
+
+    cachedSemitones = bungeePitchCacheSemitones;
+    return true;
+}
+
+void EnhancedAudioStrip::installBungeePitchCache(juce::AudioBuffer<float>&& renderedBuffer,
+                                                 double sourceRate,
+                                                 float semitones,
+                                                 uint64_t sourceVersion)
+{
+    juce::ScopedLock lock(bufferLock);
+    const juce::AudioBuffer<float>* sourceBuffer = nullptr;
+    double currentSourceRate = 0.0;
+    uint64_t currentSourceVersion = 0;
+    if (!getPitchCacheSourceLocked(sourceBuffer, currentSourceRate, currentSourceVersion)
+        || sourceBuffer == nullptr
+        || sourceVersion != currentSourceVersion
+        || renderedBuffer.getNumSamples() != sourceBuffer->getNumSamples()
+        || std::abs(sourceRate - currentSourceRate) > 1.0e-6)
+    {
+        return;
+    }
+
+    bungeePitchCacheBuffer = std::move(renderedBuffer);
+    bungeePitchCacheValid = bungeePitchCacheBuffer.getNumSamples() == sourceBuffer->getNumSamples();
+    bungeePitchCacheSourceSamples = sourceBuffer->getNumSamples();
+    bungeePitchCacheSemitones = juce::jlimit(-24.0f, 24.0f, semitones);
+    bungeePitchCacheSourceRate = currentSourceRate;
+    bungeePitchCacheSourceVersion = sourceVersion;
+    startPitchCacheOutputBlendLocked();
+}
+
+bool EnhancedAudioStrip::hasMatchingSignalsmithPitchCache(float semitones) const
+{
+    juce::ScopedLock lock(bufferLock);
+    if (!signalsmithPitchCacheValid)
+        return false;
+
+    const juce::AudioBuffer<float>* sourceBuffer = nullptr;
+    double currentSourceRate = 0.0;
+    uint64_t currentSourceVersion = 0;
+    if (!getPitchCacheSourceLocked(sourceBuffer, currentSourceRate, currentSourceVersion)
+        || sourceBuffer == nullptr)
+    {
+        return false;
+    }
+
+    const float clampedSemitones = juce::jlimit(-24.0f, 24.0f, semitones);
+    return signalsmithPitchCacheSourceSamples == sourceBuffer->getNumSamples()
+        && std::abs(signalsmithPitchCacheSemitones - clampedSemitones) <= 0.01f
+        && std::abs(signalsmithPitchCacheSourceRate - currentSourceRate) <= 1.0e-6
+        && signalsmithPitchCacheSourceVersion == currentSourceVersion;
+}
+
+bool EnhancedAudioStrip::getReusableSignalsmithPitchCacheSemitones(float& cachedSemitones) const
+{
+    juce::ScopedLock lock(bufferLock);
+    if (!signalsmithPitchCacheValid)
+        return false;
+
+    const juce::AudioBuffer<float>* sourceBuffer = nullptr;
+    double currentSourceRate = 0.0;
+    uint64_t currentSourceVersion = 0;
+    if (!getPitchCacheSourceLocked(sourceBuffer, currentSourceRate, currentSourceVersion)
+        || sourceBuffer == nullptr)
+    {
+        return false;
+    }
+
+    if (signalsmithPitchCacheSourceSamples != sourceBuffer->getNumSamples()
+        || std::abs(signalsmithPitchCacheSourceRate - currentSourceRate) > 1.0e-6
+        || signalsmithPitchCacheSourceVersion != currentSourceVersion)
+    {
+        return false;
+    }
+
+    cachedSemitones = signalsmithPitchCacheSemitones;
+    return true;
+}
+
+void EnhancedAudioStrip::installSignalsmithPitchCache(juce::AudioBuffer<float>&& renderedBuffer,
+                                                      double sourceRate,
+                                                      float semitones,
+                                                      uint64_t sourceVersion)
+{
+    juce::ScopedLock lock(bufferLock);
+    const juce::AudioBuffer<float>* sourceBuffer = nullptr;
+    double currentSourceRate = 0.0;
+    uint64_t currentSourceVersion = 0;
+    if (!getPitchCacheSourceLocked(sourceBuffer, currentSourceRate, currentSourceVersion)
+        || sourceBuffer == nullptr
+        || sourceVersion != currentSourceVersion
+        || renderedBuffer.getNumSamples() != sourceBuffer->getNumSamples()
+        || std::abs(sourceRate - currentSourceRate) > 1.0e-6)
+    {
+        return;
+    }
+
+    signalsmithPitchCacheBuffer = std::move(renderedBuffer);
+    signalsmithPitchCacheValid = signalsmithPitchCacheBuffer.getNumSamples() == sourceBuffer->getNumSamples();
+    signalsmithPitchCacheSourceSamples = sourceBuffer->getNumSamples();
+    signalsmithPitchCacheSemitones = juce::jlimit(-24.0f, 24.0f, semitones);
+    signalsmithPitchCacheSourceRate = currentSourceRate;
+    signalsmithPitchCacheSourceVersion = sourceVersion;
+    startPitchCacheOutputBlendLocked();
+}
+
 void EnhancedAudioStrip::setGlobalPitchContext(int rootMidi, int scaleIndex)
 {
     const int clampedRoot = juce::jlimit(0, 127, rootMidi);
     const int clampedScale = juce::jlimit(
         0, static_cast<int>(ModernAudioEngine::PitchScale::PentatonicMinor), scaleIndex);
+    const int previousRoot = globalPitchRootMidi.exchange(clampedRoot, std::memory_order_acq_rel);
     const int previousScale = globalPitchScale.exchange(clampedScale, std::memory_order_acq_rel);
-    globalPitchRootMidi.store(clampedRoot, std::memory_order_release);
     stepSampler.setRootMidi(clampedRoot);
-    if (previousScale != clampedScale)
+    if (previousScale != clampedScale || previousRoot != clampedRoot)
         setGrainPitch(grainPitchAtomic.load(std::memory_order_acquire));
 }
 
@@ -8135,8 +9117,525 @@ void EnhancedAudioStrip::resetPitchShifter()
     pitchShiftDelaySize = delaySamples;
     pitchShiftDelayBuffer.setSize(2, pitchShiftDelaySize, false, true, true);
     pitchShiftDelayBuffer.clear();
+    pitchShiftPreviousTransientEnergy = 0.0f;
+    pitchShiftTransientHoldoffSamples = 0;
+    pitchShiftLatchedTransientIndex = -1;
+    pitchShiftNextTransientIndex = 0;
+    pitchShiftLastTransientQueryPosition = std::numeric_limits<double>::quiet_NaN();
+    invalidatePitchShiftCaches();
     pitchShiftWritePos = 0;
     pitchShiftPhase = 0.0;
+    resetSignalsmithRealtimeAlignmentState();
+}
+
+void EnhancedAudioStrip::invalidatePitchShiftCaches()
+{
+#if MLRVST_ENABLE_SOUNDTOUCH
+    soundTouchPitchCacheBuffer.setSize(0, 0);
+    soundTouchPitchCacheValid = false;
+    soundTouchPitchCacheSourceSamples = -1;
+    soundTouchPitchCacheSemitones = 0.0f;
+    soundTouchPitchCacheSourceRate = -1.0;
+    soundTouchPitchCacheSourceVersion = 0;
+#endif
+    bungeePitchCacheBuffer.setSize(0, 0);
+    bungeePitchCacheValid = false;
+    bungeePitchCacheSourceSamples = -1;
+    bungeePitchCacheSemitones = 0.0f;
+    bungeePitchCacheSourceRate = -1.0;
+    bungeePitchCacheSourceVersion = 0;
+    signalsmithPitchCacheBuffer.setSize(0, 0);
+    signalsmithPitchCacheValid = false;
+    signalsmithPitchCacheSourceSamples = -1;
+    signalsmithPitchCacheSemitones = 0.0f;
+    signalsmithPitchCacheSourceRate = -1.0;
+    signalsmithPitchCacheSourceVersion = 0;
+    signalsmithPitchCacheActiveLastBlock = false;
+    signalsmithPitchCacheActiveBaseSemitones = 0.0f;
+}
+
+void EnhancedAudioStrip::startPitchCacheOutputBlendLocked()
+{
+    if (!playing.load(std::memory_order_acquire) || currentSampleRate <= 0.0)
+    {
+        pitchCacheOutputBlendActive = false;
+        pitchCacheOutputBlendSamplesRemaining = 0;
+        pitchCacheOutputBlendTotalSamples = 0;
+        pitchCacheOutputBlendStartL = 0.0f;
+        pitchCacheOutputBlendStartR = 0.0f;
+        return;
+    }
+
+    pitchCacheOutputBlendTotalSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.004));
+    pitchCacheOutputBlendSamplesRemaining = pitchCacheOutputBlendTotalSamples;
+    pitchCacheOutputBlendStartL = lastOutputSampleL;
+    pitchCacheOutputBlendStartR = lastOutputSampleR;
+    pitchCacheOutputBlendActive = true;
+}
+
+void EnhancedAudioStrip::resetSignalsmithRealtimePitch()
+{
+    signalsmithRealtimeOutputBuffer.setSize(0, 0);
+    signalsmithRealtimeRenderBuffer.setSize(0, 0);
+    signalsmithRealtimeWetBuffer.setSize(0, 0);
+    signalsmithRealtimeHistoryBuffer.setSize(0, 0);
+    signalsmithRealtimePitchConfigured = false;
+    signalsmithRealtimeCurrentSemitones = 0.0f;
+    signalsmithRealtimeHistoryWritePos = 0;
+    signalsmithRealtimeHistorySamples = 0;
+    signalsmithRealtimeStreamPrimed = false;
+    signalsmithRealtimeStreamProcessedLastBlock = false;
+    signalsmithRealtimeOutputActive = false;
+
+    if (!(currentSampleRate > 0.0))
+        return;
+
+    if (isSignalsmithLiveMode())
+    {
+        const int blockSamples = juce::jmax(256, static_cast<int>(std::lround(currentSampleRate * 0.02)));
+        const int intervalSamples = juce::jmax(64, static_cast<int>(std::lround(currentSampleRate * 0.005)));
+        signalsmithRealtimePitch.configure(2, blockSamples, intervalSamples, false);
+    }
+    else
+    {
+        signalsmithRealtimePitch.presetCheaper(2, static_cast<float>(currentSampleRate), true);
+    }
+    signalsmithRealtimePitch.reset();
+    const int historySamples = juce::jmax(
+        8192,
+        static_cast<int>(std::ceil(currentSampleRate * 0.35)));
+    signalsmithRealtimeHistoryBuffer.setSize(2, historySamples, false, true, true);
+    signalsmithRealtimeHistoryBuffer.clear();
+    signalsmithRealtimePitchConfigured = true;
+}
+
+bool EnhancedAudioStrip::usesRealtimeSignalsmithAlignment() const
+{
+    if (!shouldMaintainRealtimeSignalsmithStream())
+        return false;
+
+    // Only keep the global alignment delay alive while this strip is actively
+    // contributing to the realtime Signalsmith path, or while its delayed tail
+    // is still draining.
+    return playing.load(std::memory_order_acquire)
+        || signalsmithRealtimeWasPlaying
+        || hasPendingRealtimeSignalsmithAlignmentTail();
+}
+
+int EnhancedAudioStrip::getRealtimeSignalsmithAlignmentLatencySamples() const
+{
+    if (!usesRealtimeSignalsmithAlignment() || !(currentSampleRate > 0.0))
+        return 0;
+
+    auto* self = const_cast<EnhancedAudioStrip*>(this);
+    if (!signalsmithRealtimePitchConfigured)
+        self->resetSignalsmithRealtimePitch();
+
+    return signalsmithRealtimePitchConfigured
+        ? juce::jmax(0,
+                     signalsmithRealtimePitch.inputLatency()
+                         + signalsmithRealtimePitch.outputLatency())
+        : 0;
+}
+
+void EnhancedAudioStrip::setRealtimeSignalsmithAlignmentLatencySamples(int samples)
+{
+    const int clamped = juce::jmax(0, samples);
+    if (signalsmithRealtimeAlignmentDelaySamples == clamped)
+        return;
+
+    signalsmithRealtimeAlignmentDelaySamples = clamped;
+    signalsmithRealtimeAlignmentDelayBuffer.setSize(0, 0);
+    signalsmithRealtimeAlignmentDelayWritePos = 0;
+    signalsmithRealtimeAlignmentTailSamplesRemaining = 0;
+    signalsmithRealtimeWasPlaying = playing.load(std::memory_order_acquire);
+}
+
+void EnhancedAudioStrip::armRealtimeSignalsmithAlignmentTail()
+{
+    if (signalsmithRealtimeAlignmentDelaySamples > 0)
+    {
+        signalsmithRealtimeAlignmentTailSamplesRemaining = juce::jmax(
+            signalsmithRealtimeAlignmentTailSamplesRemaining,
+            signalsmithRealtimeAlignmentDelaySamples);
+    }
+}
+
+bool EnhancedAudioStrip::hasPendingRealtimeSignalsmithAlignmentTail() const
+{
+    return signalsmithRealtimeAlignmentTailSamplesRemaining > 0;
+}
+
+EnhancedAudioStrip::SignalsmithLoopDebugSnapshot EnhancedAudioStrip::getSignalsmithLoopDebugSnapshot() const
+{
+    SignalsmithLoopDebugSnapshot snapshot;
+    snapshot.sequence = signalsmithLoopDebugSequence.load(std::memory_order_acquire);
+    snapshot.playMode = signalsmithLoopDebugPlayMode.load(std::memory_order_acquire);
+    snapshot.pitchAlgorithm = signalsmithLoopDebugPitchAlgorithm.load(std::memory_order_acquire);
+    snapshot.signalsmithLiveMode = signalsmithLoopDebugSignalsmithLiveMode.load(std::memory_order_acquire) != 0;
+    snapshot.playing = signalsmithLoopDebugPlaying.load(std::memory_order_acquire) != 0;
+    snapshot.maintainRealtimeStream = signalsmithLoopDebugMaintainRealtimeStream.load(std::memory_order_acquire) != 0;
+    snapshot.useRealtimeSignalsmith = signalsmithLoopDebugUseRealtimeSignalsmith.load(std::memory_order_acquire) != 0;
+    snapshot.useRealtimeAlignmentDelay = signalsmithLoopDebugUseRealtimeAlignmentDelay.load(std::memory_order_acquire) != 0;
+    snapshot.streamPrimed = signalsmithLoopDebugStreamPrimed.load(std::memory_order_acquire) != 0;
+    snapshot.streamProcessedThisBlock = signalsmithLoopDebugStreamProcessedThisBlock.load(std::memory_order_acquire) != 0;
+    snapshot.renderedSamples = signalsmithLoopDebugRenderedSamples.load(std::memory_order_acquire);
+    snapshot.alignmentDelaySamples = signalsmithLoopDebugAlignmentDelaySamples.load(std::memory_order_acquire);
+    snapshot.historySamples = signalsmithLoopDebugHistorySamples.load(std::memory_order_acquire);
+    snapshot.targetSemitones = signalsmithLoopDebugTargetSemitones.load(std::memory_order_acquire);
+    snapshot.smoothedSemitones = signalsmithLoopDebugSmoothedSemitones.load(std::memory_order_acquire);
+    snapshot.preRms = signalsmithLoopDebugPreRms.load(std::memory_order_acquire);
+    snapshot.wetRms = signalsmithLoopDebugWetRms.load(std::memory_order_acquire);
+    snapshot.finalRms = signalsmithLoopDebugFinalRms.load(std::memory_order_acquire);
+    return snapshot;
+}
+
+void EnhancedAudioStrip::publishSignalsmithLoopDebugSnapshot(int renderedSamples,
+                                                             bool maintainRealtimeSignalsmithStream,
+                                                             bool useRealtimeSignalsmith,
+                                                             bool useRealtimeAlignmentDelay,
+                                                             bool streamProcessedThisBlock,
+                                                             float preRms,
+                                                             float wetRms,
+                                                             float finalRms)
+{
+    signalsmithLoopDebugPlayMode.store(static_cast<int>(playMode), std::memory_order_relaxed);
+    signalsmithLoopDebugPitchAlgorithm.store(static_cast<int>(getPitchShiftAlgorithm()), std::memory_order_relaxed);
+    signalsmithLoopDebugSignalsmithLiveMode.store(isSignalsmithLiveMode() ? 1 : 0, std::memory_order_relaxed);
+    signalsmithLoopDebugPlaying.store(playing.load(std::memory_order_acquire) ? 1 : 0, std::memory_order_relaxed);
+    signalsmithLoopDebugMaintainRealtimeStream.store(maintainRealtimeSignalsmithStream ? 1 : 0, std::memory_order_relaxed);
+    signalsmithLoopDebugUseRealtimeSignalsmith.store(useRealtimeSignalsmith ? 1 : 0, std::memory_order_relaxed);
+    signalsmithLoopDebugUseRealtimeAlignmentDelay.store(useRealtimeAlignmentDelay ? 1 : 0, std::memory_order_relaxed);
+    signalsmithLoopDebugStreamPrimed.store(signalsmithRealtimeStreamPrimed ? 1 : 0, std::memory_order_relaxed);
+    signalsmithLoopDebugStreamProcessedThisBlock.store(streamProcessedThisBlock ? 1 : 0, std::memory_order_relaxed);
+    signalsmithLoopDebugRenderedSamples.store(renderedSamples, std::memory_order_relaxed);
+    signalsmithLoopDebugAlignmentDelaySamples.store(signalsmithRealtimeAlignmentDelaySamples, std::memory_order_relaxed);
+    signalsmithLoopDebugHistorySamples.store(signalsmithRealtimeHistorySamples, std::memory_order_relaxed);
+    signalsmithLoopDebugTargetSemitones.store(pitchShiftSemitones.load(std::memory_order_acquire), std::memory_order_relaxed);
+    signalsmithLoopDebugSmoothedSemitones.store(smoothedPitchShift.getCurrentValue(), std::memory_order_relaxed);
+    signalsmithLoopDebugPreRms.store(preRms, std::memory_order_relaxed);
+    signalsmithLoopDebugWetRms.store(wetRms, std::memory_order_relaxed);
+    signalsmithLoopDebugFinalRms.store(finalRms, std::memory_order_relaxed);
+    signalsmithLoopDebugSequence.fetch_add(1, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::resetSignalsmithRealtimeAlignmentState()
+{
+    signalsmithRealtimeAlignmentDelayBuffer.setSize(0, 0);
+    signalsmithRealtimeAlignmentDelayWritePos = 0;
+    signalsmithRealtimeAlignmentTailSamplesRemaining = 0;
+    signalsmithRealtimeWasPlaying = false;
+    resetSignalsmithRealtimePitch();
+}
+
+void EnhancedAudioStrip::pushSignalsmithRealtimeHistorySampleLocked(float left, float right)
+{
+    const int historySamples = signalsmithRealtimeHistoryBuffer.getNumSamples();
+    if (historySamples <= 0 || signalsmithRealtimeHistoryBuffer.getNumChannels() < 2)
+        return;
+
+    signalsmithRealtimeHistoryBuffer.setSample(0, signalsmithRealtimeHistoryWritePos, left);
+    signalsmithRealtimeHistoryBuffer.setSample(1, signalsmithRealtimeHistoryWritePos, right);
+    signalsmithRealtimeHistoryWritePos = (signalsmithRealtimeHistoryWritePos + 1) % historySamples;
+    signalsmithRealtimeHistorySamples = juce::jmin(historySamples, signalsmithRealtimeHistorySamples + 1);
+}
+
+bool EnhancedAudioStrip::primeSignalsmithRealtimePitchFromHistoryLocked(float semitones)
+{
+    if (!signalsmithRealtimePitchConfigured)
+        resetSignalsmithRealtimePitch();
+    if (!signalsmithRealtimePitchConfigured)
+        return false;
+
+    const int requiredSamples = juce::jmax(1, signalsmithRealtimePitch.outputSeekLength(1.0f));
+    if (signalsmithRealtimeHistorySamples < requiredSamples)
+        return false;
+
+    ensureStereoScratchBuffer(signalsmithRealtimeOutputBuffer, requiredSamples);
+
+    const int historyBufferSamples = signalsmithRealtimeHistoryBuffer.getNumSamples();
+    if (historyBufferSamples <= 0)
+        return false;
+
+    const int startIndex = (signalsmithRealtimeHistoryWritePos + historyBufferSamples - requiredSamples)
+        % historyBufferSamples;
+    auto* scratchL = signalsmithRealtimeOutputBuffer.getWritePointer(0);
+    auto* scratchR = signalsmithRealtimeOutputBuffer.getWritePointer(1);
+    for (int i = 0; i < requiredSamples; ++i)
+    {
+        const int historyIndex = (startIndex + i) % historyBufferSamples;
+        scratchL[i] = signalsmithRealtimeHistoryBuffer.getSample(0, historyIndex);
+        scratchR[i] = signalsmithRealtimeHistoryBuffer.getSample(1, historyIndex);
+    }
+
+    struct InputView
+    {
+        const float* channels[2]{};
+        const float* operator[](int channel) const { return channels[channel]; }
+    } inputs{
+        { scratchL, scratchR }
+    };
+
+    const float clampedSemitones = juce::jlimit(-24.0f, 24.0f, semitones);
+    signalsmithRealtimePitch.setTransposeSemitones(clampedSemitones);
+    signalsmithRealtimePitch.outputSeek(inputs, requiredSamples);
+    signalsmithRealtimeCurrentSemitones = clampedSemitones;
+    return true;
+}
+
+bool EnhancedAudioStrip::shouldTrackRealtimeSignalsmithHistory() const
+{
+    if (isResamplePitchEnabled()
+        || getPitchShiftAlgorithm() != PitchShiftAlgorithm::Signalsmith)
+    {
+        return false;
+    }
+
+    if (!isSignalsmithLiveMode())
+        return false;
+
+    // Loop-style playback is built from wraps/retriggers rather than a stable
+    // forward stream, so keep Signalsmith on the cache path there.
+    if (playMode == PlayMode::Loop
+        || playMode == PlayMode::Gate
+        || playMode == PlayMode::OneShot
+        || playMode == PlayMode::Grain)
+    {
+        return false;
+    }
+
+    return playMode != PlayMode::Step && playMode != PlayMode::Grain;
+}
+
+bool EnhancedAudioStrip::shouldMaintainRealtimeSignalsmithStream() const
+{
+    if (!shouldTrackRealtimeSignalsmithHistory())
+        return false;
+
+    if (playMode != PlayMode::Loop)
+        return true;
+
+    const float targetSemitones = pitchShiftSemitones.load(std::memory_order_acquire);
+    const float currentSemitones = smoothedPitchShift.getCurrentValue();
+    return std::abs(targetSemitones) > 0.01f || std::abs(currentSemitones) > 0.01f;
+}
+
+bool EnhancedAudioStrip::shouldUseRealtimeSignalsmithAtCurrentPitch() const
+{
+    if (!shouldTrackRealtimeSignalsmithHistory())
+        return false;
+
+    const float targetSemitones = pitchShiftSemitones.load(std::memory_order_acquire);
+    const float currentSemitones = smoothedPitchShift.getCurrentValue();
+    return std::abs(targetSemitones) > 0.01f || std::abs(currentSemitones) > 0.01f;
+}
+
+void EnhancedAudioStrip::computeSignalsmithRealtimePitchWindow(int numSamples,
+                                                               float& startSemitones,
+                                                               float& endSemitones)
+{
+    if (!signalsmithRealtimePitchConfigured)
+        resetSignalsmithRealtimePitch();
+
+    auto lookaheadPitch = smoothedPitchShift;
+    if (signalsmithRealtimePitchConfigured)
+        lookaheadPitch.skip(signalsmithRealtimePitch.outputLatency());
+
+    startSemitones = juce::jlimit(-24.0f, 24.0f, lookaheadPitch.getCurrentValue());
+    endSemitones = startSemitones;
+    if (numSamples > 0)
+        endSemitones = juce::jlimit(-24.0f, 24.0f, lookaheadPitch.skip(numSamples));
+
+    if (!std::isfinite(startSemitones))
+        startSemitones = signalsmithRealtimeCurrentSemitones;
+    if (!std::isfinite(endSemitones))
+        endSemitones = startSemitones;
+}
+
+bool EnhancedAudioStrip::processSignalsmithRealtimePitchBufferInPlace(juce::AudioBuffer<float>& buffer,
+                                                                      int startSample,
+                                                                      int numSamples,
+                                                                      float startSemitones,
+                                                                      float endSemitones)
+{
+    if (numSamples <= 0 || buffer.getNumChannels() < 2)
+        return false;
+
+    if (!signalsmithRealtimePitchConfigured)
+        resetSignalsmithRealtimePitch();
+    if (!signalsmithRealtimePitchConfigured)
+        return false;
+
+    const float clampedStart = juce::jlimit(-24.0f, 24.0f,
+                                            std::isfinite(startSemitones) ? startSemitones : signalsmithRealtimeCurrentSemitones);
+    const float clampedEnd = juce::jlimit(-24.0f, 24.0f,
+                                          std::isfinite(endSemitones) ? endSemitones : clampedStart);
+
+    ensureStereoScratchBuffer(signalsmithRealtimeOutputBuffer, numSamples);
+    signalsmithRealtimeOutputBuffer.clear(0, 0, numSamples);
+    signalsmithRealtimeOutputBuffer.clear(1, 0, numSamples);
+
+    struct InputView
+    {
+        const float* channels[2]{};
+        const float* operator[](int channel) const { return channels[channel]; }
+    } inputs{
+        { buffer.getReadPointer(0, startSample),
+          buffer.getReadPointer(1, startSample) }
+    };
+
+    struct OutputView
+    {
+        float* channels[2]{};
+        float* operator[](int channel) const { return channels[channel]; }
+    } outputs{
+        { signalsmithRealtimeOutputBuffer.getWritePointer(0),
+          signalsmithRealtimeOutputBuffer.getWritePointer(1) }
+    };
+
+    const float targetSemitones = juce::jlimit(-24.0f, 24.0f, 0.5f * (clampedStart + clampedEnd));
+    if (std::abs(signalsmithRealtimeCurrentSemitones - targetSemitones) > 1.0e-4f)
+        signalsmithRealtimePitch.setTransposeSemitones(targetSemitones);
+
+    signalsmithRealtimeCurrentSemitones = targetSemitones;
+    signalsmithRealtimePitch.process(inputs, numSamples, outputs, numSamples);
+    signalsmithRealtimeCurrentSemitones = clampedEnd;
+    buffer.copyFrom(0, startSample, signalsmithRealtimeOutputBuffer, 0, 0, numSamples);
+    buffer.copyFrom(1, startSample, signalsmithRealtimeOutputBuffer, 1, 0, numSamples);
+    return true;
+}
+
+void EnhancedAudioStrip::applySignalsmithRealtimePostPitchBufferInPlace(
+    juce::AudioBuffer<float>& buffer,
+    int startSample,
+    int numSamples,
+    const juce::AudioPlayHead::PositionInfo& positionInfo,
+    double tempo)
+{
+    if (numSamples <= 0 || buffer.getNumChannels() < 2)
+        return;
+
+    const bool hasPpq = positionInfo.getPpqPosition().hasValue() && tempo > 0.0;
+    const double basePpq = hasPpq ? *positionInfo.getPpqPosition() : 0.0;
+    const double samplesPerBeatLocal = hasPpq
+        ? ((60.0 / tempo) * currentSampleRate)
+        : 0.0;
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        float leftSample = buffer.getSample(0, startSample + i);
+        float rightSample = buffer.getSample(1, startSample + i);
+
+        if (filterEnabled)
+        {
+            const float filtFreq = smoothedFilterFrequency.getNextValue();
+            const float filtRes = smoothedFilterResonance.getNextValue();
+            const float filtMorph = smoothedFilterMorph.getNextValue();
+            processFilterSample(leftSample, rightSample, filtFreq, filtRes, filtMorph);
+        }
+
+        if (hasPpq)
+        {
+            const double ppqAtSampleRaw = basePpq + (static_cast<double>(i) / juce::jmax(1.0, samplesPerBeatLocal));
+            const float gateMod = computeGateModulation(applySwingToPpq(ppqAtSampleRaw));
+            leftSample *= gateMod;
+            rightSample *= gateMod;
+        }
+
+        const float currentVol = smoothedVolume.getNextValue();
+        leftSample *= currentVol;
+        rightSample *= currentVol;
+
+        if (triggerOutputBlendActive
+            && triggerOutputBlendSamplesRemaining > 0
+            && triggerOutputBlendTotalSamples > 0)
+        {
+            const float progress = 1.0f - (static_cast<float>(triggerOutputBlendSamplesRemaining)
+                                           / static_cast<float>(triggerOutputBlendTotalSamples));
+            const float t = juce::jlimit(0.0f, 1.0f, progress);
+            leftSample = (triggerOutputBlendStartL * (1.0f - t)) + (leftSample * t);
+            rightSample = (triggerOutputBlendStartR * (1.0f - t)) + (rightSample * t);
+
+            --triggerOutputBlendSamplesRemaining;
+            if (triggerOutputBlendSamplesRemaining <= 0)
+            {
+                triggerOutputBlendActive = false;
+                triggerOutputBlendSamplesRemaining = 0;
+                triggerOutputBlendTotalSamples = 0;
+            }
+        }
+
+        if (pitchCacheOutputBlendActive
+            && pitchCacheOutputBlendSamplesRemaining > 0
+            && pitchCacheOutputBlendTotalSamples > 0)
+        {
+            const float progress = 1.0f - (static_cast<float>(pitchCacheOutputBlendSamplesRemaining)
+                                           / static_cast<float>(pitchCacheOutputBlendTotalSamples));
+            const float t = juce::jlimit(0.0f, 1.0f, progress);
+            leftSample = (pitchCacheOutputBlendStartL * (1.0f - t)) + (leftSample * t);
+            rightSample = (pitchCacheOutputBlendStartR * (1.0f - t)) + (rightSample * t);
+
+            --pitchCacheOutputBlendSamplesRemaining;
+            if (pitchCacheOutputBlendSamplesRemaining <= 0)
+            {
+                pitchCacheOutputBlendActive = false;
+                pitchCacheOutputBlendSamplesRemaining = 0;
+                pitchCacheOutputBlendTotalSamples = 0;
+            }
+        }
+
+        if (!std::isfinite(leftSample)) leftSample = 0.0f;
+        if (!std::isfinite(rightSample)) rightSample = 0.0f;
+
+        buffer.setSample(0, startSample + i, leftSample);
+        buffer.setSample(1, startSample + i, rightSample);
+    }
+}
+
+int EnhancedAudioStrip::processSignalsmithRealtimeAlignmentDelayBufferInPlace(juce::AudioBuffer<float>& buffer,
+                                                                              int startSample,
+                                                                              int numSamples)
+{
+    if (numSamples <= 0 || buffer.getNumChannels() < 2)
+        return 0;
+
+    const int delaySamples = juce::jmax(0, signalsmithRealtimeAlignmentDelaySamples);
+    if (delaySamples <= 0)
+        return numSamples;
+
+    const int requiredDelayBufferSamples = delaySamples + 1;
+    if (signalsmithRealtimeAlignmentDelayBuffer.getNumChannels() != 2
+        || signalsmithRealtimeAlignmentDelayBuffer.getNumSamples() < requiredDelayBufferSamples)
+    {
+        signalsmithRealtimeAlignmentDelayBuffer.setSize(2, requiredDelayBufferSamples, false, true, true);
+        signalsmithRealtimeAlignmentDelayBuffer.clear();
+        signalsmithRealtimeAlignmentDelayWritePos = 0;
+    }
+
+    auto* delayL = signalsmithRealtimeAlignmentDelayBuffer.getWritePointer(0);
+    auto* delayR = signalsmithRealtimeAlignmentDelayBuffer.getWritePointer(1);
+    auto* writeL = buffer.getWritePointer(0, startSample);
+    auto* writeR = buffer.getWritePointer(1, startSample);
+    const int delayBufferSamples = signalsmithRealtimeAlignmentDelayBuffer.getNumSamples();
+    int writePos = juce::jlimit(0, juce::jmax(0, delayBufferSamples - 1), signalsmithRealtimeAlignmentDelayWritePos);
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const int readPos = (writePos + delayBufferSamples - delaySamples) % delayBufferSamples;
+        const float inL = writeL[i];
+        const float inR = writeR[i];
+        writeL[i] = delayL[readPos];
+        writeR[i] = delayR[readPos];
+        delayL[writePos] = inL;
+        delayR[writePos] = inR;
+
+        ++writePos;
+        if (writePos >= delayBufferSamples)
+            writePos = 0;
+    }
+
+    signalsmithRealtimeAlignmentDelayWritePos = writePos;
+    return numSamples;
 }
 
 float EnhancedAudioStrip::readPitchDelaySample(int channel, double delaySamples) const
@@ -8171,7 +9670,155 @@ float EnhancedAudioStrip::readPitchDelaySample(int channel, double delaySamples)
     return ((a0 * t + a1) * t + a2) * t + a3;
 }
 
-void EnhancedAudioStrip::processPitchShift(float& left, float& right, float semitones)
+float EnhancedAudioStrip::readPitchDelaySampleWindowedSinc(int channel,
+                                                           double delaySamples,
+                                                           int taps) const
+{
+    if (pitchShiftDelaySize <= 4 || channel < 0 || channel >= pitchShiftDelayBuffer.getNumChannels())
+        return 0.0f;
+
+    const float* data = pitchShiftDelayBuffer.getReadPointer(channel);
+    double readPos = static_cast<double>(pitchShiftWritePos) - delaySamples;
+    while (readPos < 0.0)
+        readPos += static_cast<double>(pitchShiftDelaySize);
+    while (readPos >= static_cast<double>(pitchShiftDelaySize))
+        readPos -= static_cast<double>(pitchShiftDelaySize);
+
+    const int center = static_cast<int>(std::floor(readPos));
+    const float frac = static_cast<float>(readPos - static_cast<double>(center));
+    const int windowSize = juce::jmax(2, taps);
+    float sum = 0.0f;
+    float norm = 0.0f;
+
+    for (int i = -windowSize; i <= windowSize; ++i)
+    {
+        const int wrappedIndex = (center + i + pitchShiftDelaySize * 4) % pitchShiftDelaySize;
+        const float x = juce::MathConstants<float>::pi * (frac - static_cast<float>(i));
+        const float sinc = std::abs(x) < 1.0e-6f ? 1.0f : std::sin(x) / x;
+        const float phase = static_cast<float>(i) / static_cast<float>(windowSize);
+        const float window = 0.42f
+            + (0.5f * std::cos(juce::MathConstants<float>::pi * phase))
+            + (0.08f * std::cos(2.0f * juce::MathConstants<float>::pi * phase));
+        const float weight = sinc * window;
+        sum += data[wrappedIndex] * weight;
+        norm += weight;
+    }
+
+    return std::abs(norm) > 1.0e-6f ? (sum / norm) : sum;
+}
+
+float EnhancedAudioStrip::readPitchDelaySampleOversampled(int channel, double delaySamples, int taps) const
+{
+    constexpr double sampleOffset = 0.225;
+    const float center = readPitchDelaySampleWindowedSinc(channel, delaySamples, taps);
+    const float before = readPitchDelaySampleWindowedSinc(channel, delaySamples - sampleOffset, taps);
+    const float after = readPitchDelaySampleWindowedSinc(channel, delaySamples + sampleOffset, taps);
+    return (center * 0.5f) + (before * 0.25f) + (after * 0.25f);
+}
+
+bool EnhancedAudioStrip::shouldResetHqPitchShiftTransient(float left,
+                                                          float right,
+                                                          double sourcePosition,
+                                                          bool useTransientMarkers)
+{
+    const float energy = (std::abs(left) + std::abs(right)) * 0.5f;
+    const float previousEnergy = pitchShiftPreviousTransientEnergy;
+    pitchShiftPreviousTransientEnergy = energy;
+
+    bool markerAttack = false;
+    if (useTransientMarkers
+        && !transientSliceMapDirty
+        && analysisCacheValid
+        && sampleLength > 1.0
+        && std::isfinite(sourcePosition))
+    {
+        const int totalSamples = juce::jmax(1, static_cast<int>(sampleLength));
+        const int positionSample = juce::jlimit(0,
+                                                totalSamples - 1,
+                                                static_cast<int>(std::lround(sourcePosition)));
+        const int markerRadius = juce::jmax(32, static_cast<int>(currentSampleRate * 0.0015));
+        if (!std::isfinite(pitchShiftLastTransientQueryPosition)
+            || sourcePosition < (pitchShiftLastTransientQueryPosition - markerRadius))
+        {
+            pitchShiftNextTransientIndex = 0;
+            pitchShiftLatchedTransientIndex = -1;
+        }
+        pitchShiftLastTransientQueryPosition = sourcePosition;
+
+        while (pitchShiftNextTransientIndex < ModernAudioEngine::MaxColumns)
+        {
+            const int markerSample = juce::jlimit(0,
+                                                  totalSamples - 1,
+                                                  transientSliceSamples[static_cast<size_t>(pitchShiftNextTransientIndex)]);
+            if (markerSample >= (positionSample - markerRadius))
+                break;
+
+            if (pitchShiftLatchedTransientIndex == pitchShiftNextTransientIndex)
+                pitchShiftLatchedTransientIndex = -1;
+
+            ++pitchShiftNextTransientIndex;
+        }
+
+        auto tryMarkerIndex = [&](int markerIndex) -> bool
+        {
+            if (markerIndex < 0 || markerIndex >= ModernAudioEngine::MaxColumns)
+                return false;
+
+            const int markerSample = juce::jlimit(0,
+                                                  totalSamples - 1,
+                                                  transientSliceSamples[static_cast<size_t>(markerIndex)]);
+            if (std::abs(markerSample - positionSample) > markerRadius)
+                return false;
+
+            if (pitchShiftLatchedTransientIndex != markerIndex)
+            {
+                pitchShiftLatchedTransientIndex = markerIndex;
+                return true;
+            }
+
+            return false;
+        };
+
+        markerAttack = tryMarkerIndex(pitchShiftNextTransientIndex)
+            || tryMarkerIndex(pitchShiftNextTransientIndex - 1);
+
+        if (!markerAttack
+            && pitchShiftLatchedTransientIndex >= 0
+            && pitchShiftLatchedTransientIndex < ModernAudioEngine::MaxColumns)
+        {
+            const int latchedMarkerSample = juce::jlimit(
+                0,
+                totalSamples - 1,
+                transientSliceSamples[static_cast<size_t>(pitchShiftLatchedTransientIndex)]);
+            if (std::abs(latchedMarkerSample - positionSample) > (markerRadius * 2))
+                pitchShiftLatchedTransientIndex = -1;
+        }
+    }
+    else
+    {
+        pitchShiftLatchedTransientIndex = -1;
+        pitchShiftNextTransientIndex = 0;
+        pitchShiftLastTransientQueryPosition = std::numeric_limits<double>::quiet_NaN();
+    }
+
+    if (pitchShiftTransientHoldoffSamples > 0)
+    {
+        --pitchShiftTransientHoldoffSamples;
+        return false;
+    }
+
+    const float onsetFloor = 0.025f;
+    const bool sharpAttack = energy > onsetFloor
+        && energy > (previousEnergy * 2.4f)
+        && (energy - previousEnergy) > 0.02f;
+    if (!sharpAttack && !markerAttack)
+        return false;
+
+    pitchShiftTransientHoldoffSamples = juce::jmax(1, static_cast<int>(currentSampleRate * 0.012));
+    return true;
+}
+
+void EnhancedAudioStrip::processPitchShiftStandard(float& left, float& right, float semitones)
 {
     if (pitchShiftDelaySize <= 4)
         return;
@@ -8186,7 +9833,17 @@ void EnhancedAudioStrip::processPitchShift(float& left, float& right, float semi
 
     const double ratio = std::pow(2.0, static_cast<double>(semitones) / 12.0);
     const double detune = 1.0 - ratio;
-    const double windowSamples = juce::jlimit(128.0, static_cast<double>(pitchShiftDelaySize - 4), currentSampleRate * 0.05);
+    const double semitoneMagnitude = juce::jlimit(0.0, 24.0, std::abs(static_cast<double>(semitones)));
+    const bool responsiveLiveMode = (playMode == PlayMode::Loop
+                                     || playMode == PlayMode::Gate
+                                     || playMode == PlayMode::Sample);
+    const double maxWindowMs = responsiveLiveMode ? 24.0 : 32.0;
+    const double minWindowMs = responsiveLiveMode ? 10.0 : 14.0;
+    const double windowMs = juce::jmap(semitoneMagnitude, 0.0, 24.0, maxWindowMs, minWindowMs);
+    const double windowSamples = juce::jlimit(
+        96.0,
+        static_cast<double>(pitchShiftDelaySize - 4),
+        currentSampleRate * (windowMs * 0.001));
 
     pitchShiftDelayBuffer.setSample(0, pitchShiftWritePos, left);
     pitchShiftDelayBuffer.setSample(1, pitchShiftWritePos, right);
@@ -8226,6 +9883,141 @@ void EnhancedAudioStrip::processPitchShift(float& left, float& right, float semi
     right = r1 * w1 + r2 * w2;
 
     pitchShiftWritePos = (pitchShiftWritePos + 1) % pitchShiftDelaySize;
+}
+
+void EnhancedAudioStrip::processPitchShiftHighQuality(float& left,
+                                                      float& right,
+                                                      float semitones,
+                                                      double sourcePosition,
+                                                      bool useTransientMarkers)
+{
+    if (pitchShiftDelaySize <= 4)
+        return;
+
+    const float inputLeft = left;
+    const float inputRight = right;
+
+    if (std::abs(semitones) < 0.01f)
+    {
+        pitchShiftDelayBuffer.setSample(0, pitchShiftWritePos, left);
+        pitchShiftDelayBuffer.setSample(1, pitchShiftWritePos, right);
+        pitchShiftWritePos = (pitchShiftWritePos + 1) % pitchShiftDelaySize;
+        return;
+    }
+
+    const double ratio = std::pow(2.0, static_cast<double>(semitones) / 12.0);
+    const double detune = 1.0 - ratio;
+    const double semitoneMagnitude = juce::jlimit(0.0, 24.0, std::abs(static_cast<double>(semitones)));
+    const double windowMs = juce::jmap(semitoneMagnitude, 0.0, 24.0, 96.0, 24.0);
+    const int sincTaps = (semitoneMagnitude >= 12.0) ? 6 : ((semitoneMagnitude >= 5.0) ? 5 : 4);
+    const bool useOversampledRead = semitoneMagnitude >= 8.0;
+    const double windowSamples = juce::jlimit(
+        256.0,
+        static_cast<double>(pitchShiftDelaySize - 4),
+        currentSampleRate * (windowMs * 0.001));
+
+    pitchShiftDelayBuffer.setSample(0, pitchShiftWritePos, left);
+    pitchShiftDelayBuffer.setSample(1, pitchShiftWritePos, right);
+
+    if (std::abs(detune) < 1.0e-6)
+    {
+        pitchShiftWritePos = (pitchShiftWritePos + 1) % pitchShiftDelaySize;
+        return;
+    }
+
+    const double phaseInc = std::abs(detune) / windowSamples;
+    pitchShiftPhase += phaseInc;
+    while (pitchShiftPhase >= 1.0)
+        pitchShiftPhase -= 1.0;
+
+    if (shouldResetHqPitchShiftTransient(inputLeft, inputRight, sourcePosition, useTransientMarkers))
+        pitchShiftPhase = 0.0;
+
+    auto delayFromPhase = [&](double p)
+    {
+        if (ratio >= 1.0)
+            return (1.0 - p) * windowSamples + 1.0;
+        return p * windowSamples + 1.0;
+    };
+
+    static constexpr std::array<double, 4> offsets{{0.0, 0.25, 0.5, 0.75}};
+    float leftSum = 0.0f;
+    float rightSum = 0.0f;
+    float weightSum = 0.0f;
+
+    for (double offset : offsets)
+    {
+        const double phase = std::fmod(pitchShiftPhase + offset, 1.0);
+        const double delay = delayFromPhase(phase);
+        const float weight = 0.5f * (1.0f - std::cos(juce::MathConstants<float>::twoPi
+                                                     * static_cast<float>(phase)));
+        const float leftRead = useOversampledRead
+            ? readPitchDelaySampleOversampled(0, delay, sincTaps)
+            : readPitchDelaySampleWindowedSinc(0, delay, sincTaps);
+        const float rightRead = useOversampledRead
+            ? readPitchDelaySampleOversampled(1, delay, sincTaps)
+            : readPitchDelaySampleWindowedSinc(1, delay, sincTaps);
+        leftSum += leftRead * weight;
+        rightSum += rightRead * weight;
+        weightSum += weight;
+    }
+
+    if (weightSum > 1.0e-6f)
+    {
+        left = leftSum / weightSum;
+        right = rightSum / weightSum;
+    }
+    else
+    {
+        left = 0.0f;
+        right = 0.0f;
+    }
+
+    pitchShiftWritePos = (pitchShiftWritePos + 1) % pitchShiftDelaySize;
+}
+
+void EnhancedAudioStrip::processPitchShift(float& left,
+                                           float& right,
+                                           float semitones,
+                                           double sourcePosition,
+                                           bool useTransientMarkers)
+{
+    switch (getPitchShiftAlgorithm())
+    {
+        case PitchShiftAlgorithm::SoundTouch:
+            processPitchShiftStandard(left, right, semitones);
+            return;
+        case PitchShiftAlgorithm::Signalsmith:
+        case PitchShiftAlgorithm::Bungee:
+            juce::ignoreUnused(sourcePosition, useTransientMarkers);
+            processPitchShiftStandard(left, right, semitones);
+            return;
+        case PitchShiftAlgorithm::Standard:
+        default:
+            processPitchShiftStandard(left, right, semitones);
+            return;
+    }
+}
+
+void EnhancedAudioStrip::processPitchShiftBufferInPlace(juce::AudioBuffer<float>& buffer,
+                                                        int startSample,
+                                                        int numSamples,
+                                                        float semitones,
+                                                        PitchShiftAlgorithm algorithm)
+{
+    if (numSamples <= 0 || buffer.getNumChannels() < 2)
+        return;
+
+    juce::ignoreUnused(algorithm);
+    const int endSample = startSample + numSamples;
+    for (int sample = startSample; sample < endSample; ++sample)
+    {
+        float left = buffer.getSample(0, sample);
+        float right = buffer.getSample(1, sample);
+        processPitchShiftStandard(left, right, semitones);
+        buffer.setSample(0, sample, left);
+        buffer.setSample(1, sample, right);
+    }
 }
 
 void EnhancedAudioStrip::updateFilterCoefficients(float frequency, float resonance)
@@ -9375,6 +11167,21 @@ void ModernAudioEngine::prepareToPlay(double sampleRate, int maxBlockSize)
     for (auto& strip : strips)
         strip->prepareToPlay(sampleRate, maxBlockSize);
     setGlobalStretchBackend(sanitizeTimeStretchBackend(soundTouchEnabled.load(std::memory_order_acquire)));
+
+    int signalsmithAlignmentLatency = 0;
+    for (const auto& strip : strips)
+    {
+        if (strip != nullptr && strip->usesRealtimeSignalsmithAlignment())
+            signalsmithAlignmentLatency = juce::jmax(
+                signalsmithAlignmentLatency,
+                strip->getRealtimeSignalsmithAlignmentLatencySamples());
+    }
+    for (const auto& strip : strips)
+    {
+        if (strip != nullptr)
+            strip->setRealtimeSignalsmithAlignmentLatencySamples(signalsmithAlignmentLatency);
+    }
+    signalsmithRealtimeAlignmentLatencySamples.store(signalsmithAlignmentLatency, std::memory_order_release);
     
     liveRecorder->prepareToPlay(sampleRate, maxBlockSize);
     setCrossfadeLengthMs(crossfadeLengthMs.load(std::memory_order_acquire));
@@ -9503,6 +11310,21 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 strip->resetDuckGainSmoothing();
         }
     }
+
+    int signalsmithAlignmentLatency = 0;
+    for (const auto& strip : strips)
+    {
+        if (strip != nullptr && strip->usesRealtimeSignalsmithAlignment())
+            signalsmithAlignmentLatency = juce::jmax(
+                signalsmithAlignmentLatency,
+                strip->getRealtimeSignalsmithAlignmentLatencySamples());
+    }
+    for (const auto& strip : strips)
+    {
+        if (strip != nullptr)
+            strip->setRealtimeSignalsmithAlignmentLatencySamples(signalsmithAlignmentLatency);
+    }
+    signalsmithRealtimeAlignmentLatencySamples.store(signalsmithAlignmentLatency, std::memory_order_release);
 
     auto resolveFinalTargetBuffer = [&](size_t stripIndex) -> juce::AudioBuffer<float>*
     {
@@ -9705,14 +11527,14 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     seq.grainDezipperedRaw += (smoothedRaw - seq.grainDezipperedRaw) * juce::jlimit(0.0f, 1.0f, alpha);
                     controlRaw = seq.grainDezipperedRaw;
                 }
-                else
-                {
-                    seq.grainDezipperedRaw = smoothedRaw;
-                }
-                if (target == ModTarget::Pitch)
-                {
-                    // Dedicated pitch dezipper: keeps pitch-target modulation
-                    // free of crackles even with low/zero user smoothing.
+            else
+            {
+                seq.grainDezipperedRaw = smoothedRaw;
+            }
+            if (target == ModTarget::Pitch)
+            {
+                // Dedicated pitch dezipper: keeps pitch-target modulation
+                // free of crackles even with low/zero user smoothing.
                     constexpr float kPitchDezipMs = 10.0f;
                     const float dezipSamples = juce::jmax(1.0f, (kPitchDezipMs * 0.001f) * static_cast<float>(currentSampleRate));
                     const float alpha = 1.0f - std::exp(-static_cast<float>(segmentSamples) / dezipSamples);
@@ -11451,7 +13273,16 @@ void ModernAudioEngine::setModOffset(int stripIndex, int offset)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    getActiveModSequencer(stripIndex).offset.store(juce::jlimit(-(ModTotalSteps - 1), ModTotalSteps - 1, offset), std::memory_order_release);
+    setModOffsetForSlot(stripIndex, getActiveModSequencerSlot(stripIndex), offset);
+}
+
+void ModernAudioEngine::setModOffsetForSlot(int stripIndex, int slot, int offset)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+    getModSequencer(stripIndex, slot).offset.store(
+        juce::jlimit(-(ModTotalSteps - 1), ModTotalSteps - 1, offset),
+        std::memory_order_release);
 }
 
 int ModernAudioEngine::getModOffset(int stripIndex) const
@@ -11729,9 +13560,20 @@ double ModernAudioEngine::getModStepLengthBeats(int stripIndex, int slot) const
 
 void ModernAudioEngine::setModLengthBars(int stripIndex, int bars)
 {
+    setModLengthBarsForSlot(stripIndex, getActiveModSequencerSlot(stripIndex), bars);
+}
+
+int ModernAudioEngine::getModLengthBars(int stripIndex) const
+{
+    return getModLengthBarsForSlot(stripIndex, getActiveModSequencerSlot(stripIndex));
+}
+
+void ModernAudioEngine::setModLengthBarsForSlot(int stripIndex, int slot, int bars)
+{
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
-    auto& seq = getActiveModSequencer(stripIndex);
+
+    auto& seq = getModSequencer(stripIndex, slot);
     int clampedBars = 1;
     if (bars >= 8)
         clampedBars = 8;
@@ -11739,17 +13581,19 @@ void ModernAudioEngine::setModLengthBars(int stripIndex, int bars)
         clampedBars = 4;
     else if (bars >= 2)
         clampedBars = 2;
+
     seq.lengthBars.store(clampedBars, std::memory_order_release);
     const int maxPage = clampedBars - 1;
     const int page = juce::jlimit(0, maxPage, seq.editPage.load(std::memory_order_acquire));
     seq.editPage.store(page, std::memory_order_release);
 }
 
-int ModernAudioEngine::getModLengthBars(int stripIndex) const
+int ModernAudioEngine::getModLengthBarsForSlot(int stripIndex, int slot) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 1;
-    return juce::jlimit(1, MaxModBars, getActiveModSequencer(stripIndex).lengthBars.load(std::memory_order_acquire));
+
+    return juce::jlimit(1, MaxModBars, getModSequencer(stripIndex, slot).lengthBars.load(std::memory_order_acquire));
 }
 
 void ModernAudioEngine::setModEditPage(int stripIndex, int page)

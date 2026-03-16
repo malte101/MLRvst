@@ -34,6 +34,7 @@
 #include "TimeStretchBackend.h"
 #include "LadderFilterBase.h"
 #include "PerformanceTargets.h"
+#include "signalsmith-stretch/signalsmith-stretch.h"
 
 #ifndef MLRVST_ENABLE_SOUNDTOUCH
 #define MLRVST_ENABLE_SOUNDTOUCH 0
@@ -391,9 +392,10 @@ public:
     bool reverse = false;
     
     std::atomic<float> beatsPerLoop{-1.0f};  // -1 = auto-detect, otherwise manual override
-    int recordingBars = 1;  // Unified per-strip bars for capture + loaded sample mapping (1..8)
+    int recordingBars = 2;  // Unified per-strip bars for capture + loaded sample mapping (1..8)
     
     std::atomic<float> volume{1.0f};
+    std::atomic<float> trimDb{0.0f};
     std::atomic<float> pan{0.0f};
     
     // Step sequencer state (PUBLIC for GUI access)
@@ -478,6 +480,33 @@ public:
                                      const juce::AudioPlayHead::PositionInfo& positionInfo,
                                      double tempo,
                                      bool applyPitchShift = true);
+    bool usesRealtimeSignalsmithAlignment() const;
+    int getRealtimeSignalsmithAlignmentLatencySamples() const;
+    void setRealtimeSignalsmithAlignmentLatencySamples(int samples);
+    void armRealtimeSignalsmithAlignmentTail();
+    bool hasPendingRealtimeSignalsmithAlignmentTail() const;
+    struct SignalsmithLoopDebugSnapshot
+    {
+        uint64_t sequence = 0;
+        int playMode = 0;
+        int pitchAlgorithm = 0;
+        bool signalsmithLiveMode = false;
+        bool playing = false;
+        bool maintainRealtimeStream = false;
+        bool useRealtimeSignalsmith = false;
+        bool useRealtimeAlignmentDelay = false;
+        bool streamPrimed = false;
+        bool streamProcessedThisBlock = false;
+        int renderedSamples = 0;
+        int alignmentDelaySamples = 0;
+        int historySamples = 0;
+        float targetSemitones = 0.0f;
+        float smoothedSemitones = 0.0f;
+        float preRms = 0.0f;
+        float wetRms = 0.0f;
+        float finalRms = 0.0f;
+    };
+    SignalsmithLoopDebugSnapshot getSignalsmithLoopDebugSnapshot() const;
     
     // Playback control
     void trigger(int column, double tempo, bool quantized = false);
@@ -549,11 +578,22 @@ public:
     // Parameters
     void setVolume(float vol);
     float getVolume() const { return volume.load(); }
+    void setTrimDb(float trimAmountDb);
+    float getTrimDb() const { return trimDb.load(std::memory_order_acquire); }
     void setPan(float panValue); // -1.0 (left) to 1.0 (right)
     float getPan() const { return pan.load(); }
     void setPlayheadSpeedRatio(float ratio)
     {
-        playheadSpeedRatio.store(juce::jlimit(0.125f, 4.0f, ratio), std::memory_order_release);
+        const float clamped = juce::jlimit(0.125f, 4.0f, ratio);
+        playheadSpeedRatio.store(clamped, std::memory_order_release);
+
+        if (playMode != PlayMode::Loop || !playing.load(std::memory_order_acquire))
+        {
+            appliedPlayheadSpeedRatio.store(clamped, std::memory_order_release);
+            pendingPlayheadSpeedRatio.store(clamped, std::memory_order_release);
+            pendingPlayheadSpeedChange.store(0, std::memory_order_release);
+            pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
+        }
     }
     float getPlayheadSpeedRatio() const { return playheadSpeedRatio.load(std::memory_order_acquire); }
     void setPlaybackSpeed(float speed);
@@ -574,8 +614,28 @@ public:
     void setPitchSmoothingTime(float seconds);  // Update speed smoothing ramp time (0-1 seconds)
     float getPlaybackSpeed() const { return static_cast<float>(playbackSpeed.load()); }
     float getDisplaySpeed() const { return displaySpeedAtomic.load(std::memory_order_acquire); }
+    enum class PitchShiftAlgorithm
+    {
+        Standard = 0,
+        SoundTouch,
+        Signalsmith,
+        Bungee
+    };
     void setPitchShift(float semitones);
     float getPitchShift() const { return pitchShiftSemitones.load(); }
+    void setPitchShiftAlgorithm(PitchShiftAlgorithm algorithm);
+    void setSignalsmithLiveMode(bool enabled);
+    bool isSignalsmithLiveMode() const
+    {
+        return signalsmithLiveMode.load(std::memory_order_acquire) != 0;
+    }
+    PitchShiftAlgorithm getPitchShiftAlgorithm() const
+    {
+        return static_cast<PitchShiftAlgorithm>(juce::jlimit(
+            0,
+            static_cast<int>(PitchShiftAlgorithm::Bungee),
+            pitchShiftAlgorithm.load(std::memory_order_acquire)));
+    }
     void setGlobalPitchContext(int rootMidi, int scaleIndex);
     int getGlobalPitchRootMidi() const { return globalPitchRootMidi.load(std::memory_order_acquire); }
     void setResamplePitchEnabled(bool enabled) { resamplePitchEnabled.store(enabled ? 1 : 0, std::memory_order_release); }
@@ -749,6 +809,11 @@ public:
         playheadTraversalRatioAtLastCalc = -1.0;
         playheadTraversalPhaseOffsetSlices = 0.0;
         playheadTraversalSliceCountAtLastCalc = -1;
+        const float requestedSpeedRatio = playheadSpeedRatio.load(std::memory_order_acquire);
+        appliedPlayheadSpeedRatio.store(requestedSpeedRatio, std::memory_order_release);
+        pendingPlayheadSpeedRatio.store(requestedSpeedRatio, std::memory_order_release);
+        pendingPlayheadSpeedChange.store(0, std::memory_order_release);
+        pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
 
         // Switching INTO step mode while transport is already running must
         // immediately arm step playback; waiting for a new transport edge
@@ -875,6 +940,31 @@ public:
     bool hasAudio() const { return sampleBuffer.getNumSamples() > 0; }
     const juce::AudioBuffer<float>* getAudioBuffer() const { return &sampleBuffer; }
     double getSourceSampleRate() const { return sourceSampleRate; }
+    bool copySoundTouchPitchSourceBuffer(juce::AudioBuffer<float>& outBuffer,
+                                         double& outSourceSampleRate,
+                                         uint64_t& outSourceVersion) const;
+    bool hasMatchingSoundTouchPitchCache(float semitones) const;
+    bool getReusableSoundTouchPitchCacheSemitones(float& cachedSemitones) const;
+    void installSoundTouchPitchCache(juce::AudioBuffer<float>&& renderedBuffer,
+                                     double sourceRate,
+                                     float semitones,
+                                     uint64_t sourceVersion);
+    bool hasMatchingBungeePitchCache(float semitones) const;
+    bool getReusableBungeePitchCacheSemitones(float& cachedSemitones) const;
+    void installBungeePitchCache(juce::AudioBuffer<float>&& renderedBuffer,
+                                 double sourceRate,
+                                 float semitones,
+                                 uint64_t sourceVersion);
+    bool hasMatchingSignalsmithPitchCache(float semitones) const;
+    bool getReusableSignalsmithPitchCacheSemitones(float& cachedSemitones) const;
+    void installSignalsmithPitchCache(juce::AudioBuffer<float>&& renderedBuffer,
+                                      double sourceRate,
+                                      float semitones,
+                                      uint64_t sourceVersion);
+    uint64_t getPitchSourceVersion() const
+    {
+        return pitchSourceVersion.load(std::memory_order_acquire);
+    }
     
     // Control accessors (new ones not already defined)
     int getLoopStart() const { return loopStart; }
@@ -966,6 +1056,28 @@ private:
     bool soundTouchSwingCacheUsesTransientAnchors = false;
     std::uint64_t soundTouchSwingCacheAnchorHash = 0;
 #endif
+#if MLRVST_ENABLE_SOUNDTOUCH
+    juce::AudioBuffer<float> soundTouchPitchCacheBuffer;
+    bool soundTouchPitchCacheValid = false;
+    int soundTouchPitchCacheSourceSamples = -1;
+    float soundTouchPitchCacheSemitones = 0.0f;
+    double soundTouchPitchCacheSourceRate = -1.0;
+    uint64_t soundTouchPitchCacheSourceVersion = 0;
+#endif
+    juce::AudioBuffer<float> bungeePitchCacheBuffer;
+    bool bungeePitchCacheValid = false;
+    int bungeePitchCacheSourceSamples = -1;
+    float bungeePitchCacheSemitones = 0.0f;
+    double bungeePitchCacheSourceRate = -1.0;
+    uint64_t bungeePitchCacheSourceVersion = 0;
+    juce::AudioBuffer<float> signalsmithPitchCacheBuffer;
+    bool signalsmithPitchCacheValid = false;
+    int signalsmithPitchCacheSourceSamples = -1;
+    float signalsmithPitchCacheSemitones = 0.0f;
+    double signalsmithPitchCacheSourceRate = -1.0;
+    uint64_t signalsmithPitchCacheSourceVersion = 0;
+    bool signalsmithPitchCacheActiveLastBlock = false;
+    float signalsmithPitchCacheActiveBaseSemitones = 0.0f;
 #if MLRVST_ENABLE_BUNGEE
     juce::AudioBuffer<float> loopTempoMatchCacheBuffer;
     bool loopTempoMatchCacheValid = false;
@@ -982,7 +1094,11 @@ private:
     juce::LagrangeInterpolator interpolators[2]; // For stereo
     
     std::atomic<double> playbackPosition{0.0};
-    std::atomic<float> playheadSpeedRatio{1.0f}; // Playmarker traversal multiplier (quantized musical ratios)
+    std::atomic<float> playheadSpeedRatio{1.0f}; // Requested traversal multiplier (quantized musical ratios)
+    std::atomic<float> appliedPlayheadSpeedRatio{1.0f}; // Active traversal multiplier used by loop DSP
+    std::atomic<float> pendingPlayheadSpeedRatio{1.0f};
+    std::atomic<int> pendingPlayheadSpeedChange{0};
+    std::atomic<int> pendingPlayheadSpeedBaseSlice{-1};
     std::atomic<double> playbackSpeed{1.0};
     double playheadTraversalRatioAtLastCalc = -1.0;
     double playheadTraversalPhaseOffsetSlices = 0.0;
@@ -1028,6 +1144,7 @@ private:
     
     // Smoothed parameters
     juce::SmoothedValue<float> smoothedVolume{0.7f};
+    juce::SmoothedValue<float> smoothedTrimGain{1.0f};
     juce::SmoothedValue<float> smoothedPan{0.0f};
     juce::SmoothedValue<float> smoothedSpeed{1.0f};
     juce::SmoothedValue<float> smoothedPitchShift{0.0f};
@@ -1036,16 +1153,59 @@ private:
     juce::SmoothedValue<float> smoothedFilterMorph{0.0f};
     float duckSmoothedGain = 1.0f;
     std::atomic<float> pitchShiftSemitones{0.0f};
+    std::atomic<int> pitchShiftAlgorithm{0};
+    std::atomic<int> signalsmithLiveMode{0};
     juce::AudioBuffer<float> pitchShiftDelayBuffer;
     int pitchShiftWritePos = 0;
     int pitchShiftDelaySize = 0;
     double pitchShiftPhase = 0.0;
+    float pitchShiftPreviousTransientEnergy = 0.0f;
+    int pitchShiftTransientHoldoffSamples = 0;
+    int pitchShiftLatchedTransientIndex = -1;
+    int pitchShiftNextTransientIndex = 0;
+    double pitchShiftLastTransientQueryPosition = std::numeric_limits<double>::quiet_NaN();
+    juce::AudioBuffer<float> signalsmithRealtimeRenderBuffer;
+    juce::AudioBuffer<float> signalsmithRealtimeOutputBuffer;
+    juce::AudioBuffer<float> signalsmithRealtimeWetBuffer;
+    juce::AudioBuffer<float> signalsmithRealtimeAlignmentDelayBuffer;
+    juce::AudioBuffer<float> signalsmithRealtimeHistoryBuffer;
+    signalsmith::stretch::SignalsmithStretch<float> signalsmithRealtimePitch;
+    bool signalsmithRealtimePitchConfigured = false;
+    float signalsmithRealtimeCurrentSemitones = 0.0f;
+    int signalsmithRealtimeAlignmentDelaySamples = 0;
+    int signalsmithRealtimeAlignmentDelayWritePos = 0;
+    int signalsmithRealtimeAlignmentTailSamplesRemaining = 0;
+    int signalsmithRealtimeHistoryWritePos = 0;
+    int signalsmithRealtimeHistorySamples = 0;
+    bool signalsmithRealtimeStreamPrimed = false;
+    bool signalsmithRealtimeStreamProcessedLastBlock = false;
+    bool signalsmithRealtimeOutputActive = false;
+    bool signalsmithRealtimeWasPlaying = false;
+    std::atomic<uint64_t> signalsmithLoopDebugSequence{0};
+    std::atomic<int> signalsmithLoopDebugPlayMode{0};
+    std::atomic<int> signalsmithLoopDebugPitchAlgorithm{0};
+    std::atomic<int> signalsmithLoopDebugSignalsmithLiveMode{0};
+    std::atomic<int> signalsmithLoopDebugPlaying{0};
+    std::atomic<int> signalsmithLoopDebugMaintainRealtimeStream{0};
+    std::atomic<int> signalsmithLoopDebugUseRealtimeSignalsmith{0};
+    std::atomic<int> signalsmithLoopDebugUseRealtimeAlignmentDelay{0};
+    std::atomic<int> signalsmithLoopDebugStreamPrimed{0};
+    std::atomic<int> signalsmithLoopDebugStreamProcessedThisBlock{0};
+    std::atomic<int> signalsmithLoopDebugRenderedSamples{0};
+    std::atomic<int> signalsmithLoopDebugAlignmentDelaySamples{0};
+    std::atomic<int> signalsmithLoopDebugHistorySamples{0};
+    std::atomic<float> signalsmithLoopDebugTargetSemitones{0.0f};
+    std::atomic<float> signalsmithLoopDebugSmoothedSemitones{0.0f};
+    std::atomic<float> signalsmithLoopDebugPreRms{0.0f};
+    std::atomic<float> signalsmithLoopDebugWetRms{0.0f};
+    std::atomic<float> signalsmithLoopDebugFinalRms{0.0f};
     
     int stripIndex = 0;
     int groupId = 0;
     double sampleLength = 0;
     double sourceSampleRate = 44100.0;
     double currentSampleRate = 44100.0;
+    std::atomic<uint64_t> pitchSourceVersion{1};
     
     // For sample-accurate playback
     int triggerColumn = 0;           // Which column was triggered
@@ -1079,6 +1239,11 @@ private:
     int triggerOutputBlendTotalSamples = 0;
     float triggerOutputBlendStartL = 0.0f;
     float triggerOutputBlendStartR = 0.0f;
+    bool pitchCacheOutputBlendActive = false;
+    int pitchCacheOutputBlendSamplesRemaining = 0;
+    int pitchCacheOutputBlendTotalSamples = 0;
+    float pitchCacheOutputBlendStartL = 0.0f;
+    float pitchCacheOutputBlendStartR = 0.0f;
     float lastOutputSampleL = 0.0f;
     float lastOutputSampleR = 0.0f;
     int64_t playheadSample = 0;      // Samples since trigger (playhead position)
@@ -1299,8 +1464,67 @@ public:
     void snapToTimeline(int64_t currentGlobalSample);
     void reverseScratchToTimeline(int64_t currentGlobalSample);
     void resetPitchShifter();
+    void invalidatePitchShiftCaches();
+    void startPitchCacheOutputBlendLocked();
+    bool getPitchCacheSourceLocked(const juce::AudioBuffer<float>*& outSourceBuffer,
+                                   double& outSourceSampleRate,
+                                   uint64_t& outSourceVersion) const;
+    bool isPitchCachePlaybackSourceEligible(const juce::AudioBuffer<float>* sourceBuffer) const;
+    void resetSignalsmithRealtimePitch();
+    void resetSignalsmithRealtimeAlignmentState();
+    void pushSignalsmithRealtimeHistorySampleLocked(float left, float right);
+    bool primeSignalsmithRealtimePitchFromHistoryLocked(float semitones);
+    bool shouldTrackRealtimeSignalsmithHistory() const;
+    void publishSignalsmithLoopDebugSnapshot(int renderedSamples,
+                                             bool maintainRealtimeSignalsmithStream,
+                                             bool useRealtimeSignalsmith,
+                                             bool useRealtimeAlignmentDelay,
+                                             bool streamProcessedThisBlock,
+                                             float preRms,
+                                             float wetRms,
+                                             float finalRms);
+    bool shouldMaintainRealtimeSignalsmithStream() const;
+    bool shouldUseRealtimeSignalsmithAtCurrentPitch() const;
+    void computeSignalsmithRealtimePitchWindow(int numSamples,
+                                               float& startSemitones,
+                                               float& endSemitones);
+    bool processSignalsmithRealtimePitchBufferInPlace(juce::AudioBuffer<float>& buffer,
+                                                      int startSample,
+                                                      int numSamples,
+                                                      float startSemitones,
+                                                      float endSemitones);
+    void applySignalsmithRealtimePostPitchBufferInPlace(
+        juce::AudioBuffer<float>& buffer,
+        int startSample,
+        int numSamples,
+        const juce::AudioPlayHead::PositionInfo& positionInfo,
+        double tempo);
+    int processSignalsmithRealtimeAlignmentDelayBufferInPlace(juce::AudioBuffer<float>& buffer,
+                                                              int startSample,
+                                                              int numSamples);
     float readPitchDelaySample(int channel, double delaySamples) const;
-    void processPitchShift(float& left, float& right, float semitones);
+    float readPitchDelaySampleWindowedSinc(int channel, double delaySamples, int taps) const;
+    float readPitchDelaySampleOversampled(int channel, double delaySamples, int taps) const;
+    bool shouldResetHqPitchShiftTransient(float left,
+                                          float right,
+                                          double sourcePosition,
+                                          bool useTransientMarkers);
+    void processPitchShiftStandard(float& left, float& right, float semitones);
+    void processPitchShiftHighQuality(float& left,
+                                      float& right,
+                                      float semitones,
+                                      double sourcePosition,
+                                      bool useTransientMarkers);
+    void processPitchShift(float& left,
+                           float& right,
+                           float semitones,
+                           double sourcePosition = -1.0,
+                           bool useTransientMarkers = false);
+    void processPitchShiftBufferInPlace(juce::AudioBuffer<float>& buffer,
+                                        int startSample,
+                                        int numSamples,
+                                        float semitones,
+                                        PitchShiftAlgorithm algorithm);
     int64_t makeFeasibleScratchDuration(double startPosSamples,
                                         double endPosSamples,
                                         int64_t requestedDurationSamples,
@@ -1485,6 +1709,7 @@ public:
     void setModCurveModeForSlot(int stripIndex, int slot, bool curveMode);
     bool isModCurveModeForSlot(int stripIndex, int slot) const;
     void setModOffset(int stripIndex, int offset);
+    void setModOffsetForSlot(int stripIndex, int slot, int offset);
     int getModOffset(int stripIndex) const;
     int getModOffsetForSlot(int stripIndex, int slot) const;
     void setModStepValue(int stripIndex, int step, float value01);
@@ -1509,6 +1734,8 @@ public:
     double getModStepLengthBeats(int stripIndex, int slot) const;
     void setModLengthBars(int stripIndex, int bars);
     int getModLengthBars(int stripIndex) const;
+    void setModLengthBarsForSlot(int stripIndex, int slot, int bars);
+    int getModLengthBarsForSlot(int stripIndex, int slot) const;
     void setModEditPage(int stripIndex, int page);
     int getModEditPage(int stripIndex) const;
     void setModSmoothingMs(int stripIndex, float ms);
@@ -1579,6 +1806,10 @@ public:
     double getTimelineBeat() const;
     double getBeatPhase() const { return beatPhase; }  // 0.0 to 1.0 within current beat
     int64_t getGlobalSampleCount() const { return globalSampleCount; }
+    int getRealtimeSignalsmithAlignmentLatencySamples() const
+    {
+        return signalsmithRealtimeAlignmentLatencySamples.load(std::memory_order_acquire);
+    }
     
 private:
     struct ModSequencer
@@ -1659,6 +1890,7 @@ private:
     std::atomic<double> lastKnownPPQ{0.0};  // Last PPQ from processBlock (for quantize outside audio thread)
     std::atomic<bool> hasLastKnownPPQ{false};
     std::atomic<int64_t> globalSampleCount{0};  // Total samples processed for sample-accurate sync
+    std::atomic<int> signalsmithRealtimeAlignmentLatencySamples{0};
     double lastPatternProcessBeat = -1.0;
     
     double currentSampleRate = 44100.0;
