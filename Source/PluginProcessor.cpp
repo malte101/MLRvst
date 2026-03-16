@@ -1761,7 +1761,7 @@ void appendGlobalSettingsDiagnostic(const juce::String& tag, const juce::XmlElem
 
 constexpr juce::int64 kPersistentGlobalControlsSaveDebounceMs = 350;
 
-constexpr std::array<const char*, 15> kPersistentGlobalControlParameterIds {
+constexpr std::array<const char*, 16> kPersistentGlobalControlParameterIds {
     "masterVolume",
     "limiterThreshold",
     "limiterEnabled",
@@ -1776,6 +1776,7 @@ constexpr std::array<const char*, 15> kPersistentGlobalControlParameterIds {
     "pitchControlMode",
     "flipTempoMatchMode",
     "stretchBackend",
+    "continuousTraversal",
     "soundTouchEnabled"
 };
 
@@ -1787,6 +1788,26 @@ bool isPersistentGlobalControlParameterId(const juce::String& parameterID)
             return true;
     }
     return false;
+}
+
+float gatePageSpeedForMode(MlrVSTAudioProcessor::GatePageMode mode, float beatsPerLoop) noexcept
+{
+    const float safeBeatsPerLoop = (beatsPerLoop > 0.0f) ? beatsPerLoop : 4.0f;
+    int slicesPerLoop = 0;
+    switch (mode)
+    {
+        case MlrVSTAudioProcessor::GatePageMode::Quarter:   slicesPerLoop = 4;  break;
+        case MlrVSTAudioProcessor::GatePageMode::Sixth:     slicesPerLoop = 6;  break;
+        case MlrVSTAudioProcessor::GatePageMode::Eighth:    slicesPerLoop = 8;  break;
+        case MlrVSTAudioProcessor::GatePageMode::Sixteenth: slicesPerLoop = 16; break;
+        case MlrVSTAudioProcessor::GatePageMode::Adaptive:
+        default:                                            slicesPerLoop = 0;  break;
+    }
+
+    if (slicesPerLoop <= 0)
+        return 4.0f;
+
+    return juce::jlimit(0.25f, 8.0f, static_cast<float>(slicesPerLoop) / safeBeatsPerLoop);
 }
 
 constexpr int kStutterButtonFirstColumn = 9;
@@ -3278,6 +3299,7 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
     pitchControlModeParam = parameters.getRawParameterValue("pitchControlMode");
     flipTempoMatchModeParam = parameters.getRawParameterValue("flipTempoMatchMode");
     stretchBackendParam = parameters.getRawParameterValue("stretchBackend");
+    continuousTraversalParam = parameters.getRawParameterValue("continuousTraversal");
     soundTouchEnabledParam = parameters.getRawParameterValue("soundTouchEnabled");
     masterDuckTriggerStripParam = parameters.getRawParameterValue("masterDuckTriggerStrip");
     sceneModeParam = parameters.getRawParameterValue("sceneMode");
@@ -3317,6 +3339,27 @@ void MlrVSTAudioProcessor::markPersistentGlobalUserChange()
     persistentGlobalUserTouched.store(1, std::memory_order_release);
     persistentGlobalControlsReady.store(1, std::memory_order_release);
     queuePersistentGlobalControlsSave();
+}
+
+void MlrVSTAudioProcessor::setGatePageMode(GatePageMode mode)
+{
+    const auto safeMode = static_cast<GatePageMode>(juce::jlimit(
+        0,
+        static_cast<int>(GatePageMode::Sixteenth),
+        static_cast<int>(mode)));
+    gatePageMode.store(static_cast<int>(safeMode), std::memory_order_release);
+
+    if (audioEngine == nullptr || safeMode == GatePageMode::Adaptive)
+        return;
+
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        auto* strip = audioEngine->getStrip(stripIndex);
+        if (strip == nullptr || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+            continue;
+
+        strip->setGateSpeed(gatePageSpeedForMode(safeMode, strip->getBeatsPerLoop()));
+    }
 }
 
 void MlrVSTAudioProcessor::queuePersistentGlobalControlsSave()
@@ -3462,6 +3505,10 @@ void MlrVSTAudioProcessor::setMacroTarget(int macroIndex, MacroTarget target)
     if (macroIndex < 0 || macroIndex >= MacroCount)
         return;
 
+    const auto previousTarget = getMacroTarget(macroIndex);
+    if (previousTarget == MacroTarget::Retrigger && audioEngine != nullptr)
+        audioEngine->setMacroRetriggerAmount(getMacroTargetStripIndex(), 0.0f);
+
     macroTargetAssignments[static_cast<size_t>(macroIndex)].store(static_cast<int>(sanitizeMacroTarget(static_cast<int>(target))),
                                                                   std::memory_order_release);
     markPersistentGlobalUserChange();
@@ -3478,7 +3525,7 @@ float MlrVSTAudioProcessor::getDefaultMacroNormalizedValue(MacroTarget target)
         case MacroTarget::Volume: return 1.0f;
         case MacroTarget::Pan: return 0.5f;
         case MacroTarget::FilterEnable: return 0.0f;
-        case MacroTarget::Speed: return normalizeMacroLinear(1.0f, 0.125f, 4.0f);
+        case MacroTarget::Speed: return normalizeMacroLinear(1.0f, 0.125f, 8.0f);
         case MacroTarget::SliceLength: return 1.0f;
         case MacroTarget::Scratch: return 0.0f;
         case MacroTarget::GrainSize: return normalizeMacroLinear(1240.0f, 5.0f, 2400.0f);
@@ -3495,6 +3542,7 @@ float MlrVSTAudioProcessor::getDefaultMacroNormalizedValue(MacroTarget target)
         case MacroTarget::GrainEnvelope: return 0.0f;
         case MacroTarget::GrainShape: return 0.5f;
         case MacroTarget::Retrigger: return 0.0f;
+        case MacroTarget::Rearrange: return 0.0f;
         case MacroTarget::None:
         default: return 0.0f;
     }
@@ -3542,13 +3590,7 @@ int MlrVSTAudioProcessor::snapMacroLaneRecordingLengthBars(double recordedBeats)
 {
     const double safeBeats = juce::jmax(0.0, recordedBeats);
     const double recordedBars = safeBeats / 4.0;
-    if (recordedBars <= 1.0)
-        return 1;
-    if (recordedBars <= 2.0)
-        return 2;
-    if (recordedBars <= 4.0)
-        return 4;
-    return 8;
+    return juce::jlimit(1, ModernAudioEngine::MaxModBars, static_cast<int>(std::round(recordedBars)));
 }
 
 void MlrVSTAudioProcessor::finishMacroLaneRecording(int macroIndex, bool activateLane)
@@ -3692,10 +3734,36 @@ int MlrVSTAudioProcessor::getMacroTargetStripIndex() const
     return juce::jlimit(0, juce::jmax(0, maxStripIndex), getLastMonomePressedStripRow());
 }
 
-float MlrVSTAudioProcessor::getMacroNormalizedValueForTarget(const EnhancedAudioStrip& strip, MacroTarget target) const
+void MlrVSTAudioProcessor::setStripParameterValueFromMacro(int stripIndex,
+                                                           const juce::String& parameterId,
+                                                           float plainValue)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    if (auto* parameter = parameters.getParameter(parameterId))
+    {
+        const float normalized = juce::jlimit(0.0f, 1.0f, parameter->convertTo0to1(plainValue));
+        parameter->setValueNotifyingHost(normalized);
+    }
+}
+
+float MlrVSTAudioProcessor::getMacroNormalizedValueForTarget(int stripIndex,
+                                                             const EnhancedAudioStrip& strip,
+                                                             MacroTarget target) const
 {
     const bool isStepMode = (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
     const auto* stepSampler = isStepMode ? strip.getStepSampler() : nullptr;
+    const bool validStripIndex = stripIndex >= 0 && stripIndex < MaxStrips;
+    const auto arrayIndex = static_cast<size_t>(juce::jlimit(0, MaxStrips - 1, stripIndex));
+    const auto readParamOr = [&](const std::array<std::atomic<float>*, MaxStrips>& params, float fallback)
+    {
+        if (!validStripIndex)
+            return fallback;
+        if (const auto* rawParam = params[arrayIndex])
+            return rawParam->load(std::memory_order_acquire);
+        return fallback;
+    };
 
     switch (target)
     {
@@ -3718,13 +3786,17 @@ float MlrVSTAudioProcessor::getMacroNormalizedValueForTarget(const EnhancedAudio
             }
             return juce::jlimit(0.0f, 1.0f, strip.getFilterMorph());
         case MacroTarget::Pitch:
-            return normalizeMacroPitch(getPitchSemitonesForDisplay(strip));
+            return normalizeMacroPitch(validStripIndex
+                                           ? getStoredStripPitchSemitones(stripIndex)
+                                           : getPitchSemitonesForDisplay(strip));
         case MacroTarget::Volume:
-            return juce::jlimit(0.0f, 1.0f, (isStepMode && stepSampler) ? stepSampler->getVolume()
-                                                                        : strip.getVolume());
+            return juce::jlimit(0.0f, 1.0f, readParamOr(stripVolumeParams,
+                                                        (isStepMode && stepSampler) ? stepSampler->getVolume()
+                                                                                    : strip.getVolume()));
         case MacroTarget::Pan:
-            return normalizeMacroLinear((isStepMode && stepSampler) ? stepSampler->getPan()
-                                                                    : strip.getPan(),
+            return normalizeMacroLinear(readParamOr(stripPanParams,
+                                                    (isStepMode && stepSampler) ? stepSampler->getPan()
+                                                                                : strip.getPan()),
                                         -1.0f, 1.0f);
         case MacroTarget::FilterEnable:
             return ((isStepMode && stepSampler) ? stepSampler->isFilterEnabled()
@@ -3732,11 +3804,12 @@ float MlrVSTAudioProcessor::getMacroNormalizedValueForTarget(const EnhancedAudio
                 ? 1.0f
                 : 0.0f;
         case MacroTarget::Speed:
-            return normalizeMacroLinear((isStepMode && stepSampler) ? stepSampler->getSpeed()
-                                                                    : strip.getPlayheadSpeedRatio(),
-                                        0.125f, 4.0f);
+            return normalizeMacroLinear(readParamOr(stripSpeedParams,
+                                                    (isStepMode && stepSampler) ? stepSampler->getSpeed()
+                                                                                : strip.getPlayheadSpeedRatio()),
+                                        0.125f, 8.0f);
         case MacroTarget::SliceLength:
-            return juce::jlimit(0.0f, 1.0f, strip.getLoopSliceLength());
+            return juce::jlimit(0.0f, 1.0f, readParamOr(stripSliceLengthParams, strip.getLoopSliceLength()));
         case MacroTarget::Scratch:
             return normalizeMacroLinear(strip.getScratchAmount(), 0.0f, 100.0f);
         case MacroTarget::GrainSize:
@@ -3766,6 +3839,9 @@ float MlrVSTAudioProcessor::getMacroNormalizedValueForTarget(const EnhancedAudio
         case MacroTarget::GrainShape:
             return normalizeMacroLinear(strip.getGrainShape(), -1.0f, 1.0f);
         case MacroTarget::Retrigger:
+            return audioEngine != nullptr ? audioEngine->getMacroRetriggerAmount(stripIndex) : 0.0f;
+        case MacroTarget::Rearrange:
+            return 0.0f;
         case MacroTarget::None:
         default:
             return getDefaultMacroNormalizedValue(target);
@@ -3821,11 +3897,12 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(int stripIndex,
         }
         case MacroTarget::Pitch:
         {
-            applyPitchControlToStrip(stripIndex, strip, denormalizeMacroPitch(clamped));
+            applyUserPitchControlToStrip(stripIndex, denormalizeMacroPitch(clamped));
             break;
         }
         case MacroTarget::Volume:
         {
+            setStripParameterValueFromMacro(stripIndex, "stripVolume" + juce::String(stripIndex), clamped);
             strip.setVolume(clamped);
             if (stepSampler != nullptr)
                 stepSampler->setVolume(clamped);
@@ -3834,6 +3911,7 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(int stripIndex,
         case MacroTarget::Pan:
         {
             const float pan = denormalizeMacroLinear(clamped, -1.0f, 1.0f);
+            setStripParameterValueFromMacro(stripIndex, "stripPan" + juce::String(stripIndex), pan);
             strip.setPan(pan);
             if (stepSampler != nullptr)
                 stepSampler->setPan(pan);
@@ -3849,13 +3927,15 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(int stripIndex,
         }
         case MacroTarget::Speed:
         {
-            const float speed = denormalizeMacroLinear(clamped, 0.125f, 4.0f);
+            const float speed = denormalizeMacroLinear(clamped, 0.125f, 8.0f);
+            setStripParameterValueFromMacro(stripIndex, "stripSpeed" + juce::String(stripIndex), speed);
             strip.setPlayheadSpeedRatio(speed);
             if (stepSampler != nullptr)
                 stepSampler->setSpeed(speed);
             break;
         }
         case MacroTarget::SliceLength:
+            setStripParameterValueFromMacro(stripIndex, "stripSliceLength" + juce::String(stripIndex), clamped);
             strip.setLoopSliceLength(clamped);
             break;
         case MacroTarget::Scratch:
@@ -3901,6 +3981,11 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(int stripIndex,
             strip.setGrainShape(denormalizeMacroLinear(clamped, -1.0f, 1.0f));
             break;
         case MacroTarget::Retrigger:
+            if (audioEngine != nullptr)
+                audioEngine->setMacroRetriggerAmount(stripIndex, clamped);
+            break;
+        case MacroTarget::Rearrange:
+            break;
         case MacroTarget::None:
         default:
             break;
@@ -3922,7 +4007,9 @@ MlrVSTAudioProcessor::MacroState MlrVSTAudioProcessor::getMacroState() const
     state.hasTargetStrip = true;
 
     for (int macroIndex = 0; macroIndex < MacroCount; ++macroIndex)
-        state.values[static_cast<size_t>(macroIndex)] = getMacroNormalizedValueForTarget(*strip, getMacroTarget(macroIndex));
+        state.values[static_cast<size_t>(macroIndex)] = getMacroNormalizedValueForTarget(state.stripIndex,
+                                                                                         *strip,
+                                                                                         getMacroTarget(macroIndex));
 
     return state;
 }
@@ -3956,7 +4043,7 @@ float MlrVSTAudioProcessor::getMacroLaneRecordedValue(int macroIndex) const
 
     const auto target = sanitizeMacroPerformanceTarget(
         performanceTargetFromRaw(state.target.load(std::memory_order_acquire)));
-    return getMacroNormalizedValueForTarget(*strip, target);
+    return getMacroNormalizedValueForTarget(stripIndex, *strip, target);
 }
 
 bool MlrVSTAudioProcessor::initializeMacroLaneRecording(int macroIndex,
@@ -4222,6 +4309,13 @@ TimeStretchBackend MlrVSTAudioProcessor::getStretchBackend() const
         && soundTouchEnabledParam->load(std::memory_order_acquire) > 0.5f;
     return legacyEnabled ? TimeStretchBackend::SoundTouch
                          : TimeStretchBackend::Resample;
+}
+
+bool MlrVSTAudioProcessor::usesContinuousTraversal() const
+{
+    if (continuousTraversalParam != nullptr)
+        return continuousTraversalParam->load(std::memory_order_acquire) >= 0.5f;
+    return true;
 }
 
 TimeStretchBackend MlrVSTAudioProcessor::getLoopTempoMatchBackend() const
@@ -6025,6 +6119,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         globalChoiceAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterBool>(
+        "continuousTraversal",
+        "Continuous Traversal",
+        true,
+        globalBoolAttrs));
+
+    layout.add(std::make_unique<juce::AudioParameterBool>(
         "sceneMode",
         "Scene Mode",
         false,
@@ -6066,7 +6166,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         layout.add(std::make_unique<juce::AudioParameterFloat>(
             "stripSpeed" + juce::String(i),
             "Strip " + juce::String(i + 1) + " Playhead Speed",
-            juce::NormalisableRange<float>(0.0f, 4.0f, 0.01f, 0.5f),
+            juce::NormalisableRange<float>(0.125f, 8.0f, 0.01f, 0.5f),
             1.0f));
 
         layout.add(std::make_unique<juce::AudioParameterFloat>(
@@ -6354,6 +6454,13 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         lastAppliedStretchBackend = stretchBackendInt;
     }
 
+    const int continuousTraversalInt = usesContinuousTraversal() ? 1 : 0;
+    if (continuousTraversalInt != lastAppliedContinuousTraversal)
+    {
+        audioEngine->setGlobalContinuousTraversal(continuousTraversalInt != 0);
+        lastAppliedContinuousTraversal = continuousTraversalInt;
+    }
+
     const auto loopTempoMatchBackend = getLoopTempoMatchBackend();
     const int loopTempoMatchBackendInt = static_cast<int>(loopTempoMatchBackend);
     if (loopTempoMatchBackendInt != lastAppliedLoopTempoMatchBackend)
@@ -6403,7 +6510,7 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
             if (speedParam)
             {
                 const float speedRatio = PlayheadSpeedQuantizer::quantizeRatio(
-                    juce::jlimit(0.0f, 4.0f, speedParam->load(std::memory_order_acquire)));
+                    juce::jlimit(0.125f, 8.0f, speedParam->load(std::memory_order_acquire)));
                 strip->setPlayheadSpeedRatio(speedRatio);
             }
 
@@ -10771,7 +10878,7 @@ void MlrVSTAudioProcessor::applyMomentaryStutterMacro(const juce::AudioPlayHead:
         const float stripMorphOffset = static_cast<float>(0.08 * std::sin(
             juce::MathConstants<double>::twoPi * wrapUnitPhase(phase + (0.13 * static_cast<double>(i)))));
 
-        const float savedSpeed = juce::jlimit(0.0f, 4.0f, saved.playbackSpeed);
+        const float savedSpeed = juce::jlimit(0.125f, 8.0f, saved.playbackSpeed);
         const float speedBaseline = savedSpeed;
         const float stutterSpeedFloor = applySpeedMacro
             ? (ultraFastDivision ? 0.72f : (veryFastDivision ? 0.56f : 0.30f))

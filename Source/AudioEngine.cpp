@@ -105,6 +105,42 @@ bool isGrainModTarget(ModernAudioEngine::ModTarget target)
         || target == ModernAudioEngine::ModTarget::GrainShape;
 }
 
+bool modTargetUsesForcedBipolar(ModernAudioEngine::ModTarget target)
+{
+    return target == ModernAudioEngine::ModTarget::Speed;
+}
+
+float quantizeModLaneRate(float rate) noexcept
+{
+    return PlayheadSpeedQuantizer::quantizeRatio(juce::jlimit(0.125f, 8.0f, rate));
+}
+
+float defaultRearrangeStepValueForIndex(int absoluteStep, int totalSteps) noexcept
+{
+    if (totalSteps <= 1)
+        return 0.0f;
+
+    const int wrappedStep = juce::jlimit(0, juce::jmax(0, totalSteps - 1), absoluteStep);
+    return juce::jlimit(0.0f, 1.0f,
+                        static_cast<float>(wrappedStep)
+                            / static_cast<float>(juce::jmax(1, totalSteps - 1)));
+}
+
+int rearrangeSliceIndexFromNormalized(float value01, int localSliceCount) noexcept
+{
+    const int safeLocalSliceCount = juce::jmax(1, localSliceCount);
+    const float normalized = juce::jlimit(0.0f, 1.0f, value01);
+    const int sourceIndex16 = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1,
+                                           static_cast<int>(std::round(normalized * static_cast<float>(ModernAudioEngine::MaxColumns - 1))));
+    if (safeLocalSliceCount <= 1)
+        return 0;
+
+    return juce::jlimit(0, safeLocalSliceCount - 1,
+                        static_cast<int>(std::round((static_cast<float>(sourceIndex16)
+                                                      / static_cast<float>(ModernAudioEngine::MaxColumns - 1))
+                                                     * static_cast<float>(safeLocalSliceCount - 1))));
+}
+
 float convertModValueForBipolarMode(float value01,
                                     bool wasBipolar,
                                     bool willBeBipolar,
@@ -236,106 +272,6 @@ std::vector<int> refineOnsetSamplesToLeadingEdges(const std::vector<float>& mono
     std::sort(refined.begin(), refined.end());
     refined.erase(std::unique(refined.begin(), refined.end()), refined.end());
     return refined;
-}
-
-std::vector<int> collectAdaptiveTransientOnsetSamples(const std::vector<float>& monoSamples,
-                                                      const std::vector<float>& novelty,
-                                                      const std::vector<float>& energyDiff,
-                                                      int frameSize,
-                                                      int hopSize,
-                                                      int totalSamples,
-                                                      int minPeakSpacingFrames,
-                                                      int targetCount)
-{
-    auto collectPeakFrames = [minPeakSpacingFrames](const std::vector<float>& values,
-                                                    float minPeakLevel)
-    {
-        std::vector<std::pair<int, float>> peakFrames;
-        const int frameCount = static_cast<int>(values.size());
-        peakFrames.reserve(static_cast<size_t>(frameCount));
-
-        for (int i = 1; i < (frameCount - 1); ++i)
-        {
-            const float center = values[static_cast<size_t>(i)];
-            if (center < minPeakLevel)
-                continue;
-            if (center < values[static_cast<size_t>(i - 1)] || center < values[static_cast<size_t>(i + 1)])
-                continue;
-
-            if (!peakFrames.empty() && (i - peakFrames.back().first) < minPeakSpacingFrames)
-            {
-                if (center > peakFrames.back().second)
-                    peakFrames.back() = { i, center };
-                continue;
-            }
-
-            peakFrames.emplace_back(i, center);
-        }
-
-        return peakFrames;
-    };
-
-    auto framesToSamples = [&](const std::vector<std::pair<int, float>>& onsetFrames)
-    {
-        std::vector<int> onsetSamples;
-        onsetSamples.reserve(onsetFrames.size());
-
-        for (const auto& onset : onsetFrames)
-        {
-            const int centered = (onset.first * hopSize) + (frameSize / 2);
-            onsetSamples.push_back(juce::jlimit(0, totalSamples - 1, centered));
-        }
-
-        std::sort(onsetSamples.begin(), onsetSamples.end());
-        onsetSamples.erase(std::unique(onsetSamples.begin(), onsetSamples.end()), onsetSamples.end());
-
-        if (const auto refined = refineOnsetSamplesToLeadingEdges(monoSamples, onsetSamples, frameSize, hopSize);
-            !refined.empty())
-        {
-            onsetSamples = refined;
-        }
-
-        return onsetSamples;
-    };
-
-    auto collectWithRelaxedThreshold = [&](const std::vector<float>& values,
-                                           float baseMinPeakLevel)
-    {
-        static constexpr std::array<float, 8> kThresholdScales{{ 1.0f, 0.82f, 0.67f, 0.54f,
-                                                                 0.42f, 0.31f, 0.22f, 0.14f }};
-        std::vector<int> bestSamples;
-
-        for (const float scale : kThresholdScales)
-        {
-            const float minPeakLevel = juce::jmax(1.0e-6f, baseMinPeakLevel * scale);
-            auto onsetSamples = framesToSamples(collectPeakFrames(values, minPeakLevel));
-            if (onsetSamples.size() > bestSamples.size())
-                bestSamples = std::move(onsetSamples);
-            if (static_cast<int>(bestSamples.size()) >= targetCount)
-                break;
-        }
-
-        return bestSamples;
-    };
-
-    const float noveltyMean = std::accumulate(novelty.begin(), novelty.end(), 0.0f)
-        / static_cast<float>(juce::jmax(1, static_cast<int>(novelty.size())));
-    const float noveltyMax = novelty.empty() ? 0.0f : *std::max_element(novelty.begin(), novelty.end());
-    const float noveltyMinPeakLevel = juce::jmax(1.0e-6f,
-                                                 juce::jmax(noveltyMean * 0.35f, noveltyMax * 0.10f));
-
-    auto onsetSamples = collectWithRelaxedThreshold(novelty, noveltyMinPeakLevel);
-
-    if (static_cast<int>(onsetSamples.size()) < targetCount)
-    {
-        const float energyMax = energyDiff.empty() ? 0.0f : *std::max_element(energyDiff.begin(), energyDiff.end());
-        const float energyMinPeakLevel = juce::jmax(1.0e-6f, energyMax * 0.18f);
-        auto energyOnsetSamples = collectWithRelaxedThreshold(energyDiff, energyMinPeakLevel);
-        if (energyOnsetSamples.size() > onsetSamples.size())
-            onsetSamples = std::move(energyOnsetSamples);
-    }
-
-    return onsetSamples;
 }
 
 float smoothingCoeffFromMs(float ms, double sampleRate)
@@ -476,13 +412,37 @@ int quantizeMidiToScaleImpl(int midiNote, int rootMidi, const std::array<int, N>
     return bestMidi;
 }
 
-float quantizeSpeedRatioMusical(float unit)
+float quantizeSpeedRatioMusical(float unit, bool bipolar)
 {
     // Share one musical ratio palette between Mod Speed and Playhead Speed controls.
+    // Bipolar mode centers on 1x so the lane can move slower/faster around neutral.
     const float clamped = juce::jlimit(0.0f, 1.0f, unit);
     constexpr int kMaxIndex = static_cast<int>(PlayheadSpeedQuantizer::kSpeedRatios.size()) - 1;
-    const int idx = juce::jlimit(
-        0, kMaxIndex, static_cast<int>(std::round(clamped * static_cast<float>(kMaxIndex))));
+
+    if (!bipolar)
+    {
+        const int idx = juce::jlimit(
+            0, kMaxIndex, static_cast<int>(std::round(clamped * static_cast<float>(kMaxIndex))));
+        return PlayheadSpeedQuantizer::ratioFromColumn(idx);
+    }
+
+    constexpr int kCenterIndex = 8; // 1x
+    int idx = kCenterIndex;
+    if (clamped < 0.5f)
+    {
+        idx = juce::jlimit(
+            0,
+            kCenterIndex,
+            static_cast<int>(std::round(juce::jmap(clamped, 0.0f, 0.5f, 0.0f, static_cast<float>(kCenterIndex)))));
+    }
+    else
+    {
+        idx = juce::jlimit(
+            kCenterIndex,
+            kMaxIndex,
+            static_cast<int>(std::round(juce::jmap(clamped, 0.5f, 1.0f, static_cast<float>(kCenterIndex), static_cast<float>(kMaxIndex)))));
+    }
+
     return PlayheadSpeedQuantizer::ratioFromColumn(idx);
 }
 
@@ -2164,6 +2124,7 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
     };
 
     std::vector<float> novelty(static_cast<size_t>(frames), 0.0f);
+    float noveltySum = 0.0f;
     for (int i = 0; i < frames; ++i)
     {
         const int a = juce::jmax(0, i - 8);
@@ -2172,71 +2133,216 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
         const float peakPart = juce::jmax(0.0f, smoothedFlux[static_cast<size_t>(i)] - adaptive);
         const float mixed = peakPart + (0.25f * energyDiff[static_cast<size_t>(i)]);
         novelty[static_cast<size_t>(i)] = mixed;
+        noveltySum += mixed;
     }
 
+    const float noveltyMean = noveltySum / static_cast<float>(juce::jmax(1, frames));
+    const float noveltyMax = *std::max_element(novelty.begin(), novelty.end());
+    const float minPeakLevel = juce::jmax(1.0e-6f,
+                                          juce::jmax(noveltyMean * 0.35f, noveltyMax * 0.10f));
     const double analysisSampleRate = (sourceSampleRate > 1000.0)
         ? sourceSampleRate
         : juce::jmax(1.0, currentSampleRate);
     const int minPeakSpacingFrames = juce::jmax(1, static_cast<int>((0.015 * analysisSampleRate) / static_cast<double>(hop))); // 15ms
-    auto onsetSamples = collectAdaptiveTransientOnsetSamples(monoSamples,
-                                                             novelty,
-                                                             energyDiff,
-                                                             frameSize,
-                                                             hop,
-                                                             totalSamples,
-                                                             minPeakSpacingFrames,
-                                                             ModernAudioEngine::MaxColumns);
+
+    std::vector<std::pair<int, float>> onsetFrames;
+    onsetFrames.reserve(static_cast<size_t>(frames));
+
+    for (int i = 1; i < (frames - 1); ++i)
+    {
+        const float center = novelty[static_cast<size_t>(i)];
+        if (center < minPeakLevel)
+            continue;
+        if (center < novelty[static_cast<size_t>(i - 1)] || center < novelty[static_cast<size_t>(i + 1)])
+            continue;
+
+        if (!onsetFrames.empty() && (i - onsetFrames.back().first) < minPeakSpacingFrames)
+        {
+            if (center > onsetFrames.back().second)
+                onsetFrames.back() = { i, center };
+            continue;
+        }
+
+        onsetFrames.emplace_back(i, center);
+    }
+
+    if (onsetFrames.empty())
+    {
+        const float energyMax = *std::max_element(energyDiff.begin(), energyDiff.end());
+        const float energyMinPeak = juce::jmax(1.0e-6f, energyMax * 0.18f);
+        for (int i = 1; i < (frames - 1); ++i)
+        {
+            const float center = energyDiff[static_cast<size_t>(i)];
+            if (center < energyMinPeak)
+                continue;
+            if (center < energyDiff[static_cast<size_t>(i - 1)] || center < energyDiff[static_cast<size_t>(i + 1)])
+                continue;
+
+            if (!onsetFrames.empty() && (i - onsetFrames.back().first) < minPeakSpacingFrames)
+                continue;
+
+            onsetFrames.emplace_back(i, center);
+        }
+    }
+
+    if (static_cast<int>(onsetFrames.size()) > (ModernAudioEngine::MaxColumns - 1))
+    {
+        std::sort(onsetFrames.begin(), onsetFrames.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        onsetFrames.resize(ModernAudioEngine::MaxColumns - 1);
+        std::sort(onsetFrames.begin(), onsetFrames.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+    }
+
+    std::vector<int> onsetSamples;
+    onsetSamples.reserve(onsetFrames.size());
+    for (const auto& onset : onsetFrames)
+    {
+        const int centered = (onset.first * hop) + (frameSize / 2);
+        onsetSamples.push_back(juce::jlimit(0, totalSamples - 1, centered));
+    }
+
+    std::sort(onsetSamples.begin(), onsetSamples.end());
+    onsetSamples.erase(std::unique(onsetSamples.begin(), onsetSamples.end()), onsetSamples.end());
+    if (const auto refined = refineOnsetSamplesToLeadingEdges(monoSamples, onsetSamples, frameSize, hop);
+        !refined.empty())
+    {
+        onsetSamples = refined;
+    }
+
     if (onsetSamples.empty())
     {
         fillUniform();
         return;
     }
 
-    const int lastIndex = ModernAudioEngine::MaxColumns - 1;
-    for (int i = 0; i < ModernAudioEngine::MaxColumns; ++i)
+    std::vector<int> positions;
+    positions.reserve(ModernAudioEngine::MaxColumns);
+    positions.push_back(0);
+    for (const auto onsetSample : onsetSamples)
+        positions.push_back(juce::jlimit(0, totalSamples - 1, onsetSample));
+
+    std::sort(positions.begin(), positions.end());
+    positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+
+    if (static_cast<int>(positions.size()) < ModernAudioEngine::MaxColumns)
     {
-        if (i == 0)
+        const double gridStep = static_cast<double>(juce::jmax(1, totalSamples - 1))
+            / static_cast<double>(ModernAudioEngine::MaxColumns - 1);
+        const int baseMinSpacing = juce::jmax(1, static_cast<int>(std::round(gridStep * 0.35)));
+        std::vector<int> gridCandidates;
+        gridCandidates.reserve(ModernAudioEngine::MaxColumns - 1);
+
+        for (int i = 1; i < ModernAudioEngine::MaxColumns; ++i)
         {
-            transientSliceSamples[static_cast<size_t>(i)] = 0;
-            continue;
+            const int uniformPos = juce::jlimit(0, totalSamples - 1,
+                                                static_cast<int>((static_cast<double>(i) / 15.0) * static_cast<double>(totalSamples - 1)));
+            gridCandidates.push_back(uniformPos);
         }
 
-        const int target = juce::jlimit(0, totalSamples - 1,
-            static_cast<int>((static_cast<double>(i) / static_cast<double>(lastIndex))
-                * static_cast<double>(totalSamples - 1)));
-
-        int chosen = target;
-        auto it = std::lower_bound(onsetSamples.begin(), onsetSamples.end(), target);
-
-        int bestCandidate = chosen;
-        int bestDistance = std::numeric_limits<int>::max();
-        if (it != onsetSamples.end())
+        auto fillFromGridGaps = [&](int minSpacing)
         {
-            const int dist = std::abs(*it - target);
-            if (dist < bestDistance)
+            while (static_cast<int>(positions.size()) < ModernAudioEngine::MaxColumns)
             {
-                bestDistance = dist;
-                bestCandidate = *it;
+                int bestCandidate = -1;
+                int bestGapWidth = -1;
+                int bestMidpointDistance = std::numeric_limits<int>::max();
+
+                for (const int candidate : gridCandidates)
+                {
+                    auto upper = std::upper_bound(positions.begin(), positions.end(), candidate);
+                    const int right = (upper != positions.end()) ? *upper : (totalSamples - 1);
+                    const int left = (upper != positions.begin()) ? *std::prev(upper) : 0;
+
+                    if (candidate <= left || candidate >= right)
+                        continue;
+                    if ((candidate - left) < minSpacing || (right - candidate) < minSpacing)
+                        continue;
+
+                    const int gapWidth = right - left;
+                    const int midpoint = left + (gapWidth / 2);
+                    const int midpointDistance = std::abs(candidate - midpoint);
+
+                    if (gapWidth > bestGapWidth
+                        || (gapWidth == bestGapWidth && midpointDistance < bestMidpointDistance))
+                    {
+                        bestCandidate = candidate;
+                        bestGapWidth = gapWidth;
+                        bestMidpointDistance = midpointDistance;
+                    }
+                }
+
+                if (bestCandidate < 0)
+                    break;
+
+                positions.insert(std::upper_bound(positions.begin(), positions.end(), bestCandidate), bestCandidate);
+            }
+        };
+
+        fillFromGridGaps(baseMinSpacing);
+
+        if (static_cast<int>(positions.size()) < ModernAudioEngine::MaxColumns)
+            fillFromGridGaps(juce::jmax(1, baseMinSpacing / 2));
+
+        if (static_cast<int>(positions.size()) < ModernAudioEngine::MaxColumns)
+        {
+            for (const int candidate : gridCandidates)
+            {
+                if (static_cast<int>(positions.size()) >= ModernAudioEngine::MaxColumns)
+                    break;
+                if (!std::binary_search(positions.begin(), positions.end(), candidate))
+                    positions.insert(std::upper_bound(positions.begin(), positions.end(), candidate), candidate);
             }
         }
-        if (it != onsetSamples.begin())
-        {
-            const int prev = *std::prev(it);
-            const int dist = std::abs(prev - target);
-            if (dist < bestDistance)
-            {
-                bestDistance = dist;
-                bestCandidate = prev;
-            }
-        }
-
-        if (bestDistance < std::numeric_limits<int>::max())
-            chosen = bestCandidate;
-
-        const int prevPos = transientSliceSamples[static_cast<size_t>(i - 1)];
-        chosen = juce::jmax(prevPos + 1, chosen);
-        transientSliceSamples[static_cast<size_t>(i)] = juce::jlimit(0, totalSamples - 1, chosen);
     }
+
+    while (static_cast<int>(positions.size()) < ModernAudioEngine::MaxColumns)
+    {
+        int bestInsert = -1;
+        int bestGapWidth = -1;
+
+        for (size_t i = 0; i < positions.size(); ++i)
+        {
+            const int left = positions[i];
+            const int right = (i + 1 < positions.size()) ? positions[i + 1] : (totalSamples - 1);
+            const int gapWidth = right - left;
+            if (gapWidth <= 1)
+                continue;
+
+            const int candidate = left + (gapWidth / 2);
+            if (candidate <= left || candidate >= right)
+                continue;
+
+            if (gapWidth > bestGapWidth)
+            {
+                bestGapWidth = gapWidth;
+                bestInsert = candidate;
+            }
+        }
+
+        if (bestInsert < 0)
+            break;
+
+        positions.insert(std::upper_bound(positions.begin(), positions.end(), bestInsert), bestInsert);
+    }
+
+    while (static_cast<int>(positions.size()) < ModernAudioEngine::MaxColumns)
+    {
+        const int last = positions.empty() ? 0 : positions.back();
+        const int next = juce::jlimit(0, totalSamples - 1, last + 1);
+        positions.push_back(next);
+        if (next == last)
+            break;
+    }
+
+    if (static_cast<int>(positions.size()) < ModernAudioEngine::MaxColumns)
+        positions.resize(ModernAudioEngine::MaxColumns, positions.empty() ? 0 : positions.back());
+
+    if (static_cast<int>(positions.size()) > ModernAudioEngine::MaxColumns)
+        positions.resize(ModernAudioEngine::MaxColumns);
+
+    for (int i = 0; i < ModernAudioEngine::MaxColumns; ++i)
+        transientSliceSamples[static_cast<size_t>(i)] = positions[static_cast<size_t>(i)];
 
     transientSliceMapDirty = false;
     rebuildSampleAnalysisCacheLocked();
@@ -4641,9 +4747,12 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         if (positionInfo.getPpqPosition().hasValue())
         {
             const double hostPpq = *positionInfo.getPpqPosition();
+            const float requestedTraversalRatio = (traversalSpeedOverrideActive.load(std::memory_order_acquire) != 0)
+                ? traversalSpeedOverrideRatio.load(std::memory_order_acquire)
+                : playheadSpeedRatio.load(std::memory_order_acquire);
             const double stepTraversalRatio = juce::jmax(
                 0.125,
-                static_cast<double>(playheadSpeedRatio.load(std::memory_order_acquire)));
+                static_cast<double>(requestedTraversalRatio));
             const double stepPosition = std::floor(hostPpq * 4.0 * stepTraversalRatio);
             lastStepTime = stepPosition - 1.0;
             currentStep = static_cast<int>(stepPosition) % 16;
@@ -4793,9 +4902,12 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         static_cast<double>(appliedPlayheadSpeedRatio.load(std::memory_order_acquire)));
     if (!(playheadTraversalRatio > 0.0))
     {
+        const float requestedTraversalRatio = (traversalSpeedOverrideActive.load(std::memory_order_acquire) != 0)
+            ? traversalSpeedOverrideRatio.load(std::memory_order_acquire)
+            : playheadSpeedRatio.load(std::memory_order_acquire);
         playheadTraversalRatio = juce::jmax(
             0.125,
-            static_cast<double>(playheadSpeedRatio.load(std::memory_order_acquire)));
+            static_cast<double>(requestedTraversalRatio));
         appliedPlayheadSpeedRatio.store(static_cast<float>(playheadTraversalRatio), std::memory_order_release);
     }
 
@@ -5092,8 +5204,10 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             && !scratchGestureActive);
         const float requestedTraversalRatio = juce::jlimit(
             0.125f,
-            4.0f,
-            playheadSpeedRatio.load(std::memory_order_acquire));
+            8.0f,
+            (traversalSpeedOverrideActive.load(std::memory_order_acquire) != 0)
+                ? traversalSpeedOverrideRatio.load(std::memory_order_acquire)
+                : playheadSpeedRatio.load(std::memory_order_acquire));
         const int musicalTraversalSlices = juce::jmax(1, loopCols);
         const double musicalSliceLength = loopLenSafe / static_cast<double>(musicalTraversalSlices);
         const int currentMusicalSlice = (musicalSliceLength > 1.0e-9)
@@ -5135,6 +5249,12 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     playheadTraversalPhaseOffsetSlices = 0.0;
                     playheadTraversalSliceCountAtLastCalc = -1;
                     quantizedTraversalHandoffThisSample = true;
+                    const int fadeSamples = juce::jmax(12, static_cast<int>(currentSampleRate * 0.0015));
+                    triggerOutputBlendTotalSamples = fadeSamples;
+                    triggerOutputBlendSamplesRemaining = fadeSamples;
+                    triggerOutputBlendStartL = lastOutputSampleL;
+                    triggerOutputBlendStartR = lastOutputSampleR;
+                    triggerOutputBlendActive = true;
                 }
             }
         }
@@ -5145,6 +5265,12 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             pendingPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
             pendingPlayheadSpeedChange.store(0, std::memory_order_release);
             pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
+            const int fadeSamples = juce::jmax(12, static_cast<int>(currentSampleRate * 0.0015));
+            triggerOutputBlendTotalSamples = fadeSamples;
+            triggerOutputBlendSamplesRemaining = fadeSamples;
+            triggerOutputBlendStartL = lastOutputSampleL;
+            triggerOutputBlendStartR = lastOutputSampleR;
+            triggerOutputBlendActive = true;
         }
 
         const double slicePos = wrapped / sliceLength;
@@ -5174,6 +5300,11 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             }
         }
 
+        const bool useContinuousTraversal = usesContinuousPlayheadTraversal();
+        const double intraSlice = quantizedTraversalHandoffThisSample ? 0.0 : (slicePos - unswungBaseSlice);
+        const double traversalSlicePhase = baseSliceForTraversal + intraSlice;
+        const double speedPreservePhase = useContinuousTraversal ? traversalSlicePhase : baseSliceForTraversal;
+
         if (playheadTraversalSliceCountAtLastCalc != traversalSlices)
         {
             playheadTraversalSliceCountAtLastCalc = traversalSlices;
@@ -5192,20 +5323,211 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         }
         else if (std::abs(playheadTraversalRatio - playheadTraversalRatioAtLastCalc) > 1.0e-6)
         {
-            // Preserve the currently audible traversal slice when speed changes.
+            // Preserve the currently audible traversal phase when speed changes.
             const double oldTraversalPos
-                = (baseSliceForTraversal * playheadTraversalRatioAtLastCalc) + playheadTraversalPhaseOffsetSlices;
-            playheadTraversalPhaseOffsetSlices = oldTraversalPos - (baseSliceForTraversal * playheadTraversalRatio);
+                = (speedPreservePhase * playheadTraversalRatioAtLastCalc) + playheadTraversalPhaseOffsetSlices;
+            playheadTraversalPhaseOffsetSlices = oldTraversalPos - (speedPreservePhase * playheadTraversalRatio);
             playheadTraversalRatioAtLastCalc = playheadTraversalRatio;
         }
 
-        const double intraSlice = quantizedTraversalHandoffThisSample ? 0.0 : (slicePos - unswungBaseSlice);
-        double traversedSlice = std::floor((baseSliceForTraversal * playheadTraversalRatio) + playheadTraversalPhaseOffsetSlices);
-        traversedSlice = std::fmod(traversedSlice, static_cast<double>(traversalSlices));
-        if (traversedSlice < 0.0)
-            traversedSlice += static_cast<double>(traversalSlices);
+        double traversedPosition = 0.0;
+        if (useContinuousTraversal)
+        {
+            double traversedSlicePos = (traversalSlicePhase * playheadTraversalRatio) + playheadTraversalPhaseOffsetSlices;
+            traversedSlicePos = std::fmod(traversedSlicePos, static_cast<double>(traversalSlices));
+            if (traversedSlicePos < 0.0)
+                traversedSlicePos += static_cast<double>(traversalSlices);
+            traversedPosition = traversedSlicePos * sliceLength;
+        }
+        else
+        {
+            double traversedSlice = std::floor((baseSliceForTraversal * playheadTraversalRatio) + playheadTraversalPhaseOffsetSlices);
+            traversedSlice = std::fmod(traversedSlice, static_cast<double>(traversalSlices));
+            if (traversedSlice < 0.0)
+                traversedSlice += static_cast<double>(traversalSlices);
+            traversedPosition = (traversedSlice + intraSlice) * sliceLength;
+        }
+        if (traversalRearrangeActive.load(std::memory_order_acquire) != 0)
+        {
+            const float rearrangeDepth = juce::jlimit(0.0f, 1.0f,
+                traversalRearrangeDepth.load(std::memory_order_acquire));
+            if (rearrangeDepth > 1.0e-4f)
+            {
+                const int musicalSlices = juce::jmax(1, loopCols);
+                const int targetLocalSlice = rearrangeSliceIndexFromNormalized(
+                    traversalRearrangeValue.load(std::memory_order_acquire),
+                    musicalSlices);
+                auto armRearrangeBlend = [&]()
+                {
+                    const float rearrangeFadeMs = juce::jlimit(
+                        0.3f,
+                        8.0f,
+                        triggerFadeInMs.load(std::memory_order_acquire));
+                    const int fadeSamples = juce::jmax(12, static_cast<int>(currentSampleRate * 0.001 * rearrangeFadeMs));
+                    triggerOutputBlendTotalSamples = fadeSamples;
+                    triggerOutputBlendSamplesRemaining = fadeSamples;
+                    triggerOutputBlendStartL = lastOutputSampleL;
+                    triggerOutputBlendStartR = lastOutputSampleR;
+                    triggerOutputBlendActive = true;
+                };
 
-        return (traversedSlice + intraSlice) * sliceLength;
+                if (transientSliceMode.load(std::memory_order_acquire) && sampleLength > 1.0 && musicalSlices > 1)
+                {
+                    double wrappedTraversedPosition = std::fmod(traversedPosition, loopLenSafe);
+                    if (wrappedTraversedPosition < 0.0)
+                        wrappedTraversedPosition += loopLenSafe;
+
+                    const int safeLoopStart = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, loopStart);
+                    std::array<double, ModernAudioEngine::MaxColumns> localSliceStarts{};
+                    std::array<double, ModernAudioEngine::MaxColumns> localSliceLengths{};
+                    bool foundCurrentSlice = false;
+                    int currentLocalSlice = 0;
+                    double currentSliceOffsetSamples = 0.0;
+
+                    for (int local = 0; local < musicalSlices; ++local)
+                    {
+                        const int currentGlobalColumn = juce::jlimit(
+                            0,
+                            ModernAudioEngine::MaxColumns - 1,
+                            safeLoopStart + local);
+                        const int nextLocalColumn = (local + 1) % musicalSlices;
+                        const int nextGlobalColumn = juce::jlimit(
+                            0,
+                            ModernAudioEngine::MaxColumns - 1,
+                            safeLoopStart + nextLocalColumn);
+
+                        double currentSliceStart = std::fmod(
+                            static_cast<double>(transientSliceSamples[static_cast<size_t>(currentGlobalColumn)])
+                                - loopStartSamples,
+                            loopLenSafe);
+                        if (currentSliceStart < 0.0)
+                            currentSliceStart += loopLenSafe;
+
+                        double nextSliceStart = std::fmod(
+                            static_cast<double>(transientSliceSamples[static_cast<size_t>(nextGlobalColumn)])
+                                - loopStartSamples,
+                            loopLenSafe);
+                        if (nextSliceStart < 0.0)
+                            nextSliceStart += loopLenSafe;
+                        if (nextSliceStart <= currentSliceStart)
+                            nextSliceStart += loopLenSafe;
+
+                        const double currentSliceLength = juce::jmax(1.0, nextSliceStart - currentSliceStart);
+                        localSliceStarts[static_cast<size_t>(local)] = currentSliceStart;
+                        localSliceLengths[static_cast<size_t>(local)] = currentSliceLength;
+
+                        double absoluteWrappedPosition = wrappedTraversedPosition;
+                        if (absoluteWrappedPosition < currentSliceStart)
+                            absoluteWrappedPosition += loopLenSafe;
+
+                        if (!foundCurrentSlice
+                            && absoluteWrappedPosition >= currentSliceStart
+                            && absoluteWrappedPosition < nextSliceStart)
+                        {
+                            foundCurrentSlice = true;
+                            currentLocalSlice = local;
+                            currentSliceOffsetSamples = juce::jlimit(
+                                0.0,
+                                currentSliceLength - 1.0e-6,
+                                absoluteWrappedPosition - currentSliceStart);
+                        }
+                    }
+
+                    if (foundCurrentSlice)
+                    {
+                        if (traversalRearrangeLastSourceSlice != currentLocalSlice
+                            || traversalRearrangeLastTargetSlice != targetLocalSlice)
+                        {
+                            armRearrangeBlend();
+                        }
+
+                        traversalRearrangeLastSourceSlice = currentLocalSlice;
+                        traversalRearrangeLastTargetSlice = targetLocalSlice;
+
+                        const double targetSliceStart = localSliceStarts[static_cast<size_t>(targetLocalSlice)];
+                        const double targetSliceLength = localSliceLengths[static_cast<size_t>(targetLocalSlice)];
+                        const int targetCycle = (targetSliceLength > 1.0e-9)
+                            ? juce::jmax(0, static_cast<int>(std::floor(currentSliceOffsetSamples / targetSliceLength)))
+                            : 0;
+                        if (traversalRearrangeLastTargetCycle != targetCycle)
+                            armRearrangeBlend();
+                        traversalRearrangeLastTargetCycle = targetCycle;
+
+                        const double targetSliceOffset = (targetSliceLength > 1.0e-9)
+                            ? std::fmod(currentSliceOffsetSamples, targetSliceLength)
+                            : 0.0;
+                        double targetSlicePosition = targetSliceStart + targetSliceOffset;
+                        targetSlicePosition = std::fmod(targetSlicePosition, loopLenSafe);
+                        if (targetSlicePosition < 0.0)
+                            targetSlicePosition += loopLenSafe;
+
+                        double delta = targetSlicePosition - wrappedTraversedPosition;
+                        if (delta > (loopLenSafe * 0.5))
+                            delta -= loopLenSafe;
+                        else if (delta < -(loopLenSafe * 0.5))
+                            delta += loopLenSafe;
+
+                        traversedPosition = wrappedTraversedPosition + (delta * rearrangeDepth);
+                        traversedPosition = std::fmod(traversedPosition, loopLenSafe);
+                        if (traversedPosition < 0.0)
+                            traversedPosition += loopLenSafe;
+                    }
+                    else
+                    {
+                        traversalRearrangeLastSourceSlice = -1;
+                        traversalRearrangeLastTargetSlice = -1;
+                        traversalRearrangeLastTargetCycle = -1;
+                    }
+                }
+                else
+                {
+                    const double rearrangeMusicalSliceLength = loopLenSafe / static_cast<double>(musicalSlices);
+                    if (rearrangeMusicalSliceLength > 1.0e-9)
+                    {
+                        double localPos = std::fmod(traversedPosition / rearrangeMusicalSliceLength,
+                                                    static_cast<double>(musicalSlices));
+                        if (localPos < 0.0)
+                            localPos += static_cast<double>(musicalSlices);
+
+                        const int currentLocalSlice = juce::jlimit(
+                            0,
+                            musicalSlices - 1,
+                            static_cast<int>(std::floor(localPos)));
+                        if (traversalRearrangeLastSourceSlice != currentLocalSlice
+                            || traversalRearrangeLastTargetSlice != targetLocalSlice)
+                        {
+                            armRearrangeBlend();
+                        }
+
+                        traversalRearrangeLastSourceSlice = currentLocalSlice;
+                        traversalRearrangeLastTargetSlice = targetLocalSlice;
+                        traversalRearrangeLastTargetCycle = -1;
+
+                        const double intraLocal = localPos - std::floor(localPos);
+                        double targetLocalPos = static_cast<double>(targetLocalSlice) + intraLocal;
+                        double blendedLocalPos = localPos + ((targetLocalPos - localPos) * rearrangeDepth);
+                        blendedLocalPos = std::fmod(blendedLocalPos, static_cast<double>(musicalSlices));
+                        if (blendedLocalPos < 0.0)
+                            blendedLocalPos += static_cast<double>(musicalSlices);
+                        traversedPosition = blendedLocalPos * rearrangeMusicalSliceLength;
+                    }
+                }
+            }
+            else
+            {
+                traversalRearrangeLastSourceSlice = -1;
+                traversalRearrangeLastTargetSlice = -1;
+                traversalRearrangeLastTargetCycle = -1;
+            }
+        }
+        else
+        {
+            traversalRearrangeLastSourceSlice = -1;
+            traversalRearrangeLastTargetSlice = -1;
+            traversalRearrangeLastTargetCycle = -1;
+        }
+
+        return traversedPosition;
     };
 
     // AUTO-WARP TO GLOBAL TEMPO:
@@ -5471,9 +5793,12 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         stepSampler.setAmpAttackMs(stepEnvelopeAttackMs.load(std::memory_order_acquire));
         stepSampler.setAmpDecayMs(stepEnvelopeDecayMs.load(std::memory_order_acquire));
         stepSampler.setAmpReleaseMs(stepEnvelopeReleaseMs.load(std::memory_order_acquire));
+        const float requestedTraversalRatio = (traversalSpeedOverrideActive.load(std::memory_order_acquire) != 0)
+            ? traversalSpeedOverrideRatio.load(std::memory_order_acquire)
+            : playheadSpeedRatio.load(std::memory_order_acquire);
         const double stepTraversalRatio = juce::jmax(
             0.125,
-            static_cast<double>(playheadSpeedRatio.load(std::memory_order_acquire)));
+            static_cast<double>(requestedTraversalRatio));
         const double stepEventsPerPpq = juce::jmax(1.0e-6, 4.0 * stepTraversalRatio);
         if (stepTraversalRatioAtLastTick <= 0.0)
         {
@@ -6227,7 +6552,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             effectiveSpeed = scratchRate;
         }
 
-        float uiDisplaySpeed = juce::jlimit(0.0f, 4.0f, std::abs(static_cast<float>(rateMultiplier)));
+        float uiDisplaySpeed = juce::jlimit(0.0f, 8.0f, std::abs(static_cast<float>(rateMultiplier)));
         if (playMode == PlayMode::Grain)
         {
             const float grainScratch = scratchAmount.load(std::memory_order_acquire);
@@ -6241,14 +6566,14 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                                                                             grainGesture.targetCenterSample));
                 const double startDist = juce::jmax(1.0, grainGesture.centerTravelDistanceAbs);
                 const double progress = juce::jlimit(0.0, 1.0, 1.0 - (remain / startDist));
-                const float baseDisplay = juce::jlimit(0.1f, 4.0f, std::abs(static_cast<float>(playbackSpeed.load(std::memory_order_acquire))));
+                const float baseDisplay = juce::jlimit(0.1f, 8.0f, std::abs(static_cast<float>(playbackSpeed.load(std::memory_order_acquire))));
                 const float expFalloff = static_cast<float>(std::exp(-4.2 * progress));
-                uiDisplaySpeed = (remain < 1.0) ? 0.0f : juce::jlimit(0.0f, 4.0f, baseDisplay * expFalloff);
+                uiDisplaySpeed = (remain < 1.0) ? 0.0f : juce::jlimit(0.0f, 8.0f, baseDisplay * expFalloff);
             }
         }
         else if (scrubActive && stripScratch > 0.0f)
         {
-            uiDisplaySpeed = juce::jlimit(0.0f, 4.0f, std::abs(static_cast<float>(scratchRate)));
+            uiDisplaySpeed = juce::jlimit(0.0f, 8.0f, std::abs(static_cast<float>(scratchRate)));
         }
         displaySpeedAtomic.store(uiDisplaySpeed, std::memory_order_release);
         
@@ -10404,6 +10729,59 @@ double EnhancedAudioStrip::getNormalizedPosition() const
     return playbackPosition / sampleLength;
 }
 
+void EnhancedAudioStrip::setTraversalRearrange(float value01, float depth01)
+{
+    traversalRearrangeValue.store(juce::jlimit(0.0f, 1.0f, value01), std::memory_order_release);
+    traversalRearrangeDepth.store(juce::jlimit(0.0f, 1.0f, depth01), std::memory_order_release);
+    traversalRearrangeActive.store(depth01 > 1.0e-4f ? 1 : 0, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::setTraversalSpeedOverride(float ratio)
+{
+    traversalSpeedOverrideRatio.store(juce::jlimit(0.125f, 8.0f, ratio), std::memory_order_release);
+    traversalSpeedOverrideActive.store(1, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::clearTraversalSpeedOverride()
+{
+    traversalSpeedOverrideActive.store(0, std::memory_order_release);
+    traversalSpeedOverrideRatio.store(1.0f, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::clearTraversalRearrange()
+{
+    traversalRearrangeActive.store(0, std::memory_order_release);
+    traversalRearrangeDepth.store(0.0f, std::memory_order_release);
+    traversalRearrangeValue.store(0.0f, std::memory_order_release);
+    traversalRearrangeLastSourceSlice = -1;
+    traversalRearrangeLastTargetSlice = -1;
+    traversalRearrangeLastTargetCycle = -1;
+}
+
+double EnhancedAudioStrip::getLoopPhaseNormalized() const
+{
+    if (sampleLength <= 0.0)
+        return 0.0;
+
+    int loopCols = loopEnd - loopStart;
+    if (loopCols <= 0)
+        loopCols = ModernAudioEngine::MaxColumns;
+
+    const int safeLoopStart = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, loopStart);
+    const double loopStartSamples = (static_cast<double>(safeLoopStart)
+        / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
+    const double loopLength = (static_cast<double>(loopCols)
+        / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
+    if (loopLength <= 0.0)
+        return 0.0;
+
+    double posInLoop = std::fmod(playbackPosition.load(std::memory_order_acquire) - loopStartSamples, loopLength);
+    if (posInLoop < 0.0)
+        posInLoop += loopLength;
+
+    return juce::jlimit(0.0, 0.999999, posInLoop / loopLength);
+}
+
 int EnhancedAudioStrip::getCurrentColumn() const
 {
     if (sampleLength <= 0.0)
@@ -11080,6 +11458,7 @@ ModernAudioEngine::ModernAudioEngine()
         momentaryStutterColumns[static_cast<size_t>(i)].store(0, std::memory_order_release);
         momentaryStutterOffsetRatios[static_cast<size_t>(i)].store(0.0, std::memory_order_release);
         momentaryStutterNextPpq[static_cast<size_t>(i)].store(0.0, std::memory_order_release);
+        macroRetriggerAmounts[static_cast<size_t>(i)].store(0.0f, std::memory_order_release);
         duckDetectorEnvelopeStates[static_cast<size_t>(i)] = 0.0f;
     }
 }
@@ -11109,7 +11488,7 @@ float ModernAudioEngine::defaultModStepValueForTarget(ModTarget target)
         case ModTarget::Pitch:
             return 0.5f;
         case ModTarget::Speed:
-            return 0.53333336f; // 1x in the 16-step musical speed palette.
+            return 0.5f;
         case ModTarget::Cutoff:
             return 1.0f;
         case ModTarget::Resonance:
@@ -11149,6 +11528,8 @@ float ModernAudioEngine::defaultModStepValueForTarget(ModTarget target)
         case ModTarget::SliceLength:
             return 0.0f;
         case ModTarget::Scratch:
+            return 0.0f;
+        case ModTarget::Rearrange:
             return 0.0f;
         case ModTarget::None:
         default:
@@ -11365,11 +11746,173 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             const int seqSlot = getActiveModSequencerSlot(static_cast<int>(i));
             auto& seq = modSequencers[i][static_cast<size_t>(seqSlot)];
             const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
+            const auto transportMode = static_cast<ModTransportMode>(juce::jlimit(
+                0,
+                static_cast<int>(ModTransportMode::Sync),
+                seq.transportMode.load(std::memory_order_acquire)));
+            const float modRate = quantizeModLaneRate(seq.rate.load(std::memory_order_acquire));
             const bool stripPlaying = strip->isPlaying();
-            const bool applyParamMod = modulationPpqReady
-                && stripPlaying
+            const bool applyParamMod = stripPlaying
                 && target != ModTarget::None
-                && target != ModTarget::Retrigger;
+                && target != ModTarget::Retrigger
+                && ((transportMode == ModTransportMode::Sync)
+                    || modulationPpqReady);
+            auto evaluateRearrangeSlot = [&](ModSequencer& rearrangeSeq, float& controlRawOut, float& depthOut) -> bool
+            {
+                if (!stripPlaying)
+                    return false;
+
+                const auto rearrangeTarget = static_cast<ModTarget>(rearrangeSeq.target.load(std::memory_order_acquire));
+                if (rearrangeTarget != ModTarget::Rearrange)
+                    return false;
+
+                const float depth = juce::jlimit(0.0f, 1.0f, rearrangeSeq.depth.load(std::memory_order_acquire));
+                if (depth <= 1.0e-4f)
+                    return false;
+
+                const int lengthBars = juce::jlimit(1, MaxModBars, rearrangeSeq.lengthBars.load(std::memory_order_acquire));
+                const int totalSteps = juce::jmax(ModSteps, ModSteps * lengthBars);
+                bool identityMapping = true;
+                for (int absoluteStep = 0; absoluteStep < totalSteps; ++absoluteStep)
+                {
+                    const float expected = defaultRearrangeStepValueForIndex(absoluteStep % ModSteps, ModSteps);
+                    const float actual = juce::jlimit(
+                        0.0f,
+                        1.0f,
+                        rearrangeSeq.steps[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+                    if (std::abs(actual - expected) > 1.0e-4f)
+                    {
+                        identityMapping = false;
+                        break;
+                    }
+                }
+                if (identityMapping)
+                    return false;
+
+                const auto rearrangeTransportMode = static_cast<ModTransportMode>(juce::jlimit(
+                    0,
+                    static_cast<int>(ModTransportMode::Sync),
+                    rearrangeSeq.transportMode.load(std::memory_order_acquire)));
+                const float rearrangeRate = quantizeModLaneRate(rearrangeSeq.rate.load(std::memory_order_acquire));
+                const int offset = rearrangeSeq.offset.load(std::memory_order_acquire);
+                int globalStep = rearrangeSeq.lastGlobalStep.load(std::memory_order_acquire);
+                double stepPhase = 0.0;
+                bool updatedFromClock = false;
+
+                if (rearrangeTransportMode == ModTransportMode::Sync)
+                {
+                    const double loopPhase = strip->getLoopPhaseNormalized();
+                    if (std::isfinite(loopPhase))
+                    {
+                        const double wrappedPhase = juce::jlimit(0.0, 0.999999, loopPhase);
+                        if (!rearrangeSeq.syncPhaseValid)
+                        {
+                            rearrangeSeq.syncPhaseValid = true;
+                            rearrangeSeq.syncPhaseLast = wrappedPhase;
+                            rearrangeSeq.syncCycleCount = 0;
+                        }
+                        else
+                        {
+                            if ((rearrangeSeq.syncPhaseLast - wrappedPhase) > 0.5)
+                                ++rearrangeSeq.syncCycleCount;
+                            else if ((wrappedPhase - rearrangeSeq.syncPhaseLast) > 0.85)
+                                rearrangeSeq.syncCycleCount = 0;
+                            rearrangeSeq.syncPhaseLast = wrappedPhase;
+                        }
+
+                        const double stepsPos = (((static_cast<double>(rearrangeSeq.syncCycleCount) + wrappedPhase)
+                            * static_cast<double>(ModSteps)) * static_cast<double>(rearrangeRate))
+                            + static_cast<double>(offset);
+                        const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
+                        const double wrappedPos = (wrapped < 0.0) ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
+                        globalStep = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
+                        stepPhase = juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(globalStep));
+                        updatedFromClock = true;
+                    }
+                }
+
+                if (!updatedFromClock && modulationPpqReady)
+                {
+                    rearrangeSeq.syncPhaseValid = false;
+                    rearrangeSeq.syncPhaseLast = -1.0;
+                    rearrangeSeq.syncCycleCount = 0;
+                    const double stepPpq = basePpq + (static_cast<double>(startSample) / juce::jmax(1.0, samplesPerBeat));
+                    const double stepsPos = ((stepPpq * 4.0) * static_cast<double>(rearrangeRate)) + static_cast<double>(offset);
+                    const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
+                    const double wrappedPos = (wrapped < 0.0) ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
+                    globalStep = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
+                    stepPhase = juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(globalStep));
+                    updatedFromClock = true;
+                }
+
+                if (!updatedFromClock)
+                    return false;
+
+                rearrangeSeq.lastGlobalStep.store(globalStep, std::memory_order_release);
+
+                const int nextStep = (globalStep + 1) % totalSteps;
+                const float startA = juce::jlimit(
+                    0.0f, 1.0f, rearrangeSeq.steps[static_cast<size_t>(globalStep)].load(std::memory_order_acquire));
+                const int subdivisionsA = juce::jlimit(
+                    1,
+                    ModMaxStepSubdivisions,
+                    rearrangeSeq.stepSubdivisions[static_cast<size_t>(globalStep)].load(std::memory_order_acquire));
+                float endA = juce::jlimit(
+                    0.0f, 1.0f, rearrangeSeq.stepEndValues[static_cast<size_t>(globalStep)].load(std::memory_order_acquire));
+                if (subdivisionsA <= 1)
+                    endA = startA;
+                const float nextStart = juce::jlimit(
+                    0.0f, 1.0f, rearrangeSeq.steps[static_cast<size_t>(nextStep)].load(std::memory_order_acquire));
+                const bool curveMode = (rearrangeSeq.curveMode.load(std::memory_order_acquire) != 0);
+                const bool hasLocalSubdivisionRamp = (subdivisionsA > 1);
+                const float curveBend = juce::jlimit(-1.0f, 1.0f, rearrangeSeq.curveBend.load(std::memory_order_acquire));
+                const auto curveShape = static_cast<ModCurveShape>(juce::jlimit(
+                    0, static_cast<int>(ModCurveShape::Square),
+                    rearrangeSeq.stepCurveShapes[static_cast<size_t>(globalStep)].load(std::memory_order_acquire)));
+                const float phase = static_cast<float>(juce::jlimit(0.0, 1.0, stepPhase));
+                const float shapedPhase = curveMode ? shapeModCurvePhase(phase, curveBend, curveShape) : phase;
+                const float subdivisionPhase = (curveMode && hasLocalSubdivisionRamp)
+                    ? shapeSubdivisionBendPhase(phase, curveBend)
+                    : phase;
+                float shapedRaw = sampleStepSubdivisionValue(startA, endA, subdivisionsA, subdivisionPhase);
+                if (curveMode && !hasLocalSubdivisionRamp)
+                    shapedRaw = juce::jlimit(0.0f, 1.0f, startA + ((nextStart - startA) * shapedPhase));
+
+                const float smoothingMs = juce::jmax(0.0f, rearrangeSeq.smoothingMs.load(std::memory_order_acquire));
+                if (smoothingMs > 0.0f)
+                {
+                    const float smoothingSamples = juce::jmax(1.0f, (smoothingMs * 0.001f) * static_cast<float>(currentSampleRate));
+                    const float alpha = 1.0f - std::exp(-static_cast<float>(segmentSamples) / smoothingSamples);
+                    rearrangeSeq.smoothedRaw += (shapedRaw - rearrangeSeq.smoothedRaw) * juce::jlimit(0.0f, 1.0f, alpha);
+                    controlRawOut = rearrangeSeq.smoothedRaw;
+                }
+                else
+                {
+                    rearrangeSeq.smoothedRaw = shapedRaw;
+                    controlRawOut = shapedRaw;
+                }
+
+                depthOut = depth;
+                return true;
+            };
+            float backgroundRearrangeRaw = 0.0f;
+            float backgroundRearrangeDepth = 0.0f;
+            bool backgroundRearrangeActive = false;
+            if (stripPlaying && target != ModTarget::Rearrange)
+            {
+                for (int slot = 0; slot < NumModSequencers; ++slot)
+                {
+                    if (slot == seqSlot)
+                        continue;
+
+                    auto& rearrangeSeq = modSequencers[i][static_cast<size_t>(slot)];
+                    if (evaluateRearrangeSlot(rearrangeSeq, backgroundRearrangeRaw, backgroundRearrangeDepth))
+                    {
+                        backgroundRearrangeActive = true;
+                        break;
+                    }
+                }
+            }
 
             float originalVol = 1.0f;
             float originalPan = 0.0f;
@@ -11443,15 +11986,63 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             int globalStep = seq.lastGlobalStep.load(std::memory_order_acquire);
 
             double stepPhase = 0.0;
-            if (stripPlaying && modulationPpqReady)
+            if (stripPlaying)
             {
-                const double stepPpq = basePpq + (static_cast<double>(startSample) / juce::jmax(1.0, samplesPerBeat));
-                const double stepsPos = (stepPpq * 4.0) + static_cast<double>(offset);
-                const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
-                const double wrappedPos = (wrapped < 0.0) ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
-                globalStep = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
-                stepPhase = juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(globalStep));
-                seq.lastGlobalStep.store(globalStep, std::memory_order_release);
+                bool updatedFromClock = false;
+                if (transportMode == ModTransportMode::Sync)
+                {
+                    const double loopPhase = strip->getLoopPhaseNormalized();
+                    if (std::isfinite(loopPhase))
+                    {
+                        const double wrappedPhase = juce::jlimit(0.0, 0.999999, loopPhase);
+                        if (!seq.syncPhaseValid)
+                        {
+                            seq.syncPhaseValid = true;
+                            seq.syncPhaseLast = wrappedPhase;
+                            seq.syncCycleCount = 0;
+                        }
+                        else
+                        {
+                            if ((seq.syncPhaseLast - wrappedPhase) > 0.5)
+                                ++seq.syncCycleCount;
+                            else if ((wrappedPhase - seq.syncPhaseLast) > 0.85)
+                                seq.syncCycleCount = 0;
+                            seq.syncPhaseLast = wrappedPhase;
+                        }
+
+                        const double stepsPos = (((static_cast<double>(seq.syncCycleCount) + wrappedPhase)
+                            * static_cast<double>(ModSteps)) * static_cast<double>(modRate))
+                            + static_cast<double>(offset);
+                        const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
+                        const double wrappedPos = (wrapped < 0.0) ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
+                        globalStep = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
+                        stepPhase = juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(globalStep));
+                        updatedFromClock = true;
+                    }
+                }
+
+                if (!updatedFromClock && modulationPpqReady)
+                {
+                    seq.syncPhaseValid = false;
+                    seq.syncPhaseLast = -1.0;
+                    seq.syncCycleCount = 0;
+                    const double stepPpq = basePpq + (static_cast<double>(startSample) / juce::jmax(1.0, samplesPerBeat));
+                    const double stepsPos = ((stepPpq * 4.0) * static_cast<double>(modRate)) + static_cast<double>(offset);
+                    const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
+                    const double wrappedPos = (wrapped < 0.0) ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
+                    globalStep = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
+                    stepPhase = juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(globalStep));
+                    updatedFromClock = true;
+                }
+
+                if (updatedFromClock)
+                    seq.lastGlobalStep.store(globalStep, std::memory_order_release);
+            }
+            else
+            {
+                seq.syncPhaseValid = false;
+                seq.syncPhaseLast = -1.0;
+                seq.syncCycleCount = 0;
             }
 
             if (applyParamMod)
@@ -11459,6 +12050,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 // Grain-size modulation is applied via runtime override to avoid zippering
                 // from write/restore ping-pong against the base parameter.
                 strip->clearGrainSizeModulation();
+                strip->clearTraversalSpeedOverride();
+                strip->clearTraversalRearrange();
 
                 const int nextStep = (globalStep + 1) % totalSteps;
                 const float startA = juce::jlimit(
@@ -11475,8 +12068,6 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     0.0f, 1.0f, seq.steps[static_cast<size_t>(nextStep)].load(std::memory_order_acquire));
                 const float smoothingMs = juce::jmax(0.0f, seq.smoothingMs.load(std::memory_order_acquire));
                 const float curveBend = juce::jlimit(-1.0f, 1.0f, seq.curveBend.load(std::memory_order_acquire));
-                const bool loopSpeedImmediate = (target == ModTarget::Speed
-                    && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Loop);
                 const bool curveMode = (seq.curveMode.load(std::memory_order_acquire) != 0);
                 const bool hasLocalSubdivisionRamp = (subdivisionsA > 1);
                 const auto curveShape = static_cast<ModCurveShape>(juce::jlimit(
@@ -11498,13 +12089,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 }
 
                 float smoothedRaw = shapedRaw;
-                if (loopSpeedImmediate)
-                {
-                    // Loop-speed modulation is quantized/PPQ-driven and must respond instantly.
-                    seq.smoothedRaw = shapedRaw;
-                    smoothedRaw = shapedRaw;
-                }
-                else if (smoothingMs > 0.0f)
+                if (smoothingMs > 0.0f)
                 {
                     const float smoothingSamples = juce::jmax(1.0f, (smoothingMs * 0.001f) * static_cast<float>(currentSampleRate));
                     const float alpha = 1.0f - std::exp(-static_cast<float>(segmentSamples) / smoothingSamples);
@@ -11549,7 +12134,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     seq.speedDezipperedTarget = -1.0f;
 
                 const float depth = juce::jlimit(0.0f, 1.0f, seq.depth.load(std::memory_order_acquire));
-                const bool bipolar = modTargetSupportsBipolar(target) && (seq.bipolar.load(std::memory_order_acquire) != 0);
+                const bool bipolar = modTargetSupportsBipolar(target)
+                    && (modTargetUsesForcedBipolar(target) || (seq.bipolar.load(std::memory_order_acquire) != 0));
                 const float modNorm = juce::jlimit(0.0f, 1.0f, controlRaw * depth);
                 const float modBi = juce::jlimit(-1.0f, 1.0f, ((controlRaw * 2.0f) - 1.0f) * depth);
                 const float modSigned = bipolar ? modBi : modNorm;
@@ -11597,29 +12183,25 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     }
                     case ModTarget::Speed:
                     {
-                        const float speedRatioRaw = quantizeSpeedRatioMusical(controlRaw);
-                        const float speedRatio = std::pow(speedRatioRaw, depth);
-                        const float speedBase = (stepSampler != nullptr) ? originalStepSpeed : originalSpeed;
-                        const float speedMax = (stepSampler != nullptr) ? 8.0f : 4.0f;
-                        const float targetSpeed = juce::jlimit(0.125f, speedMax, speedBase * speedRatio);
-                        constexpr float kSpeedDezipLoopMs = 12.0f;
-                        constexpr float kSpeedDezipOtherMs = 8.0f;
-                        const float speedDezipMs = loopSpeedImmediate ? kSpeedDezipLoopMs : kSpeedDezipOtherMs;
-                        const float speedDezipSamples = juce::jmax(
-                            1.0f, (speedDezipMs * 0.001f) * static_cast<float>(currentSampleRate));
-                        const float speedAlpha = 1.0f - std::exp(
-                            -static_cast<float>(segmentSamples) / speedDezipSamples);
-                        if (!(seq.speedDezipperedTarget > 0.0f) || !std::isfinite(seq.speedDezipperedTarget))
-                            seq.speedDezipperedTarget = speedBase;
-                        seq.speedDezipperedTarget += (targetSpeed - seq.speedDezipperedTarget)
-                            * juce::jlimit(0.0f, 1.0f, speedAlpha);
-                        const float smoothSpeed = juce::jlimit(0.125f, speedMax, seq.speedDezipperedTarget);
-                        if (stepSampler != nullptr)
-                            stepSampler->setSpeed(smoothSpeed);
-                        if (loopSpeedImmediate)
-                            strip->setPlaybackSpeedImmediate(smoothSpeed);
-                        else
-                            strip->setPlaybackSpeed(smoothSpeed);
+                        const float speedControl = bipolar
+                            ? juce::jlimit(0.0f, 1.0f, 0.5f + (0.5f * modBi))
+                            : juce::jlimit(0.0f, 1.0f, modNorm);
+                        const float speedRatio = quantizeSpeedRatioMusical(speedControl, bipolar);
+                        const float speedBase = strip->getPlayheadSpeedRatio();
+                        const float targetSpeed = juce::jlimit(0.125f, 8.0f, speedBase * speedRatio);
+                        strip->setTraversalSpeedOverride(targetSpeed);
+                        break;
+                    }
+                    case ModTarget::Rearrange:
+                    {
+                        float activeRearrangeRaw = 0.0f;
+                        float activeRearrangeDepth = 0.0f;
+                        if ((strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Loop
+                             || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Gate)
+                            && evaluateRearrangeSlot(seq, activeRearrangeRaw, activeRearrangeDepth))
+                        {
+                            strip->setTraversalRearrange(activeRearrangeRaw, activeRearrangeDepth);
+                        }
                         break;
                     }
                     case ModTarget::Cutoff:
@@ -11722,10 +12304,18 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     default:
                         break;
                 }
+
+                if (target != ModTarget::Rearrange && backgroundRearrangeActive)
+                    strip->setTraversalRearrange(backgroundRearrangeRaw, backgroundRearrangeDepth);
             }
             else
             {
                 strip->clearGrainSizeModulation();
+                strip->clearTraversalSpeedOverride();
+                if (backgroundRearrangeActive)
+                    strip->setTraversalRearrange(backgroundRearrangeRaw, backgroundRearrangeDepth);
+                else
+                    strip->clearTraversalRearrange();
             }
 
             juce::AudioBuffer<float>* targetBuffer = useDuckProcessing
@@ -11781,7 +12371,9 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 strip->setVolume(originalVol);
                 strip->setPan(originalPan);
                 strip->setPlaybackSpeedImmediate(originalSpeed);
+                strip->clearTraversalSpeedOverride();
                 strip->setPitchShift(originalPitch);
+                strip->clearTraversalRearrange();
                 strip->setFilterFrequency(originalFilterFreq);
                 strip->setFilterResonance(originalFilterRes);
                 strip->setFilterMorph(originalFilterMorph);
@@ -11812,6 +12404,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             }
             else
             {
+                strip->clearTraversalSpeedOverride();
+                strip->clearTraversalRearrange();
                 seq.smoothedRaw = 0.0f;
                 seq.grainDezipperedRaw = 0.0f;
                 seq.pitchDezipperedRaw = 0.0f;
@@ -11838,7 +12432,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             const int lengthBars = juce::jlimit(1, MaxModBars, seq.lengthBars.load(std::memory_order_acquire));
             const int totalSteps = juce::jmax(ModSteps, ModSteps * lengthBars);
             const int offset = seq.offset.load(std::memory_order_acquire);
-            const double stepsPos = (ppq * 4.0) + static_cast<double>(offset);
+            const double stepsPos = ((ppq * 4.0) * static_cast<double>(quantizeModLaneRate(seq.rate.load(std::memory_order_acquire))))
+                + static_cast<double>(offset);
             const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
             const double wrappedPos = (wrapped < 0.0) ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
             const int stepA = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
@@ -11907,6 +12502,51 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 if (division <= 0.0)
                     break;
 
+                double boundaryPpq = std::ceil((cursorPpq - 1.0e-12) / division) * division;
+                if (boundaryPpq <= cursorPpq + 1.0e-12)
+                    boundaryPpq += division;
+                if (boundaryPpq >= blockEndPpq)
+                    break;
+
+                const int offsetSamples = juce::jlimit(
+                    0, numSamples - 1, static_cast<int>(std::llround((boundaryPpq - blockStartPpq) * samplesPerBeat)));
+                if (offsetSamples != lastOffsetSamples)
+                {
+                    QuantisedTrigger t;
+                    t.targetSample = blockStart + offsetSamples;
+                    t.targetPPQ = boundaryPpq;
+                    t.stripIndex = stripIdx;
+                    t.column = strip->getCurrentColumn();
+                    t.clearPendingOnFire = false;
+                    t.isSequencerRetrigger = true;
+                    eventsInBlock.push_back(t);
+                    lastOffsetSamples = offsetSamples;
+                }
+
+                cursorPpq = boundaryPpq + 1.0e-9;
+            }
+        }
+
+        for (int stripIdx = 0; stripIdx < MaxStrips; ++stripIdx)
+        {
+            auto* strip = strips[static_cast<size_t>(stripIdx)].get();
+            if (strip == nullptr || !strip->isPlaying())
+                continue;
+
+            const float amount = juce::jlimit(
+                0.0f, 1.0f, macroRetriggerAmounts[static_cast<size_t>(stripIdx)].load(std::memory_order_acquire));
+            if (amount <= 1.0e-4f)
+                continue;
+
+            const double division = retriggerDivisionFromAmount(amount);
+            if (division <= 0.0)
+                continue;
+
+            double cursorPpq = blockStartPpq;
+            int lastOffsetSamples = -1;
+            int safety = 0;
+            while (cursorPpq < blockEndPpq && safety++ < 256)
+            {
                 double boundaryPpq = std::ceil((cursorPpq - 1.0e-12) / division) * division;
                 if (boundaryPpq <= cursorPpq + 1.0e-12)
                     boundaryPpq += division;
@@ -12578,6 +13218,27 @@ void ModernAudioEngine::clearMomentaryStutterStrips()
     }
 }
 
+void ModernAudioEngine::setMacroRetriggerAmount(int stripIndex, float amount01)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    macroRetriggerAmounts[static_cast<size_t>(stripIndex)].store(
+        juce::jlimit(0.0f, 1.0f, amount01),
+        std::memory_order_release);
+}
+
+float ModernAudioEngine::getMacroRetriggerAmount(int stripIndex) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return 0.0f;
+
+    return juce::jlimit(
+        0.0f,
+        1.0f,
+        macroRetriggerAmounts[static_cast<size_t>(stripIndex)].load(std::memory_order_acquire));
+}
+
 void ModernAudioEngine::clearPendingQuantizedTriggersForStrip(int stripIndex)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
@@ -12775,6 +13436,25 @@ EnhancedAudioStrip::SwingDivision ModernAudioEngine::getGlobalSwingDivision() co
     return EnhancedAudioStrip::SwingDivision::Eighth;
 }
 
+void ModernAudioEngine::setGlobalContinuousTraversal(bool enabled)
+{
+    for (auto& strip : strips)
+    {
+        if (strip)
+            strip->setContinuousPlayheadTraversal(enabled);
+    }
+}
+
+bool ModernAudioEngine::usesGlobalContinuousTraversal() const
+{
+    for (const auto& strip : strips)
+    {
+        if (strip)
+            return strip->usesContinuousPlayheadTraversal();
+    }
+    return true;
+}
+
 void ModernAudioEngine::setGlobalStretchBackend(TimeStretchBackend backend)
 {
     const int newValue = static_cast<int>(sanitizeTimeStretchBackend(static_cast<int>(backend)));
@@ -12970,7 +13650,8 @@ bool ModernAudioEngine::modTargetSupportsBipolar(ModTarget target)
 void ModernAudioEngine::setModTargetOnSequencer(ModSequencer& seq, ModTarget target)
 {
     const bool currentBipolar = seq.bipolar.load(std::memory_order_acquire) != 0;
-    const bool nextBipolar = modTargetSupportsBipolar(target) && modTargetAutoDefaultBipolar(target);
+    const bool nextBipolar = modTargetSupportsBipolar(target)
+        && (modTargetUsesForcedBipolar(target) || modTargetAutoDefaultBipolar(target));
     if (currentBipolar != nextBipolar)
     {
         for (auto& step : seq.steps)
@@ -13004,6 +13685,24 @@ void ModernAudioEngine::setModTargetOnSequencer(ModSequencer& seq, ModTarget tar
     }
     seq.target.store(static_cast<int>(target), std::memory_order_release);
     seq.bipolar.store(nextBipolar ? 1 : 0, std::memory_order_release);
+    seq.syncPhaseLast = -1.0;
+    seq.syncCycleCount = 0;
+    seq.syncPhaseValid = false;
+
+    if (target == ModTarget::Rearrange)
+    {
+        seq.editPage.store(0, std::memory_order_release);
+        for (int step = 0; step < ModTotalSteps; ++step)
+        {
+            const float identityValue = defaultRearrangeStepValueForIndex(step % ModSteps, ModSteps);
+            const auto idx = static_cast<size_t>(step);
+            seq.steps[idx].store(identityValue, std::memory_order_release);
+            seq.stepSubdivisions[idx].store(1, std::memory_order_release);
+            seq.stepEndValues[idx].store(identityValue, std::memory_order_release);
+            seq.stepCurveShapes[idx].store(static_cast<int>(ModCurveShape::Linear), std::memory_order_release);
+        }
+        seq.curveMode.store(0, std::memory_order_release);
+    }
 
     if (target == ModTarget::Pitch && seq.smoothingMs.load(std::memory_order_acquire) < 1.0f)
         seq.smoothingMs.store(12.0f, std::memory_order_release);
@@ -13015,7 +13714,8 @@ void ModernAudioEngine::setModBipolarOnSequencer(ModSequencer& seq, bool bipolar
 {
     const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
     const bool currentBipolar = seq.bipolar.load(std::memory_order_acquire) != 0;
-    const bool nextBipolar = bipolar && modTargetSupportsBipolar(target);
+    const bool nextBipolar = modTargetSupportsBipolar(target)
+        && (modTargetUsesForcedBipolar(target) || bipolar);
     if (currentBipolar != nextBipolar)
     {
         for (auto& step : seq.steps)
@@ -13088,6 +13788,8 @@ void ModernAudioEngine::resetModSequencerSlotToDefaults(int stripIndex, int slot
     seq.bipolar.store(bipolar ? 1 : 0, std::memory_order_release);
     seq.curveMode.store(0, std::memory_order_release);
     seq.depth.store(1.0f, std::memory_order_release);
+    seq.rate.store(1.0f, std::memory_order_release);
+    seq.transportMode.store(static_cast<int>(ModTransportMode::Free), std::memory_order_release);
     seq.offset.store(0, std::memory_order_release);
     seq.lengthBars.store(1, std::memory_order_release);
     seq.editPage.store(0, std::memory_order_release);
@@ -13100,12 +13802,19 @@ void ModernAudioEngine::resetModSequencerSlotToDefaults(int stripIndex, int slot
     seq.grainDezipperedRaw = defaultValue;
     seq.pitchDezipperedRaw = defaultValue;
     seq.speedDezipperedTarget = -1.0f;
+    seq.syncPhaseLast = -1.0;
+    seq.syncCycleCount = 0;
+    seq.syncPhaseValid = false;
     seq.lastGlobalStep.store(0, std::memory_order_release);
     for (size_t stepIndex = 0; stepIndex < seq.steps.size(); ++stepIndex)
     {
-        seq.steps[stepIndex].store(defaultValue, std::memory_order_release);
+        const float stepValue = (target == ModTarget::Rearrange)
+            ? defaultRearrangeStepValueForIndex(static_cast<int>(stepIndex % static_cast<size_t>(ModSteps)),
+                                                ModSteps)
+            : defaultValue;
+        seq.steps[stepIndex].store(stepValue, std::memory_order_release);
         seq.stepSubdivisions[stepIndex].store(1, std::memory_order_release);
-        seq.stepEndValues[stepIndex].store(defaultValue, std::memory_order_release);
+        seq.stepEndValues[stepIndex].store(stepValue, std::memory_order_release);
         seq.stepCurveShapes[stepIndex].store(static_cast<int>(ModCurveShape::Linear), std::memory_order_release);
     }
 }
@@ -13121,9 +13830,13 @@ ModernAudioEngine::ModSequencerState ModernAudioEngine::getModSequencerState(int
 
     const auto& seq = getActiveModSequencer(stripIndex);
     state.target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
-    state.bipolar = modTargetSupportsBipolar(state.target) && (seq.bipolar.load(std::memory_order_acquire) != 0);
+    state.bipolar = modTargetSupportsBipolar(state.target)
+        && (modTargetUsesForcedBipolar(state.target) || (seq.bipolar.load(std::memory_order_acquire) != 0));
     state.curveMode = (seq.curveMode.load(std::memory_order_acquire) != 0);
     state.depth = seq.depth.load(std::memory_order_acquire);
+    state.rate = quantizeModLaneRate(seq.rate.load(std::memory_order_acquire));
+    state.transportMode = juce::jlimit(0, static_cast<int>(ModTransportMode::Sync),
+                                       seq.transportMode.load(std::memory_order_acquire));
     state.offset = seq.offset.load(std::memory_order_acquire);
     state.lengthBars = juce::jlimit(1, MaxModBars, seq.lengthBars.load(std::memory_order_acquire));
     state.editPage = juce::jlimit(0, MaxModBars - 1, seq.editPage.load(std::memory_order_acquire));
@@ -13195,8 +13908,12 @@ void ModernAudioEngine::setModBipolar(int stripIndex, bool bipolar, ModBipolarTo
 bool ModernAudioEngine::isModBipolar(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
-    return false;
-    return getActiveModSequencer(stripIndex).bipolar.load(std::memory_order_acquire) != 0;
+        return false;
+
+    const auto& seq = getActiveModSequencer(stripIndex);
+    const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
+    return modTargetSupportsBipolar(target)
+        && (modTargetUsesForcedBipolar(target) || (seq.bipolar.load(std::memory_order_acquire) != 0));
 }
 
 void ModernAudioEngine::setModBipolarForSlot(int stripIndex, int slot, bool bipolar, ModBipolarToggleMode mode)
@@ -13210,7 +13927,11 @@ bool ModernAudioEngine::isModBipolarForSlot(int stripIndex, int slot) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return false;
-    return getModSequencer(stripIndex, slot).bipolar.load(std::memory_order_acquire) != 0;
+
+    const auto& seq = getModSequencer(stripIndex, slot);
+    const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
+    return modTargetSupportsBipolar(target)
+        && (modTargetUsesForcedBipolar(target) || (seq.bipolar.load(std::memory_order_acquire) != 0));
 }
 
 void ModernAudioEngine::setModDepth(int stripIndex, float depth)
@@ -13239,6 +13960,68 @@ float ModernAudioEngine::getModDepthForSlot(int stripIndex, int slot) const
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 1.0f;
     return getModSequencer(stripIndex, slot).depth.load(std::memory_order_acquire);
+}
+
+void ModernAudioEngine::setModRate(int stripIndex, float rate)
+{
+    setModRateForSlot(stripIndex, getActiveModSequencerSlot(stripIndex), rate);
+}
+
+float ModernAudioEngine::getModRate(int stripIndex) const
+{
+    return getModRateForSlot(stripIndex, getActiveModSequencerSlot(stripIndex));
+}
+
+void ModernAudioEngine::setModRateForSlot(int stripIndex, int slot, float rate)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    getModSequencer(stripIndex, slot).rate.store(quantizeModLaneRate(rate), std::memory_order_release);
+}
+
+float ModernAudioEngine::getModRateForSlot(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return 1.0f;
+
+    return quantizeModLaneRate(getModSequencer(stripIndex, slot).rate.load(std::memory_order_acquire));
+}
+
+void ModernAudioEngine::setModTransportMode(int stripIndex, ModTransportMode mode)
+{
+    setModTransportModeForSlot(stripIndex, getActiveModSequencerSlot(stripIndex), mode);
+}
+
+ModernAudioEngine::ModTransportMode ModernAudioEngine::getModTransportMode(int stripIndex) const
+{
+    return getModTransportModeForSlot(stripIndex, getActiveModSequencerSlot(stripIndex));
+}
+
+void ModernAudioEngine::setModTransportModeForSlot(int stripIndex, int slot, ModTransportMode mode)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    auto& seq = getModSequencer(stripIndex, slot);
+    seq.transportMode.store(juce::jlimit(0,
+                                         static_cast<int>(ModTransportMode::Sync),
+                                         static_cast<int>(mode)),
+                            std::memory_order_release);
+    seq.syncPhaseLast = -1.0;
+    seq.syncCycleCount = 0;
+    seq.syncPhaseValid = false;
+}
+
+ModernAudioEngine::ModTransportMode ModernAudioEngine::getModTransportModeForSlot(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return ModTransportMode::Free;
+
+    return static_cast<ModTransportMode>(juce::jlimit(
+        0,
+        static_cast<int>(ModTransportMode::Sync),
+        getModSequencer(stripIndex, slot).transportMode.load(std::memory_order_acquire)));
 }
 
 void ModernAudioEngine::setModCurveMode(int stripIndex, bool curveMode)
@@ -13554,8 +14337,9 @@ int ModernAudioEngine::getModTotalActiveSteps(int stripIndex, int slot) const
 
 double ModernAudioEngine::getModStepLengthBeats(int stripIndex, int slot) const
 {
-    juce::ignoreUnused(stripIndex, slot);
-    return 4.0 / static_cast<double>(ModSteps);
+    const double baseStepLengthBeats = 4.0 / static_cast<double>(ModSteps);
+    const double rate = static_cast<double>(juce::jmax(0.125f, getModRateForSlot(stripIndex, slot)));
+    return baseStepLengthBeats / rate;
 }
 
 void ModernAudioEngine::setModLengthBars(int stripIndex, int bars)
@@ -13574,13 +14358,7 @@ void ModernAudioEngine::setModLengthBarsForSlot(int stripIndex, int slot, int ba
         return;
 
     auto& seq = getModSequencer(stripIndex, slot);
-    int clampedBars = 1;
-    if (bars >= 8)
-        clampedBars = 8;
-    else if (bars >= 4)
-        clampedBars = 4;
-    else if (bars >= 2)
-        clampedBars = 2;
+    const int clampedBars = juce::jlimit(1, MaxModBars, bars);
 
     seq.lengthBars.store(clampedBars, std::memory_order_release);
     const int maxPage = clampedBars - 1;

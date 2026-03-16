@@ -31,6 +31,7 @@ enum class PerformanceTarget
     FilterEnable,
     SliceLength,
     Scratch,
+    Rearrange,
     FilterFrequency = Cutoff
 };
 
@@ -46,12 +47,12 @@ struct PerformanceTargetInfo
     bool supportsPitchScaleQuantize;
 };
 
-inline constexpr std::array<PerformanceTargetInfo, 25> kPerformanceTargetInfos{{
+inline constexpr std::array<PerformanceTargetInfo, 26> kPerformanceTargetInfos{{
     { PerformanceTarget::None, "none", "None", "None", true, true, false, false },
     { PerformanceTarget::Volume, "volume", "Volume", "Vol", true, true, false, false },
     { PerformanceTarget::Pan, "pan", "Pan", "Pan", true, true, true, false },
     { PerformanceTarget::Pitch, "pitch", "Pitch", "Pitch", true, true, true, true },
-    { PerformanceTarget::Speed, "speed", "Speed", "Speed", true, true, false, false },
+    { PerformanceTarget::Speed, "speed", "Speed", "Speed", true, true, true, false },
     { PerformanceTarget::Cutoff, "cutoff", "Cutoff", "Cutoff", true, true, false, false },
     { PerformanceTarget::Resonance, "resonance", "Resonance", "Reso", true, true, false, false },
     { PerformanceTarget::GrainSize, "grain_size", "Grain Size", "G.Size", true, true, true, false },
@@ -65,16 +66,17 @@ inline constexpr std::array<PerformanceTargetInfo, 25> kPerformanceTargetInfos{{
     { PerformanceTarget::GrainCloud, "grain_cloud", "Grain Cloud", "G.Cloud", true, true, false, false },
     { PerformanceTarget::GrainEmitter, "grain_emitter", "Grain Emitter", "G.Emit", true, true, false, false },
     { PerformanceTarget::GrainEnvelope, "grain_envelope", "Grain Envelope", "G.Env", true, true, false, false },
-    { PerformanceTarget::Retrigger, "retrigger", "Stutter", "Retrig", false, true, false, false },
+    { PerformanceTarget::Retrigger, "retrigger", "Stutter", "Retrig", true, true, false, false },
     { PerformanceTarget::GrainPositionJitter, "grain_position_jitter", "Grain Pos Jitter", "G.PosJ", true, true, true, false },
     { PerformanceTarget::GrainShape, "grain_shape", "Grain Shape", "G.Shape", true, true, true, false },
     { PerformanceTarget::FilterMorph, "filter_morph", "Filter Morph", "F.Morph", true, true, true, false },
     { PerformanceTarget::FilterEnable, "filter_enable", "Filter Enable", "F.En", true, false, false, false },
     { PerformanceTarget::SliceLength, "slice_length", "Slice Length", "Slice", true, false, false, false },
-    { PerformanceTarget::Scratch, "scratch", "Scratch", "Scratch", true, false, false, false }
+    { PerformanceTarget::Scratch, "scratch", "Scratch", "Scratch", true, false, false, false },
+    { PerformanceTarget::Rearrange, "rearrange", "Rearrange", "Rearr", false, true, false, false }
 }};
 
-inline constexpr std::array<PerformanceTarget, 24> kMacroPerformanceTargetOrder{{
+inline constexpr std::array<PerformanceTarget, 25> kMacroPerformanceTargetOrder{{
     PerformanceTarget::None,
     PerformanceTarget::Cutoff,
     PerformanceTarget::Resonance,
@@ -85,6 +87,7 @@ inline constexpr std::array<PerformanceTarget, 24> kMacroPerformanceTargetOrder{
     PerformanceTarget::FilterEnable,
     PerformanceTarget::Speed,
     PerformanceTarget::SliceLength,
+    PerformanceTarget::Retrigger,
     PerformanceTarget::Scratch,
     PerformanceTarget::GrainSize,
     PerformanceTarget::GrainDensity,
@@ -101,12 +104,13 @@ inline constexpr std::array<PerformanceTarget, 24> kMacroPerformanceTargetOrder{
     PerformanceTarget::GrainShape
 }};
 
-inline constexpr std::array<PerformanceTarget, 22> kModPerformanceTargetOrder{{
+inline constexpr std::array<PerformanceTarget, 23> kModPerformanceTargetOrder{{
     PerformanceTarget::None,
     PerformanceTarget::Volume,
     PerformanceTarget::Pan,
     PerformanceTarget::Pitch,
     PerformanceTarget::Speed,
+    PerformanceTarget::Rearrange,
     PerformanceTarget::Cutoff,
     PerformanceTarget::Resonance,
     PerformanceTarget::GrainSize,
@@ -128,7 +132,7 @@ inline constexpr std::array<PerformanceTarget, 22> kModPerformanceTargetOrder{{
 
 inline constexpr int performanceTargetCount()
 {
-    return static_cast<int>(PerformanceTarget::Scratch) + 1;
+    return static_cast<int>(PerformanceTarget::Rearrange) + 1;
 }
 
 inline constexpr bool isKnownPerformanceTargetValue(int rawValue)
@@ -178,6 +182,7 @@ inline bool performanceTargetAutoDefaultBipolar(PerformanceTarget target)
     {
         case PerformanceTarget::Pan:
         case PerformanceTarget::Pitch:
+        case PerformanceTarget::Speed:
         case PerformanceTarget::GrainPitch:
         case PerformanceTarget::GrainSize:
         case PerformanceTarget::GrainShape:
@@ -185,7 +190,6 @@ inline bool performanceTargetAutoDefaultBipolar(PerformanceTarget target)
             return true;
         case PerformanceTarget::None:
         case PerformanceTarget::Volume:
-        case PerformanceTarget::Speed:
         case PerformanceTarget::Cutoff:
         case PerformanceTarget::Resonance:
         case PerformanceTarget::GrainDensity:
@@ -202,6 +206,7 @@ inline bool performanceTargetAutoDefaultBipolar(PerformanceTarget target)
         case PerformanceTarget::FilterEnable:
         case PerformanceTarget::SliceLength:
         case PerformanceTarget::Scratch:
+        case PerformanceTarget::Rearrange:
         default:
             return false;
     }
@@ -319,6 +324,7 @@ inline int legacyMacroRawFromPerformanceTarget(PerformanceTarget target)
         case PerformanceTarget::GrainEnvelope: return 22;
         case PerformanceTarget::GrainShape: return 23;
         case PerformanceTarget::None:
+        case PerformanceTarget::Rearrange:
         case PerformanceTarget::Retrigger:
         default:
             return 0;

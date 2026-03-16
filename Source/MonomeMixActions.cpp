@@ -242,7 +242,7 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
                 const float openness = unitFromColumn(clampedColumn);
                 strip.setGateSpeed(adaptiveGateSpeedForStrip(strip, gatePageMode));
                 strip.setGateShape(openness);
-                strip.setGateAmount(1.0f - openness);
+                strip.setGateAmount(1.0f);
             }
         }
     }

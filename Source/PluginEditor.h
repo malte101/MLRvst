@@ -572,6 +572,10 @@ private:
     juce::ToggleButton modBipolarToggle;
     juce::Label modDepthLabel;
     juce::Slider modDepthSlider;
+    juce::Label modRateLabel;
+    juce::ComboBox modRateBox;
+    juce::Label modTransportLabel;
+    juce::ComboBox modTransportBox;
     juce::Label modOffsetLabel;
     juce::Slider modOffsetSlider;
     juce::Label modCurveBendLabel;
@@ -822,6 +826,7 @@ private:
     juce::ToggleButton momentaryToggle;
     juce::ComboBox stretchBackendBox;
     juce::Label stretchBackendLabel;
+    juce::ToggleButton continuousTraversalToggle;
     juce::ToggleButton tooltipsToggle;
     
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterVolumeAttachment;
@@ -836,6 +841,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> pitchControlModeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> flipTempoMatchModeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> stretchBackendAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> continuousTraversalAttachment;
     bool globalUiReady = false;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GlobalControlPanel)
@@ -1042,6 +1048,10 @@ private:
     juce::ToggleButton bipolarToggle;
     juce::Label depthLabel;
     juce::Slider depthSlider;
+    juce::Label rateLabel;
+    juce::ComboBox rateBox;
+    juce::Label transportLabel;
+    juce::ComboBox transportBox;
     juce::Label offsetLabel;
     juce::Slider offsetSlider;
     juce::Label lengthLabel;

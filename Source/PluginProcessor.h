@@ -288,6 +288,7 @@ public:
     StripPitchControlMode getStripPitchControlMode(int stripIndex) const;
     PitchControlMode resolvePitchControlModeForStrip(int stripIndex) const;
     TimeStretchBackend getStretchBackend() const;
+    bool usesContinuousTraversal() const;
     TimeStretchBackend getLoopTempoMatchBackend() const;
     StripTempoMatchMode getStripTempoMatchMode(int stripIndex) const;
     TimeStretchBackend resolveLoopTempoMatchBackendForStrip(int stripIndex) const;
@@ -349,14 +350,7 @@ public:
             static_cast<int>(GatePageMode::Sixteenth),
             gatePageMode.load(std::memory_order_acquire)));
     }
-    void setGatePageMode(GatePageMode mode)
-    {
-        gatePageMode.store(
-            juce::jlimit(0,
-                         static_cast<int>(GatePageMode::Sixteenth),
-                         static_cast<int>(mode)),
-            std::memory_order_release);
-    }
+    void setGatePageMode(GatePageMode mode);
     int getLoopStripAssignedPitchMidi(int stripIndex) const;
     float getLoopStripPitchSyncCorrectionSemitones(int stripIndex) const;
     void setLoopStripAssignedPitchMidi(int stripIndex, int midiNote, bool manualOverride = true);
@@ -726,6 +720,7 @@ private:
     std::atomic<float>* outputRoutingParam = nullptr;
     std::atomic<float>* pitchControlModeParam = nullptr;
     std::atomic<float>* stretchBackendParam = nullptr;
+    std::atomic<float>* continuousTraversalParam = nullptr;
     std::atomic<float>* flipTempoMatchModeParam = nullptr;
     std::atomic<float>* soundTouchEnabledParam = nullptr;
     std::atomic<float>* masterDuckTriggerStripParam = nullptr;
@@ -790,6 +785,7 @@ private:
     std::atomic<int> swingDivisionSelection{1}; // 0=1/4,1=1/8,2=1/16,3=1/8T,4=1/2,5=1/32,6=1/16T
     std::atomic<int> gatePageMode{0};
     int lastAppliedStretchBackend = -1; // -1 = force initial sync on first process block
+    int lastAppliedContinuousTraversal = -1;
     int lastAppliedLoopTempoMatchBackend = -1;
     
     // LED state cache to prevent flickering
@@ -1154,8 +1150,9 @@ private:
     void loadSceneModeStateFromState(const juce::ValueTree& state);
     void handleIncomingMacroCc(const juce::MidiBuffer& midiMessages);
     int getMacroTargetStripIndex() const;
-    float getMacroNormalizedValueForTarget(const EnhancedAudioStrip& strip, MacroTarget target) const;
+    float getMacroNormalizedValueForTarget(int stripIndex, const EnhancedAudioStrip& strip, MacroTarget target) const;
     void applyMacroTargetValue(int stripIndex, EnhancedAudioStrip& strip, MacroTarget target, float normalizedValue);
+    void setStripParameterValueFromMacro(int stripIndex, const juce::String& parameterId, float plainValue);
     void resetMacroLaneRecordState(int macroIndex);
     void finishMacroLaneRecording(int macroIndex, bool activateLane);
     static int snapMacroLaneRecordingLengthBars(double recordedBeats);

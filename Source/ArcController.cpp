@@ -304,7 +304,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
                 else
                 {
                     const float speedStep = fineAdjust ? 0.01f : 0.04f;
-                    const float next = juce::jlimit(0.0f, 4.0f, strip->getPlaybackSpeed() + (static_cast<float>(delta) * speedStep));
+                    const float next = juce::jlimit(0.0f, 8.0f, strip->getPlaybackSpeed() + (static_cast<float>(delta) * speedStep));
                     strip->setPlaybackSpeed(next);
                     notifyStripParam("stripSpeed", next);
                 }
@@ -459,7 +459,7 @@ void MlrVSTAudioProcessor::updateMonomeArcRings()
         else
         {
             if (ringCount >= 1)
-                sendRingIfChanged(0, makeAbsoluteRing(hasStrip ? (strip->getPlaybackSpeed() / 4.0f) : 0.0f));
+                sendRingIfChanged(0, makeAbsoluteRing(hasStrip ? (strip->getPlaybackSpeed() / 8.0f) : 0.0f));
             if (ringCount >= 2)
                 sendRingIfChanged(1, makeBipolarRing(hasStrip ? (strip->getPitchShift() / 24.0f) : 0.0f));
             if (ringCount >= 3)

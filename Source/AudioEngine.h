@@ -584,7 +584,7 @@ public:
     float getPan() const { return pan.load(); }
     void setPlayheadSpeedRatio(float ratio)
     {
-        const float clamped = juce::jlimit(0.125f, 4.0f, ratio);
+        const float clamped = juce::jlimit(0.125f, 8.0f, ratio);
         playheadSpeedRatio.store(clamped, std::memory_order_release);
 
         if (playMode != PlayMode::Loop || !playing.load(std::memory_order_acquire))
@@ -596,6 +596,23 @@ public:
         }
     }
     float getPlayheadSpeedRatio() const { return playheadSpeedRatio.load(std::memory_order_acquire); }
+    void setContinuousPlayheadTraversal(bool enabled)
+    {
+        const int next = enabled ? 1 : 0;
+        const int previous = continuousPlayheadTraversal.exchange(next, std::memory_order_acq_rel);
+        if (previous != next)
+        {
+            playheadTraversalRatioAtLastCalc = -1.0;
+            playheadTraversalPhaseOffsetSlices = 0.0;
+            playheadTraversalSliceCountAtLastCalc = -1;
+            pendingPlayheadSpeedChange.store(0, std::memory_order_release);
+            pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
+        }
+    }
+    bool usesContinuousPlayheadTraversal() const
+    {
+        return continuousPlayheadTraversal.load(std::memory_order_acquire) != 0;
+    }
     void setPlaybackSpeed(float speed);
     void setPlaybackSpeedImmediate(float speed);
     void setMomentaryStutterTimingActive(bool active)
@@ -676,6 +693,11 @@ public:
     }
     void setLoopSliceLength(float amount) { loopSliceLength.store(juce::jlimit(0.02f, 1.0f, amount), std::memory_order_release); }
     float getLoopSliceLength() const { return loopSliceLength.load(std::memory_order_acquire); }
+    void setTraversalSpeedOverride(float ratio);
+    void clearTraversalSpeedOverride();
+    void setTraversalRearrange(float value01, float depth01);
+    void clearTraversalRearrange();
+    double getLoopPhaseNormalized() const;
     std::array<int, 16> getSliceStartSamples(bool transientMode) const;
     std::array<int, 16> getCachedTransientSliceSamples() const;
     std::array<float, 128> getCachedRmsMap() const;
@@ -1094,11 +1116,20 @@ private:
     juce::LagrangeInterpolator interpolators[2]; // For stereo
     
     std::atomic<double> playbackPosition{0.0};
-    std::atomic<float> playheadSpeedRatio{1.0f}; // Requested traversal multiplier (quantized musical ratios)
+    std::atomic<float> playheadSpeedRatio{1.0f}; // Requested traversal multiplier
     std::atomic<float> appliedPlayheadSpeedRatio{1.0f}; // Active traversal multiplier used by loop DSP
+    std::atomic<int> continuousPlayheadTraversal{1};
     std::atomic<float> pendingPlayheadSpeedRatio{1.0f};
     std::atomic<int> pendingPlayheadSpeedChange{0};
     std::atomic<int> pendingPlayheadSpeedBaseSlice{-1};
+    std::atomic<int> traversalSpeedOverrideActive{0};
+    std::atomic<float> traversalSpeedOverrideRatio{1.0f};
+    std::atomic<int> traversalRearrangeActive{0};
+    std::atomic<float> traversalRearrangeValue{0.0f};
+    std::atomic<float> traversalRearrangeDepth{0.0f};
+    int traversalRearrangeLastSourceSlice = -1;
+    int traversalRearrangeLastTargetSlice = -1;
+    int traversalRearrangeLastTargetCycle = -1;
     std::atomic<double> playbackSpeed{1.0};
     double playheadTraversalRatioAtLastCalc = -1.0;
     double playheadTraversalPhaseOffsetSlices = 0.0;
@@ -1563,12 +1594,20 @@ public:
         Reinterpret
     };
 
+    enum class ModTransportMode
+    {
+        Free = 0,
+        Sync
+    };
+
     struct ModSequencerState
     {
         ModTarget target = ModTarget::None;
         bool bipolar = false;
         bool curveMode = true;
         float depth = 1.0f;
+        float rate = 1.0f;
+        int transportMode = static_cast<int>(ModTransportMode::Free);
         int offset = 0;
         int lengthBars = 1;
         int editPage = 0;
@@ -1659,6 +1698,8 @@ public:
     void setMomentaryStutterRetriggerFadeMs(float fadeMs);
     void setMomentaryStutterStrip(int stripIndex, int column, double offsetRatio, bool enabled);
     void clearMomentaryStutterStrips();
+    void setMacroRetriggerAmount(int stripIndex, float amount01);
+    float getMacroRetriggerAmount(int stripIndex) const;
     void clearPendingQuantizedTriggersForStrip(int stripIndex);
     void setMasterDuckTriggerStrip(int stripIndex);
     int getMasterDuckTriggerStrip() const;
@@ -1704,6 +1745,14 @@ public:
     float getModDepth(int stripIndex) const;
     void setModDepthForSlot(int stripIndex, int slot, float depth);
     float getModDepthForSlot(int stripIndex, int slot) const;
+    void setModRate(int stripIndex, float rate);
+    float getModRate(int stripIndex) const;
+    void setModRateForSlot(int stripIndex, int slot, float rate);
+    float getModRateForSlot(int stripIndex, int slot) const;
+    void setModTransportMode(int stripIndex, ModTransportMode mode);
+    ModTransportMode getModTransportMode(int stripIndex) const;
+    void setModTransportModeForSlot(int stripIndex, int slot, ModTransportMode mode);
+    ModTransportMode getModTransportModeForSlot(int stripIndex, int slot) const;
     void setModCurveMode(int stripIndex, bool curveMode);
     bool isModCurveMode(int stripIndex) const;
     void setModCurveModeForSlot(int stripIndex, int slot, bool curveMode);
@@ -1783,6 +1832,8 @@ public:
     float getTriggerFadeInMs() const { return triggerFadeInMs.load(std::memory_order_acquire); }
     void setGlobalSwingDivision(EnhancedAudioStrip::SwingDivision division);
     EnhancedAudioStrip::SwingDivision getGlobalSwingDivision() const;
+    void setGlobalContinuousTraversal(bool enabled);
+    bool usesGlobalContinuousTraversal() const;
     void setGlobalStretchBackend(TimeStretchBackend backend);
     void setGlobalTempoMatchBackend(TimeStretchBackend backend);
     TimeStretchBackend getGlobalStretchBackend() const
@@ -1818,6 +1869,8 @@ private:
         std::atomic<int> bipolar{0};
         std::atomic<int> curveMode{0};
         std::atomic<float> depth{1.0f};
+        std::atomic<float> rate{1.0f};
+        std::atomic<int> transportMode{static_cast<int>(ModTransportMode::Free)};
         std::atomic<int> offset{0};
         std::atomic<int> lengthBars{1};
         std::atomic<int> editPage{0};
@@ -1834,6 +1887,9 @@ private:
         float grainDezipperedRaw = 0.0f;
         float pitchDezipperedRaw = 0.0f;
         float speedDezipperedTarget = -1.0f;
+        double syncPhaseLast = -1.0;
+        int64_t syncCycleCount = 0;
+        bool syncPhaseValid = false;
         std::atomic<int> lastGlobalStep{0};
     };
 
@@ -1859,6 +1915,7 @@ private:
     std::array<std::atomic<int>, MaxStrips> momentaryStutterStripEnabled{};
     std::array<std::atomic<int>, MaxStrips> momentaryStutterColumns{};
     std::array<std::atomic<double>, MaxStrips> momentaryStutterOffsetRatios{};
+    std::array<std::atomic<float>, MaxStrips> macroRetriggerAmounts{};
     SampleModeRenderCallback sampleModeRenderCallback;
     SampleModeTriggerCallback sampleModeTriggerCallback;
     SampleModeStopCallback sampleModeStopCallback;

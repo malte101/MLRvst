@@ -10,8 +10,7 @@
 
 namespace
 {
-constexpr int kMonomeModSlotFirstColumn = 13;
-constexpr int kMonomeVisibleModSlotButtons = 3;
+constexpr int kMonomeModCycleColumn = 15;
 
 double stutterDivisionBeatsFromButton(int x)
 {
@@ -46,19 +45,12 @@ int stutterColumnFromMask(uint8_t mask)
     return -1;
 }
 
-int getMonomeVisibleModSlotButtonCount(int gridWidth)
+float quantizeMonomeRearrangeValue(float value01)
 {
-    return juce::jmax(0, juce::jmin(kMonomeVisibleModSlotButtons, gridWidth - kMonomeModSlotFirstColumn));
-}
-
-int getMonomeModSlotBankBase(int activeSlot, int visibleButtonCount)
-{
-    if (visibleButtonCount <= 0)
-        return 0;
-
-    const int clampedActiveSlot = juce::jlimit(0, ModernAudioEngine::NumModSequencers - 1, activeSlot);
-    const int maxBase = juce::jmax(0, ModernAudioEngine::NumModSequencers - visibleButtonCount);
-    return juce::jlimit(0, maxBase, (clampedActiveSlot / visibleButtonCount) * visibleButtonCount);
+    return juce::jlimit(0.0f, 1.0f,
+                        std::round(juce::jlimit(0.0f, 1.0f, value01)
+                                   * static_cast<float>(ModernAudioEngine::MaxColumns - 1))
+                            / static_cast<float>(juce::jmax(1, ModernAudioEngine::MaxColumns - 1)));
 }
 }
 
@@ -427,10 +419,27 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         return juce::jlimit(0.0f, 1.0f, static_cast<float>((CONTROL_ROW - 1) - row)
             / static_cast<float>(stripRowsDenom));
     };
-    const auto modulationRowToUnit = [CONTROL_ROW, modulationRowsDenom](int row)
+    const auto modulationRowToUnitForColumn = [CONTROL_ROW, visibleStripCount, modulationRowsDenom](int row, int column)
     {
+        const int denom = (column == kMonomeModCycleColumn)
+            ? juce::jmax(1, visibleStripCount - 1)
+            : modulationRowsDenom;
         return juce::jlimit(0.0f, 1.0f, static_cast<float>((CONTROL_ROW - 1) - row)
-            / static_cast<float>(modulationRowsDenom));
+            / static_cast<float>(denom));
+    };
+    const auto syncMonomeModEditPageToPlayback = [&](ModernAudioEngine& engine, int stripIndex)
+    {
+        if (stripIndex < 0 || stripIndex >= MaxStrips)
+            return false;
+
+        auto* strip = engine.getStrip(stripIndex);
+        if (strip == nullptr || !strip->isPlaying())
+            return false;
+
+        const int playbackPage = engine.getModCurrentPage(stripIndex);
+        if (engine.getModEditPage(stripIndex) != playbackPage)
+            engine.setModEditPage(stripIndex, playbackPage);
+        return true;
     };
     const auto isPresetCell = [](int gridX, int gridY)
     {
@@ -819,34 +828,19 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 auto* engine = getAudioEngine();
                 if (!engine)
                     return;
-                const int visibleSlotButtons = getMonomeVisibleModSlotButtonCount(gridWidth);
-                const int activeSlot = engine->getModSequencerSlot(targetStrip);
-                const int slotBankBase = getMonomeModSlotBankBase(activeSlot, visibleSlotButtons);
+                syncMonomeModEditPageToPlayback(*engine, targetStrip);
 
-                // Dedicated modulation page navigation in monome mod mode.
-                if (x == 11 || x == 12)
+                if (x == kMonomeModCycleColumn)
                 {
-                    const int delta = (x == 11) ? -1 : 1;
-                    const int currentPage = engine->getModEditPage(targetStrip);
-                    const int maxPage = juce::jmax(0, engine->getModLengthBars(targetStrip) - 1);
-                    engine->setModEditPage(targetStrip, juce::jlimit(0, maxPage, currentPage + delta));
-                    updateMonomeLEDs();
-                    return;
-                }
-
-                // Monome exposes a 3-slot window into the modulation lanes.
-                if (visibleSlotButtons > 0
-                    && x >= kMonomeModSlotFirstColumn
-                    && x < (kMonomeModSlotFirstColumn + visibleSlotButtons))
-                {
-                    const int requestedSlot = slotBankBase + (x - kMonomeModSlotFirstColumn);
-                    engine->setModSequencerSlot(targetStrip,
-                                                juce::jlimit(0, ModernAudioEngine::NumModSequencers - 1, requestedSlot));
+                    const int activeSlot = engine->getModSequencerSlot(targetStrip);
+                    const int nextSlot = (activeSlot + 1) % ModernAudioEngine::NumModSequencers;
+                    engine->setModSequencerSlot(targetStrip, nextSlot);
                     updateMonomeLEDs();
                     return;
                 }
 
                 const bool bipolar = engine->isModBipolar(targetStrip);
+                const bool rearrangeTarget = (engine->getModTarget(targetStrip) == ModernAudioEngine::ModTarget::Rearrange);
                 const float normalizedY = 1.0f; // y=0 is highest value
                 float value = normalizedY;
                 if (bipolar)
@@ -854,6 +848,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     const float signedValue = (normalizedY * 2.0f) - 1.0f;
                     value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
                 }
+                if (rearrangeTarget)
+                    value = quantizeMonomeRearrangeValue(value);
                 engine->setModStepValue(targetStrip, x, value);
 
                 updateMonomeLEDs();
@@ -989,21 +985,6 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
                 updateMonomeLEDs();  // Force immediate LED update
                 return;  // Don't process as strip trigger!
-            }
-            else if (controlModeActive && currentControlMode == ControlMode::Modulation && (x == 13 || x == 14))
-            {
-                auto* engine = getAudioEngine();
-                if (!engine)
-                    return;
-
-                const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
-                const int requestedBaseSlot = (x == 13) ? 0 : kMonomeVisibleModSlotButtons;
-                engine->setModSequencerSlot(targetStrip,
-                                            juce::jlimit(0,
-                                                         ModernAudioEngine::NumModSequencers - 1,
-                                                         requestedBaseSlot));
-                updateMonomeLEDs();
-                return;
             }
             else if (stepEditModeActive && (x == 13 || x == 14))
             {
@@ -1401,8 +1382,10 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     else if (currentControlMode == ControlMode::Modulation)
                     {
                         const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
+                        syncMonomeModEditPageToPlayback(*audioEngine, targetStrip);
                         const bool bipolar = audioEngine->isModBipolar(targetStrip);
-                        const float normalizedY = modulationRowToUnit(y);
+                        const bool rearrangeTarget = (audioEngine->getModTarget(targetStrip) == ModernAudioEngine::ModTarget::Rearrange);
+                        const float normalizedY = modulationRowToUnitForColumn(y, x);
                         float value = normalizedY;
                         if (bipolar)
                         {
@@ -1410,6 +1393,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                             const float signedValue = (normalizedY * 2.0f) - 1.0f;
                             value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
                         }
+                        if (rearrangeTarget)
+                            value = quantizeMonomeRearrangeValue(value);
                         audioEngine->setModStepValue(targetStrip, x, value);
                         updateMonomeLEDs();
                     }
@@ -1576,8 +1561,10 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
         }
         
-        // Handle gate mode - stop strip on key release
-        if (isDisplayedDataRow(y))
+        // Gate-playback release should only stop strips during normal launch use,
+        // not while a control page is open and rows are editing parameters.
+        if ((!controlModeActive || currentControlMode == ControlMode::Normal)
+            && isDisplayedDataRow(y))
         {
             int stripIndex = y - FIRST_STRIP_ROW;
             if (stripIndex >= 0 && stripIndex < visibleStripCount && x < MaxColumns)
@@ -1640,6 +1627,20 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         const int denom = juce::jmax(1, visibleStripCount - 1);
         return juce::jlimit(0.0f, 1.0f,
             static_cast<float>((CONTROL_ROW - 1) - row) / static_cast<float>(denom));
+    };
+    const auto syncMonomeModEditPageToPlayback = [&](int stripIndex)
+    {
+        if (stripIndex < 0 || stripIndex >= MaxStrips)
+            return false;
+
+        auto* strip = audioEngine->getStrip(stripIndex);
+        if (strip == nullptr || !strip->isPlaying())
+            return false;
+
+        const int playbackPage = audioEngine->getModCurrentPage(stripIndex);
+        if (audioEngine->getModEditPage(stripIndex) != playbackPage)
+            audioEngine->setModEditPage(stripIndex, playbackPage);
+        return true;
     };
     
     // Temporary LED state
@@ -1901,6 +1902,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     else if (currentControlMode == ControlMode::Modulation && controlModeActive)
     {
         const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
+        syncMonomeModEditPageToPlayback(targetStrip);
         const auto seq = audioEngine->getModSequencerState(targetStrip);
         const int activeGlobalStep = audioEngine->getModCurrentGlobalStep(targetStrip);
         const int playbackPage = juce::jlimit(
@@ -1956,6 +1958,12 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
 
         for (int x = 0; x < 16; ++x)
         {
+            if (x == kMonomeModCycleColumn)
+            {
+                newLedState[x][GROUP_ROW] = slowBlinkOn ? 15 : 5;
+                continue;
+            }
+
             newLedState[x][GROUP_ROW] = 0;
             const float v = seq.steps[static_cast<size_t>(x)];
             const int pointRow = valueToRow(v);
@@ -1982,21 +1990,6 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
 
             if (stripPlaying && x == activeStep)
                 newLedState[x][GROUP_ROW] = juce::jmax(newLedState[x][GROUP_ROW], 15);
-        }
-
-        const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, seq.lengthBars);
-        const int editPage = juce::jlimit(0, lengthBars - 1, seq.editPage);
-        newLedState[11][GROUP_ROW] = (editPage > 0) ? 10 : 2;                 // Page down
-        newLedState[12][GROUP_ROW] = (editPage < (lengthBars - 1)) ? 10 : 2;  // Page up
-
-        const int activeSlot = audioEngine->getModSequencerSlot(targetStrip);
-        const int visibleSlotButtons = getMonomeVisibleModSlotButtonCount(gridWidth);
-        const int slotBankBase = getMonomeModSlotBankBase(activeSlot, visibleSlotButtons);
-        for (int buttonIndex = 0; buttonIndex < visibleSlotButtons; ++buttonIndex)
-        {
-            const int slot = slotBankBase + buttonIndex;
-            const int col = kMonomeModSlotFirstColumn + buttonIndex;
-            newLedState[col][GROUP_ROW] = (slot == activeSlot) ? 15 : 4;
         }
     }
     else
@@ -2328,18 +2321,30 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                 : -1;
             const bool stripPlaying = audioEngine->getStrip(selectedStrip) && audioEngine->getStrip(selectedStrip)->isPlaying();
             const int displayRow = y; // Strip rows, with row 0 rendered in GROUP_ROW branch.
-            const int modulationBaseRow = seq.bipolar ? (modulationMaxRow / 2) : modulationMaxRow;
+            auto baseRowForColumn = [&](int column)
+            {
+                if (column == kMonomeModCycleColumn)
+                    return seq.bipolar ? (1 + ((modulationMaxRow - 1) / 2)) : modulationMaxRow;
+                return seq.bipolar ? (modulationMaxRow / 2) : modulationMaxRow;
+            };
 
-            auto valueToRow = [&](float v)
+            auto valueToRow = [&](float v, int column)
             {
                 v = juce::jlimit(0.0f, 1.0f, v);
+                const bool reservedTopCell = (column == kMonomeModCycleColumn);
+                const int topRow = reservedTopCell ? 1 : 0;
+                const int usableRows = reservedTopCell ? juce::jmax(1, modulationMaxRow - 1) : modulationMaxRow;
                 if (seq.bipolar)
                 {
                     const float signedV = (v * 2.0f) - 1.0f;
                     const float n = (signedV + 1.0f) * 0.5f;
-                    return juce::jlimit(0, modulationMaxRow, static_cast<int>(std::round((1.0f - n) * modulationMaxRow)));
+                    return juce::jlimit(topRow,
+                                        modulationMaxRow,
+                                        topRow + static_cast<int>(std::round((1.0f - n) * usableRows)));
                 }
-                return juce::jlimit(0, modulationMaxRow, static_cast<int>(std::round((1.0f - v) * modulationMaxRow)));
+                return juce::jlimit(topRow,
+                                    modulationMaxRow,
+                                    topRow + static_cast<int>(std::round((1.0f - v) * usableRows)));
             };
             auto curveLevelForRow = [&](int row, bool isPoint)
             {
@@ -2374,7 +2379,8 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             {
                 newLedState[x][y] = 0;
                 const float v = seq.steps[static_cast<size_t>(x)];
-                const int pointRow = valueToRow(v);
+                const int pointRow = valueToRow(v, x);
+                const int modulationBaseRow = baseRowForColumn(x);
 
                 if (seq.curveMode)
                 {
@@ -2384,7 +2390,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                         level = juce::jmax(level, curveLevelForRow(displayRow, true));
                     if (x < 15)
                     {
-                        const int nextRow = valueToRow(seq.steps[static_cast<size_t>(x + 1)]);
+                        const int nextRow = valueToRow(seq.steps[static_cast<size_t>(x + 1)], x + 1);
                         const int minRow = juce::jmin(pointRow, nextRow);
                         const int maxRow = juce::jmax(pointRow, nextRow);
                         if (displayRow >= minRow && displayRow <= maxRow)
@@ -2625,18 +2631,6 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
 
         newLedState[13][CONTROL_ROW] = downLevel;
         newLedState[14][CONTROL_ROW] = upLevel;
-    }
-    else if (controlModeActive && currentControlMode == ControlMode::Modulation)
-    {
-        const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
-        const int activeSlot = audioEngine->getModSequencerSlot(targetStrip);
-        const int visibleSlotButtons = getMonomeVisibleModSlotButtonCount(gridWidth);
-        const int slotBankBase = getMonomeModSlotBankBase(activeSlot, visibleSlotButtons);
-        const bool firstBankActive = (slotBankBase == 0);
-        const bool secondBankActive = (slotBankBase >= kMonomeVisibleModSlotButtons);
-
-        newLedState[13][CONTROL_ROW] = firstBankActive ? 15 : 4;
-        newLedState[14][CONTROL_ROW] = secondBankActive ? 15 : 4;
     }
     else if (!controlModeActive || currentControlMode == ControlMode::Normal)
     {

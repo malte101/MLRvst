@@ -778,6 +778,8 @@ bool savePreset(int presetIndex,
             stripXml->setAttribute(slotKey("Bipolar"), mod.bipolar);
             stripXml->setAttribute(slotKey("CurveMode"), mod.curveMode);
             stripXml->setAttribute(slotKey("Depth"), mod.depth);
+            stripXml->setAttribute(slotKey("Rate"), mod.rate);
+            stripXml->setAttribute(slotKey("TransportMode"), mod.transportMode);
             stripXml->setAttribute(slotKey("Offset"), mod.offset);
             stripXml->setAttribute(slotKey("LengthBars"), mod.lengthBars);
             stripXml->setAttribute(slotKey("EditPage"), mod.editPage);
@@ -1233,6 +1235,18 @@ bool loadPreset(int presetIndex,
                 audioEngine->getModDepth(stripIndex),
                 0.0f,
                 1.0f);
+            audioEngine->setModRate(stripIndex,
+                                    clampedFloat(stripXml->getDoubleAttribute(slotKey("Rate"), 1.0),
+                                                 1.0f,
+                                                 0.125f,
+                                                 4.0f));
+            audioEngine->setModTransportMode(stripIndex,
+                static_cast<ModernAudioEngine::ModTransportMode>(clampedInt(
+                    stripXml->getIntAttribute(slotKey("TransportMode"),
+                                              static_cast<int>(ModernAudioEngine::ModTransportMode::Free)),
+                    0,
+                    static_cast<int>(ModernAudioEngine::ModTransportMode::Sync),
+                    static_cast<int>(ModernAudioEngine::ModTransportMode::Free))));
             audioEngine->setModOffset(stripIndex, clampedInt(stripXml->getIntAttribute(slotKey("Offset"), 0), -127, 127, 0));
             audioEngine->setModLengthBars(stripIndex, clampedInt(stripXml->getIntAttribute(slotKey("LengthBars"), 1), 1, 8, 1));
             audioEngine->setModEditPage(stripIndex, clampedInt(stripXml->getIntAttribute(slotKey("EditPage"), 0), 0, 7, 0));
@@ -1247,7 +1261,16 @@ bool loadPreset(int presetIndex,
             const auto stepsText = stripXml->getStringAttribute(stepsKey);
             if (stepsText.isEmpty())
             {
-                modSteps.fill(ModernAudioEngine::defaultModStepValueForTarget(loadedTarget));
+                if (loadedTarget == ModernAudioEngine::ModTarget::Rearrange)
+                {
+                    for (int step = 0; step < ModernAudioEngine::ModTotalSteps; ++step)
+                        modSteps[static_cast<size_t>(step)] = static_cast<float>(step % ModernAudioEngine::ModSteps)
+                            / static_cast<float>(juce::jmax(1, ModernAudioEngine::ModSteps - 1));
+                }
+                else
+                {
+                    modSteps.fill(ModernAudioEngine::defaultModStepValueForTarget(loadedTarget));
+                }
             }
             else
             {
