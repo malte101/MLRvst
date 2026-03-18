@@ -864,6 +864,14 @@ private:
     juce::ComboBox stretchBackendBox;
     juce::Label stretchBackendLabel;
     juce::ToggleButton continuousTraversalToggle;
+    juce::ComboBox transientMethodBox;
+    juce::Label transientMethodLabel;
+    juce::ComboBox transientSensitivityBox;
+    juce::Label transientSensitivityLabel;
+    juce::ComboBox transientSnapBox;
+    juce::Label transientSnapLabel;
+    juce::ComboBox transientSpacingBox;
+    juce::Label transientSpacingLabel;
     juce::ToggleButton tooltipsToggle;
     
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterVolumeAttachment;
@@ -878,6 +886,10 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> pitchControlModeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> flipTempoMatchModeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> stretchBackendAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> transientMethodAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> transientSensitivityAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> transientSnapAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> transientSpacingAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> continuousTraversalAttachment;
     bool globalUiReady = false;
     

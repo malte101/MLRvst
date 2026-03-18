@@ -79,14 +79,14 @@ inline constexpr std::array<PerformanceTargetInfo, 31> kPerformanceTargetInfos{{
     { PerformanceTarget::SliceLength, "slice_length", "Slice Length", "Slice", true, false, false, false },
     { PerformanceTarget::Scratch, "scratch", "Scratch", "Scratch", true, false, false, false },
     { PerformanceTarget::Rearrange, "rearrange", "Rearrange", "Rearr", false, true, false, false },
-    { PerformanceTarget::DelayMix, "delay_mix", "Delay Mix", "D.Mix", false, true, true, false },
-    { PerformanceTarget::DelayTime, "delay_time", "Delay Time", "D.Time", false, true, true, false },
-    { PerformanceTarget::DelayFeedback, "delay_feedback", "Delay Feedback", "D.Fdbk", false, true, true, false },
-    { PerformanceTarget::DelayLowCut, "delay_low_cut", "Delay Low Cut", "D.Low", false, true, true, false },
-    { PerformanceTarget::DelayHighCut, "delay_high_cut", "Delay High Cut", "D.High", false, true, true, false }
+    { PerformanceTarget::DelayMix, "delay_mix", "Delay Mix", "D.Mix", true, true, true, false },
+    { PerformanceTarget::DelayTime, "delay_time", "Delay Time", "D.Time", true, true, true, false },
+    { PerformanceTarget::DelayFeedback, "delay_feedback", "Delay Feedback", "D.Fdbk", true, true, true, false },
+    { PerformanceTarget::DelayLowCut, "delay_low_cut", "Delay Low Cut", "D.Low", true, true, true, false },
+    { PerformanceTarget::DelayHighCut, "delay_high_cut", "Delay High Cut", "D.High", true, true, true, false }
 }};
 
-inline constexpr std::array<PerformanceTarget, 25> kMacroPerformanceTargetOrder{{
+inline constexpr std::array<PerformanceTarget, 30> kMacroPerformanceTargetOrder{{
     PerformanceTarget::None,
     PerformanceTarget::Cutoff,
     PerformanceTarget::Resonance,
@@ -111,7 +111,12 @@ inline constexpr std::array<PerformanceTarget, 25> kMacroPerformanceTargetOrder{
     PerformanceTarget::GrainCloud,
     PerformanceTarget::GrainEmitter,
     PerformanceTarget::GrainEnvelope,
-    PerformanceTarget::GrainShape
+    PerformanceTarget::GrainShape,
+    PerformanceTarget::DelayMix,
+    PerformanceTarget::DelayTime,
+    PerformanceTarget::DelayFeedback,
+    PerformanceTarget::DelayLowCut,
+    PerformanceTarget::DelayHighCut
 }};
 
 inline constexpr std::array<PerformanceTarget, 28> kModPerformanceTargetOrder{{

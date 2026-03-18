@@ -39,7 +39,11 @@ struct GlobalParameterSnapshot
     float pitchControlMode = 0.0f;
     float flipTempoMatchMode = 0.0f;
     float stretchBackend = 1.0f;
-    float sceneRecallMode = 0.0f;
+    float transientOnsetMethod = 0.0f;
+    float transientSensitivity = 2.0f;
+    float transientSnap = 2.0f;
+    float transientSpacing = 2.0f;
+    float sceneRecallMode = 1.0f;
     float sceneMode = 0.0f;
 };
 
@@ -140,6 +144,14 @@ GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeSta
         snapshot.flipTempoMatchMode = *p;
     if (auto* p = parameters.getRawParameterValue("stretchBackend"))
         snapshot.stretchBackend = *p;
+    if (auto* p = parameters.getRawParameterValue("transientOnsetMethod"))
+        snapshot.transientOnsetMethod = *p;
+    if (auto* p = parameters.getRawParameterValue("transientSensitivity"))
+        snapshot.transientSensitivity = *p;
+    if (auto* p = parameters.getRawParameterValue("transientSnap"))
+        snapshot.transientSnap = *p;
+    if (auto* p = parameters.getRawParameterValue("transientSpacing"))
+        snapshot.transientSpacing = *p;
     if (auto* p = parameters.getRawParameterValue("sceneRecallMode"))
         snapshot.sceneRecallMode = *p;
     if (auto* p = parameters.getRawParameterValue("sceneMode"))
@@ -196,6 +208,26 @@ void restoreGlobalParameters(juce::AudioProcessorValueTreeState& parameters, con
             param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(snapshot.stretchBackend)));
         else
             param->setValueNotifyingHost(snapshot.stretchBackend > 0.5f ? 1.0f : 0.0f);
+    }
+    if (auto* param = parameters.getParameter("transientOnsetMethod"))
+    {
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(param))
+            param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(snapshot.transientOnsetMethod)));
+    }
+    if (auto* param = parameters.getParameter("transientSensitivity"))
+    {
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(param))
+            param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(snapshot.transientSensitivity)));
+    }
+    if (auto* param = parameters.getParameter("transientSnap"))
+    {
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(param))
+            param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(snapshot.transientSnap)));
+    }
+    if (auto* param = parameters.getParameter("transientSpacing"))
+    {
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(param))
+            param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(snapshot.transientSpacing)));
     }
     if (auto* param = parameters.getParameter("sceneRecallMode"))
     {

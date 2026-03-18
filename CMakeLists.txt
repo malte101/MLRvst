@@ -211,6 +211,12 @@ target_sources(mlrVST
         Source/PluginEditor.h
         Source/AudioEngine.cpp
         Source/AudioEngine.h
+        Source/MacroTargetDispatcher.cpp
+        Source/MacroTargetDispatcher.h
+        Source/SceneScheduler.cpp
+        Source/SceneScheduler.h
+        Source/StripControlState.cpp
+        Source/StripControlState.h
         Source/PresetStore.cpp
         Source/PresetStore.h
         Source/TimeStretchBackend.cpp

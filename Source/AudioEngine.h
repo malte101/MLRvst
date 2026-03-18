@@ -703,6 +703,8 @@ public:
     bool isReversed() const { return reverse; }
     void setTransientSliceMode(bool enabled);
     bool isTransientSliceMode() const { return transientSliceMode.load(std::memory_order_acquire); }
+    void refreshTransientSliceMap();
+    void markTransientSliceMapDirty();
     void setSampleModeLegacyLoopEngineEnabled(bool enabled)
     {
         sampleModeLegacyLoopEngineEnabled.store(enabled ? 1 : 0, std::memory_order_release);
@@ -1757,6 +1759,11 @@ public:
     // Strip access
     EnhancedAudioStrip* getStrip(int index);
     bool loadSampleToStrip(int stripIndex, const juce::File& file);
+    void setTransientDetectionConfig(int onsetMethodChoice,
+                                     int sensitivityChoice,
+                                     int snapChoice,
+                                     int spacingChoice);
+    void refreshTransientSliceMaps();
     
     // Groups
     StripGroup* getGroup(int index);

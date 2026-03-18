@@ -212,17 +212,6 @@ float adaptiveGateSpeedForStrip(const EnhancedAudioStrip& strip,
     return juce::jlimit(0.25f, 8.0f, static_cast<float>(slicesPerLoop) / beatsPerLoop);
 }
 
-void setStripParameter(MlrVSTAudioProcessor& processor, int stripIndex, const juce::String& paramId, float value)
-{
-    if (auto* param = processor.parameters.getParameter(paramId + juce::String(stripIndex)))
-        param->setValueNotifyingHost(param->convertTo0to1(value));
-}
-
-void setStripBoolParameter(MlrVSTAudioProcessor& processor, int stripIndex, const juce::String& paramId, bool enabled)
-{
-    if (auto* param = processor.parameters.getParameter(paramId + juce::String(stripIndex)))
-        param->setValueNotifyingHost(param->convertTo0to1(enabled ? 1.0f : 0.0f));
-}
 }
 
 void applyButtonPressLive(EnhancedAudioStrip& strip,
@@ -232,55 +221,24 @@ void applyButtonPressLive(EnhancedAudioStrip& strip,
 {
     const int clampedColumn = juce::jlimit(0, 15, x);
 
-    if (mode == speedMode)
+    switch (mode)
     {
-        const float speedRatio = PlayheadSpeedQuantizer::ratioFromColumn(clampedColumn);
-        if (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
-            strip.setPlaybackSpeed(PlayheadSpeedQuantizer::grainPlaybackSpeedFromControl(speedRatio));
-        else
-            strip.setPlayheadSpeedRatio(speedRatio);
-    }
-    else if (mode == panMode)
-    {
-        float pan = (clampedColumn - 8) / 8.0f;
-        pan = juce::jlimit(-1.0f, 1.0f, pan);
+        case grainSizeMode:
+            strip.setGrainSizeMs(grainSizeFromColumn(clampedColumn));
+            break;
 
-        if (strip.playMode == EnhancedAudioStrip::PlayMode::Step)
-        {
-            if (auto* stepSampler = strip.getStepSampler())
-                stepSampler->setPan(pan);
-        }
+        case swingMode:
+            strip.setSwingAmount(unitFromColumn(clampedColumn));
+            break;
 
-        strip.setPan(pan);
-    }
-    else if (mode == volumeMode)
-    {
-        const float vol = clampedColumn / 15.0f;
+        case gateMode:
+        {
+            if (strip.playMode == EnhancedAudioStrip::PlayMode::Step)
+            {
+                strip.setStepEnvelopeDecayMs(stepDecayMsFromColumn(clampedColumn));
+                break;
+            }
 
-        if (strip.playMode == EnhancedAudioStrip::PlayMode::Step)
-        {
-            if (auto* stepSampler = strip.getStepSampler())
-                stepSampler->setVolume(vol);
-        }
-
-        strip.setVolume(vol);
-    }
-    else if (mode == grainSizeMode)
-    {
-        strip.setGrainSizeMs(grainSizeFromColumn(clampedColumn));
-    }
-    else if (mode == swingMode)
-    {
-        strip.setSwingAmount(unitFromColumn(clampedColumn));
-    }
-    else if (mode == gateMode)
-    {
-        if (strip.playMode == EnhancedAudioStrip::PlayMode::Step)
-        {
-            strip.setStepEnvelopeDecayMs(stepDecayMsFromColumn(clampedColumn));
-        }
-        else
-        {
             const auto safeGateMode = static_cast<MlrVSTAudioProcessor::GatePageMode>(juce::jlimit(
                 static_cast<int>(MlrVSTAudioProcessor::GatePageMode::Adaptive),
                 static_cast<int>(MlrVSTAudioProcessor::GatePageMode::Sixteenth),
@@ -291,15 +249,18 @@ void applyButtonPressLive(EnhancedAudioStrip& strip,
                 const float sliceLength = sliceLengthFromColumn(clampedColumn);
                 strip.setLoopSliceLength(sliceLength);
                 strip.setGateAmount(0.0f);
+                break;
             }
-            else
-            {
-                const float openness = unitFromColumn(clampedColumn);
-                strip.setGateSpeed(adaptiveGateSpeedForStrip(strip, safeGateMode));
-                strip.setGateShape(openness);
-                strip.setGateAmount(1.0f);
-            }
+
+            const float openness = unitFromColumn(clampedColumn);
+            strip.setGateSpeed(adaptiveGateSpeedForStrip(strip, safeGateMode));
+            strip.setGateShape(openness);
+            strip.setGateAmount(1.0f);
+            break;
         }
+
+        default:
+            break;
     }
 }
 
@@ -309,61 +270,65 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
                        int x,
                        int mode)
 {
-    if (mode == speedMode)
+    switch (mode)
     {
-        applyButtonPressLive(strip, x, mode, static_cast<int>(processor.getGatePageMode()));
-        const float speedRatio = PlayheadSpeedQuantizer::ratioFromColumn(juce::jlimit(0, 15, x));
-
-        if (auto* param = processor.parameters.getParameter("stripSpeed" + juce::String(stripIndex)))
-            param->setValueNotifyingHost(param->convertTo0to1(speedRatio));
-    }
-    else if (mode == pitchMode)
-    {
-        const int semitones = musicalPitchSemitones[static_cast<size_t>(juce::jlimit(0, 15, x))];
-        processor.applyUserPitchControlToStrip(stripIndex, static_cast<float>(semitones));
-    }
-    else if (mode == panMode)
-    {
-        applyButtonPressLive(strip, x, mode, static_cast<int>(processor.getGatePageMode()));
-        float pan = (x - 8) / 8.0f;
-        pan = juce::jlimit(-1.0f, 1.0f, pan);
-
-        if (auto* param = processor.parameters.getParameter("stripPan" + juce::String(stripIndex)))
-            param->setValueNotifyingHost((pan + 1.0f) / 2.0f);
-    }
-    else if (mode == volumeMode)
-    {
-        applyButtonPressLive(strip, x, mode, static_cast<int>(processor.getGatePageMode()));
-        float vol = x / 15.0f;
-
-        if (auto* param = processor.parameters.getParameter("stripVolume" + juce::String(stripIndex)))
-            param->setValueNotifyingHost(vol);
-    }
-    else if (mode == grainSizeMode)
-    {
-        applyButtonPressLive(strip, x, mode, static_cast<int>(processor.getGatePageMode()));
-    }
-    else if (mode == swingMode)
-    {
-        applyButtonPressLive(strip, x, mode, static_cast<int>(processor.getGatePageMode()));
-    }
-    else if (mode == gateMode)
-    {
-        applyButtonPressLive(strip, x, mode, static_cast<int>(processor.getGatePageMode()));
-        const int clampedColumn = juce::jlimit(0, 15, x);
-        if (strip.playMode == EnhancedAudioStrip::PlayMode::Step)
+        case speedMode:
         {
+            const float speedRatio = PlayheadSpeedQuantizer::ratioFromColumn(juce::jlimit(0, 15, x));
+            processor.setStripSpeedControlValue(stripIndex,
+                                                speedRatio,
+                                                MlrVSTAudioProcessor::StripControlWriteMode::NotifyHost);
+            break;
         }
-        else
+
+        case pitchMode:
         {
-            const auto gatePageMode = processor.getGatePageMode();
-            if (gatePageMode == MlrVSTAudioProcessor::GatePageMode::Adaptive)
+            const int semitones = musicalPitchSemitones[static_cast<size_t>(juce::jlimit(0, 15, x))];
+            processor.applyUserPitchControlToStrip(stripIndex, static_cast<float>(semitones));
+            break;
+        }
+
+        case panMode:
+        {
+            float pan = (x - 8) / 8.0f;
+            pan = juce::jlimit(-1.0f, 1.0f, pan);
+            processor.setStripPanControlValue(stripIndex,
+                                              pan,
+                                              MlrVSTAudioProcessor::StripControlWriteMode::NotifyHost);
+            break;
+        }
+
+        case volumeMode:
+        {
+            const float vol = x / 15.0f;
+            processor.setStripVolumeControlValue(stripIndex,
+                                                 vol,
+                                                 MlrVSTAudioProcessor::StripControlWriteMode::NotifyHost);
+            break;
+        }
+
+        case grainSizeMode:
+        case swingMode:
+            applyButtonPressLive(strip, x, mode, static_cast<int>(processor.getGatePageMode()));
+            break;
+
+        case gateMode:
+        {
+            applyButtonPressLive(strip, x, mode, static_cast<int>(processor.getGatePageMode()));
+            if (strip.playMode == EnhancedAudioStrip::PlayMode::Step)
+                break;
+
+            if (processor.getGatePageMode() == MlrVSTAudioProcessor::GatePageMode::Adaptive)
             {
-                const float sliceLength = sliceLengthFromColumn(clampedColumn);
+                const float sliceLength = sliceLengthFromColumn(juce::jlimit(0, 15, x));
                 if (auto* param = processor.parameters.getParameter("stripSliceLength" + juce::String(stripIndex)))
                     param->setValueNotifyingHost(param->convertTo0to1(sliceLength));
             }
+            break;
         }
+
+        default:
+            break;
     }
 }
 
@@ -376,108 +341,125 @@ void renderRow(const EnhancedAudioStrip& strip,
     const bool isStepMode = (strip.playMode == EnhancedAudioStrip::PlayMode::Step);
     auto* stepSampler = isStepMode ? const_cast<EnhancedAudioStrip&>(strip).getStepSampler() : nullptr;
 
-    if (mode == speedMode)
+    switch (mode)
     {
-        const float speed = PlayheadSpeedQuantizer::quantizeRatio(
-            strip.getPlayheadSpeedRatio());
-        const int activeCol = findNearestSpeedColumn(speed);
-
-        for (int x = 0; x < 16; ++x)
+        case speedMode:
         {
-            newLedState[x][y] = 4;
-            if (x == 8)
-                newLedState[x][y] = 6;
-            if (x == activeCol)
-                newLedState[x][y] = 15;
+            const float speed = PlayheadSpeedQuantizer::quantizeRatio(strip.getPlayheadSpeedRatio());
+            const int activeCol = findNearestSpeedColumn(speed);
+
+            for (int x = 0; x < 16; ++x)
+            {
+                newLedState[x][y] = 4;
+                if (x == 8)
+                    newLedState[x][y] = 6;
+                if (x == activeCol)
+                    newLedState[x][y] = 15;
+            }
+            break;
         }
-    }
-    else if (mode == pitchMode)
-    {
-        const int semitones = static_cast<int>(std::round(processor.getPitchSemitonesForDisplay(strip)));
 
-        const int activeCol = findNearestPitchColumn(semitones);
-
-        for (int x = 0; x < 16; ++x)
+        case pitchMode:
         {
-            newLedState[x][y] = 4;
-            if (x == 8)
-                newLedState[x][y] = 6;
-            if (x == activeCol)
-                newLedState[x][y] = 15;
+            const int semitones = static_cast<int>(std::round(processor.getPitchSemitonesForDisplay(strip)));
+            const int activeCol = findNearestPitchColumn(semitones);
+
+            for (int x = 0; x < 16; ++x)
+            {
+                newLedState[x][y] = 4;
+                if (x == 8)
+                    newLedState[x][y] = 6;
+                if (x == activeCol)
+                    newLedState[x][y] = 15;
+            }
+            break;
         }
-    }
-    else if (mode == panMode)
-    {
-        float pan = 0.0f;
-        if (isStepMode && stepSampler)
-            pan = stepSampler->getPan();
-        else
-            pan = strip.getPan();
 
-        int panX = 8 + static_cast<int>(pan * 8.0f);
-        panX = juce::jlimit(0, 15, panX);
-
-        for (int x = 0; x < 16; ++x)
+        case panMode:
         {
-            if (x == panX)
-                newLedState[x][y] = 15;
-            else if (x == 8)
-                newLedState[x][y] = 6;
+            float pan = 0.0f;
+            if (isStepMode && stepSampler)
+                pan = stepSampler->getPan();
             else
-                newLedState[x][y] = 2;
-        }
-    }
-    else if (mode == volumeMode)
-    {
-        float vol = 0.0f;
-        if (isStepMode && stepSampler)
-            vol = stepSampler->getVolume();
-        else
-            vol = strip.getVolume();
+                pan = strip.getPan();
 
-        int numLit = static_cast<int>(vol * 16.0f);
-        for (int x = 0; x < 16; ++x)
-            newLedState[x][y] = (x < numLit) ? 12 : 2;
-    }
-    else if (mode == grainSizeMode)
-    {
-        const int activeCol = findNearestGrainSizeColumn(strip.getGrainSizeMs());
-        for (int x = 0; x < 16; ++x)
+            int panX = 8 + static_cast<int>(pan * 8.0f);
+            panX = juce::jlimit(0, 15, panX);
+
+            for (int x = 0; x < 16; ++x)
+            {
+                if (x == panX)
+                    newLedState[x][y] = 15;
+                else if (x == 8)
+                    newLedState[x][y] = 6;
+                else
+                    newLedState[x][y] = 2;
+            }
+            break;
+        }
+
+        case volumeMode:
         {
-            if (x == activeCol)
-                newLedState[x][y] = 15;
-            else if (x <= activeCol)
-                newLedState[x][y] = 8;
+            float vol = 0.0f;
+            if (isStepMode && stepSampler)
+                vol = stepSampler->getVolume();
             else
-                newLedState[x][y] = 2;
-        }
-    }
-    else if (mode == swingMode)
-    {
-        const int activeCol = findNearestColumn(strip.getSwingAmount(), 0.0f, 1.0f);
-        for (int x = 0; x < 16; ++x)
-            newLedState[x][y] = (x <= activeCol) ? (x == activeCol ? 15 : 8) : 2;
-    }
-    else if (mode == gateMode)
-    {
-        int activeCol = 0;
-        if (isStepMode)
-        {
-            activeCol = findNearestStepDecayColumn(strip.getStepEnvelopeDecayMs());
-        }
-        else if (processor.getGatePageMode() == MlrVSTAudioProcessor::GatePageMode::Adaptive)
-        {
-            activeCol = findNearestSliceLengthColumn(strip.getLoopSliceLength());
-        }
-        else
-        {
-            activeCol = (strip.getGateAmount() <= 0.01f)
-                ? 15
-                : findNearestColumn(strip.getGateShape(), 0.0f, 1.0f);
+                vol = strip.getVolume();
+
+            const int numLit = static_cast<int>(vol * 16.0f);
+            for (int x = 0; x < 16; ++x)
+                newLedState[x][y] = (x < numLit) ? 12 : 2;
+            break;
         }
 
-        for (int x = 0; x < 16; ++x)
-            newLedState[x][y] = (x <= activeCol) ? (x == activeCol ? 15 : 8) : 2;
+        case grainSizeMode:
+        {
+            const int activeCol = findNearestGrainSizeColumn(strip.getGrainSizeMs());
+            for (int x = 0; x < 16; ++x)
+            {
+                if (x == activeCol)
+                    newLedState[x][y] = 15;
+                else if (x <= activeCol)
+                    newLedState[x][y] = 8;
+                else
+                    newLedState[x][y] = 2;
+            }
+            break;
+        }
+
+        case swingMode:
+        {
+            const int activeCol = findNearestColumn(strip.getSwingAmount(), 0.0f, 1.0f);
+            for (int x = 0; x < 16; ++x)
+                newLedState[x][y] = (x <= activeCol) ? (x == activeCol ? 15 : 8) : 2;
+            break;
+        }
+
+        case gateMode:
+        {
+            int activeCol = 0;
+            if (isStepMode)
+            {
+                activeCol = findNearestStepDecayColumn(strip.getStepEnvelopeDecayMs());
+            }
+            else if (processor.getGatePageMode() == MlrVSTAudioProcessor::GatePageMode::Adaptive)
+            {
+                activeCol = findNearestSliceLengthColumn(strip.getLoopSliceLength());
+            }
+            else
+            {
+                activeCol = (strip.getGateAmount() <= 0.01f)
+                    ? 15
+                    : findNearestColumn(strip.getGateShape(), 0.0f, 1.0f);
+            }
+
+            for (int x = 0; x < 16; ++x)
+                newLedState[x][y] = (x <= activeCol) ? (x == activeCol ? 15 : 8) : 2;
+            break;
+        }
+
+        default:
+            break;
     }
 }
 
@@ -535,87 +517,39 @@ void handleDelayPageButtonPress(MlrVSTAudioProcessor& processor,
                                 int controlRow,
                                 int x)
 {
-    applyDelayPageButtonPressLive(targetStrip, controlRow, x);
-
     const int cx = juce::jlimit(0, 15, x);
     switch (juce::jlimit(0, 5, controlRow))
     {
         case 0:
-        {
-            const float mix = unitFromColumn(cx);
-            setStripParameter(processor, stripIndex, "stripDelayMix", mix);
+            processor.setStripDelayMixControlValue(stripIndex, unitFromColumn(cx));
             break;
-        }
         case 1:
         {
             const bool syncEnabled = targetStrip.isDelaySyncEnabled();
             const float timeValue = syncEnabled ? delayTimeBeatsFromColumn(cx) : delayTimeSecondsFromColumn(cx);
-            setStripParameter(processor, stripIndex, "stripDelayTime", timeValue);
+            processor.setStripDelayTimeControlValue(stripIndex, timeValue);
             break;
         }
         case 2:
-        {
-            const float feedback = 0.97f * unitFromColumn(cx);
-            setStripParameter(processor, stripIndex, "stripDelayFeedback", feedback);
+            processor.setStripDelayFeedbackControlValue(stripIndex, 0.97f * unitFromColumn(cx));
             break;
-        }
         case 3:
-        {
-            const float hz = delayLowCutFromColumn(cx);
-            setStripParameter(processor, stripIndex, "stripDelayLowCut", hz);
+            processor.setStripDelayLowCutControlValue(stripIndex, delayLowCutFromColumn(cx));
             break;
-        }
         case 4:
-        {
-            const float hz = delayHighCutFromColumn(cx);
-            setStripParameter(processor, stripIndex, "stripDelayHighCut", hz);
+            processor.setStripDelayHighCutControlValue(stripIndex, delayHighCutFromColumn(cx));
             break;
-        }
         case 5:
         {
             if (cx <= 2)
-            {
-                setStripParameter(processor, stripIndex, "stripDelayMode", static_cast<float>(cx));
-            }
+                processor.setStripDelayModeControlValue(stripIndex,
+                                                       static_cast<EnhancedAudioStrip::DelayMode>(cx));
             else if (cx >= 12)
-            {
-                const bool syncEnabled = (cx >= 14);
-                setStripBoolParameter(processor, stripIndex, "stripDelaySync", syncEnabled);
-            }
+                processor.setStripDelaySyncEnabledControlValue(stripIndex, cx >= 14);
             break;
         }
         default:
             break;
-    }
-}
-
-void applyDelayPageButtonPressLive(EnhancedAudioStrip& targetStrip,
-                                   int controlRow,
-                                   int x)
-{
-    const int cx = juce::jlimit(0, 15, x);
-    switch (juce::jlimit(0, 5, controlRow))
-    {
-        case 0: targetStrip.setDelayMix(unitFromColumn(cx)); break;
-        case 1:
-        {
-            const bool syncEnabled = targetStrip.isDelaySyncEnabled();
-            const float timeValue = syncEnabled ? delayTimeBeatsFromColumn(cx) : delayTimeSecondsFromColumn(cx);
-            targetStrip.setDelayTimeBeats(timeValue);
-            break;
-        }
-        case 2: targetStrip.setDelayFeedback(0.97f * unitFromColumn(cx)); break;
-        case 3: targetStrip.setDelayLowCutHz(delayLowCutFromColumn(cx)); break;
-        case 4: targetStrip.setDelayHighCutHz(delayHighCutFromColumn(cx)); break;
-        case 5:
-        {
-            if (cx <= 2)
-                targetStrip.setDelayMode(static_cast<EnhancedAudioStrip::DelayMode>(cx));
-            else if (cx >= 12)
-                targetStrip.setDelaySyncEnabled(cx >= 14);
-            break;
-        }
-        default: break;
     }
 }
 

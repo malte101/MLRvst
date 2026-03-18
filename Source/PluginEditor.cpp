@@ -1205,16 +1205,37 @@ void WaveformDisplay::mouseDoubleClick(const juce::MouseEvent& e)
 
 void WaveformDisplay::mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel)
 {
-    if (!hasAudio || !loopInteractionEnabled || std::abs(wheel.deltaY) <= 1.0e-5f)
+    if (!hasAudio || !loopInteractionEnabled)
         return;
 
-    const float cursorNorm = normalizedPositionFromX(static_cast<float>(e.position.x));
-    const float zoomFactor = (wheel.deltaY > 0.0f) ? 0.85f : 1.18f;
-    const float nextSpan = juce::jlimit(1.0f / 64.0f, 1.0f, viewSpanNorm * zoomFactor);
-    const float cursorRatio = juce::jlimit(0.0f, 1.0f,
-                                           (cursorNorm - viewStartNorm) / juce::jmax(1.0e-6f, viewSpanNorm));
-    float nextStart = cursorNorm - (cursorRatio * nextSpan);
-    nextStart = juce::jlimit(0.0f, juce::jmax(0.0f, 1.0f - nextSpan), nextStart);
+    constexpr float epsilon = 1.0e-5f;
+    bool changed = false;
+    float nextSpan = viewSpanNorm;
+    float nextStart = viewStartNorm;
+
+    if (std::abs(wheel.deltaY) > epsilon)
+    {
+        const float cursorNorm = normalizedPositionFromX(static_cast<float>(e.position.x));
+        const float zoomFactor = (wheel.deltaY > 0.0f) ? 0.85f : 1.18f;
+        nextSpan = juce::jlimit(1.0f / 64.0f, 1.0f, nextSpan * zoomFactor);
+        const float cursorRatio = juce::jlimit(0.0f, 1.0f,
+                                               (cursorNorm - nextStart) / juce::jmax(1.0e-6f, viewSpanNorm));
+        nextStart = cursorNorm - (cursorRatio * nextSpan);
+        nextStart = juce::jlimit(0.0f, juce::jmax(0.0f, 1.0f - nextSpan), nextStart);
+        changed = true;
+    }
+
+    if (std::abs(wheel.deltaX) > epsilon && nextSpan < 0.999f)
+    {
+        const float panScale = juce::jmax(0.015f, nextSpan * 0.42f);
+        nextStart = juce::jlimit(0.0f,
+                                 juce::jmax(0.0f, 1.0f - nextSpan),
+                                 nextStart - (wheel.deltaX * panScale));
+        changed = true;
+    }
+
+    if (!changed)
+        return;
 
     viewSpanNorm = nextSpan;
     viewStartNorm = nextStart;
@@ -2087,9 +2108,9 @@ void StripControl::setupComponents()
         {
             if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
             {
-                const float playbackSpeed = PlayheadSpeedQuantizer::grainPlaybackSpeedFromControl(
-                    static_cast<float>(speedSlider.getValue()));
-                strip->setPlaybackSpeed(playbackSpeed);
+                processor.setStripSpeedControlValue(stripIndex,
+                                                    static_cast<float>(speedSlider.getValue()),
+                                                    MlrVSTAudioProcessor::StripControlWriteMode::CacheOnly);
             }
             else
             {
@@ -2099,7 +2120,9 @@ void StripControl::setupComponents()
                     speedSlider.setValue(quantizedRatio, juce::sendNotificationSync);
                     return;
                 }
-                strip->setPlayheadSpeedRatio(quantizedRatio);
+                processor.setStripSpeedControlValue(stripIndex,
+                                                    quantizedRatio,
+                                                    MlrVSTAudioProcessor::StripControlWriteMode::CacheOnly);
             }
         }
     };
@@ -5176,16 +5199,8 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     filterEnableButton.setButtonText("Filter");
     filterEnableButton.setClickingTogglesState(true);
     filterEnableButton.onClick = [this]() {
-        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-        {
-            const bool enabled = filterEnableButton.getToggleState();
-            strip->setFilterEnabled(enabled);
-            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
-            {
-                if (auto* stepSampler = strip->getStepSampler())
-                    stepSampler->setFilterEnabled(enabled);
-            }
-        }
+        processor.setStripFilterEnabledControlValue(stripIndex,
+                                                    filterEnableButton.getToggleState());
     };
     addAndMakeVisible(filterEnableButton);
     
@@ -5204,20 +5219,8 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     enableAltClickReset(filterFreqSlider, 20000.0);
     filterFreqSlider.setTextValueSuffix(" Hz");
     filterFreqSlider.onValueChange = [this]() {
-        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-        {
-            const float frequency = static_cast<float>(filterFreqSlider.getValue());
-            strip->setFilterEnabled(true);
-            strip->setFilterFrequency(frequency);
-            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
-            {
-                if (auto* stepSampler = strip->getStepSampler())
-                {
-                    stepSampler->setFilterEnabled(true);
-                    stepSampler->setFilterFrequency(frequency);
-                }
-            }
-        }
+        processor.setStripFilterFrequencyControlValue(stripIndex,
+                                                      static_cast<float>(filterFreqSlider.getValue()));
     };
     addAndMakeVisible(filterFreqSlider);
     
@@ -5235,20 +5238,8 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     enableAltClickReset(filterResSlider, 0.707);
     filterResSlider.setTextValueSuffix(" Q");
     filterResSlider.onValueChange = [this]() {
-        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-        {
-            const float resonance = static_cast<float>(filterResSlider.getValue());
-            strip->setFilterEnabled(true);
-            strip->setFilterResonance(resonance);
-            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
-            {
-                if (auto* stepSampler = strip->getStepSampler())
-                {
-                    stepSampler->setFilterEnabled(true);
-                    stepSampler->setFilterResonance(resonance);
-                }
-            }
-        }
+        processor.setStripFilterResonanceControlValue(stripIndex,
+                                                      static_cast<float>(filterResSlider.getValue()));
     };
     addAndMakeVisible(filterResSlider);
     
@@ -5281,34 +5272,8 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     };
     filterMorphSlider.onValueChange = [this]()
     {
-        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-        {
-            const float morphValue = static_cast<float>(filterMorphSlider.getValue());
-            strip->setFilterEnabled(true);
-            strip->setFilterMorph(morphValue);
-            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
-            {
-                EnhancedAudioStrip::FilterType stripType = EnhancedAudioStrip::FilterType::LowPass;
-                FilterType stepType = FilterType::LowPass;
-                if (morphValue >= 0.75f)
-                {
-                    stripType = EnhancedAudioStrip::FilterType::HighPass;
-                    stepType = FilterType::HighPass;
-                }
-                else if (morphValue >= 0.25f)
-                {
-                    stripType = EnhancedAudioStrip::FilterType::BandPass;
-                    stepType = FilterType::BandPass;
-                }
-
-                strip->setFilterType(stripType);
-                if (auto* stepSampler = strip->getStepSampler())
-                {
-                    stepSampler->setFilterEnabled(true);
-                    stepSampler->setFilterType(stepType);
-                }
-            }
-        }
+        processor.setStripFilterMorphControlValue(stripIndex,
+                                                  static_cast<float>(filterMorphSlider.getValue()));
     };
     addAndMakeVisible(filterMorphSlider);
 
@@ -5339,18 +5304,14 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
 #endif
     filterAlgoBox.onChange = [this]()
     {
-        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-        {
-            const int id = filterAlgoBox.getSelectedId();
-            auto algo = EnhancedAudioStrip::FilterAlgorithm::Tpt12;
-            if (id == 2) algo = EnhancedAudioStrip::FilterAlgorithm::Tpt24;
-            else if (id == 3) algo = EnhancedAudioStrip::FilterAlgorithm::Ladder12;
-            else if (id == 4) algo = EnhancedAudioStrip::FilterAlgorithm::Ladder24;
-            else if (id == 5) algo = EnhancedAudioStrip::FilterAlgorithm::MoogStilson;
-            else if (id == 6) algo = EnhancedAudioStrip::FilterAlgorithm::MoogHuov;
-            strip->setFilterEnabled(true);
-            strip->setFilterAlgorithm(algo);
-        }
+        const int id = filterAlgoBox.getSelectedId();
+        auto algo = EnhancedAudioStrip::FilterAlgorithm::Tpt12;
+        if (id == 2) algo = EnhancedAudioStrip::FilterAlgorithm::Tpt24;
+        else if (id == 3) algo = EnhancedAudioStrip::FilterAlgorithm::Ladder12;
+        else if (id == 4) algo = EnhancedAudioStrip::FilterAlgorithm::Ladder24;
+        else if (id == 5) algo = EnhancedAudioStrip::FilterAlgorithm::MoogStilson;
+        else if (id == 6) algo = EnhancedAudioStrip::FilterAlgorithm::MoogHuov;
+        processor.setStripFilterAlgorithmControlValue(stripIndex, algo);
     };
     addAndMakeVisible(filterAlgoBox);
 
@@ -6773,6 +6734,88 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
             processor.markPersistentGlobalUserChange();
     };
 
+    transientMethodLabel.setText("Transients", juce::dontSendNotification);
+    transientMethodLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(transientMethodLabel);
+
+    transientMethodBox.addItem("Hybrid", 1);
+    transientMethodBox.addItem("HFC", 2);
+    transientMethodBox.addItem("Flux", 3);
+    transientMethodBox.setTooltip("Transient onset detector family. Hybrid blends HFC and spectral flux, HFC favors drums, Flux favors broader attacks.");
+    styleUiCombo(transientMethodBox);
+    addAndMakeVisible(transientMethodBox);
+    transientMethodAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "transientOnsetMethod", transientMethodBox);
+    transientMethodBox.onChange = [this]()
+    {
+        processor.syncTransientDetectionSettingsFromParameters(true);
+        if (globalUiReady)
+            processor.markPersistentGlobalUserChange();
+    };
+
+    transientSensitivityLabel.setText("Sens", juce::dontSendNotification);
+    transientSensitivityLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(transientSensitivityLabel);
+
+    transientSensitivityBox.addItem("VLow", 1);
+    transientSensitivityBox.addItem("Low", 2);
+    transientSensitivityBox.addItem("Norm", 3);
+    transientSensitivityBox.addItem("High", 4);
+    transientSensitivityBox.addItem("VHigh", 5);
+    transientSensitivityBox.setTooltip("How easily attacks are detected. Higher values find more transients and quieter hits.");
+    styleUiCombo(transientSensitivityBox);
+    addAndMakeVisible(transientSensitivityBox);
+    transientSensitivityAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "transientSensitivity", transientSensitivityBox);
+    transientSensitivityBox.onChange = [this]()
+    {
+        processor.syncTransientDetectionSettingsFromParameters(true);
+        if (globalUiReady)
+            processor.markPersistentGlobalUserChange();
+    };
+
+    transientSnapLabel.setText("Snap", juce::dontSendNotification);
+    transientSnapLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(transientSnapLabel);
+
+    transientSnapBox.addItem("Soft", 1);
+    transientSnapBox.addItem("Loose", 2);
+    transientSnapBox.addItem("Norm", 3);
+    transientSnapBox.addItem("Tight", 4);
+    transientSnapBox.addItem("Exact", 5);
+    transientSnapBox.setTooltip("How aggressively slice markers pull onto the attack start once an onset is found.");
+    styleUiCombo(transientSnapBox);
+    addAndMakeVisible(transientSnapBox);
+    transientSnapAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "transientSnap", transientSnapBox);
+    transientSnapBox.onChange = [this]()
+    {
+        processor.syncTransientDetectionSettingsFromParameters(true);
+        if (globalUiReady)
+            processor.markPersistentGlobalUserChange();
+    };
+
+    transientSpacingLabel.setText("Space", juce::dontSendNotification);
+    transientSpacingLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(transientSpacingLabel);
+
+    transientSpacingBox.addItem("Tight", 1);
+    transientSpacingBox.addItem("Close", 2);
+    transientSpacingBox.addItem("Norm", 3);
+    transientSpacingBox.addItem("Wide", 4);
+    transientSpacingBox.addItem("Wider", 5);
+    transientSpacingBox.setTooltip("Minimum spacing between transient slices. Wider avoids clustering, tighter allows closer markers.");
+    styleUiCombo(transientSpacingBox);
+    addAndMakeVisible(transientSpacingBox);
+    transientSpacingAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "transientSpacing", transientSpacingBox);
+    transientSpacingBox.onChange = [this]()
+    {
+        processor.syncTransientDetectionSettingsFromParameters(true);
+        if (globalUiReady)
+            processor.markPersistentGlobalUserChange();
+    };
+
     continuousTraversalToggle.setButtonText("Full Slices");
     continuousTraversalToggle.setClickingTogglesState(true);
     continuousTraversalToggle.setTooltip("On keeps high speeds moving through every slice. Off restores the older skip-style traversal.");
@@ -7461,6 +7504,8 @@ void GlobalControlPanel::resized()
     auto policyRow = comboArea.removeFromTop(comboRowHeight);
     comboArea.removeFromTop(rowGap);
     auto musicalRow = comboArea.removeFromTop(comboRowHeight);
+    comboArea.removeFromTop(rowGap);
+    auto transientRow = comboArea.removeFromTop(comboRowHeight);
 
     auto measureLabelWidth = [](juce::Label& label)
     {
@@ -7509,6 +7554,27 @@ void GlobalControlPanel::resized()
                            globalScaleLabel, globalScaleBox, column2LabelWidth, column2BoxWidth);
     layoutAlignedComboCell({ column3.getX(), musicalRow.getY(), column3.getWidth(), musicalRow.getHeight() },
                            qualityLabel, resamplingQualityBox, column3LabelWidth, column3BoxWidth);
+
+    auto transientCells = transientRow;
+    const int transientGap = 6;
+    const int transientCellWidth = juce::jmax(76, (transientCells.getWidth() - (transientGap * 3)) / 4);
+    auto transientCell1 = transientCells.removeFromLeft(transientCellWidth);
+    transientCells.removeFromLeft(transientGap);
+    auto transientCell2 = transientCells.removeFromLeft(transientCellWidth);
+    transientCells.removeFromLeft(transientGap);
+    auto transientCell3 = transientCells.removeFromLeft(transientCellWidth);
+    transientCells.removeFromLeft(transientGap);
+    auto transientCell4 = transientCells;
+
+    const int transientMethodLabelWidth = measureLabelWidth(transientMethodLabel);
+    const int transientSensitivityLabelWidth = measureLabelWidth(transientSensitivityLabel);
+    const int transientSnapLabelWidth = measureLabelWidth(transientSnapLabel);
+    const int transientSpacingLabelWidth = measureLabelWidth(transientSpacingLabel);
+
+    layoutAlignedComboCell(transientCell1, transientMethodLabel, transientMethodBox, transientMethodLabelWidth, 74);
+    layoutAlignedComboCell(transientCell2, transientSensitivityLabel, transientSensitivityBox, transientSensitivityLabelWidth, 72);
+    layoutAlignedComboCell(transientCell3, transientSnapLabel, transientSnapBox, transientSnapLabelWidth, 72);
+    layoutAlignedComboCell(transientCell4, transientSpacingLabel, transientSpacingBox, transientSpacingLabelWidth, 72);
 }
 
 void GlobalControlPanel::updateMeters(float leftLevel, float rightLevel)

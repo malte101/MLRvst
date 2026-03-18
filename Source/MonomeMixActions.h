@@ -39,9 +39,6 @@ void handleDelayPageButtonPress(MlrVSTAudioProcessor& processor,
                                 int stripIndex,
                                 int controlRow,
                                 int x);
-void applyDelayPageButtonPressLive(EnhancedAudioStrip& targetStrip,
-                                   int controlRow,
-                                   int x);
 
 void renderDelayPageRow(const EnhancedAudioStrip& targetStrip,
                         int controlRow,

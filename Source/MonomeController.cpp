@@ -11,6 +11,7 @@
 namespace
 {
 constexpr int kMonomeModCycleColumn = 15;
+constexpr float kScratchZeroEpsilon = 1.0e-6f;
 
 double stutterDivisionBeatsFromButton(int x)
 {
@@ -128,9 +129,9 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
     {
         outPpq = audioEngine ? audioEngine->getTimelineBeat() : 0.0;
         outTempo = audioEngine ? juce::jmax(1.0, audioEngine->getCurrentTempo()) : 120.0;
-        if (auto* playHead = getPlayHead())
+        if (auto* hostPlayHead = getPlayHead())
         {
-            if (auto position = playHead->getPosition())
+            if (auto position = hostPlayHead->getPosition())
             {
                 if (position->getPpqPosition().hasValue())
                     outPpq = *position->getPpqPosition();
@@ -261,9 +262,9 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
 
     double currentPpq = audioEngine->getTimelineBeat();
     double tempoNow = juce::jmax(1.0, audioEngine->getCurrentTempo());
-    if (auto* playHead = getPlayHead())
+    if (auto* hostPlayHead = getPlayHead())
     {
-        if (auto position = playHead->getPosition())
+        if (auto position = hostPlayHead->getPosition())
         {
             if (position->getPpqPosition().hasValue())
                 currentPpq = *position->getPpqPosition();
@@ -1299,7 +1300,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     && loopSetFirstButton >= 0
                     && loopSetStrip == stripIndex
                     && strip->isButtonHeld(loopSetFirstButton)
-                    && strip->getScratchAmount() == 0.0f)
+                    && std::abs(strip->getScratchAmount()) <= kScratchZeroEpsilon)
                 {
                     const int firstButton = juce::jlimit(0, MaxColumns - 1, loopSetFirstButton);
                     const int secondButton = juce::jlimit(0, MaxColumns - 1, x);
@@ -1344,86 +1345,100 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 // Control modes - adjust parameters
                 else if (controlModeActive && currentControlMode != ControlMode::Normal)
                 {
-                    if (currentControlMode == ControlMode::Speed)
+                    auto handleSimpleMixControlPress = [&]()
                     {
                         MonomeMixActions::handleButtonPress(*this, *strip, stripIndex, x, static_cast<int>(currentControlMode));
                         recordMonomeControlPatternEvent(currentControlMode, stripIndex, -1, x);
-                    }
-                    else if (currentControlMode == ControlMode::Pitch)
+                    };
+
+                    switch (currentControlMode)
                     {
-                        MonomeMixActions::handleButtonPress(*this, *strip, stripIndex, x, static_cast<int>(currentControlMode));
-                        recordMonomeControlPatternEvent(currentControlMode, stripIndex, -1, x);
-                    }
-                    else if (currentControlMode == ControlMode::Pan)
-                    {
-                        MonomeMixActions::handleButtonPress(*this, *strip, stripIndex, x, static_cast<int>(currentControlMode));
-                        recordMonomeControlPatternEvent(currentControlMode, stripIndex, -1, x);
-                    }
-                    else if (currentControlMode == ControlMode::Volume)
-                    {
-                        MonomeMixActions::handleButtonPress(*this, *strip, stripIndex, x, static_cast<int>(currentControlMode));
-                        recordMonomeControlPatternEvent(currentControlMode, stripIndex, -1, x);
-                    }
-                    else if (currentControlMode == ControlMode::Swing)
-                    {
-                        MonomeMixActions::handleButtonPress(*this, *strip, stripIndex, x, static_cast<int>(currentControlMode));
-                        recordMonomeControlPatternEvent(currentControlMode, stripIndex, -1, x);
-                    }
-                    else if (currentControlMode == ControlMode::Gate)
-                    {
-                        MonomeMixActions::handleButtonPress(*this, *strip, stripIndex, x, static_cast<int>(currentControlMode));
-                        recordMonomeControlPatternEvent(currentControlMode, stripIndex, -1, x);
-                    }
-                    else if (currentControlMode == ControlMode::GrainSize)
-                    {
-                        const int targetStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
-                        if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
+                        case ControlMode::Speed:
+                        case ControlMode::Pitch:
+                        case ControlMode::Pan:
+                        case ControlMode::Volume:
+                        case ControlMode::Swing:
+                        case ControlMode::Gate:
+                            handleSimpleMixControlPress();
+                            break;
+
+                        case ControlMode::GrainSize:
                         {
-                            MonomeMixActions::handleGrainPageButtonPress(*targetStrip, stripIndex, x);
-                            recordMonomeControlPatternEvent(currentControlMode, targetStripIndex, stripIndex, x);
+                            const int targetStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
+                            if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
+                            {
+                                MonomeMixActions::handleGrainPageButtonPress(*targetStrip, stripIndex, x);
+                                recordMonomeControlPatternEvent(currentControlMode, targetStripIndex, stripIndex, x);
+                            }
+                            break;
                         }
-                    }
-                    else if (currentControlMode == ControlMode::Filter)
-                    {
-                        MonomeFilterActions::handleButtonPress(*strip, x, static_cast<int>(filterSubPage));
-                        recordMonomeControlPatternEvent(currentControlMode, stripIndex, static_cast<int>(filterSubPage), x);
-                    }
-                    else if (currentControlMode == ControlMode::Delay)
-                    {
-                        const int targetStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
-                        if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
+
+                        case ControlMode::Filter:
+                            if (filterSubPage == FilterSubPage::Frequency)
+                            {
+                                const float t = juce::jlimit(0.0f, 1.0f, x / 15.0f);
+                                setStripFilterFrequencyControlValue(stripIndex,
+                                                                    20.0f * std::pow(1000.0f, t));
+                            }
+                            else if (filterSubPage == FilterSubPage::Resonance)
+                            {
+                                setStripFilterResonanceControlValue(stripIndex,
+                                                                    0.1f + (x / 15.0f) * 9.9f);
+                            }
+                            else if (filterSubPage == FilterSubPage::Type && x <= 2)
+                            {
+                                const float morph = (x == 0) ? 0.0f : (x == 1 ? 0.5f : 1.0f);
+                                setStripFilterMorphControlValue(stripIndex, morph);
+                            }
+                            recordMonomeControlPatternEvent(currentControlMode, stripIndex, static_cast<int>(filterSubPage), x);
+                            break;
+
+                        case ControlMode::Delay:
                         {
-                            MonomeMixActions::handleDelayPageButtonPress(*this, *targetStrip, targetStripIndex, stripIndex, x);
-                            recordMonomeControlPatternEvent(currentControlMode, targetStripIndex, stripIndex, x);
+                            const int targetStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
+                            if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
+                            {
+                                MonomeMixActions::handleDelayPageButtonPress(*this, *targetStrip, targetStripIndex, stripIndex, x);
+                                recordMonomeControlPatternEvent(currentControlMode, targetStripIndex, stripIndex, x);
+                            }
+                            break;
                         }
-                    }
-                    else if (currentControlMode == ControlMode::FileBrowser)
-                    {
-                        MonomeFileBrowserActions::handleButtonPress(*this, *strip, stripIndex, x);
-                    }
-                    else if (currentControlMode == ControlMode::GroupAssign)
-                    {
-                        if (MonomeGroupAssignActions::handleButtonPress(*audioEngine, stripIndex, x))
+
+                        case ControlMode::FileBrowser:
+                            MonomeFileBrowserActions::handleButtonPress(*this, *strip, stripIndex, x);
+                            break;
+
+                        case ControlMode::GroupAssign:
+                            if (MonomeGroupAssignActions::handleButtonPress(*audioEngine, stripIndex, x))
+                                updateMonomeLEDs();
+                            break;
+
+                        case ControlMode::Modulation:
+                        {
+                            const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
+                            syncMonomeModEditPageToPlayback(*audioEngine, targetStrip);
+                            const bool bipolar = audioEngine->isModBipolar(targetStrip);
+                            const bool rearrangeTarget = (audioEngine->getModTarget(targetStrip) == ModernAudioEngine::ModTarget::Rearrange);
+                            const float normalizedY = modulationRowToUnitForColumn(y, x);
+                            float value = normalizedY;
+                            if (bipolar)
+                            {
+                                // In bipolar mode, center row maps to 0.5 and extremes map to 0/1.
+                                const float signedValue = (normalizedY * 2.0f) - 1.0f;
+                                value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
+                            }
+                            if (rearrangeTarget)
+                                value = quantizeMonomeRearrangeValue(value);
+                            audioEngine->setModStepValue(targetStrip, x, value);
                             updateMonomeLEDs();
-                    }
-                    else if (currentControlMode == ControlMode::Modulation)
-                    {
-                        const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
-                        syncMonomeModEditPageToPlayback(*audioEngine, targetStrip);
-                        const bool bipolar = audioEngine->isModBipolar(targetStrip);
-                        const bool rearrangeTarget = (audioEngine->getModTarget(targetStrip) == ModernAudioEngine::ModTarget::Rearrange);
-                        const float normalizedY = modulationRowToUnitForColumn(y, x);
-                        float value = normalizedY;
-                        if (bipolar)
-                        {
-                            // In bipolar mode, center row maps to 0.5 and extremes map to 0/1.
-                            const float signedValue = (normalizedY * 2.0f) - 1.0f;
-                            value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
+                            break;
                         }
-                        if (rearrangeTarget)
-                            value = quantizeMonomeRearrangeValue(value);
-                        audioEngine->setModStepValue(targetStrip, x, value);
-                        updateMonomeLEDs();
+
+                        case ControlMode::Normal:
+                        case ControlMode::Preset:
+                        case ControlMode::StepEdit:
+                        default:
+                            break;
                     }
                 }
                 else
@@ -2295,27 +2310,15 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
         
         // Different displays per mode - ONLY when control button is HELD
-        if (controlModeActive && currentControlMode == ControlMode::Speed)
-        {
-            MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
-        }
-        else if (controlModeActive && currentControlMode == ControlMode::Pitch)
-        {
-            MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
-        }
-        else if (controlModeActive && currentControlMode == ControlMode::Pan)
-        {
-            MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
-        }
-        else if (controlModeActive && currentControlMode == ControlMode::Volume)
-        {
-            MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
-        }
-        else if (controlModeActive && currentControlMode == ControlMode::Swing)
-        {
-            MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
-        }
-        else if (controlModeActive && currentControlMode == ControlMode::Gate)
+        const bool simpleMixRenderMode = controlModeActive && (
+            currentControlMode == ControlMode::Speed
+            || currentControlMode == ControlMode::Pitch
+            || currentControlMode == ControlMode::Pan
+            || currentControlMode == ControlMode::Volume
+            || currentControlMode == ControlMode::Swing
+            || currentControlMode == ControlMode::Gate);
+
+        if (simpleMixRenderMode)
         {
             MonomeMixActions::renderRow(*strip, *this, y, newLedState, static_cast<int>(currentControlMode));
         }

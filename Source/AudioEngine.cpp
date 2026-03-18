@@ -34,12 +34,56 @@ constexpr float kGrainMinSizeMs = 5.0f;
 constexpr float kGrainMaxSizeMs = 2400.0f;
 constexpr float kGrainMinDensity = 0.05f;
 constexpr float kGrainMaxDensity = 0.9f;
+constexpr float kSincZeroEpsilon = 1.0e-6f;
 constexpr int kModScaleSize = 12;
 constexpr std::array<int, kModScaleSize> kScaleChromatic{{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}};
 constexpr std::array<int, 7> kScaleMajor{{0, 2, 4, 5, 7, 9, 11}};
 constexpr std::array<int, 7> kScaleMinor{{0, 2, 3, 5, 7, 8, 10}};
 constexpr std::array<int, 7> kScaleDorian{{0, 2, 3, 5, 7, 9, 10}};
 constexpr std::array<int, 5> kScalePentMinor{{0, 3, 5, 7, 10}};
+enum class TransientOnsetMethod
+{
+    Hybrid = 0,
+    Hfc,
+    SpecFlux
+};
+std::atomic<int> gTransientOnsetMethodChoice{static_cast<int>(TransientOnsetMethod::Hybrid)};
+std::atomic<int> gTransientSensitivityChoice{2};
+std::atomic<int> gTransientSnapChoice{2};
+std::atomic<int> gTransientSpacingChoice{2};
+
+TransientOnsetMethod sanitizedTransientOnsetMethodChoice(int rawChoice) noexcept
+{
+    return static_cast<TransientOnsetMethod>(juce::jlimit(0,
+                                                          static_cast<int>(TransientOnsetMethod::SpecFlux),
+                                                          rawChoice));
+}
+
+float transientChoiceToNormalized01(int rawChoice) noexcept
+{
+    return juce::jlimit(0.0f, 1.0f, static_cast<float>(juce::jlimit(0, 4, rawChoice)) / 4.0f);
+}
+
+float configuredTransientSensitivity01() noexcept
+{
+    return transientChoiceToNormalized01(gTransientSensitivityChoice.load(std::memory_order_acquire));
+}
+
+float configuredTransientSnap01() noexcept
+{
+    return transientChoiceToNormalized01(gTransientSnapChoice.load(std::memory_order_acquire));
+}
+
+float configuredTransientSpacingScale() noexcept
+{
+    static constexpr std::array<float, 5> kSpacingScales{{0.70f, 0.85f, 1.0f, 1.2f, 1.4f}};
+    return kSpacingScales[static_cast<size_t>(juce::jlimit(0, 4, gTransientSpacingChoice.load(std::memory_order_acquire)))];
+}
+
+TransientOnsetMethod configuredTransientOnsetMethod() noexcept
+{
+    return sanitizedTransientOnsetMethodChoice(gTransientOnsetMethodChoice.load(std::memory_order_acquire));
+}
 
 float pitchSmoothingSecondsForAlgorithm(EnhancedAudioStrip::PitchShiftAlgorithm algorithm) noexcept
 {
@@ -249,11 +293,20 @@ std::vector<int> refineOnsetSamplesToLeadingEdges(const std::vector<float>& mono
     std::vector<double> absolutePrefixSum(static_cast<size_t>(totalSamples) + 1u, 0.0);
     for (int i = 0; i < totalSamples; ++i)
         absolutePrefixSum[static_cast<size_t>(i) + 1u] = absolutePrefixSum[static_cast<size_t>(i)] + std::abs(monoSamples[static_cast<size_t>(i)]);
+    const float snap01 = configuredTransientSnap01();
 
-    const int searchBehind = juce::jlimit(24, juce::jmax(24, totalSamples / 256), frameSize / 2);
-    const int searchAhead = juce::jlimit(8, juce::jmax(8, totalSamples / 1024), juce::jmax(8, hopSize / 3));
-    const int lookBehind = juce::jlimit(3, juce::jmax(3, totalSamples / 4096), juce::jmax(4, hopSize / 8));
-    const int lookAhead = juce::jlimit(6, juce::jmax(6, totalSamples / 2048), juce::jmax(6, hopSize / 5));
+    const int envelopeRadius = juce::jmax(2, juce::jmin(32, juce::jmax(4, hopSize / 12)));
+    std::vector<float> amplitudeEnvelope(static_cast<size_t>(totalSamples), 0.0f);
+    for (int i = 0; i < totalSamples; ++i)
+    {
+        amplitudeEnvelope[static_cast<size_t>(i)] = static_cast<float>(
+            meanAbsoluteLevelInRange(absolutePrefixSum, i - envelopeRadius, i + envelopeRadius + 1));
+    }
+
+    const int searchBehind = juce::jmax(48, juce::jmin(frameSize, juce::jmax(frameSize * 3 / 4, hopSize * 5)));
+    const int searchAhead = juce::jmax(12, juce::jmin(frameSize / 2, juce::jmax(hopSize, frameSize / 6)));
+    const int lookBehind = juce::jmax(4, juce::jmin(32, juce::jmax(6, hopSize / 6)));
+    const int lookAhead = juce::jmax(8, juce::jmin(48, juce::jmax(10, hopSize / 3)));
 
     refined.reserve(onsetSamples.size());
     for (const auto onsetSample : onsetSamples)
@@ -273,16 +326,30 @@ std::vector<int> refineOnsetSamplesToLeadingEdges(const std::vector<float>& mono
 
         for (int sampleIndex = searchStart; sampleIndex <= searchEnd; ++sampleIndex)
         {
-            const double levelBefore = meanAbsoluteLevelInRange(absolutePrefixSum, sampleIndex - lookBehind, sampleIndex);
-            const double levelAfter = meanAbsoluteLevelInRange(absolutePrefixSum, sampleIndex, sampleIndex + lookAhead);
-            const double levelRise = juce::jmax(0.0, levelAfter - levelBefore);
-            const double attackStep = std::abs(monoSamples[static_cast<size_t>(sampleIndex)] - monoSamples[static_cast<size_t>(sampleIndex - 1)])
-                + (0.5 * std::abs(monoSamples[static_cast<size_t>(sampleIndex + 1)] - monoSamples[static_cast<size_t>(sampleIndex)]));
+            const double levelBefore = amplitudeEnvelope[static_cast<size_t>(juce::jmax(0, sampleIndex - 1))];
+            const double levelNow = amplitudeEnvelope[static_cast<size_t>(sampleIndex)];
+            const double levelAfter = amplitudeEnvelope[static_cast<size_t>(juce::jmin(totalSamples - 1, sampleIndex + 1))];
+            const double levelRise = juce::jmax(0.0, levelNow - levelBefore)
+                + (0.75 * juce::jmax(0.0, levelAfter - levelNow));
+            const double macroRise = juce::jmax(0.0,
+                                                meanAbsoluteLevelInRange(absolutePrefixSum, sampleIndex, sampleIndex + lookAhead)
+                                                    - meanAbsoluteLevelInRange(absolutePrefixSum, sampleIndex - lookBehind, sampleIndex));
+            const double absPrev = std::abs(monoSamples[static_cast<size_t>(sampleIndex - 1)]);
+            const double absNow = std::abs(monoSamples[static_cast<size_t>(sampleIndex)]);
+            const double absNext = std::abs(monoSamples[static_cast<size_t>(sampleIndex + 1)]);
+            const double attackStep = juce::jmax(0.0, absNow - absPrev)
+                + (0.8 * juce::jmax(0.0, absNext - absNow));
+            const double slopeMagnitude = std::abs(monoSamples[static_cast<size_t>(sampleIndex + 1)]
+                                                   - monoSamples[static_cast<size_t>(sampleIndex - 1)]);
             const int delta = sampleIndex - center;
             const double proximityPenalty = delta > 0
-                ? 0.0030 * static_cast<double>(delta)
-                : 0.00045 * static_cast<double>(-delta);
-            const double score = (levelRise * 8.0) + (attackStep * 2.0) - proximityPenalty;
+                ? 0.0011 * static_cast<double>(delta)
+                : 0.00018 * static_cast<double>(-delta);
+            const double score = (levelRise * 18.0)
+                + (macroRise * 8.0)
+                + (attackStep * 3.4)
+                + (slopeMagnitude * 1.25)
+                - proximityPenalty;
             scores[static_cast<size_t>(sampleIndex - searchStart)] = score;
 
             if (score > bestScore)
@@ -295,11 +362,39 @@ std::vector<int> refineOnsetSamplesToLeadingEdges(const std::vector<float>& mono
         int refinedIndex = bestIndex;
         if (bestScore > 0.0)
         {
-            const double threshold = bestScore * 0.58;
-            for (int sampleIndex = searchStart; sampleIndex <= bestIndex; ++sampleIndex)
+            const int anchorSearchStart = juce::jmax(searchStart, bestIndex - juce::jmax(12, lookBehind * 6));
+            const int anchorSearchEnd = juce::jmin(searchEnd, bestIndex + juce::jmax(8, lookAhead * 3));
+            int localPeakIndex = bestIndex;
+            float localPeakLevel = amplitudeEnvelope[static_cast<size_t>(bestIndex)];
+            for (int sampleIndex = bestIndex; sampleIndex <= anchorSearchEnd; ++sampleIndex)
             {
-                const double score = scores[static_cast<size_t>(sampleIndex - searchStart)];
-                if (score >= threshold)
+                const float level = amplitudeEnvelope[static_cast<size_t>(sampleIndex)];
+                if (level > localPeakLevel)
+                {
+                    localPeakLevel = level;
+                    localPeakIndex = sampleIndex;
+                }
+            }
+
+            const double localNoiseFloor = meanAbsoluteLevelInRange(absolutePrefixSum,
+                                                                    anchorSearchStart - juce::jmax(8, lookBehind * 5),
+                                                                    anchorSearchStart + 1);
+            const double triggerLevel = juce::jmax(localNoiseFloor + ((static_cast<double>(localPeakLevel) - localNoiseFloor)
+                                                                      * static_cast<double>(juce::jmap(snap01, 0.20f, 0.06f))),
+                                                   localNoiseFloor * static_cast<double>(juce::jmap(snap01, 1.70f, 1.10f)));
+
+            for (int sampleIndex = anchorSearchStart + 1; sampleIndex <= localPeakIndex; ++sampleIndex)
+            {
+                const double previousAbs = amplitudeEnvelope[static_cast<size_t>(sampleIndex - 1)];
+                const double currentAbs = amplitudeEnvelope[static_cast<size_t>(sampleIndex)];
+                const double nextAbs = amplitudeEnvelope[static_cast<size_t>(juce::jmin(totalSamples - 1, sampleIndex + 1))];
+                const double currentScore = scores[static_cast<size_t>(sampleIndex - searchStart)];
+                const bool thresholdCrossed = previousAbs < triggerLevel && currentAbs >= triggerLevel;
+                const bool strongAttackPoint = currentScore >= (bestScore * static_cast<double>(juce::jmap(snap01, 0.44f, 0.62f)))
+                    && currentAbs >= previousAbs
+                    && nextAbs >= currentAbs * static_cast<double>(juce::jmap(snap01, 0.92f, 0.985f));
+
+                if (thresholdCrossed && strongAttackPoint)
                 {
                     refinedIndex = sampleIndex;
                     break;
@@ -714,8 +809,8 @@ float Resampler::sincInterpolate(const float* data, int length, double position,
         if (index < 0 || index >= length)
             continue;
         
-        float x = juce::MathConstants<float>::pi * (frac - i);
-        float sinc = (x == 0.0f) ? 1.0f : std::sin(x) / x;
+        const float x = juce::MathConstants<float>::pi * (frac - i);
+        const float sinc = (std::abs(x) <= kSincZeroEpsilon) ? 1.0f : std::sin(x) / x;
         
         // Hamming window
         const float phase = static_cast<float>(i) / static_cast<float>(windowSize);
@@ -2069,6 +2164,20 @@ void EnhancedAudioStrip::setTransientSliceMode(bool enabled)
 #endif
 }
 
+void EnhancedAudioStrip::refreshTransientSliceMap()
+{
+    juce::ScopedLock lock(bufferLock);
+    transientSliceMapDirty = true;
+    if (sampleBuffer.getNumSamples() > 0)
+        rebuildTransientSliceMap();
+}
+
+void EnhancedAudioStrip::markTransientSliceMapDirty()
+{
+    juce::ScopedLock lock(bufferLock);
+    transientSliceMapDirty = true;
+}
+
 std::array<int, 16> EnhancedAudioStrip::getSliceStartSamples(bool transientMode) const
 {
     std::array<int, 16> out{};
@@ -2104,7 +2213,9 @@ int EnhancedAudioStrip::getTransientSliceMinimumSpacingSamples(int totalSamples)
         : juce::jmax(1.0, currentSampleRate);
     const int averageSliceSpacing = juce::jmax(1, totalSamples / juce::jmax(1, ModernAudioEngine::MaxColumns));
     const int timeFloor = juce::jmax(16, static_cast<int>(std::round(analysisRate * 0.008)));
-    return juce::jmin(juce::jmax(1, averageSliceSpacing / 2), juce::jmax(timeFloor, averageSliceSpacing / 5));
+    const int baseSpacing = juce::jmin(juce::jmax(1, averageSliceSpacing / 2), juce::jmax(timeFloor, averageSliceSpacing / 5));
+    return juce::jlimit(1, juce::jmax(1, totalSamples - 1),
+                        static_cast<int>(std::round(static_cast<float>(baseSpacing) * configuredTransientSpacingScale())));
 }
 
 void EnhancedAudioStrip::commitTransientSlicePositionsLocked(const std::array<int, 16>& positions)
@@ -2229,6 +2340,7 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
     std::vector<float> fftData(static_cast<size_t>(2 * frameSize), 0.0f);
     std::vector<float> prevMag(static_cast<size_t>(halfBins), 0.0f);
     std::vector<float> spectralFlux(static_cast<size_t>(frames), 0.0f);
+    std::vector<float> highFrequencyContent(static_cast<size_t>(frames), 0.0f);
     std::vector<float> frameEnergy(static_cast<size_t>(frames), 0.0f);
     std::vector<float> monoSamples(static_cast<size_t>(totalSamples), 0.0f);
 
@@ -2262,28 +2374,38 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
         frameEnergy[static_cast<size_t>(frame)] = static_cast<float>(std::sqrt(energy / static_cast<double>(frameSize)));
 
         float flux = 0.0f;
+        float hfc = 0.0f;
         for (int bin = 1; bin < halfBins; ++bin)
         {
             const float mag = fftData[static_cast<size_t>(bin)];
             const float diff = juce::jmax(0.0f, mag - prevMag[static_cast<size_t>(bin)]);
             const float weight = 1.0f + (2.0f * static_cast<float>(bin) / static_cast<float>(halfBins));
             flux += diff * weight;
+            hfc += mag * weight * (1.0f + (3.0f * static_cast<float>(bin) / static_cast<float>(halfBins)));
             prevMag[static_cast<size_t>(bin)] = mag;
         }
 
         spectralFlux[static_cast<size_t>(frame)] = flux;
+        highFrequencyContent[static_cast<size_t>(frame)] = hfc;
     }
 
-    std::vector<float> smoothedFlux(static_cast<size_t>(frames), 0.0f);
-    for (int i = 0; i < frames; ++i)
+    auto smoothFrameSeries = [frames](const std::vector<float>& source)
     {
-        const int a = juce::jmax(0, i - 1);
-        const int b = juce::jmin(frames - 1, i + 1);
-        float sum = 0.0f;
-        for (int k = a; k <= b; ++k)
-            sum += spectralFlux[static_cast<size_t>(k)];
-        smoothedFlux[static_cast<size_t>(i)] = sum / static_cast<float>(b - a + 1);
-    }
+        std::vector<float> smoothed(static_cast<size_t>(frames), 0.0f);
+        for (int i = 0; i < frames; ++i)
+        {
+            const int a = juce::jmax(0, i - 1);
+            const int b = juce::jmin(frames - 1, i + 1);
+            float sum = 0.0f;
+            for (int k = a; k <= b; ++k)
+                sum += source[static_cast<size_t>(k)];
+            smoothed[static_cast<size_t>(i)] = sum / static_cast<float>(b - a + 1);
+        }
+        return smoothed;
+    };
+
+    const std::vector<float> smoothedFlux = smoothFrameSeries(spectralFlux);
+    const std::vector<float> smoothedHfc = smoothFrameSeries(highFrequencyContent);
 
     std::vector<float> energyDiff(static_cast<size_t>(frames), 0.0f);
     for (int i = 1; i < frames; ++i)
@@ -2300,48 +2422,119 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
         return *midIt;
     };
 
-    std::vector<float> novelty(static_cast<size_t>(frames), 0.0f);
-    float noveltySum = 0.0f;
-    for (int i = 0; i < frames; ++i)
+    auto buildAdaptiveNovelty = [&](const std::vector<float>& series,
+                                    float adaptiveScale,
+                                    float energyWeight)
     {
-        const int a = juce::jmax(0, i - 8);
-        const int b = juce::jmin(frames - 1, i + 8);
-        const float adaptive = (medianInWindow(smoothedFlux, a, b) * 1.25f) + 1.0e-6f;
-        const float peakPart = juce::jmax(0.0f, smoothedFlux[static_cast<size_t>(i)] - adaptive);
-        const float mixed = peakPart + (0.25f * energyDiff[static_cast<size_t>(i)]);
-        novelty[static_cast<size_t>(i)] = mixed;
-        noveltySum += mixed;
-    }
+        std::vector<float> novelty(static_cast<size_t>(frames), 0.0f);
+        for (int i = 0; i < frames; ++i)
+        {
+            const int a = juce::jmax(0, i - 8);
+            const int b = juce::jmin(frames - 1, i + 8);
+            const float adaptive = (medianInWindow(series, a, b) * adaptiveScale) + 1.0e-6f;
+            const float peakPart = juce::jmax(0.0f, series[static_cast<size_t>(i)] - adaptive);
+            novelty[static_cast<size_t>(i)] = peakPart + (energyWeight * energyDiff[static_cast<size_t>(i)]);
+        }
+        return novelty;
+    };
 
-    const float noveltyMean = noveltySum / static_cast<float>(juce::jmax(1, frames));
-    const float noveltyMax = *std::max_element(novelty.begin(), novelty.end());
-    const float minPeakLevel = juce::jmax(1.0e-6f,
-                                          juce::jmax(noveltyMean * 0.35f, noveltyMax * 0.10f));
+    auto normalizeNovelty = [](const std::vector<float>& values)
+    {
+        std::vector<float> normalized(values.size(), 0.0f);
+        if (values.empty())
+            return normalized;
+
+        const auto [minIt, maxIt] = std::minmax_element(values.begin(), values.end());
+        const float minValue = *minIt;
+        const float maxValue = *maxIt;
+        const float range = juce::jmax(1.0e-6f, maxValue - minValue);
+        for (size_t i = 0; i < values.size(); ++i)
+            normalized[i] = juce::jlimit(0.0f, 1.0f, (values[i] - minValue) / range);
+        return normalized;
+    };
+
+    const std::vector<float> specFluxNovelty = buildAdaptiveNovelty(smoothedFlux, 1.25f, 0.25f);
+    const std::vector<float> hfcNovelty = buildAdaptiveNovelty(smoothedHfc, 1.18f, 0.18f);
+    const std::vector<float> normalizedFluxNovelty = normalizeNovelty(specFluxNovelty);
+    const std::vector<float> normalizedHfcNovelty = normalizeNovelty(hfcNovelty);
+    const std::vector<float> normalizedEnergyDiff = normalizeNovelty(energyDiff);
+    const float sensitivity01 = configuredTransientSensitivity01();
+    std::vector<float> hybridNovelty(static_cast<size_t>(frames), 0.0f);
+    for (int i = 0; i < frames; ++i)
+        hybridNovelty[static_cast<size_t>(i)] = (normalizedHfcNovelty[static_cast<size_t>(i)] * 0.58f)
+            + (normalizedFluxNovelty[static_cast<size_t>(i)] * 0.42f)
+            + (0.10f * normalizedEnergyDiff[static_cast<size_t>(i)]);
+
     const double analysisSampleRate = (sourceSampleRate > 1000.0)
         ? sourceSampleRate
         : juce::jmax(1.0, currentSampleRate);
-    const int minPeakSpacingFrames = juce::jmax(1, static_cast<int>((0.015 * analysisSampleRate) / static_cast<double>(hop))); // 15ms
+    const int minPeakSpacingFrames = juce::jmax(1,
+                                                static_cast<int>(((0.015 * analysisSampleRate) / static_cast<double>(hop))
+                                                                 * static_cast<double>(configuredTransientSpacingScale()))); // 15ms
 
-    std::vector<std::pair<int, float>> onsetFrames;
-    onsetFrames.reserve(static_cast<size_t>(frames));
-
-    for (int i = 1; i < (frames - 1); ++i)
+    auto extractPeakFrames = [&](const std::vector<float>& noveltyCurve,
+                                 float meanScale,
+                                 float maxScale)
     {
-        const float center = novelty[static_cast<size_t>(i)];
-        if (center < minPeakLevel)
-            continue;
-        if (center < novelty[static_cast<size_t>(i - 1)] || center < novelty[static_cast<size_t>(i + 1)])
-            continue;
+        std::vector<std::pair<int, float>> peakFrames;
+        peakFrames.reserve(static_cast<size_t>(frames));
+        const float noveltySum = std::accumulate(noveltyCurve.begin(), noveltyCurve.end(), 0.0f);
+        const float noveltyMean = noveltySum / static_cast<float>(juce::jmax(1, frames));
+        const float noveltyMax = *std::max_element(noveltyCurve.begin(), noveltyCurve.end());
+        const float minPeakLevel = juce::jmax(1.0e-6f,
+                                              juce::jmax(noveltyMean * meanScale, noveltyMax * maxScale));
 
-        if (!onsetFrames.empty() && (i - onsetFrames.back().first) < minPeakSpacingFrames)
+        for (int i = 1; i < (frames - 1); ++i)
         {
-            if (center > onsetFrames.back().second)
-                onsetFrames.back() = { i, center };
-            continue;
+            const float center = noveltyCurve[static_cast<size_t>(i)];
+            if (center < minPeakLevel)
+                continue;
+            if (center < noveltyCurve[static_cast<size_t>(i - 1)] || center < noveltyCurve[static_cast<size_t>(i + 1)])
+                continue;
+
+            if (!peakFrames.empty() && (i - peakFrames.back().first) < minPeakSpacingFrames)
+            {
+                if (center > peakFrames.back().second)
+                    peakFrames.back() = { i, center };
+                continue;
+            }
+
+            peakFrames.emplace_back(i, center);
         }
 
-        onsetFrames.emplace_back(i, center);
+        return peakFrames;
+    };
+
+    std::vector<std::pair<int, float>> onsetFrames;
+    switch (configuredTransientOnsetMethod())
+    {
+        case TransientOnsetMethod::Hfc:
+            onsetFrames = extractPeakFrames(hfcNovelty,
+                                            juce::jmap(sensitivity01, 0.40f, 0.16f),
+                                            juce::jmap(sensitivity01, 0.18f, 0.06f));
+            break;
+        case TransientOnsetMethod::SpecFlux:
+            onsetFrames = extractPeakFrames(specFluxNovelty,
+                                            juce::jmap(sensitivity01, 0.48f, 0.22f),
+                                            juce::jmap(sensitivity01, 0.18f, 0.06f));
+            break;
+        case TransientOnsetMethod::Hybrid:
+        default:
+            onsetFrames = extractPeakFrames(hybridNovelty,
+                                            juce::jmap(sensitivity01, 0.42f, 0.20f),
+                                            juce::jmap(sensitivity01, 0.18f, 0.08f));
+            break;
     }
+
+    if (onsetFrames.empty() && configuredTransientOnsetMethod() != TransientOnsetMethod::SpecFlux)
+        onsetFrames = extractPeakFrames(specFluxNovelty,
+                                        juce::jmap(sensitivity01, 0.48f, 0.22f),
+                                        juce::jmap(sensitivity01, 0.18f, 0.06f));
+
+    if (onsetFrames.empty() && configuredTransientOnsetMethod() != TransientOnsetMethod::Hfc)
+        onsetFrames = extractPeakFrames(hfcNovelty,
+                                        juce::jmap(sensitivity01, 0.40f, 0.16f),
+                                        juce::jmap(sensitivity01, 0.18f, 0.06f));
 
     if (onsetFrames.empty())
     {
@@ -11863,6 +12056,32 @@ ModernAudioEngine::ModernAudioEngine()
         momentaryStutterNextPpq[static_cast<size_t>(i)].store(0.0, std::memory_order_release);
         macroRetriggerAmounts[static_cast<size_t>(i)].store(0.0f, std::memory_order_release);
         duckDetectorEnvelopeStates[static_cast<size_t>(i)] = 0.0f;
+    }
+}
+
+void ModernAudioEngine::setTransientDetectionConfig(int onsetMethodChoice,
+                                                    int sensitivityChoice,
+                                                    int snapChoice,
+                                                    int spacingChoice)
+{
+    gTransientOnsetMethodChoice.store(static_cast<int>(sanitizedTransientOnsetMethodChoice(onsetMethodChoice)),
+                                      std::memory_order_release);
+    gTransientSensitivityChoice.store(juce::jlimit(0, 4, sensitivityChoice), std::memory_order_release);
+    gTransientSnapChoice.store(juce::jlimit(0, 4, snapChoice), std::memory_order_release);
+    gTransientSpacingChoice.store(juce::jlimit(0, 4, spacingChoice), std::memory_order_release);
+}
+
+void ModernAudioEngine::refreshTransientSliceMaps()
+{
+    for (auto& strip : strips)
+    {
+        if (strip == nullptr)
+            continue;
+
+        if (strip->isTransientSliceMode())
+            strip->refreshTransientSliceMap();
+        else
+            strip->markTransientSliceMapDirty();
     }
 }
 

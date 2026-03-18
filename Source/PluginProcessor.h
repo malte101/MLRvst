@@ -17,6 +17,10 @@
 #include "PerformanceTargets.h"
 #include "AudioEngine.h"
 #include "SampleMode.h"
+#include "StripControlState.h"
+
+class MacroTargetDispatcher;
+class SceneScheduler;
 
 //==============================================================================
 /**
@@ -183,6 +187,7 @@ public:
 
     bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
 
+    using juce::AudioProcessor::processBlock;
     void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
     void parameterChanged(const juce::String& parameterID, float newValue) override;
 
@@ -455,6 +460,57 @@ public:
     void setControlModeFromGui(ControlMode mode, bool shouldBeActive);
     void setSwingDivisionSelection(int mode);
     void setInnerLoopLengthSelection(int choiceIndex);
+    void syncTransientDetectionSettingsFromParameters(bool refreshSlicesNow);
+    enum class StripControlWriteMode
+    {
+        NotifyHost,
+        CacheOnly
+    };
+    void setStripVolumeControlValue(int stripIndex,
+                                    float volume,
+                                    StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripPanControlValue(int stripIndex,
+                                 float pan,
+                                 StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripSpeedControlValue(int stripIndex,
+                                   float speed,
+                                   StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripFilterEnabledControlValue(int stripIndex,
+                                           bool enabled,
+                                           StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripFilterFrequencyControlValue(int stripIndex,
+                                             float frequency,
+                                             StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripFilterResonanceControlValue(int stripIndex,
+                                             float resonance,
+                                             StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripFilterMorphControlValue(int stripIndex,
+                                         float morph,
+                                         StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripFilterAlgorithmControlValue(int stripIndex,
+                                             EnhancedAudioStrip::FilterAlgorithm algorithm,
+                                             StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripDelayMixControlValue(int stripIndex,
+                                      float mix,
+                                      StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripDelayTimeControlValue(int stripIndex,
+                                       float timeValue,
+                                       StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripDelaySyncEnabledControlValue(int stripIndex,
+                                              bool enabled,
+                                              StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripDelayFeedbackControlValue(int stripIndex,
+                                           float feedback,
+                                           StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripDelayLowCutControlValue(int stripIndex,
+                                         float hz,
+                                         StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripDelayHighCutControlValue(int stripIndex,
+                                          float hz,
+                                          StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+    void setStripDelayModeControlValue(int stripIndex,
+                                       EnhancedAudioStrip::DelayMode mode,
+                                       StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
     int getSwingDivisionSelection() const { return swingDivisionSelection.load(std::memory_order_acquire); }
     int getLastMonomePressedStripRow() const { return lastMonomePressedStripRow.load(std::memory_order_acquire); }
     int getArcSelectedStripRow() const { return arcSelectedStripRow.load(std::memory_order_acquire); }
@@ -594,6 +650,9 @@ public:
     static constexpr int MaxGridHeight = 16;
 
 private:
+    friend class MacroTargetDispatcher;
+    friend class SceneScheduler;
+
     //==============================================================================
     enum class FilterSubPage
     {
@@ -727,6 +786,10 @@ private:
     std::atomic<float>* soundTouchEnabledParam = nullptr;
     std::atomic<float>* masterDuckTriggerStripParam = nullptr;
     std::atomic<float>* sceneRecallModeParam = nullptr;
+    std::atomic<float>* transientOnsetMethodParam = nullptr;
+    std::atomic<float>* transientSensitivityParam = nullptr;
+    std::atomic<float>* transientSnapParam = nullptr;
+    std::atomic<float>* transientSpacingParam = nullptr;
     std::array<std::atomic<float>*, MaxStrips> stripVolumeParams{};
     std::array<std::atomic<float>*, MaxStrips> stripTrimDbParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPanParams{};
@@ -803,6 +866,10 @@ private:
     int lastAppliedStretchBackend = -1; // -1 = force initial sync on first process block
     int lastAppliedContinuousTraversal = -1;
     int lastAppliedLoopTempoMatchBackend = -1;
+    int lastAppliedTransientOnsetMethod = -1;
+    int lastAppliedTransientSensitivity = -1;
+    int lastAppliedTransientSnap = -1;
+    int lastAppliedTransientSpacing = -1;
     
     // LED state cache to prevent flickering
     int ledCache[MaxGridWidth][MaxGridHeight] = {{0}};
@@ -1133,6 +1200,8 @@ private:
     void applyMomentaryStutterMacro(const juce::AudioPlayHead::PositionInfo& posInfo);
     void restoreMomentaryStutterMacroBaseline();
     void updateMacroLaneRecording(const juce::AudioPlayHead::PositionInfo& posInfo, int numSamples);
+    bool getCurrentHostPositionInfo(juce::AudioPlayHead::PositionInfo& outPosition) const;
+    bool getCurrentHostPpq(double& outPpq) const;
     bool isHostTransportPlaying() const;
     bool getHostSyncSnapshot(double& outPpq, double& outTempo) const;
     void refreshUtilityTimerCadence();
@@ -1175,6 +1244,25 @@ private:
     float getMacroNormalizedValueForTarget(int stripIndex, const EnhancedAudioStrip& strip, MacroTarget target) const;
     void applyMacroTargetValue(int stripIndex, EnhancedAudioStrip& strip, MacroTarget target, float normalizedValue);
     void setStripParameterValueFromMacro(int stripIndex, const juce::String& parameterId, float plainValue);
+    using ResolvedOwnedStripControlState = StripControlState::ResolvedOwnedStripControlState;
+    ResolvedOwnedStripControlState resolveOwnedStripControlStateFromParameters(int stripIndex,
+                                                                               const EnhancedAudioStrip& strip) const;
+    void applyResolvedOwnedStripControlState(EnhancedAudioStrip& strip,
+                                             const ResolvedOwnedStripControlState& state) const;
+    void applyResolvedStripFilterState(EnhancedAudioStrip& strip,
+                                       const ResolvedOwnedStripControlState& state) const;
+    void applyResolvedStripDelayState(EnhancedAudioStrip& strip,
+                                      const ResolvedOwnedStripControlState& state) const;
+    StripControlState::ParameterView makeOwnedStripControlParameterView(int stripIndex) const;
+    void writeStripFloatParameter(const juce::String& parameterId,
+                                  float plainValue,
+                                  std::atomic<float>* rawParam,
+                                  StripControlWriteMode writeMode);
+    void writeStripBoolParameter(const juce::String& parameterId,
+                                 bool enabled,
+                                 std::atomic<float>* rawParam,
+                                 StripControlWriteMode writeMode);
+    void applyOwnedStripControlsFromParameters(int stripIndex, EnhancedAudioStrip& strip);
     void resetMacroLaneRecordState(int macroIndex);
     void finishMacroLaneRecording(int macroIndex, bool activateLane);
     static int snapMacroLaneRecordingLengthBars(double recordedBeats);
