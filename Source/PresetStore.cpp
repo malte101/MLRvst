@@ -827,6 +827,9 @@ bool savePreset(int presetIndex,
                 eventXml->setAttribute("sampleStartSample", juce::String(e.sampleStartSample));
                 eventXml->setAttribute("time", e.time);
                 eventXml->setAttribute("noteOn", e.isNoteOn);
+                eventXml->setAttribute("eventType", static_cast<int>(e.type));
+                eventXml->setAttribute("controlMode", e.controlMode);
+                eventXml->setAttribute("controlRow", e.controlRow);
             }
         }
     }
@@ -853,14 +856,14 @@ bool savePreset(int presetIndex,
     if (auto* crossfade = parameters.getRawParameterValue("crossfadeLength"))
         globalsXml->setAttribute("crossfadeLength", *crossfade);
 
-        if (writePresetAtomically(preset, presetFile))
-        {
-            DBG("Preset " << (presetIndex + 1) << " saved: " << presetFile.getFullPathName());
-            return true;
-        }
+    if (writePresetAtomically(preset, presetFile))
+    {
+        DBG("Preset " << (presetIndex + 1) << " saved: " << presetFile.getFullPathName());
+        return true;
+    }
 
-        DBG("Preset save failed for slot " << (presetIndex + 1) << ": write failed");
-        return false;
+    DBG("Preset save failed for slot " << (presetIndex + 1) << ": write failed");
+    return false;
     }
     catch (const std::exception& e)
     {
@@ -1438,6 +1441,11 @@ bool loadPreset(int presetIndex,
                 e.sampleStartSample = eventXml->getStringAttribute("sampleStartSample", "-1").getLargeIntValue();
                 e.time = eventXml->getDoubleAttribute("time", 0.0);
                 e.isNoteOn = eventXml->getBoolAttribute("noteOn", true);
+                e.type = static_cast<PatternRecorder::EventType>(
+                    eventXml->getIntAttribute("eventType",
+                                              static_cast<int>(PatternRecorder::EventType::Note)));
+                e.controlMode = eventXml->getIntAttribute("controlMode", -1);
+                e.controlRow = eventXml->getIntAttribute("controlRow", -1);
                 events.push_back(e);
             }
 

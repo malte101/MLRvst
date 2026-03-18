@@ -432,6 +432,7 @@ public:
         Volume,
         GrainSize,
         Filter,
+        Delay,
         Swing,
         Gate,
         FileBrowser,
@@ -443,7 +444,7 @@ public:
     ControlMode getCurrentControlMode() const { return currentControlMode; }
     bool isControlModeActive() const { return controlModeActive; }
     static juce::String getControlModeName(ControlMode mode);
-    static constexpr int NumControlRowPages = 13;
+    static constexpr int NumControlRowPages = 14;
     using ControlPageOrder = std::array<ControlMode, NumControlRowPages>;
     ControlPageOrder getControlPageOrder() const;
     ControlMode getControlModeForControlButton(int buttonIndex) const;
@@ -453,6 +454,7 @@ public:
     void setControlPageMomentary(bool shouldBeMomentary);
     void setControlModeFromGui(ControlMode mode, bool shouldBeActive);
     void setSwingDivisionSelection(int mode);
+    void setInnerLoopLengthSelection(int choiceIndex);
     int getSwingDivisionSelection() const { return swingDivisionSelection.load(std::memory_order_acquire); }
     int getLastMonomePressedStripRow() const { return lastMonomePressedStripRow.load(std::memory_order_acquire); }
     int getArcSelectedStripRow() const { return arcSelectedStripRow.load(std::memory_order_acquire); }
@@ -733,6 +735,11 @@ private:
     std::array<std::atomic<float>*, MaxStrips> stripSliceLengthParams{};
     std::array<std::atomic<float>*, MaxStrips> stripPitchControlModeParams{};
     std::array<std::atomic<float>*, MaxStrips> stripTempoMatchModeParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripFilterEnabledParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripFilterFrequencyParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripFilterResonanceParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripFilterMorphParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripFilterAlgorithmParams{};
     std::array<std::atomic<float>*, MaxStrips> stripDuckEnabledParams{};
     std::array<std::atomic<float>*, MaxStrips> stripDuckSourceParams{};
     std::array<std::atomic<float>*, MaxStrips> stripDuckThresholdParams{};
@@ -741,6 +748,13 @@ private:
     std::array<std::atomic<float>*, MaxStrips> stripDuckReleaseParams{};
     std::array<std::atomic<float>*, MaxStrips> stripDuckGainCompParams{};
     std::array<std::atomic<float>*, MaxStrips> stripDuckFollowMasterParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDelayMixParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDelayTimeParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDelaySyncParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDelayFeedbackParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDelayLowCutParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDelayHighCutParams{};
+    std::array<std::atomic<float>*, MaxStrips> stripDelayModeParams{};
     juce::CriticalSection pendingLoopChangeLock;
     std::array<PendingLoopChange, MaxStrips> pendingLoopChanges{};
     juce::CriticalSection pendingBarChangeLock;
@@ -766,6 +780,7 @@ private:
         ControlMode::FileBrowser,
         ControlMode::GroupAssign,
         ControlMode::Filter,
+        ControlMode::Delay,
         ControlMode::Modulation,
         ControlMode::Preset,
         ControlMode::StepEdit
@@ -783,6 +798,7 @@ private:
     static constexpr uint32_t stepEditVelocityGestureLatchMs = 180;
     std::atomic<bool> controlPageMomentary{true};
     std::atomic<int> swingDivisionSelection{1}; // 0=1/4,1=1/8,2=1/16,3=1/8T,4=1/2,5=1/32,6=1/16T
+    std::atomic<int> innerLoopLengthSelection{0}; // 0=1,1=1/2,2=1/4,3=1/8,4=1/16
     std::atomic<int> gatePageMode{0};
     int lastAppliedStretchBackend = -1; // -1 = force initial sync on first process block
     int lastAppliedContinuousTraversal = -1;
@@ -959,6 +975,12 @@ private:
     std::vector<FlipLegacyLoopRenderResult> flipLegacyLoopRenderResults;
     
     // LED update
+    bool monomeControlPageShowsPatternRecorder(ControlMode mode) const;
+    void recordMonomeControlPatternEvent(ControlMode mode,
+                                         int targetStripIndex,
+                                         int controlRow,
+                                         int column);
+    void playbackMonomeControlPatternEvent(const PatternRecorder::Event& event);
     void updateMonomeLEDs();
     void updateMonomeArcRings();
     void renderSampleModeStrip(int stripIndex,

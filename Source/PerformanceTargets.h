@@ -32,6 +32,11 @@ enum class PerformanceTarget
     SliceLength,
     Scratch,
     Rearrange,
+    DelayMix,
+    DelayTime,
+    DelayFeedback,
+    DelayLowCut,
+    DelayHighCut,
     FilterFrequency = Cutoff
 };
 
@@ -47,14 +52,14 @@ struct PerformanceTargetInfo
     bool supportsPitchScaleQuantize;
 };
 
-inline constexpr std::array<PerformanceTargetInfo, 26> kPerformanceTargetInfos{{
+inline constexpr std::array<PerformanceTargetInfo, 31> kPerformanceTargetInfos{{
     { PerformanceTarget::None, "none", "None", "None", true, true, false, false },
     { PerformanceTarget::Volume, "volume", "Volume", "Vol", true, true, false, false },
     { PerformanceTarget::Pan, "pan", "Pan", "Pan", true, true, true, false },
     { PerformanceTarget::Pitch, "pitch", "Pitch", "Pitch", true, true, true, true },
     { PerformanceTarget::Speed, "speed", "Speed", "Speed", true, true, true, false },
-    { PerformanceTarget::Cutoff, "cutoff", "Cutoff", "Cutoff", true, true, false, false },
-    { PerformanceTarget::Resonance, "resonance", "Resonance", "Reso", true, true, false, false },
+    { PerformanceTarget::Cutoff, "cutoff", "Cutoff", "Cutoff", true, true, true, false },
+    { PerformanceTarget::Resonance, "resonance", "Resonance", "Reso", true, true, true, false },
     { PerformanceTarget::GrainSize, "grain_size", "Grain Size", "G.Size", true, true, true, false },
     { PerformanceTarget::GrainDensity, "grain_density", "Grain Density", "G.Dens", true, true, true, false },
     { PerformanceTarget::GrainPitch, "grain_pitch", "Grain Pitch", "G.Pitch", true, true, true, true },
@@ -73,7 +78,12 @@ inline constexpr std::array<PerformanceTargetInfo, 26> kPerformanceTargetInfos{{
     { PerformanceTarget::FilterEnable, "filter_enable", "Filter Enable", "F.En", true, false, false, false },
     { PerformanceTarget::SliceLength, "slice_length", "Slice Length", "Slice", true, false, false, false },
     { PerformanceTarget::Scratch, "scratch", "Scratch", "Scratch", true, false, false, false },
-    { PerformanceTarget::Rearrange, "rearrange", "Rearrange", "Rearr", false, true, false, false }
+    { PerformanceTarget::Rearrange, "rearrange", "Rearrange", "Rearr", false, true, false, false },
+    { PerformanceTarget::DelayMix, "delay_mix", "Delay Mix", "D.Mix", false, true, true, false },
+    { PerformanceTarget::DelayTime, "delay_time", "Delay Time", "D.Time", false, true, true, false },
+    { PerformanceTarget::DelayFeedback, "delay_feedback", "Delay Feedback", "D.Fdbk", false, true, true, false },
+    { PerformanceTarget::DelayLowCut, "delay_low_cut", "Delay Low Cut", "D.Low", false, true, true, false },
+    { PerformanceTarget::DelayHighCut, "delay_high_cut", "Delay High Cut", "D.High", false, true, true, false }
 }};
 
 inline constexpr std::array<PerformanceTarget, 25> kMacroPerformanceTargetOrder{{
@@ -104,7 +114,7 @@ inline constexpr std::array<PerformanceTarget, 25> kMacroPerformanceTargetOrder{
     PerformanceTarget::GrainShape
 }};
 
-inline constexpr std::array<PerformanceTarget, 23> kModPerformanceTargetOrder{{
+inline constexpr std::array<PerformanceTarget, 28> kModPerformanceTargetOrder{{
     PerformanceTarget::None,
     PerformanceTarget::Volume,
     PerformanceTarget::Pan,
@@ -127,12 +137,17 @@ inline constexpr std::array<PerformanceTarget, 23> kModPerformanceTargetOrder{{
     PerformanceTarget::GrainPositionJitter,
     PerformanceTarget::GrainShape,
     PerformanceTarget::FilterMorph,
+    PerformanceTarget::DelayMix,
+    PerformanceTarget::DelayTime,
+    PerformanceTarget::DelayFeedback,
+    PerformanceTarget::DelayLowCut,
+    PerformanceTarget::DelayHighCut,
     PerformanceTarget::Retrigger
 }};
 
 inline constexpr int performanceTargetCount()
 {
-    return static_cast<int>(PerformanceTarget::Rearrange) + 1;
+    return static_cast<int>(PerformanceTarget::DelayHighCut) + 1;
 }
 
 inline constexpr bool isKnownPerformanceTargetValue(int rawValue)
@@ -183,15 +198,20 @@ inline bool performanceTargetAutoDefaultBipolar(PerformanceTarget target)
         case PerformanceTarget::Pan:
         case PerformanceTarget::Pitch:
         case PerformanceTarget::Speed:
+        case PerformanceTarget::Cutoff:
+        case PerformanceTarget::Resonance:
         case PerformanceTarget::GrainPitch:
         case PerformanceTarget::GrainSize:
         case PerformanceTarget::GrainShape:
         case PerformanceTarget::FilterMorph:
+        case PerformanceTarget::DelayMix:
+        case PerformanceTarget::DelayTime:
+        case PerformanceTarget::DelayFeedback:
+        case PerformanceTarget::DelayLowCut:
+        case PerformanceTarget::DelayHighCut:
             return true;
         case PerformanceTarget::None:
         case PerformanceTarget::Volume:
-        case PerformanceTarget::Cutoff:
-        case PerformanceTarget::Resonance:
         case PerformanceTarget::GrainDensity:
         case PerformanceTarget::GrainPitchJitter:
         case PerformanceTarget::GrainSpread:
@@ -323,6 +343,11 @@ inline int legacyMacroRawFromPerformanceTarget(PerformanceTarget target)
         case PerformanceTarget::GrainEmitter: return 21;
         case PerformanceTarget::GrainEnvelope: return 22;
         case PerformanceTarget::GrainShape: return 23;
+        case PerformanceTarget::DelayMix:
+        case PerformanceTarget::DelayTime:
+        case PerformanceTarget::DelayFeedback:
+        case PerformanceTarget::DelayLowCut:
+        case PerformanceTarget::DelayHighCut:
         case PerformanceTarget::None:
         case PerformanceTarget::Rearrange:
         case PerformanceTarget::Retrigger:

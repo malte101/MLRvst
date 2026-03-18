@@ -8,6 +8,8 @@
 */
 
 #include "PluginProcessor.h"
+#include "MonomeFilterActions.h"
+#include "MonomeMixActions.h"
 #include "PluginEditor.h"
 #include "PlayheadSpeedQuantizer.h"
 #include "PresetStore.h"
@@ -15,7 +17,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <utility>
 
@@ -26,8 +27,6 @@
 namespace
 {
 constexpr bool kEnableTriggerDebugLogging = false;
-constexpr bool kEnableSignalsmithLoopDebugLogging = true;
-constexpr const char* kSignalsmithLoopDebugLogPath = "/tmp/mlrvst-signalsmith-loop-debug.log";
 constexpr int kPitchControlModeSchemaVersion = 3;
 constexpr const char* kEmbeddedFlipSampleAttr = "embeddedSampleWavBase64";
 constexpr size_t kMaxEmbeddedFlipWavBytes = 48 * 1024 * 1024;
@@ -167,6 +166,7 @@ juce::String controlModeToKey(MlrVSTAudioProcessor::ControlMode mode)
         case MlrVSTAudioProcessor::ControlMode::Volume: return "volume";
         case MlrVSTAudioProcessor::ControlMode::GrainSize: return "grainsize";
         case MlrVSTAudioProcessor::ControlMode::Filter: return "filter";
+        case MlrVSTAudioProcessor::ControlMode::Delay: return "delay";
         case MlrVSTAudioProcessor::ControlMode::Swing: return "swing";
         case MlrVSTAudioProcessor::ControlMode::Gate: return "gate";
         case MlrVSTAudioProcessor::ControlMode::FileBrowser: return "browser";
@@ -188,6 +188,7 @@ bool controlModeFromKey(const juce::String& key, MlrVSTAudioProcessor::ControlMo
     if (normalized == "volume") { mode = MlrVSTAudioProcessor::ControlMode::Volume; return true; }
     if (normalized == "grainsize" || normalized == "grain_size" || normalized == "grain") { mode = MlrVSTAudioProcessor::ControlMode::GrainSize; return true; }
     if (normalized == "filter") { mode = MlrVSTAudioProcessor::ControlMode::Filter; return true; }
+    if (normalized == "delay") { mode = MlrVSTAudioProcessor::ControlMode::Delay; return true; }
     if (normalized == "swing") { mode = MlrVSTAudioProcessor::ControlMode::Swing; return true; }
     if (normalized == "gate") { mode = MlrVSTAudioProcessor::ControlMode::Gate; return true; }
     if (normalized == "browser") { mode = MlrVSTAudioProcessor::ControlMode::FileBrowser; return true; }
@@ -1743,22 +1744,6 @@ void saveGlobalSettingsXml(const juce::XmlElement& xml)
     }
 }
 
-void appendGlobalSettingsDiagnostic(const juce::String& tag, const juce::XmlElement* xml)
-{
-    auto diagFile = getGlobalSettingsFile().getParentDirectory().getChildFile("GlobalSettings_diag.txt");
-    juce::FileOutputStream stream(diagFile, 1024);
-    if (!stream.openedOk())
-        return;
-    stream.setPosition(diagFile.getSize());
-    stream << "=== " << tag << " @ " << juce::Time::getCurrentTime().toString(true, true) << " ===\n";
-    stream << "Path: " << getGlobalSettingsFile().getFullPathName() << "\n";
-    stream << "Exists: " << (getGlobalSettingsFile().existsAsFile() ? "yes" : "no") << "\n";
-    if (xml != nullptr)
-        stream << "XML: " << xml->toString() << "\n";
-    stream << "\n";
-    stream.flush();
-}
-
 constexpr juce::int64 kPersistentGlobalControlsSaveDebounceMs = 350;
 
 constexpr std::array<const char*, 16> kPersistentGlobalControlParameterIds {
@@ -3151,6 +3136,11 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
         {
             stopSampleModeStrip(stripIndex, immediateStop);
         });
+    audioEngine->setPatternControlEventCallback(
+        [this](const PatternRecorder::Event& event)
+        {
+            playbackMonomeControlPatternEvent(event);
+        });
     for (int i = 0; i < MacroCount; ++i)
     {
         macroMidiCcAssignments[static_cast<size_t>(i)].store(getDefaultMacroMidiCc(i), std::memory_order_release);
@@ -3290,6 +3280,10 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
     limiterEnabledParam = parameters.getRawParameterValue("limiterEnabled");
     quantizeParam = parameters.getRawParameterValue("quantize");
     innerLoopLengthParam = parameters.getRawParameterValue("innerLoopLength");
+    innerLoopLengthSelection.store(innerLoopLengthParam != nullptr
+                                       ? juce::jlimit(0, 4, static_cast<int>(innerLoopLengthParam->load(std::memory_order_acquire)))
+                                       : 0,
+                                   std::memory_order_release);
     grainQualityParam = parameters.getRawParameterValue("quality");
     pitchSmoothingParam = parameters.getRawParameterValue("pitchSmoothing");
     inputMonitorParam = parameters.getRawParameterValue("inputMonitor");
@@ -3315,6 +3309,11 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
         stripSliceLengthParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripSliceLength" + juce::String(i));
         stripPitchControlModeParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripPitchControlMode" + juce::String(i));
         stripTempoMatchModeParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripTempoMatchMode" + juce::String(i));
+        stripFilterEnabledParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripFilterEnabled" + juce::String(i));
+        stripFilterFrequencyParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripFilterFrequency" + juce::String(i));
+        stripFilterResonanceParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripFilterResonance" + juce::String(i));
+        stripFilterMorphParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripFilterMorph" + juce::String(i));
+        stripFilterAlgorithmParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripFilterAlgorithm" + juce::String(i));
         stripDuckEnabledParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckEnabled" + juce::String(i));
         stripDuckSourceParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckSource" + juce::String(i));
         stripDuckThresholdParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckThreshold" + juce::String(i));
@@ -3323,6 +3322,13 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
         stripDuckReleaseParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckRelease" + juce::String(i));
         stripDuckGainCompParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckGainComp" + juce::String(i));
         stripDuckFollowMasterParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDuckFollowMaster" + juce::String(i));
+        stripDelayMixParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDelayMix" + juce::String(i));
+        stripDelayTimeParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDelayTime" + juce::String(i));
+        stripDelaySyncParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDelaySync" + juce::String(i));
+        stripDelayFeedbackParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDelayFeedback" + juce::String(i));
+        stripDelayLowCutParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDelayLowCut" + juce::String(i));
+        stripDelayHighCutParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDelayHighCut" + juce::String(i));
+        stripDelayModeParams[static_cast<size_t>(i)] = parameters.getRawParameterValue("stripDelayMode" + juce::String(i));
     }
 }
 
@@ -3406,6 +3412,7 @@ juce::String MlrVSTAudioProcessor::getControlModeName(ControlMode mode)
         case ControlMode::Volume: return "Volume";
         case ControlMode::GrainSize: return "Grain Size";
         case ControlMode::Filter: return "Filter";
+        case ControlMode::Delay: return "Delay";
         case ControlMode::Swing: return "Swing";
         case ControlMode::Gate: return "Gate";
         case ControlMode::FileBrowser: return "Browser";
@@ -3543,6 +3550,11 @@ float MlrVSTAudioProcessor::getDefaultMacroNormalizedValue(MacroTarget target)
         case MacroTarget::GrainShape: return 0.5f;
         case MacroTarget::Retrigger: return 0.0f;
         case MacroTarget::Rearrange: return 0.0f;
+        case MacroTarget::DelayMix:
+        case MacroTarget::DelayTime:
+        case MacroTarget::DelayFeedback:
+        case MacroTarget::DelayLowCut:
+        case MacroTarget::DelayHighCut:
         case MacroTarget::None:
         default: return 0.0f;
     }
@@ -3841,6 +3853,11 @@ float MlrVSTAudioProcessor::getMacroNormalizedValueForTarget(int stripIndex,
         case MacroTarget::Retrigger:
             return audioEngine != nullptr ? audioEngine->getMacroRetriggerAmount(stripIndex) : 0.0f;
         case MacroTarget::Rearrange:
+        case MacroTarget::DelayMix:
+        case MacroTarget::DelayTime:
+        case MacroTarget::DelayFeedback:
+        case MacroTarget::DelayLowCut:
+        case MacroTarget::DelayHighCut:
             return 0.0f;
         case MacroTarget::None:
         default:
@@ -3895,6 +3912,12 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(int stripIndex,
             }
             break;
         }
+        case MacroTarget::DelayMix:
+        case MacroTarget::DelayTime:
+        case MacroTarget::DelayFeedback:
+        case MacroTarget::DelayLowCut:
+        case MacroTarget::DelayHighCut:
+            break;
         case MacroTarget::Pitch:
         {
             applyUserPitchControlToStrip(stripIndex, denormalizeMacroPitch(clamped));
@@ -3929,7 +3952,10 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(int stripIndex,
         {
             const float speed = denormalizeMacroLinear(clamped, 0.125f, 8.0f);
             setStripParameterValueFromMacro(stripIndex, "stripSpeed" + juce::String(stripIndex), speed);
-            strip.setPlayheadSpeedRatio(speed);
+            if (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
+                strip.setPlaybackSpeed(PlayheadSpeedQuantizer::grainPlaybackSpeedFromControl(speed));
+            else
+                strip.setPlayheadSpeedRatio(speed);
             if (stepSampler != nullptr)
                 stepSampler->setSpeed(speed);
             break;
@@ -4443,6 +4469,7 @@ MlrVSTAudioProcessor::ResolvedPitchControl MlrVSTAudioProcessor::resolvePitchCon
 void MlrVSTAudioProcessor::applyResolvedPitchControl(EnhancedAudioStrip& strip,
                                                      const ResolvedPitchControl& resolved) const
 {
+    const bool preservePlaybackSpeed = (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Grain);
     strip.setGlobalPitchContext(resolved.globalRootMidi, static_cast<int>(resolved.globalScale));
     strip.setSignalsmithLiveMode(false);
     strip.setPitchShiftAlgorithm(resolved.pitchAlgorithm);
@@ -4466,13 +4493,15 @@ void MlrVSTAudioProcessor::applyResolvedPitchControl(EnhancedAudioStrip& strip,
         strip.setResamplePitchRatio(resolved.resampleRatio);
         strip.setPitchShift(0.0f);
         // Keep traversal/playmarker speed independent from resample pitch ratio.
-        strip.setPlaybackSpeed(1.0f);
+        if (!preservePlaybackSpeed)
+            strip.setPlaybackSpeed(1.0f);
         return;
     }
 
     strip.setResamplePitchEnabled(false);
     strip.setResamplePitchRatio(1.0f);
-    strip.setPlaybackSpeed(1.0f);
+    if (!preservePlaybackSpeed)
+        strip.setPlaybackSpeed(1.0f);
     strip.setPitchShift(resolved.quantizedSemitones);
 }
 
@@ -5978,6 +6007,15 @@ void MlrVSTAudioProcessor::setSwingDivisionSelection(int mode)
     savePersistentControlPages();
 }
 
+void MlrVSTAudioProcessor::setInnerLoopLengthSelection(int choiceIndex)
+{
+    const int clamped = juce::jlimit(0, 4, choiceIndex);
+    innerLoopLengthSelection.store(clamped, std::memory_order_release);
+
+    if (auto* param = parameters.getParameter("innerLoopLength"))
+        param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(clamped)));
+}
+
 void MlrVSTAudioProcessor::setControlModeFromGui(ControlMode mode, bool shouldBeActive)
 {
     if (isSceneModeEnabled() && mode == ControlMode::GroupAssign)
@@ -6000,6 +6038,223 @@ void MlrVSTAudioProcessor::setControlModeFromGui(ControlMode mode, bool shouldBe
     }
 
     updateMonomeLEDs();
+}
+
+bool MlrVSTAudioProcessor::monomeControlPageShowsPatternRecorder(ControlMode mode) const
+{
+    switch (mode)
+    {
+        case ControlMode::Speed:
+        case ControlMode::Pitch:
+        case ControlMode::Pan:
+        case ControlMode::Volume:
+        case ControlMode::GrainSize:
+        case ControlMode::Swing:
+        case ControlMode::Delay:
+            return true;
+        case ControlMode::Normal:
+        case ControlMode::Filter:
+        case ControlMode::Gate:
+        case ControlMode::FileBrowser:
+        case ControlMode::GroupAssign:
+        case ControlMode::Modulation:
+        case ControlMode::Preset:
+        case ControlMode::StepEdit:
+        default:
+            return false;
+    }
+}
+
+void MlrVSTAudioProcessor::recordMonomeControlPatternEvent(ControlMode mode,
+                                                           int targetStripIndex,
+                                                           int controlRow,
+                                                           int column)
+{
+    if (!audioEngine || !monomeControlPageShowsPatternRecorder(mode))
+        return;
+
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, targetStripIndex);
+    const int safeColumn = juce::jlimit(0, MaxColumns - 1, column);
+    const double eventBeat = audioEngine->getTimelineBeat();
+
+    for (int i = 0; i < ModernAudioEngine::MaxPatterns; ++i)
+    {
+        auto* pattern = audioEngine->getPattern(i);
+        if (pattern == nullptr
+            || !pattern->isRecording()
+            || !audioEngine->patternRecorderMatchesStrip(i, safeStripIndex))
+        {
+            continue;
+        }
+
+        pattern->recordControlEvent(safeStripIndex,
+                                    static_cast<int>(mode),
+                                    controlRow,
+                                    safeColumn,
+                                    eventBeat);
+    }
+}
+
+void MlrVSTAudioProcessor::playbackMonomeControlPatternEvent(const PatternRecorder::Event& event)
+{
+    if (!audioEngine)
+        return;
+
+    const int stripIndex = juce::jlimit(0, MaxStrips - 1, event.stripIndex);
+    auto* strip = audioEngine->getStrip(stripIndex);
+    if (strip == nullptr)
+        return;
+
+    const auto mode = static_cast<ControlMode>(event.controlMode);
+    const int controlRow = event.controlRow;
+    const int column = juce::jlimit(0, MaxColumns - 1, event.column);
+
+    switch (mode)
+    {
+        case ControlMode::Speed:
+        {
+            MonomeMixActions::applyButtonPressLive(*strip,
+                                                   column,
+                                                   static_cast<int>(mode),
+                                                   static_cast<int>(getGatePageMode()));
+            if (auto* rawParam = stripSpeedParams[static_cast<size_t>(stripIndex)])
+                rawParam->store(PlayheadSpeedQuantizer::ratioFromColumn(column), std::memory_order_release);
+            break;
+        }
+
+        case ControlMode::Pan:
+        {
+            MonomeMixActions::applyButtonPressLive(*strip,
+                                                   column,
+                                                   static_cast<int>(mode),
+                                                   static_cast<int>(getGatePageMode()));
+            if (auto* rawParam = stripPanParams[static_cast<size_t>(stripIndex)])
+            {
+                float pan = (column - 8) / 8.0f;
+                rawParam->store(juce::jlimit(-1.0f, 1.0f, pan), std::memory_order_release);
+            }
+            break;
+        }
+
+        case ControlMode::Volume:
+        {
+            MonomeMixActions::applyButtonPressLive(*strip,
+                                                   column,
+                                                   static_cast<int>(mode),
+                                                   static_cast<int>(getGatePageMode()));
+            if (auto* rawParam = stripVolumeParams[static_cast<size_t>(stripIndex)])
+                rawParam->store(juce::jlimit(0.0f, 1.0f, column / 15.0f), std::memory_order_release);
+            break;
+        }
+
+        case ControlMode::Swing:
+        case ControlMode::Gate:
+        {
+            MonomeMixActions::applyButtonPressLive(*strip,
+                                                   column,
+                                                   static_cast<int>(mode),
+                                                   static_cast<int>(getGatePageMode()));
+            break;
+        }
+
+        case ControlMode::Pitch:
+        {
+            static constexpr std::array<float, 16> kMusicalPitchSemitones{
+                -24.0f, -21.0f, -18.0f, -15.0f, -12.0f, -9.0f, -6.0f, -3.0f,
+                  0.0f,   3.0f,   6.0f,   9.0f,  12.0f, 15.0f, 18.0f, 24.0f
+            };
+            const float quantizedSemitones = quantizePitchSemitonesForStripControl(
+                stripIndex,
+                kMusicalPitchSemitones[static_cast<size_t>(column)]);
+            if (auto* rawParam = stripPitchParams[static_cast<size_t>(stripIndex)])
+                rawParam->store(quantizedSemitones, std::memory_order_release);
+
+            const auto loopPitchRole = getLoopPitchRole(stripIndex);
+            if (loopPitchRole == LoopPitchRole::Sync)
+                requestLoopPitchRoleStateUpdate(stripIndex);
+            else
+                applyPitchControlToStrip(stripIndex, *strip, quantizedSemitones);
+
+            if (loopPitchRole == LoopPitchRole::Master)
+                updateGlobalRootFromLoopPitchMaster(stripIndex, true);
+            break;
+        }
+
+        case ControlMode::GrainSize:
+            MonomeMixActions::applyGrainPageButtonPressLive(*strip, controlRow, column);
+            break;
+
+        case ControlMode::Delay:
+        {
+            MonomeMixActions::applyDelayPageButtonPressLive(*strip, controlRow, column);
+            switch (juce::jlimit(0, 5, controlRow))
+            {
+                case 0:
+                    if (auto* rawParam = stripDelayMixParams[static_cast<size_t>(stripIndex)])
+                        rawParam->store(juce::jlimit(0.0f, 1.0f, column / 15.0f), std::memory_order_release);
+                    break;
+                case 1:
+                    if (auto* rawParam = stripDelayTimeParams[static_cast<size_t>(stripIndex)])
+                    {
+                        const bool syncEnabled = strip->isDelaySyncEnabled();
+                        const juce::NormalisableRange<float> syncRange(0.25f, 4.0f, 0.001f, 0.45f);
+                        const juce::NormalisableRange<float> freeRange(0.25f, 4.0f, 0.001f, 0.4f);
+                        const float unit = juce::jlimit(0.0f, 1.0f, column / 15.0f);
+                        rawParam->store((syncEnabled ? syncRange : freeRange).convertFrom0to1(unit),
+                                        std::memory_order_release);
+                    }
+                    break;
+                case 2:
+                    if (auto* rawParam = stripDelayFeedbackParams[static_cast<size_t>(stripIndex)])
+                        rawParam->store(0.97f * juce::jlimit(0.0f, 1.0f, column / 15.0f), std::memory_order_release);
+                    break;
+                case 3:
+                    if (auto* rawParam = stripDelayLowCutParams[static_cast<size_t>(stripIndex)])
+                    {
+                        const juce::NormalisableRange<float> range(20.0f, 12000.0f, 1.0f, 0.25f);
+                        rawParam->store(range.convertFrom0to1(juce::jlimit(0.0f, 1.0f, column / 15.0f)),
+                                        std::memory_order_release);
+                    }
+                    break;
+                case 4:
+                    if (auto* rawParam = stripDelayHighCutParams[static_cast<size_t>(stripIndex)])
+                    {
+                        const juce::NormalisableRange<float> range(200.0f, 20000.0f, 1.0f, 0.3f);
+                        rawParam->store(range.convertFrom0to1(juce::jlimit(0.0f, 1.0f, column / 15.0f)),
+                                        std::memory_order_release);
+                    }
+                    break;
+                case 5:
+                    if (column <= 2)
+                    {
+                        if (auto* rawParam = stripDelayModeParams[static_cast<size_t>(stripIndex)])
+                            rawParam->store(static_cast<float>(column), std::memory_order_release);
+                    }
+                    else if (column >= 12)
+                    {
+                        if (auto* rawParam = stripDelaySyncParams[static_cast<size_t>(stripIndex)])
+                            rawParam->store(column >= 14 ? 1.0f : 0.0f, std::memory_order_release);
+                    }
+                    break;
+                default:
+                    break;
+            }
+            break;
+        }
+
+        case ControlMode::Filter:
+            MonomeFilterActions::applyButtonPressLive(*strip, column, controlRow);
+            break;
+
+        case ControlMode::Normal:
+        case ControlMode::FileBrowser:
+        case ControlMode::GroupAssign:
+        case ControlMode::Modulation:
+        case ControlMode::Preset:
+        case ControlMode::StepEdit:
+        default:
+            break;
+    }
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::createParameterLayout()
@@ -6166,7 +6421,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         layout.add(std::make_unique<juce::AudioParameterFloat>(
             "stripSpeed" + juce::String(i),
             "Strip " + juce::String(i + 1) + " Playhead Speed",
-            juce::NormalisableRange<float>(0.125f, 8.0f, 0.01f, 0.5f),
+            juce::NormalisableRange<float>(0.0f, 8.0f, 0.01f, 0.5f),
             1.0f));
 
         layout.add(std::make_unique<juce::AudioParameterFloat>(
@@ -6192,6 +6447,40 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
             "stripTempoMatchMode" + juce::String(i),
             "Strip " + juce::String(i + 1) + " Tempo Match Mode",
             juce::StringArray{"Global", "Repitch", "Stretch"},
+            0,
+            globalChoiceAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterBool>(
+            "stripFilterEnabled" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Filter Enabled",
+            false,
+            globalBoolAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripFilterFrequency" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Filter Frequency",
+            juce::NormalisableRange<float>(20.0f, 20000.0f, 1.0f, 0.25f),
+            20000.0f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripFilterResonance" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Filter Resonance",
+            juce::NormalisableRange<float>(0.1f, 10.0f, 0.01f, 0.35f),
+            0.707f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripFilterMorph" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Filter Morph",
+            juce::NormalisableRange<float>(0.0f, 1.0f, 0.001f),
+            0.0f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterChoice>(
+            "stripFilterAlgorithm" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Filter Algorithm",
+            juce::StringArray{"SVF12", "SVF24", "LAD12", "LAD24", "MOOG S", "MOOG H"},
             0,
             globalChoiceAttrs));
 
@@ -6252,6 +6541,54 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
             "Strip " + juce::String(i + 1) + " Duck Follow Master",
             false,
             globalBoolAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripDelayMix" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Delay Mix",
+            juce::NormalisableRange<float>(0.0f, 1.0f, 0.001f),
+            0.0f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripDelayTime" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Delay Time",
+            juce::NormalisableRange<float>(0.25f, 4.0f, 0.001f, 0.45f),
+            1.0f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterBool>(
+            "stripDelaySync" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Delay Sync",
+            true,
+            globalBoolAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripDelayFeedback" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Delay Feedback",
+            juce::NormalisableRange<float>(0.0f, 0.97f, 0.001f),
+            0.35f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripDelayLowCut" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Delay Low Cut",
+            juce::NormalisableRange<float>(20.0f, 12000.0f, 1.0f, 0.25f),
+            20.0f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            "stripDelayHighCut" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Delay High Cut",
+            juce::NormalisableRange<float>(200.0f, 20000.0f, 1.0f, 0.3f),
+            12000.0f,
+            globalFloatAttrs));
+
+        layout.add(std::make_unique<juce::AudioParameterChoice>(
+            "stripDelayMode" + juce::String(i),
+            "Strip " + juce::String(i + 1) + " Delay Mode",
+            juce::StringArray{"Single", "Dual", "Ping-Pong"},
+            0,
+            globalChoiceAttrs));
     }
     
     return layout;
@@ -6509,9 +6846,18 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
             auto* speedParam = stripSpeedParams[static_cast<size_t>(i)];
             if (speedParam)
             {
-                const float speedRatio = PlayheadSpeedQuantizer::quantizeRatio(
-                    juce::jlimit(0.125f, 8.0f, speedParam->load(std::memory_order_acquire)));
-                strip->setPlayheadSpeedRatio(speedRatio);
+                if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
+                {
+                    const float playbackSpeed = PlayheadSpeedQuantizer::grainPlaybackSpeedFromControl(
+                        juce::jlimit(0.0f, 8.0f, speedParam->load(std::memory_order_acquire)));
+                    strip->setPlaybackSpeed(playbackSpeed);
+                }
+                else
+                {
+                    const float speedRatio = PlayheadSpeedQuantizer::quantizeRatio(
+                        juce::jlimit(0.125f, 8.0f, speedParam->load(std::memory_order_acquire)));
+                    strip->setPlayheadSpeedRatio(speedRatio);
+                }
             }
 
             auto* pitchParam = stripPitchParams[static_cast<size_t>(i)];
@@ -6604,6 +6950,37 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
             auto* duckFollowMasterParam = stripDuckFollowMasterParams[static_cast<size_t>(i)];
             if (duckFollowMasterParam)
                 strip->setDuckFollowMaster(duckFollowMasterParam->load(std::memory_order_acquire) > 0.5f);
+
+            auto* delayMixParam = stripDelayMixParams[static_cast<size_t>(i)];
+            if (delayMixParam)
+                strip->setDelayMix(delayMixParam->load(std::memory_order_acquire));
+
+            auto* delayTimeParam = stripDelayTimeParams[static_cast<size_t>(i)];
+            if (delayTimeParam)
+                strip->setDelayTimeBeats(delayTimeParam->load(std::memory_order_acquire));
+
+            auto* delaySyncParam = stripDelaySyncParams[static_cast<size_t>(i)];
+            if (delaySyncParam)
+                strip->setDelaySyncEnabled(delaySyncParam->load(std::memory_order_acquire) > 0.5f);
+
+            auto* delayFeedbackParam = stripDelayFeedbackParams[static_cast<size_t>(i)];
+            if (delayFeedbackParam)
+                strip->setDelayFeedback(delayFeedbackParam->load(std::memory_order_acquire));
+
+            auto* delayLowCutParam = stripDelayLowCutParams[static_cast<size_t>(i)];
+            if (delayLowCutParam)
+                strip->setDelayLowCutHz(delayLowCutParam->load(std::memory_order_acquire));
+
+            auto* delayHighCutParam = stripDelayHighCutParams[static_cast<size_t>(i)];
+            if (delayHighCutParam)
+                strip->setDelayHighCutHz(delayHighCutParam->load(std::memory_order_acquire));
+
+            auto* delayModeParam = stripDelayModeParams[static_cast<size_t>(i)];
+            if (delayModeParam)
+            {
+                strip->setDelayMode(static_cast<EnhancedAudioStrip::DelayMode>(
+                    juce::jlimit(0, 2, static_cast<int>(delayModeParam->load(std::memory_order_acquire)))));
+            }
         }
     }
 
@@ -9516,9 +9893,7 @@ void MlrVSTAudioProcessor::performSceneLoad(int mainPresetIndex,
 
 float MlrVSTAudioProcessor::getInnerLoopLengthFactor() const
 {
-    const int choice = innerLoopLengthParam
-        ? juce::jlimit(0, 4, static_cast<int>(*innerLoopLengthParam))
-        : 0;
+    const int choice = innerLoopLengthSelection.load(std::memory_order_acquire);
     static constexpr std::array<float, 5> kFactors { 1.0f, 0.5f, 0.25f, 0.125f, 0.0625f };
     return kFactors[static_cast<size_t>(choice)];
 }
@@ -11937,6 +12312,7 @@ void MlrVSTAudioProcessor::loadControlPagesFromState(const juce::ValueTree& stat
         ControlMode::FileBrowser,
         ControlMode::GroupAssign,
         ControlMode::Filter,
+        ControlMode::Delay,
         ControlMode::Pitch,
         ControlMode::Modulation,
         ControlMode::Preset,
@@ -12107,7 +12483,6 @@ void MlrVSTAudioProcessor::loadPersistentControlPages()
 
     loadControlPagesFromState(state);
     suppressPersistentGlobalControlsSave.store(previousSuppress, std::memory_order_release);
-    appendGlobalSettingsDiagnostic("load-control-pages", xml.get());
 }
 
 void MlrVSTAudioProcessor::loadPersistentGlobalControls()
@@ -12236,6 +12611,10 @@ void MlrVSTAudioProcessor::loadPersistentGlobalControls()
     anyRestored = restoreBoolParam("limiterEnabled", "limiterEnabled") || anyRestored;
     anyRestored = restoreChoiceParam("quantize", "quantize", 0, 9) || anyRestored;
     anyRestored = restoreChoiceParam("innerLoopLength", "innerLoopLength", 0, 4) || anyRestored;
+    innerLoopLengthSelection.store(innerLoopLengthParam != nullptr
+                                       ? juce::jlimit(0, 4, static_cast<int>(innerLoopLengthParam->load(std::memory_order_acquire)))
+                                       : 0,
+                                   std::memory_order_release);
     anyRestored = restoreChoiceParam("quality", "quality", 0, 3) || anyRestored;
     anyRestored = restoreFloatParam("pitchSmoothing", "pitchSmoothing", 0.0, 1.0) || anyRestored;
     anyRestored = restoreFloatParam("inputMonitor", "inputMonitor", 0.0, 1.0) || anyRestored;
@@ -12276,7 +12655,6 @@ void MlrVSTAudioProcessor::loadPersistentGlobalControls()
 
     applyLoopPitchSyncToAllStrips();
     persistentGlobalControlsReady.store(1, std::memory_order_release);
-    appendGlobalSettingsDiagnostic("load-globals", xml.get());
 }
 
 void MlrVSTAudioProcessor::savePersistentControlPages() const
@@ -12339,7 +12717,6 @@ void MlrVSTAudioProcessor::savePersistentControlPages() const
     xml.setAttribute("rootNoteMidi", globalRootNoteMidi.load(std::memory_order_acquire));
     xml.setAttribute("pitchScale", globalPitchScale.load(std::memory_order_acquire));
     saveGlobalSettingsXml(xml);
-    appendGlobalSettingsDiagnostic("save-globals", &xml);
 }
 
 void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
@@ -12628,82 +13005,6 @@ void MlrVSTAudioProcessor::timerCallback()
                 setLatencySamples(requiredLatencySamples);
                 lastReportedLatencySamples = requiredLatencySamples;
             }
-        }
-    }
-
-    if constexpr (kEnableSignalsmithLoopDebugLogging)
-    {
-        static bool logInitialised = false;
-        static std::ofstream logStream;
-        static std::array<uint64_t, MaxStrips> lastSequences{};
-        static std::array<bool, MaxStrips> lastRelevantStates{};
-
-        if (!logInitialised)
-        {
-            logStream.open(kSignalsmithLoopDebugLogPath, std::ios::out | std::ios::trunc);
-            logInitialised = true;
-        }
-
-        if (audioEngine != nullptr && logStream.is_open())
-        {
-            const auto nowMs = juce::Time::currentTimeMillis();
-            for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
-            {
-                const auto arrayIndex = static_cast<size_t>(stripIndex);
-                auto* strip = audioEngine->getStrip(stripIndex);
-                if (strip == nullptr)
-                    continue;
-
-                const auto snapshot = strip->getSignalsmithLoopDebugSnapshot();
-                const auto* rawPitchParam = stripPitchParams[arrayIndex];
-                const float rawPitchSemitones = rawPitchParam != nullptr
-                    ? rawPitchParam->load(std::memory_order_acquire)
-                    : 0.0f;
-                const auto loopPitchRole = getLoopPitchRole(stripIndex);
-                const auto loopPitchTiming = getLoopPitchSyncTiming(stripIndex);
-                const bool relevant = snapshot.playMode == static_cast<int>(EnhancedAudioStrip::PlayMode::Loop)
-                    && snapshot.pitchAlgorithm == static_cast<int>(EnhancedAudioStrip::PitchShiftAlgorithm::Signalsmith)
-                    && snapshot.signalsmithLiveMode;
-
-                if (snapshot.sequence == lastSequences[arrayIndex]
-                    && relevant == lastRelevantStates[arrayIndex])
-                {
-                    continue;
-                }
-
-                if (!relevant && !lastRelevantStates[arrayIndex])
-                {
-                    lastSequences[arrayIndex] = snapshot.sequence;
-                    continue;
-                }
-
-                juce::String line;
-                line << juce::String(nowMs)
-                     << " strip=" << stripIndex
-                     << " relevant=" << (relevant ? 1 : 0)
-                     << " playing=" << (snapshot.playing ? 1 : 0)
-                     << " maintain=" << (snapshot.maintainRealtimeStream ? 1 : 0)
-                     << " use_rt=" << (snapshot.useRealtimeSignalsmith ? 1 : 0)
-                     << " use_align=" << (snapshot.useRealtimeAlignmentDelay ? 1 : 0)
-                     << " primed=" << (snapshot.streamPrimed ? 1 : 0)
-                     << " processed=" << (snapshot.streamProcessedThisBlock ? 1 : 0)
-                     << " rendered=" << snapshot.renderedSamples
-                     << " delay=" << snapshot.alignmentDelaySamples
-                     << " history=" << snapshot.historySamples
-                     << " raw_pitch=" << juce::String(rawPitchSemitones, 3)
-                     << " role=" << static_cast<int>(loopPitchRole)
-                     << " sync_timing=" << static_cast<int>(loopPitchTiming)
-                     << " target_st=" << juce::String(snapshot.targetSemitones, 3)
-                     << " smooth_st=" << juce::String(snapshot.smoothedSemitones, 3)
-                     << " pre_rms=" << juce::String(snapshot.preRms, 6)
-                     << " wet_rms=" << juce::String(snapshot.wetRms, 6)
-                     << " final_rms=" << juce::String(snapshot.finalRms, 6);
-                logStream << line << '\n';
-
-                lastSequences[arrayIndex] = snapshot.sequence;
-                lastRelevantStates[arrayIndex] = relevant;
-            }
-            logStream.flush();
         }
     }
 
@@ -13072,6 +13373,28 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
         if (auto* param = parameters.getParameter("stripPitchControlMode" + juce::String(i)))
             param->setValueNotifyingHost(param->getDefaultValue());
         if (auto* param = parameters.getParameter("stripTempoMatchMode" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripFilterEnabled" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripFilterFrequency" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripFilterResonance" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripFilterMorph" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripFilterAlgorithm" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripDelayMix" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripDelayTime" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripDelayFeedback" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripDelayLowCut" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripDelayHighCut" + juce::String(i)))
+            param->setValueNotifyingHost(param->getDefaultValue());
+        if (auto* param = parameters.getParameter("stripDelayMode" + juce::String(i)))
             param->setValueNotifyingHost(param->getDefaultValue());
     }
 

@@ -88,4 +88,20 @@ inline float ratioFromBeatsPerLoop(float beatsPerLoop, int recordingBars)
         return 1.0f;
     return baseBeats / beatsPerLoop;
 }
+
+inline float grainPlaybackSpeedFromControl(float controlValue)
+{
+    const float clamped = std::clamp(controlValue, 0.0f, 8.0f);
+    if (clamped <= 1.0f)
+        return clamped;
+    return 1.0f + ((clamped - 1.0f) / 7.0f);
+}
+
+inline float grainControlValueFromPlaybackSpeed(float playbackSpeed)
+{
+    const float clamped = std::clamp(playbackSpeed, 0.0f, 2.0f);
+    if (clamped <= 1.0f)
+        return clamped;
+    return 1.0f + ((clamped - 1.0f) * 7.0f);
+}
 }

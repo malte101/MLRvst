@@ -157,8 +157,23 @@ juce::String getPlayheadSpeedLabel(float ratio)
     return juce::String(PlayheadSpeedQuantizer::labelForRatio(ratio));
 }
 
-float getPlayheadSpeedRatioForStrip(const EnhancedAudioStrip& strip)
+juce::String getGrainSpeedLabel(float speed)
 {
+    speed = PlayheadSpeedQuantizer::grainPlaybackSpeedFromControl(speed);
+    if (std::abs(speed) <= 1.0e-4f)
+        return "0";
+
+    if (std::abs(speed - std::round(speed)) <= 1.0e-3f)
+        return juce::String(static_cast<int>(std::round(speed)));
+
+    return juce::String(speed, speed < 1.0f ? 2 : 1);
+}
+
+float getSpeedControlValueForStrip(const EnhancedAudioStrip& strip)
+{
+    if (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
+        return PlayheadSpeedQuantizer::grainControlValueFromPlaybackSpeed(strip.getPlaybackSpeed());
+
     return PlayheadSpeedQuantizer::quantizeRatio(strip.getPlayheadSpeedRatio());
 }
 
@@ -214,6 +229,7 @@ juce::String getMonomePageDisplayName(MlrVSTAudioProcessor::ControlMode mode)
         case MlrVSTAudioProcessor::ControlMode::Volume: return "Volume";
         case MlrVSTAudioProcessor::ControlMode::GrainSize: return "Grain Size";
         case MlrVSTAudioProcessor::ControlMode::Filter: return "Filter";
+        case MlrVSTAudioProcessor::ControlMode::Delay: return "Delay";
         case MlrVSTAudioProcessor::ControlMode::Swing: return "Swing";
         case MlrVSTAudioProcessor::ControlMode::Gate: return "Gate";
         case MlrVSTAudioProcessor::ControlMode::Modulation: return "Modulation";
@@ -235,6 +251,7 @@ juce::String getMonomePageShortName(MlrVSTAudioProcessor::ControlMode mode)
         case MlrVSTAudioProcessor::ControlMode::Volume: return "VOL";
         case MlrVSTAudioProcessor::ControlMode::GrainSize: return "GRN";
         case MlrVSTAudioProcessor::ControlMode::Filter: return "FLT";
+        case MlrVSTAudioProcessor::ControlMode::Delay: return "DLY";
         case MlrVSTAudioProcessor::ControlMode::Swing: return "SWG";
         case MlrVSTAudioProcessor::ControlMode::Gate: return "GATE";
         case MlrVSTAudioProcessor::ControlMode::FileBrowser: return "BRW";
@@ -433,6 +450,11 @@ juce::String macroValueText(MlrVSTAudioProcessor::MacroTarget target, float norm
         case MlrVSTAudioProcessor::MacroTarget::Retrigger:
             return retriggerDivisionLabel(clamped);
         case MlrVSTAudioProcessor::MacroTarget::Rearrange:
+        case MlrVSTAudioProcessor::MacroTarget::DelayMix:
+        case MlrVSTAudioProcessor::MacroTarget::DelayTime:
+        case MlrVSTAudioProcessor::MacroTarget::DelayFeedback:
+        case MlrVSTAudioProcessor::MacroTarget::DelayLowCut:
+        case MlrVSTAudioProcessor::MacroTarget::DelayHighCut:
             return "Unassigned";
         case MlrVSTAudioProcessor::MacroTarget::None:
         default:
@@ -775,6 +797,30 @@ float shapeSubdivisionBendPhaseUi(float phase01, float bend)
 WaveformDisplay::WaveformDisplay()
 {
     setOpaque(false);
+    setMouseCursor(juce::MouseCursor::NormalCursor);
+}
+
+float WaveformDisplay::normalizedPositionFromX(float x) const
+{
+    const float width = static_cast<float>(juce::jmax(1, getWidth()));
+    const float clampedX = juce::jlimit(0.0f, width, x);
+    const float localNorm = clampedX / width;
+    return juce::jlimit(0.0f, 1.0f, viewStartNorm + (localNorm * viewSpanNorm));
+}
+
+float WaveformDisplay::xFromNormalizedPosition(float normalizedPosition, float width) const
+{
+    if (viewSpanNorm <= 1.0e-6f)
+        return 0.0f;
+
+    return ((normalizedPosition - viewStartNorm) / viewSpanNorm) * width;
+}
+
+void WaveformDisplay::resetView()
+{
+    viewStartNorm = 0.0f;
+    viewSpanNorm = 1.0f;
+    repaint();
 }
 
 void WaveformDisplay::paint(juce::Graphics& g)
@@ -819,21 +865,38 @@ void WaveformDisplay::paint(juce::Graphics& g)
     const juce::Colour grainAccent = waveformColor.interpolatedWith(kAccent, 0.35f)
                                        .withMultipliedSaturation(1.1f)
                                        .withMultipliedBrightness(1.08f);
+    const float visibleStart = juce::jlimit(0.0f, 1.0f, viewStartNorm);
+    const float visibleSpan = juce::jlimit(1.0f / 64.0f, 1.0f, viewSpanNorm);
+    const float visibleEnd = juce::jlimit(visibleStart, 1.0f, visibleStart + visibleSpan);
+    const auto normToX = [&](float normalized) -> float
+    {
+        return xFromNormalizedPosition(normalized, bounds.getWidth());
+    };
+    const auto isNormVisible = [&](float normalized) -> bool
+    {
+        return normalized >= (visibleStart - 1.0e-4f) && normalized <= (visibleEnd + 1.0e-4f);
+    };
     
     // Draw waveform
     if (!thumbnail.empty())
     {
         juce::Path waveformPath;
-        auto width = bounds.getWidth();
         auto height = bounds.getHeight();
         auto centerY = height * 0.5f;
-        
-        waveformPath.startNewSubPath(0, centerY);
-        
-        for (size_t i = 0; i < thumbnail.size(); ++i)
+
+        const int thumbCount = static_cast<int>(thumbnail.size());
+        const int firstIndex = juce::jlimit(0, juce::jmax(0, thumbCount - 1),
+                                            static_cast<int>(std::floor(visibleStart * static_cast<float>(juce::jmax(1, thumbCount - 1)))));
+        const int lastIndex = juce::jlimit(firstIndex, juce::jmax(0, thumbCount - 1),
+                                           static_cast<int>(std::ceil(visibleEnd * static_cast<float>(juce::jmax(1, thumbCount - 1)))));
+
+        waveformPath.startNewSubPath(normToX(static_cast<float>(firstIndex) / static_cast<float>(juce::jmax(1, thumbCount - 1))), centerY);
+
+        for (int i = firstIndex; i <= lastIndex; ++i)
         {
-            auto x = (i / static_cast<float>(thumbnail.size())) * width;
-            const float displayValue = juce::jlimit(0.0f, 1.0f, thumbnail[i] * visualGain);
+            const float fullNorm = static_cast<float>(i) / static_cast<float>(juce::jmax(1, thumbCount - 1));
+            auto x = normToX(fullNorm);
+            const float displayValue = juce::jlimit(0.0f, 1.0f, thumbnail[static_cast<size_t>(i)] * visualGain);
             auto y = centerY - (displayValue * centerY * 0.9f);
             
             // Safety check for valid coordinates
@@ -842,9 +905,10 @@ void WaveformDisplay::paint(juce::Graphics& g)
         }
         
         // Mirror bottom half
-        for (int i = static_cast<int>(thumbnail.size()) - 1; i >= 0; --i)
+        for (int i = lastIndex; i >= firstIndex; --i)
         {
-            auto x = (i / static_cast<float>(thumbnail.size())) * width;
+            const float fullNorm = static_cast<float>(i) / static_cast<float>(juce::jmax(1, thumbCount - 1));
+            auto x = normToX(fullNorm);
             const float displayValue = juce::jlimit(0.0f, 1.0f, thumbnail[static_cast<size_t>(i)] * visualGain);
             auto y = centerY + (displayValue * centerY * 0.9f);
             
@@ -867,8 +931,10 @@ void WaveformDisplay::paint(juce::Graphics& g)
     // Draw loop points with matching waveform color
     if (maxColumns > 0)
     {
-        auto loopStartX = (loopStart / static_cast<float>(maxColumns)) * bounds.getWidth();
-        auto loopEndX = (loopEnd / static_cast<float>(maxColumns)) * bounds.getWidth();
+        const float loopStartNorm = juce::jlimit(0.0f, 1.0f, loopStart / static_cast<float>(juce::jmax(1, maxColumns)));
+        const float loopEndNorm = juce::jlimit(0.0f, 1.0f, loopEnd / static_cast<float>(juce::jmax(1, maxColumns)));
+        auto loopStartX = normToX(loopStartNorm);
+        auto loopEndX = normToX(loopEndNorm);
         auto rectWidth = loopEndX - loopStartX;
         auto rectHeight = bounds.getHeight();
         
@@ -892,7 +958,7 @@ void WaveformDisplay::paint(juce::Graphics& g)
     // Draw playback position with matching waveform color (darker)
     if (std::isfinite(playbackPosition) && playbackPosition >= 0.0 && playbackPosition <= 1.0)
     {
-        auto playX = playbackPosition * bounds.getWidth();
+        auto playX = normToX(static_cast<float>(playbackPosition));
         if (std::isfinite(playX))
         {
             if (grainWindowOverlayEnabled && grainWindowNorm > 0.0)
@@ -932,7 +998,9 @@ void WaveformDisplay::paint(juce::Graphics& g)
                 const float norm = juce::jlimit(0.0f, 1.0f,
                                                 static_cast<float>(slices[static_cast<size_t>(i)])
                                                 / static_cast<float>(juce::jmax(1, waveformTotalSamples - 1)));
-                const float x = norm * bounds.getWidth();
+                if (!isNormVisible(norm))
+                    continue;
+                const float x = normToX(norm);
                 if (std::isfinite(x))
                     g.drawLine(x, 0.0f, x, bounds.getHeight(), thickness);
             }
@@ -949,7 +1017,10 @@ void WaveformDisplay::paint(juce::Graphics& g)
     g.setColour(juce::Colour(0xff4a4a4a).withAlpha(grainWindowOverlayEnabled ? 0.55f : 1.0f));
     for (int i = 1; i < maxColumns; ++i)
     {
-        auto x = (i / static_cast<float>(maxColumns)) * bounds.getWidth();
+        const float norm = i / static_cast<float>(juce::jmax(1, maxColumns));
+        if (!isNormVisible(norm))
+            continue;
+        auto x = normToX(norm);
         if (std::isfinite(x))
             g.drawLine(x, 0, x, bounds.getHeight(), 0.5f);
     }
@@ -970,7 +1041,12 @@ void WaveformDisplay::paint(juce::Graphics& g)
                 ++markerIdx;
                 continue;
             }
-            const float x = marker * bounds.getWidth();
+            if (!isNormVisible(marker))
+            {
+                ++markerIdx;
+                continue;
+            }
+            const float x = normToX(marker);
             float pitchNorm = juce::jlimit(-1.0f, 1.0f, grainHudPitchSemitones / 48.0f);
             if (markerIdx >= 0 && markerIdx < static_cast<int>(grainMarkerPitchNorms.size()))
             {
@@ -1077,6 +1153,74 @@ void WaveformDisplay::resized()
 {
 }
 
+void WaveformDisplay::mouseDown(const juce::MouseEvent& e)
+{
+    if (!hasAudio || !loopInteractionEnabled)
+        return;
+
+    if (e.mods.isShiftDown())
+    {
+        if (onShiftSliceEdit != nullptr)
+            onShiftSliceEdit(static_cast<double>(normalizedPositionFromX(static_cast<float>(e.position.x))));
+        return;
+    }
+
+    if ((e.mods.isAltDown() || e.mods.isMiddleButtonDown()) && viewSpanNorm < 0.999f)
+    {
+        viewDragActive = true;
+        viewDragStart = e.getPosition();
+        viewDragStartNorm = viewStartNorm;
+        setMouseCursor(juce::MouseCursor::DraggingHandCursor);
+    }
+}
+
+void WaveformDisplay::mouseDrag(const juce::MouseEvent& e)
+{
+    if (!viewDragActive || !loopInteractionEnabled)
+        return;
+
+    const float width = static_cast<float>(juce::jmax(1, getWidth()));
+    const float deltaNorm = static_cast<float>(e.getDistanceFromDragStartX()) / width * viewSpanNorm;
+    viewStartNorm = juce::jlimit(0.0f, juce::jmax(0.0f, 1.0f - viewSpanNorm), viewDragStartNorm - deltaNorm);
+    repaint();
+}
+
+void WaveformDisplay::mouseUp(const juce::MouseEvent& /*e*/)
+{
+    if (!viewDragActive)
+        return;
+
+    viewDragActive = false;
+    setMouseCursor(juce::MouseCursor::NormalCursor);
+}
+
+void WaveformDisplay::mouseDoubleClick(const juce::MouseEvent& e)
+{
+    if (!loopInteractionEnabled)
+        return;
+
+    if (!e.mods.isShiftDown())
+        resetView();
+}
+
+void WaveformDisplay::mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel)
+{
+    if (!hasAudio || !loopInteractionEnabled || std::abs(wheel.deltaY) <= 1.0e-5f)
+        return;
+
+    const float cursorNorm = normalizedPositionFromX(static_cast<float>(e.position.x));
+    const float zoomFactor = (wheel.deltaY > 0.0f) ? 0.85f : 1.18f;
+    const float nextSpan = juce::jlimit(1.0f / 64.0f, 1.0f, viewSpanNorm * zoomFactor);
+    const float cursorRatio = juce::jlimit(0.0f, 1.0f,
+                                           (cursorNorm - viewStartNorm) / juce::jmax(1.0e-6f, viewSpanNorm));
+    float nextStart = cursorNorm - (cursorRatio * nextSpan);
+    nextStart = juce::jlimit(0.0f, juce::jmax(0.0f, 1.0f - nextSpan), nextStart);
+
+    viewSpanNorm = nextSpan;
+    viewStartNorm = nextStart;
+    repaint();
+}
+
 void WaveformDisplay::setAudioBuffer(const juce::AudioBuffer<float>& buffer, double sampleRate)
 {
     (void) sampleRate;
@@ -1093,14 +1237,14 @@ void WaveformDisplay::setAudioBuffer(const juce::AudioBuffer<float>& buffer, dou
 
 void WaveformDisplay::generateThumbnail(const juce::AudioBuffer<float>& buffer)
 {
-    const int thumbnailSize = 512;
+    const int thumbnailSize = 2048;
     thumbnail.clear();
     thumbnail.resize(static_cast<size_t>(thumbnailSize), 0.0f);
     
     auto numSamples = buffer.getNumSamples();
     if (numSamples == 0) return;
     
-    auto samplesPerPixel = numSamples / thumbnailSize;
+    auto samplesPerPixel = juce::jmax(1, numSamples / thumbnailSize);
     
     for (int i = 0; i < thumbnailSize; ++i)
     {
@@ -1197,6 +1341,19 @@ void WaveformDisplay::setLoopPitchOverlay(bool enabled, const juce::String& line
     repaint();
 }
 
+void WaveformDisplay::setLoopInteractionEnabled(bool enabled)
+{
+    if (loopInteractionEnabled == enabled)
+        return;
+
+    loopInteractionEnabled = enabled;
+    if (!loopInteractionEnabled)
+    {
+        viewDragActive = false;
+        resetView();
+    }
+}
+
 void WaveformDisplay::clear()
 {
     hasAudio = false;
@@ -1221,6 +1378,9 @@ void WaveformDisplay::clear()
     loopPitchOverlayEnabled = false;
     loopPitchOverlayLineA.clear();
     loopPitchOverlayLineB.clear();
+    viewDragActive = false;
+    viewStartNorm = 0.0f;
+    viewSpanNorm = 1.0f;
     repaint();
 }
 
@@ -1390,6 +1550,10 @@ void StripControl::setupComponents()
     
     // Waveform display with rainbow color
     waveform.setWaveformColor(stripColor.withMultipliedSaturation(1.35f).withMultipliedBrightness(1.25f));
+    waveform.onShiftSliceEdit = [this](double normalizedPosition)
+    {
+        handleWaveformShiftSliceEdit(normalizedPosition);
+    };
     addAndMakeVisible(waveform);
 
     sampleModeComponent.setEngine(nullptr);
@@ -1904,26 +2068,40 @@ void StripControl::setupComponents()
     speedSlider.setLookAndFeel(&knobLookAndFeel);
     speedSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
     speedSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-    speedSlider.setRange(0.125, 8.0, 0.001);
+    speedSlider.setRange(0.0, 8.0, 0.001);
     speedSlider.setValue(1.0);
     enableAltClickReset(speedSlider, 1.0);
-    speedSlider.textFromValueFunction = [](double value)
+    speedSlider.textFromValueFunction = [this](double value)
     {
+        auto* strip = processor.getAudioEngine() != nullptr ? processor.getAudioEngine()->getStrip(stripIndex) : nullptr;
+        if (strip != nullptr && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
+            return getGrainSpeedLabel(static_cast<float>(value));
+
         return getPlayheadSpeedLabel(PlayheadSpeedQuantizer::quantizeRatio(static_cast<float>(value)));
     };
     speedSlider.setPopupDisplayEnabled(true, false, this);
-    speedSlider.setTooltip("Playhead speed (slice traversal only).");
+    speedSlider.setTooltip("Speed. In Grain mode this changes playback position speed from 0 to 2; otherwise it changes slice traversal speed.");
     speedSlider.onValueChange = [this]()
     {
-        const float quantizedRatio = PlayheadSpeedQuantizer::quantizeRatio(static_cast<float>(speedSlider.getValue()));
-        if (std::abs(quantizedRatio - static_cast<float>(speedSlider.getValue())) > 1.0e-4f)
-        {
-            speedSlider.setValue(quantizedRatio, juce::sendNotificationSync);
-            return;
-        }
-
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-            strip->setPlayheadSpeedRatio(quantizedRatio);
+        {
+            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
+            {
+                const float playbackSpeed = PlayheadSpeedQuantizer::grainPlaybackSpeedFromControl(
+                    static_cast<float>(speedSlider.getValue()));
+                strip->setPlaybackSpeed(playbackSpeed);
+            }
+            else
+            {
+                const float quantizedRatio = PlayheadSpeedQuantizer::quantizeRatio(static_cast<float>(speedSlider.getValue()));
+                if (std::abs(quantizedRatio - static_cast<float>(speedSlider.getValue())) > 1.0e-4f)
+                {
+                    speedSlider.setValue(quantizedRatio, juce::sendNotificationSync);
+                    return;
+                }
+                strip->setPlayheadSpeedRatio(quantizedRatio);
+            }
+        }
     };
     addAndMakeVisible(speedSlider);
     
@@ -2451,7 +2629,9 @@ void StripControl::setupComponents()
     pitchControlOverrideBox.addItem("Bungee", 6);
     pitchControlOverrideBox.setSelectedId(1, juce::dontSendNotification);
     pitchControlOverrideBox.setJustificationType(juce::Justification::centred);
-    pitchControlOverrideBox.setTooltip("Per-strip pitch backend override. Global follows the Global Pitch dropdown; the other options force this strip to use that pitch method.");
+    pitchControlOverrideBox.setTooltip(
+        "Per-strip pitch backend override. Global follows the Global Pitch dropdown; the other options force this strip to use that pitch method. "
+        "Signalsmith is not currently available in Sample mode, so Sample strips use the local Pitch Shift path instead.");
     addAndMakeVisible(pitchControlOverrideBox);
     styleUiCombo(pitchControlOverrideBox);
     pitchControlOverrideAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
@@ -2710,9 +2890,17 @@ void StripControl::updateGrainOverlayVisibility()
     else
         sampleModeComponent.setEngine(processor.getSampleModeEngine(stripIndex, false));
 
+    waveform.setLoopInteractionEnabled(playMode == EnhancedAudioStrip::PlayMode::Loop);
+
     waveform.setVisible(!isStepMode && !isSampleMode && !modulationLaneView);
     stepDisplay.setVisible(isStepMode && !modulationLaneView);
     sampleModeComponent.setVisible(isSampleMode && !modulationLaneView);
+
+    speedSlider.setSliderStyle(isGrainMode
+                                   ? juce::Slider::LinearHorizontal
+                                   : juce::Slider::RotaryHorizontalVerticalDrag);
+    speedSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+    speedSlider.setRange(isGrainMode ? 0.0 : 0.125, 8.0, 0.001);
 
     volumeSlider.setVisible(!isGrainMode);
     panSlider.setVisible(!isGrainMode);
@@ -2814,6 +3002,41 @@ void StripControl::updateModSequencerTabButtons()
         tab.setColour(juce::TextButton::textColourOnId,
                       active ? juce::Colour(0xff101010) : juce::Colour(0xfff5f5f5));
     }
+}
+
+void StripControl::handleWaveformShiftSliceEdit(double normalizedPosition)
+{
+    auto* engine = processor.getAudioEngine();
+    if (engine == nullptr)
+        return;
+
+    auto* strip = engine->getStrip(stripIndex);
+    if (strip == nullptr || !strip->hasAudio() || !strip->isTransientSliceMode())
+        return;
+
+    const int totalSamples = juce::jmax(1, strip->getAudioBuffer()->getNumSamples());
+    const int sampleIndex = juce::jlimit(0,
+                                         totalSamples - 1,
+                                         static_cast<int>(std::round(juce::jlimit(0.0, 1.0, normalizedPosition)
+                                                                     * static_cast<double>(juce::jmax(1, totalSamples - 1)))));
+    const auto slices = strip->getSliceStartSamples(true);
+    int closestIndex = 1;
+    int closestDistance = std::numeric_limits<int>::max();
+    for (int i = 1; i < ModernAudioEngine::MaxColumns; ++i)
+    {
+        const int distance = std::abs(slices[static_cast<size_t>(i)] - sampleIndex);
+        if (distance < closestDistance)
+        {
+            closestDistance = distance;
+            closestIndex = i;
+        }
+    }
+
+    strip->setTransientSliceMarkerSample(closestIndex, sampleIndex);
+    waveform.setSliceMarkers(strip->getSliceStartSamples(false),
+                             strip->getSliceStartSamples(true),
+                             totalSamples,
+                             true);
 }
 
 
@@ -3824,9 +4047,9 @@ void StripControl::resized()
         recordLengthLabel.setVisible(false);
         recordLengthLabel.setBounds({});
 
-        const int grainTabRowHeight = 14;
-        const int grainTabGap = 4;
-        const int preferredGrainTabWidth = 60;
+        const int grainTabRowHeight = 13;
+        const int grainTabGap = 3;
+        const int preferredGrainTabWidth = 58;
         auto tabRow = controlsArea.removeFromTop(grainTabRowHeight);
         const int minClusterWidth = (3 * preferredGrainTabWidth) + (2 * grainTabGap);
         const int grainTabWidth = tabRow.getWidth() >= minClusterWidth
@@ -3841,14 +4064,14 @@ void StripControl::resized()
         tabRow.removeFromLeft(grainTabGap);
         grainTabShapeButton.setBounds(tabRow.removeFromLeft(grainTabWidth));
 
-        const int grainSectionGap = 3;
+        const int grainSectionGap = 2;
         if (controlsArea.getHeight() > grainSectionGap)
             controlsArea.removeFromTop(grainSectionGap);
 
         const bool showEnginePage = grainSubPage == GrainSubPage::Pitch;
         if (showEnginePage)
         {
-            const int engineRowHeight = 14;
+            const int engineRowHeight = 13;
             const int engineRowGap = 1;
             const int engineLabelW = 34;
             const int syncToggleW = 14;
@@ -3900,14 +4123,14 @@ void StripControl::resized()
             speedLabel.setBounds({});
         }
 
-        const int rowGapMini = 2;
+        const int rowGapMini = 1;
         const int totalMiniRows = (grainSubPage == GrainSubPage::Space) ? 3 : 2;
-        const int minMiniRowH = 10;
+        const int minMiniRowH = 9;
         const int maxMiniRowH = 20;
         const int rowH = juce::jlimit(minMiniRowH,
                                       maxMiniRowH,
                                       (controlsArea.getHeight() - ((totalMiniRows - 1) * rowGapMini)) / totalMiniRows);
-        const int miniLabelW = 36;
+        const int miniLabelW = 34;
         auto layoutGrainMiniRow = [&](juce::Label& labelA, juce::Slider& sliderA,
                                       juce::Label& labelB, juce::Slider& sliderB)
         {
@@ -4468,7 +4691,7 @@ void StripControl::updateFromEngine()
     }
     
     if (!speedSlider.isMouseButtonDown() && !modulates(ModernAudioEngine::ModTarget::Speed))
-        speedSlider.setValue(getPlayheadSpeedRatioForStrip(*strip), juce::dontSendNotification);
+        speedSlider.setValue(getSpeedControlValueForStrip(*strip), juce::dontSendNotification);
     if (!scratchSlider.isMouseButtonDown())
         scratchSlider.setValue(strip->getScratchAmount(), juce::dontSendNotification);
     if (!sliceLengthSlider.isMouseButtonDown())
@@ -4912,6 +5135,11 @@ void StripControl::updateFromEngine()
                     case ModernAudioEngine::ModTarget::SliceLength: return nullptr;
                     case ModernAudioEngine::ModTarget::Scratch: return nullptr;
                     case ModernAudioEngine::ModTarget::Rearrange: return nullptr;
+                    case ModernAudioEngine::ModTarget::DelayMix: return nullptr;
+                    case ModernAudioEngine::ModTarget::DelayTime: return nullptr;
+                    case ModernAudioEngine::ModTarget::DelayFeedback: return nullptr;
+                    case ModernAudioEngine::ModTarget::DelayLowCut: return nullptr;
+                    case ModernAudioEngine::ModTarget::DelayHighCut: return nullptr;
                     default: return nullptr;
                 }
             }();
@@ -4978,11 +5206,16 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     filterFreqSlider.onValueChange = [this]() {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
         {
-            strip->setFilterFrequency(static_cast<float>(filterFreqSlider.getValue()));
+            const float frequency = static_cast<float>(filterFreqSlider.getValue());
+            strip->setFilterEnabled(true);
+            strip->setFilterFrequency(frequency);
             if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
             {
                 if (auto* stepSampler = strip->getStepSampler())
-                    stepSampler->setFilterFrequency(static_cast<float>(filterFreqSlider.getValue()));
+                {
+                    stepSampler->setFilterEnabled(true);
+                    stepSampler->setFilterFrequency(frequency);
+                }
             }
         }
     };
@@ -5004,11 +5237,16 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     filterResSlider.onValueChange = [this]() {
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
         {
-            strip->setFilterResonance(static_cast<float>(filterResSlider.getValue()));
+            const float resonance = static_cast<float>(filterResSlider.getValue());
+            strip->setFilterEnabled(true);
+            strip->setFilterResonance(resonance);
             if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
             {
                 if (auto* stepSampler = strip->getStepSampler())
-                    stepSampler->setFilterResonance(static_cast<float>(filterResSlider.getValue()));
+                {
+                    stepSampler->setFilterEnabled(true);
+                    stepSampler->setFilterResonance(resonance);
+                }
             }
         }
     };
@@ -5046,6 +5284,7 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
         {
             const float morphValue = static_cast<float>(filterMorphSlider.getValue());
+            strip->setFilterEnabled(true);
             strip->setFilterMorph(morphValue);
             if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
             {
@@ -5064,7 +5303,10 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
 
                 strip->setFilterType(stripType);
                 if (auto* stepSampler = strip->getStepSampler())
+                {
+                    stepSampler->setFilterEnabled(true);
                     stepSampler->setFilterType(stepType);
+                }
             }
         }
     };
@@ -5106,6 +5348,7 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
             else if (id == 4) algo = EnhancedAudioStrip::FilterAlgorithm::Ladder24;
             else if (id == 5) algo = EnhancedAudioStrip::FilterAlgorithm::MoogStilson;
             else if (id == 6) algo = EnhancedAudioStrip::FilterAlgorithm::MoogHuov;
+            strip->setFilterEnabled(true);
             strip->setFilterAlgorithm(algo);
         }
     };
@@ -5192,6 +5435,78 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
     duckGainCompSlider.setTooltip("Compressor output gain compensation in dB");
     addAndMakeVisible(duckGainCompSlider);
 
+    auto setupDelayLabel = [this](juce::Label& label, const juce::String& text)
+    {
+        label.setText(text, juce::dontSendNotification);
+        label.setJustificationType(juce::Justification::centredLeft);
+        label.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+        label.setColour(juce::Label::textColourId, stripColor);
+        addAndMakeVisible(label);
+    };
+
+    auto setupDelaySlider = [](juce::Slider& slider)
+    {
+        slider.setSliderStyle(juce::Slider::LinearHorizontal);
+        slider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+    };
+
+    setupDelayLabel(delayModeLabel, "Mode");
+    delayModeBox.addItem("Single", 1);
+    delayModeBox.addItem("Dual", 2);
+    delayModeBox.addItem("Ping-Pong", 3);
+    delayModeBox.setSelectedId(1);
+    styleUiCombo(delayModeBox);
+    delayModeBox.setJustificationType(juce::Justification::centred);
+    delayModeBox.setTooltip("Delay routing: Single = mono repeats, Dual = independent left/right repeats, Ping-Pong = alternating cross-feedback repeats.");
+    addAndMakeVisible(delayModeBox);
+
+    delaySyncButton.setButtonText("Sync");
+    delaySyncButton.setClickingTogglesState(true);
+    delaySyncButton.setTooltip("Sync delay time to tempo. Off = free seconds.");
+    addAndMakeVisible(delaySyncButton);
+
+    setupDelayLabel(delayMixLabel, "Mix");
+    setupDelaySlider(delayMixSlider);
+    delayMixSlider.setRange(0.0, 1.0, 0.001);
+    delayMixSlider.setValue(0.0);
+    enableAltClickReset(delayMixSlider, 0.0);
+    delayMixSlider.setTooltip("Delay wet/dry mix.");
+    addAndMakeVisible(delayMixSlider);
+
+    setupDelayLabel(delayTimeLabel, "Time");
+    setupDelaySlider(delayTimeSlider);
+    delayTimeSlider.setRange(0.25, 4.0, 0.001);
+    delayTimeSlider.setValue(1.0);
+    enableAltClickReset(delayTimeSlider, 1.0);
+    delayTimeSlider.setTooltip("Delay time. Sync on = beats, Sync off = seconds.");
+    addAndMakeVisible(delayTimeSlider);
+
+    setupDelayLabel(delayFeedbackLabel, "Fdbk");
+    setupDelaySlider(delayFeedbackSlider);
+    delayFeedbackSlider.setRange(0.0, 0.97, 0.001);
+    delayFeedbackSlider.setValue(0.35);
+    enableAltClickReset(delayFeedbackSlider, 0.35);
+    delayFeedbackSlider.setTooltip("Delay feedback amount.");
+    addAndMakeVisible(delayFeedbackSlider);
+
+    setupDelayLabel(delayLowCutLabel, "Low");
+    setupDelaySlider(delayLowCutSlider);
+    delayLowCutSlider.setRange(20.0, 12000.0, 1.0);
+    delayLowCutSlider.setSkewFactorFromMidPoint(400.0);
+    delayLowCutSlider.setValue(20.0);
+    enableAltClickReset(delayLowCutSlider, 20.0);
+    delayLowCutSlider.setTooltip("Delay low cut in Hz.");
+    addAndMakeVisible(delayLowCutSlider);
+
+    setupDelayLabel(delayHighCutLabel, "High");
+    setupDelaySlider(delayHighCutSlider);
+    delayHighCutSlider.setRange(200.0, 20000.0, 1.0);
+    delayHighCutSlider.setSkewFactorFromMidPoint(3000.0);
+    delayHighCutSlider.setValue(12000.0);
+    enableAltClickReset(delayHighCutSlider, 12000.0);
+    delayHighCutSlider.setTooltip("Delay high cut in Hz.");
+    addAndMakeVisible(delayHighCutSlider);
+
     duckEnableAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
         processor.parameters, "stripDuckEnabled" + juce::String(stripIndex), duckEnableButton);
     duckFollowMasterAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
@@ -5208,6 +5523,20 @@ FXStripControl::FXStripControl(int idx, MlrVSTAudioProcessor& p)
         processor.parameters, "stripDuckRelease" + juce::String(stripIndex), duckReleaseSlider);
     duckGainCompAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
         processor.parameters, "stripDuckGainComp" + juce::String(stripIndex), duckGainCompSlider);
+    delayModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor.parameters, "stripDelayMode" + juce::String(stripIndex), delayModeBox);
+    delaySyncAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+        processor.parameters, "stripDelaySync" + juce::String(stripIndex), delaySyncButton);
+    delayMixAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "stripDelayMix" + juce::String(stripIndex), delayMixSlider);
+    delayTimeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "stripDelayTime" + juce::String(stripIndex), delayTimeSlider);
+    delayFeedbackAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "stripDelayFeedback" + juce::String(stripIndex), delayFeedbackSlider);
+    delayLowCutAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "stripDelayLowCut" + juce::String(stripIndex), delayLowCutSlider);
+    delayHighCutAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor.parameters, "stripDelayHighCut" + juce::String(stripIndex), delayHighCutSlider);
 
     // Start timer for updating from engine
     startTimer(50);  // Update at 20Hz
@@ -5220,55 +5549,41 @@ void FXStripControl::paint(juce::Graphics& g)
     drawPanel(g, bounds, stripColor, 10.0f);
 
     const auto inner = bounds.reduced(8.0f, 8.0f);
-    const float filterWidth = inner.getWidth() / 3.0f;
-    const float dividerX = inner.getX() + filterWidth;
+    const float filterWidth = inner.getWidth() * 0.32f;
+    const float delayWidth = inner.getWidth() * 0.32f;
+    const float dividerX1 = inner.getX() + filterWidth;
+    const float dividerX2 = dividerX1 + delayWidth;
 
     g.setColour(kPanelStroke.withAlpha(0.7f));
-    g.fillRect(dividerX - 1.0f, inner.getY() + 22.0f, 2.0f, inner.getHeight() - 30.0f);
-
-    auto drawTabHeader = [&](juce::Rectangle<float> area, const juce::String& text, juce::Colour accent)
-    {
-        g.setColour(juce::Colour(0xff1d1d1d).withAlpha(0.95f));
-        g.fillRoundedRectangle(area, 6.0f);
-        g.setColour(accent.withAlpha(0.75f));
-        g.drawRoundedRectangle(area, 6.0f, 1.1f);
-        g.setColour(kTextPrimary);
-        g.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
-        g.drawFittedText(text, area.toNearestInt(), juce::Justification::centred, 1);
-    };
-
-    drawTabHeader({ inner.getX() + 4.0f, inner.getY(), 74.0f, 18.0f }, "FILTER", stripColor);
-    drawTabHeader({ dividerX + 10.0f, inner.getY(), 64.0f, 18.0f }, "COMP", stripColor.brighter(0.1f));
+    g.fillRect(dividerX1 - 1.0f, inner.getY() + 4.0f, 2.0f, inner.getHeight() - 8.0f);
+    g.fillRect(dividerX2 - 1.0f, inner.getY() + 4.0f, 2.0f, inner.getHeight() - 8.0f);
 }
 
 void FXStripControl::resized()
 {
     auto bounds = getLocalBounds();
-    
-    // Match Play strip padding
     bounds.reduce(8, 8);
-    
-    const int filterWidth = juce::jlimit(170, juce::jmax(170, bounds.getWidth() / 3), (bounds.getWidth() * 3) / 8);
 
-    // Field 1: Filter controls (left third)
-    auto field1 = bounds.removeFromLeft(filterWidth).reduced(6, 0);
-
-    // Right pane: compressor/duck controls
+    const int totalWidth = bounds.getWidth();
+    const int filterWidth = juce::jmax(210, static_cast<int>(std::round(totalWidth * 0.32f)));
+    const int delayWidth = juce::jmax(224, static_cast<int>(std::round(totalWidth * 0.32f)));
+    auto filterField = bounds.removeFromLeft(filterWidth).reduced(6, 0);
+    auto delayField = bounds.removeFromLeft(delayWidth).reduced(6, 0);
     auto compField = bounds.reduced(6, 0);
-    field1.removeFromTop(20);
-    compField.removeFromTop(20);
-    
-    // Top row: Filter enable + compact algorithm selector
-    auto topRow = field1.removeFromTop(22);
+
+    filterField.removeFromTop(4);
+    delayField.removeFromTop(4);
+    compField.removeFromTop(4);
+
+    auto topRow = filterField.removeFromTop(22);
     filterEnableButton.setBounds(topRow.removeFromLeft(56));
     topRow.removeFromLeft(4);
     filterAlgoLabel.setBounds(topRow.removeFromLeft(24));
     topRow.removeFromLeft(3);
     filterAlgoBox.setBounds(topRow.removeFromLeft(92));
-    field1.removeFromTop(4);
-    
-    // Three rotary controls: Freq | Res | Morph
-    auto controlsRow = field1.removeFromTop(64);
+    filterField.removeFromTop(4);
+
+    auto controlsRow = filterField.removeFromTop(64);
 
     int controlWidth = controlsRow.getWidth() / 3;
     auto freqCol = controlsRow.removeFromLeft(controlWidth).reduced(2, 0);
@@ -5283,12 +5598,51 @@ void FXStripControl::resized()
     filterMorphLabel.setBounds(morphCol.removeFromTop(12));
     filterMorphSlider.setBounds(morphCol);
 
+    auto delayTopRow = delayField.removeFromTop(22);
+    delayModeLabel.setBounds(delayTopRow.removeFromLeft(34));
+    delayTopRow.removeFromLeft(4);
+    delayModeBox.setBounds(delayTopRow.removeFromLeft(96));
+    delayTopRow.removeFromLeft(6);
+    delaySyncButton.setBounds(delayTopRow.removeFromLeft(54));
+    delayField.removeFromTop(4);
+
+    const int delayRowCount = 5;
+    const int delayRowGap = 2;
+    const int delayRowHeight = juce::jmax(12,
+                                          (delayField.getHeight() - ((delayRowCount - 1) * delayRowGap))
+                                              / juce::jmax(1, delayRowCount));
+
+    auto layoutDelayRow = [&delayField, delayRowHeight](juce::Label& label, juce::Slider& slider)
+    {
+        if (delayField.getHeight() <= 0)
+        {
+            label.setBounds({});
+            slider.setBounds({});
+            return;
+        }
+
+        const int rowHeight = juce::jmin(delayRowHeight, delayField.getHeight());
+        auto row = delayField.removeFromTop(rowHeight);
+        const int labelWidth = juce::jmin(38, juce::jmax(28, row.getWidth() / 7));
+        label.setBounds(row.removeFromLeft(labelWidth));
+        row.removeFromLeft(4);
+        slider.setBounds(row);
+        if (delayField.getHeight() > delayRowGap)
+            delayField.removeFromTop(delayRowGap);
+    };
+
+    layoutDelayRow(delayMixLabel, delayMixSlider);
+    layoutDelayRow(delayTimeLabel, delayTimeSlider);
+    layoutDelayRow(delayFeedbackLabel, delayFeedbackSlider);
+    layoutDelayRow(delayLowCutLabel, delayLowCutSlider);
+    layoutDelayRow(delayHighCutLabel, delayHighCutSlider);
+
     auto duckTopRow = compField.removeFromTop(22);
     duckEnableButton.setBounds(duckTopRow.removeFromLeft(54));
     duckTopRow.removeFromLeft(4);
-    duckFollowMasterButton.setBounds(duckTopRow.removeFromLeft(78));
-    duckTopRow.removeFromLeft(8);
-    duckSourceLabel.setBounds(duckTopRow.removeFromLeft(28));
+    duckFollowMasterButton.setBounds(duckTopRow.removeFromLeft(68));
+    duckTopRow.removeFromLeft(6);
+    duckSourceLabel.setBounds(duckTopRow.removeFromLeft(24));
     duckTopRow.removeFromLeft(4);
     duckSourceBox.setBounds(duckTopRow);
     compField.removeFromTop(4);
@@ -5299,7 +5653,7 @@ void FXStripControl::resized()
                                          (compField.getHeight() - ((duckRowCount - 1) * duckRowGap))
                                              / juce::jmax(1, duckRowCount));
 
-    auto layoutDuckRow = [&compField, duckRowHeight, duckRowGap](juce::Label& label, juce::Slider& slider)
+    auto layoutDuckRow = [&compField, duckRowHeight](juce::Label& label, juce::Slider& slider)
     {
         if (compField.getHeight() <= 0)
         {
@@ -5386,6 +5740,11 @@ void FXStripControl::updateFromEngine()
     setBaseSliderTint(duckAttackSlider, base);
     setBaseSliderTint(duckReleaseSlider, base);
     setBaseSliderTint(duckGainCompSlider, base);
+    setBaseSliderTint(delayMixSlider, base);
+    setBaseSliderTint(delayTimeSlider, base);
+    setBaseSliderTint(delayFeedbackSlider, base);
+    setBaseSliderTint(delayLowCutSlider, base);
+    setBaseSliderTint(delayHighCutSlider, base);
 
     const auto algo = strip->getFilterAlgorithm();
     int algoId = 1;
@@ -5401,7 +5760,12 @@ void FXStripControl::updateFromEngine()
         const auto mod = engine->getModSequencerState(stripIndex);
         const bool active = (mod.target == ModernAudioEngine::ModTarget::Cutoff
                           || mod.target == ModernAudioEngine::ModTarget::Resonance
-                          || mod.target == ModernAudioEngine::ModTarget::FilterMorph);
+                          || mod.target == ModernAudioEngine::ModTarget::FilterMorph
+                          || mod.target == ModernAudioEngine::ModTarget::DelayMix
+                          || mod.target == ModernAudioEngine::ModTarget::DelayTime
+                          || mod.target == ModernAudioEngine::ModTarget::DelayFeedback
+                          || mod.target == ModernAudioEngine::ModTarget::DelayLowCut
+                          || mod.target == ModernAudioEngine::ModTarget::DelayHighCut);
         if (active)
         {
             const float depth = juce::jlimit(0.0f, 1.0f, mod.depth);
@@ -5421,8 +5785,18 @@ void FXStripControl::updateFromEngine()
                 setBaseSliderTint(filterFreqSlider, modColour);
             else if (mod.target == ModernAudioEngine::ModTarget::Resonance)
                 setBaseSliderTint(filterResSlider, modColour);
-            else
+            else if (mod.target == ModernAudioEngine::ModTarget::FilterMorph)
                 setBaseSliderTint(filterMorphSlider, modColour);
+            else if (mod.target == ModernAudioEngine::ModTarget::DelayMix)
+                setBaseSliderTint(delayMixSlider, modColour);
+            else if (mod.target == ModernAudioEngine::ModTarget::DelayTime)
+                setBaseSliderTint(delayTimeSlider, modColour);
+            else if (mod.target == ModernAudioEngine::ModTarget::DelayFeedback)
+                setBaseSliderTint(delayFeedbackSlider, modColour);
+            else if (mod.target == ModernAudioEngine::ModTarget::DelayLowCut)
+                setBaseSliderTint(delayLowCutSlider, modColour);
+            else if (mod.target == ModernAudioEngine::ModTarget::DelayHighCut)
+                setBaseSliderTint(delayHighCutSlider, modColour);
         }
     }
 
@@ -6156,11 +6530,8 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
         processor.parameters, "innerLoopLength", innerLoopLengthBox);
     innerLoopLengthBox.onChange = [this]()
     {
-        if (auto* param = processor.parameters.getParameter("innerLoopLength"))
-        {
-            const int selectedIndex = juce::jmax(0, innerLoopLengthBox.getSelectedId() - 1);
-            param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(selectedIndex)));
-        }
+        const int selectedIndex = juce::jmax(0, innerLoopLengthBox.getSelectedId() - 1);
+        processor.setInnerLoopLengthSelection(selectedIndex);
         if (globalUiReady)
             processor.markPersistentGlobalUserChange();
     };
@@ -6216,7 +6587,10 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     pitchControlModeBox.setSelectedId(1, juce::dontSendNotification);
     addAndMakeVisible(pitchControlModeBox);
     styleUiCombo(pitchControlModeBox);
-    pitchControlModeBox.setTooltip("Global strip pitch behavior: Pitch Shift, SoundTouch, Signalsmith, Bungee, or playback-rate Resample. SoundTouch, Signalsmith, and Bungee use cached/hybrid pitch paths.");
+    pitchControlModeBox.setTooltip(
+        "Global strip pitch behavior: Pitch Shift, SoundTouch, Signalsmith, Bungee, or playback-rate Resample. "
+        "SoundTouch, Signalsmith, and Bungee use cached/hybrid pitch paths. Signalsmith is not currently available in Sample mode, "
+        "so Sample strips use the local Pitch Shift path instead.");
     pitchControlModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
         processor.parameters, "pitchControlMode", pitchControlModeBox);
     pitchControlModeBox.onChange = [this]()
@@ -7018,7 +7392,7 @@ void GlobalControlPanel::resized()
     const int knobWidth = 80;
     const int meterVerticalInset = 6;
 
-    auto layoutTallControl = [labelHeight](juce::Rectangle<int> area, juce::Label& label, juce::Component& control)
+    auto layoutTallControl = [](juce::Rectangle<int> area, juce::Label& label, juce::Component& control)
     {
         label.setBounds(area.removeFromTop(labelHeight));
         area.removeFromTop(2);
@@ -7366,7 +7740,7 @@ void SceneControlPanel::resized()
     {
         int textWidth = 0;
         for (const auto& label : labels)
-            textWidth = juce::jmax(textWidth, comboFont.getStringWidth(label));
+            textWidth = juce::jmax(textWidth, juce::GlyphArrangement::getStringWidthInt(comboFont, label));
         return juce::jlimit(minWidth, maxWidth, textWidth + 34);
     };
 
@@ -7678,8 +8052,8 @@ void MacroControlPanel::paint(juce::Graphics& g)
 
 void MacroControlPanel::resized()
 {
-    auto bounds = getLocalBounds().reduced(6, 2);
-    bounds.removeFromBottom(2);
+    auto bounds = getLocalBounds().reduced(6, 0);
+    bounds.removeFromBottom(1);
     const int columns = 4;
     const int rows = 2;
     const int gapX = 6;
@@ -9188,11 +9562,8 @@ void MlrVSTAudioProcessorEditor::createUIComponents()
         void resized() override
         {
             auto bounds = getLocalBounds();
-            auto header = bounds.removeFromTop(28).reduced(8, 2);
-            masterDuckLabel.setBounds(header.removeFromLeft(122));
-            header.removeFromLeft(6);
-            masterDuckTriggerBox.setBounds(header.removeFromLeft(116));
-            bounds.removeFromTop(4);
+            masterDuckLabel.setBounds({});
+            masterDuckTriggerBox.setBounds({});
             const int gap = 1;
             const int totalStrips = strips.size();
             if (totalStrips <= 0 || bounds.isEmpty())

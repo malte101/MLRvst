@@ -126,6 +126,47 @@ float defaultRearrangeStepValueForIndex(int absoluteStep, int totalSteps) noexce
                             / static_cast<float>(juce::jmax(1, totalSteps - 1)));
 }
 
+float filterCutoffToNormalized(float hz) noexcept
+{
+    const float safeHz = juce::jlimit(20.0f, 20000.0f, hz);
+    return juce::jlimit(0.0f, 1.0f,
+                        static_cast<float>(std::log(static_cast<double>(safeHz / 20.0f))
+                            / std::log(1000.0)));
+}
+
+float normalizedToFilterCutoff(float normalized) noexcept
+{
+    return 20.0f * std::pow(1000.0f, juce::jlimit(0.0f, 1.0f, normalized));
+}
+
+float filterResonanceToNormalized(float q) noexcept
+{
+    return juce::jmap(juce::jlimit(0.1f, 10.0f, q), 0.1f, 10.0f, 0.0f, 1.0f);
+}
+
+float normalizedToFilterResonance(float normalized) noexcept
+{
+    return juce::jmap(juce::jlimit(0.0f, 1.0f, normalized), 0.0f, 1.0f, 0.1f, 10.0f);
+}
+
+const juce::NormalisableRange<float>& delayTimeRange() noexcept
+{
+    static const juce::NormalisableRange<float> range(0.25f, 4.0f, 0.001f, 0.45f);
+    return range;
+}
+
+const juce::NormalisableRange<float>& delayLowCutRange() noexcept
+{
+    static const juce::NormalisableRange<float> range(20.0f, 12000.0f, 1.0f, 0.25f);
+    return range;
+}
+
+const juce::NormalisableRange<float>& delayHighCutRange() noexcept
+{
+    static const juce::NormalisableRange<float> range(200.0f, 20000.0f, 1.0f, 0.3f);
+    return range;
+}
+
 int rearrangeSliceIndexFromNormalized(float value01, int localSliceCount) noexcept
 {
     const int safeLocalSliceCount = juce::jmax(1, localSliceCount);
@@ -1158,6 +1199,7 @@ void PatternRecorder::recordEvent(int strip,
     // Time is relative to pattern start (0 to lengthInBeats)
     event.time = currentBeat - startBeat;
     event.isNoteOn = noteOn;
+    event.type = EventType::Note;
     
     events.push_back(event);
     
@@ -1165,6 +1207,39 @@ void PatternRecorder::recordEvent(int strip,
         << ", col=" << column
         << ", sliceId=" << sampleSliceId
         << ", start=" << sampleStartSample
+        << ", beat=" << event.time);
+}
+
+void PatternRecorder::recordControlEvent(int strip,
+                                         int controlMode,
+                                         int controlRow,
+                                         int column,
+                                         double currentBeat)
+{
+    if (!recording.load(std::memory_order_acquire))
+        return;
+
+    const double startBeat = recordingStartBeat.load(std::memory_order_acquire);
+    const double endBeat = recordingEndBeat.load(std::memory_order_acquire);
+    if (currentBeat < startBeat || currentBeat >= endBeat)
+        return;
+
+    juce::ScopedLock lock(recordLock);
+
+    Event event;
+    event.stripIndex = strip;
+    event.column = column;
+    event.time = currentBeat - startBeat;
+    event.type = EventType::ControlChange;
+    event.controlMode = controlMode;
+    event.controlRow = controlRow;
+
+    events.push_back(event);
+
+    DBG("Control event recorded: strip=" << strip
+        << ", mode=" << controlMode
+        << ", row=" << controlRow
+        << ", col=" << column
         << ", beat=" << event.time);
 }
 
@@ -1574,6 +1649,7 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     pitchCacheOutputBlendStartR = 0.0f;
     lastOutputSampleL = 0.0f;
     lastOutputSampleR = 0.0f;
+    resetDelayState();
     
     // Initialize step sampler
     stepSampler.prepareToPlay(sampleRate, maxBlockSize);
@@ -1588,9 +1664,14 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     smoothedPan.reset(sampleRate, 0.05);
     smoothedSpeed.reset(sampleRate, 0.05);
     smoothedPitchShift.reset(sampleRate, pitchSmoothingSecondsForAlgorithm(getPitchShiftAlgorithm()));
-    smoothedFilterFrequency.reset(sampleRate, 0.01);
-    smoothedFilterResonance.reset(sampleRate, 0.01);
+    smoothedFilterFrequency.reset(sampleRate, 0.04);
+    smoothedFilterResonance.reset(sampleRate, 0.05);
     smoothedFilterMorph.reset(sampleRate, 0.01);
+    smoothedDelayMix.reset(sampleRate, 0.06);
+    smoothedDelayTimeBeats.reset(sampleRate, 0.08);
+    smoothedDelayFeedback.reset(sampleRate, 0.06);
+    smoothedDelayLowCutHz.reset(sampleRate, 0.08);
+    smoothedDelayHighCutHz.reset(sampleRate, 0.08);
     rateSmoother.reset(sampleRate, 0.05);  // For clock-locked scratching
     grainCenterSmoother.reset(sampleRate, 0.01);
     grainSizeSmoother.reset(sampleRate, 0.015);
@@ -1609,6 +1690,18 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     smoothedFilterFrequency.setCurrentAndTargetValue(filterFrequency.load(std::memory_order_acquire));
     smoothedFilterResonance.setCurrentAndTargetValue(filterResonance.load(std::memory_order_acquire));
     smoothedFilterMorph.setCurrentAndTargetValue(filterMorph.load(std::memory_order_acquire));
+    displayedFilterFrequency.store(smoothedFilterFrequency.getCurrentValue(), std::memory_order_release);
+    displayedFilterResonance.store(smoothedFilterResonance.getCurrentValue(), std::memory_order_release);
+    smoothedDelayMix.setCurrentAndTargetValue(delayMix.load(std::memory_order_acquire));
+    smoothedDelayTimeBeats.setCurrentAndTargetValue(delayTimeBeats.load(std::memory_order_acquire));
+    smoothedDelayFeedback.setCurrentAndTargetValue(delayFeedback.load(std::memory_order_acquire));
+    smoothedDelayLowCutHz.setCurrentAndTargetValue(delayLowCutHz.load(std::memory_order_acquire));
+    smoothedDelayHighCutHz.setCurrentAndTargetValue(delayHighCutHz.load(std::memory_order_acquire));
+    displayedDelayMix.store(smoothedDelayMix.getCurrentValue(), std::memory_order_release);
+    displayedDelayTimeBeats.store(smoothedDelayTimeBeats.getCurrentValue(), std::memory_order_release);
+    displayedDelayFeedback.store(smoothedDelayFeedback.getCurrentValue(), std::memory_order_release);
+    displayedDelayLowCutHz.store(smoothedDelayLowCutHz.getCurrentValue(), std::memory_order_release);
+    displayedDelayHighCutHz.store(smoothedDelayHighCutHz.getCurrentValue(), std::memory_order_release);
     duckSmoothedGain = 1.0f;
     rateSmoother.setCurrentAndTargetValue(1.0);
     grainCenterSmoother.setCurrentAndTargetValue(0.0);
@@ -1682,6 +1775,10 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     spec.sampleRate = sampleRate;
     spec.maximumBlockSize = static_cast<juce::uint32>(maxBlockSize);
     spec.numChannels = 2;
+    juce::dsp::ProcessSpec delaySpec;
+    delaySpec.sampleRate = sampleRate;
+    delaySpec.maximumBlockSize = static_cast<juce::uint32>(maxBlockSize);
+    delaySpec.numChannels = 1;
     filterLp.prepare(spec);
     filterBp.prepare(spec);
     filterHp.prepare(spec);
@@ -1704,6 +1801,15 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     ladderLp.setDrive(1.0f);
     ladderBp.setDrive(1.0f);
     ladderHp.setDrive(1.0f);
+    delayLowCutFilterL.prepare(delaySpec);
+    delayLowCutFilterR.prepare(delaySpec);
+    delayHighCutFilterL.prepare(delaySpec);
+    delayHighCutFilterR.prepare(delaySpec);
+    delayLowCutFilterL.setType(juce::dsp::StateVariableTPTFilterType::highpass);
+    delayLowCutFilterR.setType(juce::dsp::StateVariableTPTFilterType::highpass);
+    delayHighCutFilterL.setType(juce::dsp::StateVariableTPTFilterType::lowpass);
+    delayHighCutFilterR.setType(juce::dsp::StateVariableTPTFilterType::lowpass);
+    resetDelayState();
     updateFilterCoefficients(filterFrequency.load(std::memory_order_acquire),
                              filterResonance.load(std::memory_order_acquire));
     
@@ -1726,6 +1832,7 @@ void EnhancedAudioStrip::loadSample(const juce::AudioBuffer<float>& buffer, doub
     pitchCacheOutputBlendStartR = 0.0f;
     lastOutputSampleL = 0.0f;
     lastOutputSampleR = 0.0f;
+    resetDelayState();
     
     // Safety check
     if (buffer.getNumSamples() == 0)
@@ -1801,6 +1908,7 @@ void EnhancedAudioStrip::loadSampleWithAnalysisCache(const juce::AudioBuffer<flo
     pitchCacheOutputBlendStartR = 0.0f;
     lastOutputSampleL = 0.0f;
     lastOutputSampleR = 0.0f;
+    resetDelayState();
 
     if (buffer.getNumSamples() == 0)
     {
@@ -1989,6 +2097,74 @@ std::array<int, 16> EnhancedAudioStrip::getCachedTransientSliceSamples() const
     return out;
 }
 
+int EnhancedAudioStrip::getTransientSliceMinimumSpacingSamples(int totalSamples) const
+{
+    const double analysisRate = (sourceSampleRate > 1000.0)
+        ? sourceSampleRate
+        : juce::jmax(1.0, currentSampleRate);
+    const int averageSliceSpacing = juce::jmax(1, totalSamples / juce::jmax(1, ModernAudioEngine::MaxColumns));
+    const int timeFloor = juce::jmax(16, static_cast<int>(std::round(analysisRate * 0.008)));
+    return juce::jmin(juce::jmax(1, averageSliceSpacing / 2), juce::jmax(timeFloor, averageSliceSpacing / 5));
+}
+
+void EnhancedAudioStrip::commitTransientSlicePositionsLocked(const std::array<int, 16>& positions)
+{
+    const int totalSamples = sampleBuffer.getNumSamples();
+    if (totalSamples <= 0)
+        return;
+
+    const int minSpacing = getTransientSliceMinimumSpacingSamples(totalSamples);
+    std::array<int, 16> normalized = positions;
+    normalized[0] = 0;
+
+    for (int i = 1; i < ModernAudioEngine::MaxColumns; ++i)
+    {
+        const int minAllowed = normalized[static_cast<size_t>(i - 1)] + minSpacing;
+        normalized[static_cast<size_t>(i)] = juce::jlimit(minAllowed,
+                                                          totalSamples - 1,
+                                                          normalized[static_cast<size_t>(i)]);
+    }
+
+    for (int i = ModernAudioEngine::MaxColumns - 2; i >= 1; --i)
+    {
+        const int maxAllowed = normalized[static_cast<size_t>(i + 1)] - minSpacing;
+        normalized[static_cast<size_t>(i)] = juce::jlimit(normalized[static_cast<size_t>(i - 1)] + minSpacing,
+                                                          juce::jmax(normalized[static_cast<size_t>(i - 1)] + minSpacing, maxAllowed),
+                                                          normalized[static_cast<size_t>(i)]);
+    }
+
+    for (int i = 0; i < ModernAudioEngine::MaxColumns; ++i)
+        transientSliceSamples[static_cast<size_t>(i)] = juce::jlimit(0, totalSamples - 1, normalized[static_cast<size_t>(i)]);
+
+    transientSliceMapDirty = false;
+    rebuildSampleAnalysisCacheLocked();
+}
+
+void EnhancedAudioStrip::setTransientSliceMarkerSample(int sliceIndex, int sampleIndex)
+{
+    if (sliceIndex <= 0 || sliceIndex >= ModernAudioEngine::MaxColumns)
+        return;
+
+    juce::ScopedLock lock(bufferLock);
+    const int totalSamples = sampleBuffer.getNumSamples();
+    if (totalSamples <= 0)
+        return;
+
+    std::array<int, 16> positions{};
+    for (int i = 0; i < ModernAudioEngine::MaxColumns; ++i)
+        positions[static_cast<size_t>(i)] = transientSliceSamples[static_cast<size_t>(i)];
+
+    positions[static_cast<size_t>(sliceIndex)] = juce::jlimit(0, totalSamples - 1, sampleIndex);
+    std::sort(positions.begin() + 1, positions.end());
+    commitTransientSlicePositionsLocked(positions);
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
+    invalidateSoundTouchSwingCache();
+#endif
+#if MLRVST_ENABLE_BUNGEE
+    invalidateLoopTempoMatchCache();
+#endif
+}
+
 std::array<float, 128> EnhancedAudioStrip::getCachedRmsMap() const
 {
     return analysisRmsMap;
@@ -2028,6 +2204,7 @@ void EnhancedAudioStrip::rebuildTransientSliceMap()
             transientSliceSamples[static_cast<size_t>(i)] = juce::jlimit(0, totalSamples - 1,
                                                                          (i * totalSamples) / ModernAudioEngine::MaxColumns);
         transientSliceMapDirty = false;
+        rebuildSampleAnalysisCacheLocked();
     };
 
     int fftOrder = 8; // 256
@@ -3091,16 +3268,16 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
     const int arpMode = arpActive ? juce::jlimit(0, 5, grainArpModeAtomic.load(std::memory_order_acquire)) : 0;
     const float arpRangeSemis = juce::jlimit(0.0f, 48.0f, std::abs(pitchBase));
     const int rootMidi = globalPitchRootMidi.load(std::memory_order_acquire);
-    auto quantizeToScale = [](float semi, const std::array<int, 7>& scale, int rootMidi)
+    auto quantizeToScale = [](float semi, const std::array<int, 7>& scale, int rootNoteMidi)
     {
-        const int midi = static_cast<int>(std::round(semi + static_cast<float>(rootMidi)));
+        const int midi = static_cast<int>(std::round(semi + static_cast<float>(rootNoteMidi)));
         int bestMidi = midi;
         int bestDist = 999;
         for (int oct = -4; oct <= 4; ++oct)
         {
             for (int deg : scale)
             {
-                const int cand = (12 * oct) + deg + rootMidi;
+                const int cand = (12 * oct) + deg + rootNoteMidi;
                 const int dist = std::abs(cand - midi);
                 if (dist < bestDist)
                 {
@@ -3109,7 +3286,7 @@ void EnhancedAudioStrip::spawnGrainVoice(double centerSamplePos, float sizeMs, f
                 }
             }
         }
-        return static_cast<float>(bestMidi - rootMidi);
+        return static_cast<float>(bestMidi - rootNoteMidi);
     };
     auto quantizeToArpMode = [&](float semi) -> float
     {
@@ -4246,6 +4423,7 @@ void EnhancedAudioStrip::clearSample()
 #endif
     resetGrainState();
     resetPitchShifter();
+    resetDelayState();
     resetScratchComboState();
 }
 
@@ -4870,6 +5048,11 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     smoothedFilterFrequency.setTargetValue(filterFrequency.load(std::memory_order_acquire));
     smoothedFilterResonance.setTargetValue(filterResonance.load(std::memory_order_acquire));
     smoothedFilterMorph.setTargetValue(filterMorph.load(std::memory_order_acquire));
+    smoothedDelayMix.setTargetValue(delayMix.load(std::memory_order_acquire));
+    smoothedDelayTimeBeats.setTargetValue(delayTimeBeats.load(std::memory_order_acquire));
+    smoothedDelayFeedback.setTargetValue(delayFeedback.load(std::memory_order_acquire));
+    smoothedDelayLowCutHz.setTargetValue(delayLowCutHz.load(std::memory_order_acquire));
+    smoothedDelayHighCutHz.setTargetValue(delayHighCutHz.load(std::memory_order_acquire));
     
     // Check if scratching (disable inner loop during scratch for full sample access)
     float stripScratch = scratchAmount.load();
@@ -7124,7 +7307,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         float finalGainRight = currentVol * fadeValue;
         
         // Apply filter if enabled
-        if (filterEnabled)
+        if (isFilterEnabled())
         {
             const float filtFreq = smoothedFilterFrequency.getNextValue();
             const float filtRes = smoothedFilterResonance.getNextValue();
@@ -7188,6 +7371,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 pitchCacheOutputBlendTotalSamples = 0;
             }
         }
+
+        processDelaySample(outL, outR, tempo);
 
         if (!std::isfinite(outL)) outL = 0.0f;
         if (!std::isfinite(outR)) outR = 0.0f;
@@ -7297,6 +7482,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             signalsmithRealtimeAlignmentDelaySamples);
     }
 
+    publishDisplayedControlState();
+
     publishSignalsmithLoopDebugSnapshot(renderedSamples,
                                         maintainRealtimeSignalsmithStream,
                                         useRealtimeSignalsmith,
@@ -7327,6 +7514,11 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
     smoothedFilterFrequency.setTargetValue(filterFrequency.load(std::memory_order_acquire));
     smoothedFilterResonance.setTargetValue(filterResonance.load(std::memory_order_acquire));
     smoothedFilterMorph.setTargetValue(filterMorph.load(std::memory_order_acquire));
+    smoothedDelayMix.setTargetValue(delayMix.load(std::memory_order_acquire));
+    smoothedDelayTimeBeats.setTargetValue(delayTimeBeats.load(std::memory_order_acquire));
+    smoothedDelayFeedback.setTargetValue(delayFeedback.load(std::memory_order_acquire));
+    smoothedDelayLowCutHz.setTargetValue(delayLowCutHz.load(std::memory_order_acquire));
+    smoothedDelayHighCutHz.setTargetValue(delayHighCutHz.load(std::memory_order_acquire));
 
     const auto pitchAlgorithm = getPitchShiftAlgorithm();
     const bool trackSignalsmithHistory = applyPitchShift
@@ -7413,7 +7605,7 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
             processPitchShift(leftSample, rightSample, semitonesNow, -1.0, false);
         }
 
-        if (filterEnabled)
+        if (isFilterEnabled())
         {
             const float filtFreq = smoothedFilterFrequency.getNextValue();
             const float filtRes = smoothedFilterResonance.getNextValue();
@@ -7433,6 +7625,8 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
         leftSample *= currentVol;
         rightSample *= currentVol;
 
+        processDelaySample(leftSample, rightSample, tempo);
+
         if (!std::isfinite(leftSample)) leftSample = 0.0f;
         if (!std::isfinite(rightSample)) rightSample = 0.0f;
 
@@ -7451,6 +7645,8 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
             0,
             signalsmithRealtimeAlignmentTailSamplesRemaining - numSamples);
     }
+
+    publishDisplayedControlState();
 
 }
 
@@ -9013,6 +9209,29 @@ void EnhancedAudioStrip::setPlaybackSpeed(float speed)
     const float current = static_cast<float>(playbackSpeed.load(std::memory_order_acquire));
     if (std::abs(current - speed) <= 1.0e-6f)
         return;
+
+    if (playMode == PlayMode::Grain && playing.load(std::memory_order_acquire) && sampleLength > 0.0)
+    {
+        juce::ScopedLock lock(bufferLock);
+        int loopCols = loopEnd - loopStart;
+        if (loopCols <= 0)
+            loopCols = ModernAudioEngine::MaxColumns;
+
+        const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
+        const double loopLength = juce::jmax(1.0, (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength);
+        double currentPos = playbackPosition.load(std::memory_order_acquire);
+        double posInLoop = currentPos - loopStartSamples;
+        posInLoop = std::fmod(posInLoop, loopLength);
+        if (posInLoop < 0.0)
+            posInLoop += loopLength;
+
+        triggerSample = lastObservedGlobalSample;
+        triggerOffsetRatio = juce::jlimit(0.0, 0.999999, posInLoop / loopLength);
+        if (lastObservedPpqValid)
+            triggerPpqPosition = lastObservedPPQ;
+        speedPpqBypassActive = false;
+    }
+
     playbackSpeed.store(static_cast<double>(speed), std::memory_order_release);
     displaySpeedAtomic.store(speed, std::memory_order_release);
     smoothedSpeed.setTargetValue(speed);
@@ -9024,6 +9243,29 @@ void EnhancedAudioStrip::setPlaybackSpeedImmediate(float speed)
     const float current = static_cast<float>(playbackSpeed.load(std::memory_order_acquire));
     if (std::abs(current - speed) <= 1.0e-6f)
         return;
+
+    if (playMode == PlayMode::Grain && playing.load(std::memory_order_acquire) && sampleLength > 0.0)
+    {
+        juce::ScopedLock lock(bufferLock);
+        int loopCols = loopEnd - loopStart;
+        if (loopCols <= 0)
+            loopCols = ModernAudioEngine::MaxColumns;
+
+        const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
+        const double loopLength = juce::jmax(1.0, (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength);
+        double currentPos = playbackPosition.load(std::memory_order_acquire);
+        double posInLoop = currentPos - loopStartSamples;
+        posInLoop = std::fmod(posInLoop, loopLength);
+        if (posInLoop < 0.0)
+            posInLoop += loopLength;
+
+        triggerSample = lastObservedGlobalSample;
+        triggerOffsetRatio = juce::jlimit(0.0, 0.999999, posInLoop / loopLength);
+        if (lastObservedPpqValid)
+            triggerPpqPosition = lastObservedPPQ;
+        speedPpqBypassActive = false;
+    }
+
     playbackSpeed.store(static_cast<double>(speed), std::memory_order_release);
     displaySpeedAtomic.store(speed, std::memory_order_release);
     smoothedSpeed.setCurrentAndTargetValue(speed);
@@ -9851,7 +10093,7 @@ void EnhancedAudioStrip::applySignalsmithRealtimePostPitchBufferInPlace(
         float leftSample = buffer.getSample(0, startSample + i);
         float rightSample = buffer.getSample(1, startSample + i);
 
-        if (filterEnabled)
+        if (isFilterEnabled())
         {
             const float filtFreq = smoothedFilterFrequency.getNextValue();
             const float filtRes = smoothedFilterResonance.getNextValue();
@@ -9909,12 +10151,16 @@ void EnhancedAudioStrip::applySignalsmithRealtimePostPitchBufferInPlace(
             }
         }
 
+        processDelaySample(leftSample, rightSample, tempo);
+
         if (!std::isfinite(leftSample)) leftSample = 0.0f;
         if (!std::isfinite(rightSample)) rightSample = 0.0f;
 
         buffer.setSample(0, startSample + i, leftSample);
         buffer.setSample(1, startSample + i, rightSample);
     }
+
+    publishDisplayedControlState();
 }
 
 int EnhancedAudioStrip::processSignalsmithRealtimeAlignmentDelayBufferInPlace(juce::AudioBuffer<float>& buffer,
@@ -9961,6 +10207,136 @@ int EnhancedAudioStrip::processSignalsmithRealtimeAlignmentDelayBufferInPlace(ju
 
     signalsmithRealtimeAlignmentDelayWritePos = writePos;
     return numSamples;
+}
+
+void EnhancedAudioStrip::publishDisplayedControlState()
+{
+    displayedFilterFrequency.store(smoothedFilterFrequency.getCurrentValue(), std::memory_order_release);
+    displayedFilterResonance.store(smoothedFilterResonance.getCurrentValue(), std::memory_order_release);
+    displayedDelayMix.store(smoothedDelayMix.getCurrentValue(), std::memory_order_release);
+    displayedDelayTimeBeats.store(smoothedDelayTimeBeats.getCurrentValue(), std::memory_order_release);
+    displayedDelayFeedback.store(smoothedDelayFeedback.getCurrentValue(), std::memory_order_release);
+    displayedDelayLowCutHz.store(smoothedDelayLowCutHz.getCurrentValue(), std::memory_order_release);
+    displayedDelayHighCutHz.store(smoothedDelayHighCutHz.getCurrentValue(), std::memory_order_release);
+}
+
+void EnhancedAudioStrip::resetDelayState()
+{
+    stripDelayWritePos = 0;
+    const int maxDelaySamples = juce::jmax(1, static_cast<int>(std::ceil(currentSampleRate * 8.0)));
+    stripDelayBuffer.setSize(2, maxDelaySamples, false, true, true);
+    stripDelayBuffer.clear();
+    delayLowCutFilterL.reset();
+    delayLowCutFilterR.reset();
+    delayHighCutFilterL.reset();
+    delayHighCutFilterR.reset();
+}
+
+void EnhancedAudioStrip::processDelaySample(float& leftSample, float& rightSample, double tempo)
+{
+    if (stripDelayBuffer.getNumChannels() < 2 || stripDelayBuffer.getNumSamples() <= 1 || currentSampleRate <= 0.0)
+        return;
+
+    // Delay dry path should always preserve the already-processed strip signal
+    // arriving here (filter/gate/volume/etc.), regardless of mode-specific wet logic.
+    const float dryInputL = leftSample;
+    const float dryInputR = rightSample;
+
+    const float mix = smoothedDelayMix.getNextValue();
+    const float feedback = smoothedDelayFeedback.getNextValue();
+    const float timeBeats = smoothedDelayTimeBeats.getNextValue();
+    const float lowCut = smoothedDelayLowCutHz.getNextValue();
+    const float highCut = juce::jmax(lowCut + 20.0f, smoothedDelayHighCutHz.getNextValue());
+
+    if (mix <= 1.0e-4f && feedback <= 1.0e-4f)
+        return;
+
+    delayLowCutFilterL.setCutoffFrequency(lowCut);
+    delayLowCutFilterR.setCutoffFrequency(lowCut);
+    delayHighCutFilterL.setCutoffFrequency(highCut);
+    delayHighCutFilterR.setCutoffFrequency(highCut);
+    delayLowCutFilterL.setResonance(0.707f);
+    delayLowCutFilterR.setResonance(0.707f);
+    delayHighCutFilterL.setResonance(0.707f);
+    delayHighCutFilterR.setResonance(0.707f);
+
+    const double safeTempo = (tempo > 1.0) ? tempo : 120.0;
+    const bool syncEnabled = isDelaySyncEnabled();
+    const double baseDelaySeconds = syncEnabled
+        ? (60.0 / safeTempo) * juce::jlimit(0.25f, 4.0f, timeBeats)
+        : juce::jlimit(0.25f, 4.0f, timeBeats);
+    const auto secondsToSamples = [this](double seconds)
+    {
+        return juce::jlimit(
+            1,
+            juce::jmax(1, stripDelayBuffer.getNumSamples() - 1),
+            static_cast<int>(std::round(seconds * currentSampleRate)));
+    };
+
+    int delaySamplesL = secondsToSamples(baseDelaySeconds);
+    int delaySamplesR = delaySamplesL;
+
+    if (getDelayMode() == DelayMode::Dual)
+    {
+        const double rightSeconds = juce::jmin(
+            7.95,
+            baseDelaySeconds * (syncEnabled ? 1.5 : 1.3333333333333333));
+        delaySamplesR = secondsToSamples(rightSeconds);
+    }
+
+    auto computeReadPos = [this](int delaySamples)
+    {
+        int readPos = stripDelayWritePos - delaySamples;
+        while (readPos < 0)
+            readPos += stripDelayBuffer.getNumSamples();
+        return readPos;
+    };
+
+    const int readPosL = computeReadPos(delaySamplesL);
+    const int readPosR = computeReadPos(delaySamplesR);
+
+    float delayedL = stripDelayBuffer.getSample(0, readPosL);
+    float delayedR = stripDelayBuffer.getSample(1, readPosR);
+    delayedL = delayHighCutFilterL.processSample(0, delayLowCutFilterL.processSample(0, delayedL));
+    delayedR = delayHighCutFilterR.processSample(0, delayLowCutFilterR.processSample(0, delayedR));
+
+    const auto mode = getDelayMode();
+    float wetL = delayedL;
+    float wetR = delayedR;
+    float writeL = dryInputL;
+    float writeR = dryInputR;
+
+    if (mode == DelayMode::Single)
+    {
+        const float monoInput = 0.5f * (dryInputL + dryInputR);
+        const float monoWet = 0.5f * (delayedL + delayedR);
+        wetL = monoWet;
+        wetR = monoWet;
+        writeL = monoInput + (monoWet * feedback);
+        writeR = writeL;
+    }
+    else if (mode == DelayMode::Dual)
+    {
+        writeL = dryInputL + (delayedL * feedback);
+        writeR = dryInputR + (delayedR * feedback);
+    }
+    else
+    {
+        // True ping-pong: inject fresh audio once, then alternate repeats via cross-feedback.
+        const float monoInput = 0.5f * (dryInputL + dryInputR);
+        writeL = monoInput + (delayedR * feedback);
+        writeR = delayedL * feedback;
+    }
+
+    if (!std::isfinite(writeL)) writeL = 0.0f;
+    if (!std::isfinite(writeR)) writeR = 0.0f;
+    stripDelayBuffer.setSample(0, stripDelayWritePos, writeL);
+    stripDelayBuffer.setSample(1, stripDelayWritePos, writeR);
+    stripDelayWritePos = (stripDelayWritePos + 1) % stripDelayBuffer.getNumSamples();
+
+    const float dry = juce::jlimit(0.0f, 1.0f, 1.0f - mix);
+    leftSample = (dryInputL * dry) + (wetL * mix);
+    rightSample = (dryInputR * dry) + (wetR * mix);
 }
 
 float EnhancedAudioStrip::readPitchDelaySample(int channel, double delaySamples) const
@@ -10410,6 +10786,9 @@ void EnhancedAudioStrip::ensureAnalogFiltersInitialized(FilterAlgorithm algorith
             case FilterAlgorithm::MoogStilson:
                 return std::make_unique<StilsonMoog>(static_cast<float>(currentSampleRate));
         }
+
+        jassertfalse;
+        return std::make_unique<StilsonMoog>(static_cast<float>(currentSampleRate));
     };
 
     const bool needMoog = (algorithm == FilterAlgorithm::MoogStilson || algorithm == FilterAlgorithm::MoogHuov);
@@ -10549,8 +10928,8 @@ void EnhancedAudioStrip::setFilterFrequency(float freq)
     const float clamped = juce::jlimit(20.0f, 20000.0f, freq);
     filterFrequency.store(clamped, std::memory_order_release);
     smoothedFilterFrequency.setTargetValue(clamped);
-    if (!filterEnabled)
-        filterEnabled = true;
+    if (!isFilterEnabled())
+        setFilterEnabled(true);
 }
 
 void EnhancedAudioStrip::setFilterResonance(float res)
@@ -10558,8 +10937,8 @@ void EnhancedAudioStrip::setFilterResonance(float res)
     const float clamped = juce::jlimit(0.1f, 10.0f, res);
     filterResonance.store(clamped, std::memory_order_release);
     smoothedFilterResonance.setTargetValue(clamped);
-    if (!filterEnabled)
-        filterEnabled = true;
+    if (!isFilterEnabled())
+        setFilterEnabled(true);
 }
 
 void EnhancedAudioStrip::setFilterMorph(float morph)
@@ -10573,8 +10952,8 @@ void EnhancedAudioStrip::setFilterMorph(float morph)
     else if (clamped < 0.6666f) filterType = FilterType::BandPass;
     else filterType = FilterType::HighPass;
 
-    if (!filterEnabled)
-        filterEnabled = true;
+    if (!isFilterEnabled())
+        setFilterEnabled(true);
 }
 
 void EnhancedAudioStrip::setFilterType(FilterType type)
@@ -10592,9 +10971,33 @@ void EnhancedAudioStrip::setFilterType(FilterType type)
 void EnhancedAudioStrip::setFilterAlgorithm(FilterAlgorithm algorithm)
 {
     const int raw = juce::jlimit(0, 5, static_cast<int>(algorithm));
+    const int previous = filterAlgorithm.load(std::memory_order_acquire);
     filterAlgorithm.store(raw, std::memory_order_release);
-    if (!filterEnabled)
-        filterEnabled = true;
+
+    if (previous != raw)
+    {
+        filterLp.reset();
+        filterBp.reset();
+        filterHp.reset();
+        filterLpStage2.reset();
+        filterBpStage2.reset();
+        filterHpStage2.reset();
+        ladderLp.reset();
+        ladderBp.reset();
+        ladderHp.reset();
+        cachedLadderMode = -1;
+        moogLpL.reset();
+        moogLpR.reset();
+        cachedMoogCutoff = -1.0f;
+        cachedMoogResonance = -1.0f;
+        cachedMoogModel = -1;
+        cachedMoogSampleRate = -1.0f;
+        updateFilterCoefficients(filterFrequency.load(std::memory_order_acquire),
+                                 filterResonance.load(std::memory_order_acquire));
+    }
+
+    if (!isFilterEnabled())
+        setFilterEnabled(true);
 }
 
 int EnhancedAudioStrip::resolveDuckDetectorStripIndex(int selfStripIndex, int masterTriggerStripIndex) const
@@ -11490,9 +11893,9 @@ float ModernAudioEngine::defaultModStepValueForTarget(ModTarget target)
         case ModTarget::Speed:
             return 0.5f;
         case ModTarget::Cutoff:
-            return 1.0f;
+            return 0.5f;
         case ModTarget::Resonance:
-            return juce::jlimit(0.0f, 1.0f, (0.707f - 0.1f) / (10.0f - 0.1f));
+            return 0.5f;
         case ModTarget::GrainSize:
             return 0.5f;
         case ModTarget::GrainDensity:
@@ -11522,6 +11925,16 @@ float ModernAudioEngine::defaultModStepValueForTarget(ModTarget target)
         case ModTarget::GrainShape:
             return 0.5f;
         case ModTarget::FilterMorph:
+            return 0.5f;
+        case ModTarget::DelayMix:
+            return 0.5f;
+        case ModTarget::DelayTime:
+            return 0.5f;
+        case ModTarget::DelayFeedback:
+            return 0.5f;
+        case ModTarget::DelayLowCut:
+            return 0.5f;
+        case ModTarget::DelayHighCut:
             return 0.5f;
         case ModTarget::FilterEnable:
             return 0.0f;
@@ -11743,20 +12156,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             auto* strip = strips[i].get();
             const bool stripIsStepMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
             auto* stepSampler = stripIsStepMode ? strip->getStepSampler() : nullptr;
-            const int seqSlot = getActiveModSequencerSlot(static_cast<int>(i));
-            auto& seq = modSequencers[i][static_cast<size_t>(seqSlot)];
-            const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
-            const auto transportMode = static_cast<ModTransportMode>(juce::jlimit(
-                0,
-                static_cast<int>(ModTransportMode::Sync),
-                seq.transportMode.load(std::memory_order_acquire)));
-            const float modRate = quantizeModLaneRate(seq.rate.load(std::memory_order_acquire));
             const bool stripPlaying = strip->isPlaying();
-            const bool applyParamMod = stripPlaying
-                && target != ModTarget::None
-                && target != ModTarget::Retrigger
-                && ((transportMode == ModTransportMode::Sync)
-                    || modulationPpqReady);
             auto evaluateRearrangeSlot = [&](ModSequencer& rearrangeSeq, float& controlRawOut, float& depthOut) -> bool
             {
                 if (!stripPlaying)
@@ -11895,24 +12295,6 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 depthOut = depth;
                 return true;
             };
-            float backgroundRearrangeRaw = 0.0f;
-            float backgroundRearrangeDepth = 0.0f;
-            bool backgroundRearrangeActive = false;
-            if (stripPlaying && target != ModTarget::Rearrange)
-            {
-                for (int slot = 0; slot < NumModSequencers; ++slot)
-                {
-                    if (slot == seqSlot)
-                        continue;
-
-                    auto& rearrangeSeq = modSequencers[i][static_cast<size_t>(slot)];
-                    if (evaluateRearrangeSlot(rearrangeSeq, backgroundRearrangeRaw, backgroundRearrangeDepth))
-                    {
-                        backgroundRearrangeActive = true;
-                        break;
-                    }
-                }
-            }
 
             float originalVol = 1.0f;
             float originalPan = 0.0f;
@@ -11921,6 +12303,11 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             float originalFilterFreq = 20000.0f;
             float originalFilterRes = 0.707f;
             float originalFilterMorph = 0.0f;
+            float originalDelayMix = 0.0f;
+            float originalDelayTimeBeats = 1.0f;
+            float originalDelayFeedback = 0.35f;
+            float originalDelayLowCutHz = 20.0f;
+            float originalDelayHighCutHz = 12000.0f;
             float originalGrainSize = 1240.0f;
             float originalGrainDensity = 0.05f;
             float originalGrainPitch = 0.0f;
@@ -11943,7 +12330,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             float originalStepFilterRes = 0.7f;
             bool originalStepFilterEnabled = false;
             FilterType originalStepFilterType = FilterType::LowPass;
-            if (applyParamMod)
+            if (stripPlaying)
             {
                 originalVol = strip->getVolume();
                 originalPan = strip->getPan();
@@ -11953,6 +12340,11 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 originalFilterFreq = strip->getFilterFrequency();
                 originalFilterRes = strip->getFilterResonance();
                 originalFilterMorph = strip->getFilterMorph();
+                originalDelayMix = strip->getDelayMix();
+                originalDelayTimeBeats = strip->getDelayTimeBeats();
+                originalDelayFeedback = strip->getDelayFeedback();
+                originalDelayLowCutHz = strip->getDelayLowCutHz();
+                originalDelayHighCutHz = strip->getDelayHighCutHz();
                 originalGrainSize = strip->getGrainBaseSizeMs();
                 originalGrainDensity = strip->getGrainDensity();
                 originalGrainPitch = strip->getGrainPitch();
@@ -11980,78 +12372,192 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 }
             }
 
-            const int lengthBars = juce::jlimit(1, MaxModBars, seq.lengthBars.load(std::memory_order_acquire));
-            const int totalSteps = juce::jmax(ModSteps, ModSteps * lengthBars);
-            const int offset = seq.offset.load(std::memory_order_acquire);
-            int globalStep = seq.lastGlobalStep.load(std::memory_order_acquire);
-
-            double stepPhase = 0.0;
-            if (stripPlaying)
+            auto resetLaneRuntime = [](ModSequencer& laneSeq)
             {
+                laneSeq.smoothedRaw = 0.0f;
+                laneSeq.grainDezipperedRaw = 0.0f;
+                laneSeq.pitchDezipperedRaw = 0.0f;
+                laneSeq.speedDezipperedTarget = -1.0f;
+            };
+
+            auto resetLaneClock = [](ModSequencer& laneSeq)
+            {
+                laneSeq.syncPhaseValid = false;
+                laneSeq.syncPhaseLast = -1.0;
+                laneSeq.syncCycleCount = 0;
+            };
+
+            auto isLegacyDefaultFilterModLane = [](const ModSequencer& laneSeq, ModTarget laneTarget)
+            {
+                if (laneTarget != ModTarget::Cutoff && laneTarget != ModTarget::Resonance)
+                    return false;
+
+                if (laneSeq.bipolar.load(std::memory_order_acquire) != 0
+                    || laneSeq.curveMode.load(std::memory_order_acquire) != 0
+                    || laneSeq.offset.load(std::memory_order_acquire) != 0
+                    || laneSeq.lengthBars.load(std::memory_order_acquire) != 1
+                    || std::abs(laneSeq.depth.load(std::memory_order_acquire) - 1.0f) > 1.0e-4f
+                    || std::abs(laneSeq.rate.load(std::memory_order_acquire) - 1.0f) > 1.0e-4f
+                    || std::abs(laneSeq.smoothingMs.load(std::memory_order_acquire)) > 1.0e-4f
+                    || laneSeq.transportMode.load(std::memory_order_acquire) != static_cast<int>(ModTransportMode::Free))
+                    return false;
+
+                const float expectedValue = (laneTarget == ModTarget::Cutoff)
+                    ? 1.0f
+                    : filterResonanceToNormalized(0.707f);
+
+                for (size_t stepIndex = 0; stepIndex < laneSeq.steps.size(); ++stepIndex)
+                {
+                    if (laneSeq.stepSubdivisions[stepIndex].load(std::memory_order_acquire) != 1)
+                        return false;
+                    if (std::abs(laneSeq.steps[stepIndex].load(std::memory_order_acquire) - expectedValue) > 1.0e-4f)
+                        return false;
+                    if (std::abs(laneSeq.stepEndValues[stepIndex].load(std::memory_order_acquire) - expectedValue) > 1.0e-4f)
+                        return false;
+                }
+
+                return true;
+            };
+
+            auto resolveLanePhase = [&](ModSequencer& laneSeq,
+                                        ModTransportMode laneTransportMode,
+                                        float laneRate,
+                                        int offset,
+                                        int totalSteps,
+                                        int& globalStepOut,
+                                        double& stepPhaseOut) -> bool
+            {
+                if (!stripPlaying)
+                {
+                    resetLaneClock(laneSeq);
+                    return false;
+                }
+
                 bool updatedFromClock = false;
-                if (transportMode == ModTransportMode::Sync)
+                if (laneTransportMode == ModTransportMode::Sync)
                 {
                     const double loopPhase = strip->getLoopPhaseNormalized();
                     if (std::isfinite(loopPhase))
                     {
                         const double wrappedPhase = juce::jlimit(0.0, 0.999999, loopPhase);
-                        if (!seq.syncPhaseValid)
+                        if (!laneSeq.syncPhaseValid)
                         {
-                            seq.syncPhaseValid = true;
-                            seq.syncPhaseLast = wrappedPhase;
-                            seq.syncCycleCount = 0;
+                            laneSeq.syncPhaseValid = true;
+                            laneSeq.syncPhaseLast = wrappedPhase;
+                            laneSeq.syncCycleCount = 0;
                         }
                         else
                         {
-                            if ((seq.syncPhaseLast - wrappedPhase) > 0.5)
-                                ++seq.syncCycleCount;
-                            else if ((wrappedPhase - seq.syncPhaseLast) > 0.85)
-                                seq.syncCycleCount = 0;
-                            seq.syncPhaseLast = wrappedPhase;
+                            if ((laneSeq.syncPhaseLast - wrappedPhase) > 0.5)
+                                ++laneSeq.syncCycleCount;
+                            else if ((wrappedPhase - laneSeq.syncPhaseLast) > 0.85)
+                                laneSeq.syncCycleCount = 0;
+                            laneSeq.syncPhaseLast = wrappedPhase;
                         }
 
-                        const double stepsPos = (((static_cast<double>(seq.syncCycleCount) + wrappedPhase)
-                            * static_cast<double>(ModSteps)) * static_cast<double>(modRate))
+                        const double stepsPos = (((static_cast<double>(laneSeq.syncCycleCount) + wrappedPhase)
+                            * static_cast<double>(ModSteps)) * static_cast<double>(laneRate))
                             + static_cast<double>(offset);
                         const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
                         const double wrappedPos = (wrapped < 0.0) ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
-                        globalStep = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
-                        stepPhase = juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(globalStep));
+                        globalStepOut = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
+                        stepPhaseOut = juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(globalStepOut));
                         updatedFromClock = true;
                     }
                 }
 
                 if (!updatedFromClock && modulationPpqReady)
                 {
-                    seq.syncPhaseValid = false;
-                    seq.syncPhaseLast = -1.0;
-                    seq.syncCycleCount = 0;
+                    laneSeq.syncPhaseValid = false;
+                    laneSeq.syncPhaseLast = -1.0;
+                    laneSeq.syncCycleCount = 0;
                     const double stepPpq = basePpq + (static_cast<double>(startSample) / juce::jmax(1.0, samplesPerBeat));
-                    const double stepsPos = ((stepPpq * 4.0) * static_cast<double>(modRate)) + static_cast<double>(offset);
+                    const double stepsPos = ((stepPpq * 4.0) * static_cast<double>(laneRate)) + static_cast<double>(offset);
                     const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
                     const double wrappedPos = (wrapped < 0.0) ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
-                    globalStep = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
-                    stepPhase = juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(globalStep));
+                    globalStepOut = juce::jlimit(0, totalSteps - 1, static_cast<int>(std::floor(wrappedPos)));
+                    stepPhaseOut = juce::jlimit(0.0, 1.0, wrappedPos - static_cast<double>(globalStepOut));
                     updatedFromClock = true;
                 }
 
                 if (updatedFromClock)
-                    seq.lastGlobalStep.store(globalStep, std::memory_order_release);
-            }
-            else
-            {
-                seq.syncPhaseValid = false;
-                seq.syncPhaseLast = -1.0;
-                seq.syncCycleCount = 0;
-            }
+                    laneSeq.lastGlobalStep.store(globalStepOut, std::memory_order_release);
 
-            if (applyParamMod)
+                return updatedFromClock;
+            };
+
+            strip->clearGrainSizeModulation();
+            strip->clearTraversalSpeedOverride();
+            strip->clearTraversalRearrange();
+
+            bool anyParamModApplied = false;
+
+            for (int slot = 0; slot < NumModSequencers; ++slot)
             {
-                // Grain-size modulation is applied via runtime override to avoid zippering
-                // from write/restore ping-pong against the base parameter.
-                strip->clearGrainSizeModulation();
-                strip->clearTraversalSpeedOverride();
-                strip->clearTraversalRearrange();
+                auto& seq = modSequencers[i][static_cast<size_t>(slot)];
+                const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
+                const auto transportMode = static_cast<ModTransportMode>(juce::jlimit(
+                    0,
+                    static_cast<int>(ModTransportMode::Sync),
+                    seq.transportMode.load(std::memory_order_acquire)));
+                const float modRate = quantizeModLaneRate(seq.rate.load(std::memory_order_acquire));
+
+                if (!stripPlaying)
+                {
+                    resetLaneClock(seq);
+                    resetLaneRuntime(seq);
+                    continue;
+                }
+
+                if (target == ModTarget::None)
+                {
+                    resetLaneRuntime(seq);
+                    if (transportMode != ModTransportMode::Sync)
+                        resetLaneClock(seq);
+                    continue;
+                }
+
+                if (target == ModTarget::Retrigger)
+                    continue;
+
+                if (target == ModTarget::Rearrange)
+                {
+                    float activeRearrangeRaw = 0.0f;
+                    float activeRearrangeDepth = 0.0f;
+                    if ((strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Loop
+                         || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Gate)
+                        && evaluateRearrangeSlot(seq, activeRearrangeRaw, activeRearrangeDepth))
+                    {
+                        strip->setTraversalRearrange(activeRearrangeRaw, activeRearrangeDepth);
+                    }
+                    else
+                    {
+                        seq.speedDezipperedTarget = -1.0f;
+                    }
+                    continue;
+                }
+
+                const bool applyParamMod = ((transportMode == ModTransportMode::Sync) || modulationPpqReady);
+                if (!applyParamMod)
+                {
+                    resetLaneRuntime(seq);
+                    if (transportMode != ModTransportMode::Sync)
+                        resetLaneClock(seq);
+                    continue;
+                }
+
+                const int lengthBars = juce::jlimit(1, MaxModBars, seq.lengthBars.load(std::memory_order_acquire));
+                const int totalSteps = juce::jmax(ModSteps, ModSteps * lengthBars);
+                const int offset = seq.offset.load(std::memory_order_acquire);
+                int globalStep = seq.lastGlobalStep.load(std::memory_order_acquire);
+                double stepPhase = 0.0;
+                if (!resolveLanePhase(seq, transportMode, modRate, offset, totalSteps, globalStep, stepPhase))
+                {
+                    resetLaneRuntime(seq);
+                    continue;
+                }
+
+                anyParamModApplied = true;
 
                 const int nextStep = (globalStep + 1) % totalSteps;
                 const float startA = juce::jlimit(
@@ -12084,9 +12590,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     startA, endA, subdivisionsA, subdivisionPhase);
                 float shapedRaw = rawA;
                 if (curveMode && !hasLocalSubdivisionRamp)
-                {
                     shapedRaw = juce::jlimit(0.0f, 1.0f, startA + ((nextStart - startA) * shapedPhase));
-                }
 
                 float smoothedRaw = shapedRaw;
                 if (smoothingMs > 0.0f)
@@ -12098,28 +12602,25 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 }
                 else
                 {
-                    // True zero smoothing: use step values directly.
                     seq.smoothedRaw = shapedRaw;
                 }
+
                 float controlRaw = smoothedRaw;
                 if (isGrainModTarget(target))
                 {
-                    // Safety dezipper for grain-FX automation, independent of user smoothing.
-                    // Keeps modulation sample-safe for dense grain parameter changes.
                     constexpr float kGrainDezipMs = 8.0f;
                     const float dezipSamples = juce::jmax(1.0f, (kGrainDezipMs * 0.001f) * static_cast<float>(currentSampleRate));
                     const float alpha = 1.0f - std::exp(-static_cast<float>(segmentSamples) / dezipSamples);
                     seq.grainDezipperedRaw += (smoothedRaw - seq.grainDezipperedRaw) * juce::jlimit(0.0f, 1.0f, alpha);
                     controlRaw = seq.grainDezipperedRaw;
                 }
-            else
-            {
-                seq.grainDezipperedRaw = smoothedRaw;
-            }
-            if (target == ModTarget::Pitch)
-            {
-                // Dedicated pitch dezipper: keeps pitch-target modulation
-                // free of crackles even with low/zero user smoothing.
+                else
+                {
+                    seq.grainDezipperedRaw = smoothedRaw;
+                }
+
+                if (target == ModTarget::Pitch)
+                {
                     constexpr float kPitchDezipMs = 10.0f;
                     const float dezipSamples = juce::jmax(1.0f, (kPitchDezipMs * 0.001f) * static_cast<float>(currentSampleRate));
                     const float alpha = 1.0f - std::exp(-static_cast<float>(segmentSamples) / dezipSamples);
@@ -12130,6 +12631,10 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 {
                     seq.pitchDezipperedRaw = controlRaw;
                 }
+
+                if (isLegacyDefaultFilterModLane(seq, target))
+                    controlRaw = 0.5f;
+
                 if (target != ModTarget::Speed)
                     seq.speedDezipperedTarget = -1.0f;
 
@@ -12152,8 +12657,6 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     }
                     case ModTarget::Pan:
                     {
-                        // Pan modulation is an absolute pan target blended by depth.
-                        // 0.0 -> hard left, 0.5 -> center, 1.0 -> hard right.
                         const float panTarget = juce::jlimit(-1.0f, 1.0f, (controlRaw * 2.0f) - 1.0f);
                         const float targetPan = juce::jlimit(-1.0f, 1.0f, originalPan + ((panTarget - originalPan) * depth));
                         strip->setPan(targetPan);
@@ -12193,38 +12696,36 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                         break;
                     }
                     case ModTarget::Rearrange:
-                    {
-                        float activeRearrangeRaw = 0.0f;
-                        float activeRearrangeDepth = 0.0f;
-                        if ((strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Loop
-                             || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Gate)
-                            && evaluateRearrangeSlot(seq, activeRearrangeRaw, activeRearrangeDepth))
-                        {
-                            strip->setTraversalRearrange(activeRearrangeRaw, activeRearrangeDepth);
-                        }
                         break;
-                    }
                     case ModTarget::Cutoff:
                     {
-                        const float targetFreq = 20.0f * std::pow(1000.0f, juce::jlimit(0.0f, 1.0f, modNorm));
-                        const float mixedFreq = juce::jmap(depth, originalFilterFreq, targetFreq);
+                        const float baseNorm = filterCutoffToNormalized(originalFilterFreq);
+                        const float offsetNorm = ((controlRaw * 2.0f) - 1.0f) * depth;
+                        const float targetNorm = juce::jlimit(0.0f, 1.0f, baseNorm + offsetNorm);
+                        const float mixedFreq = normalizedToFilterCutoff(targetNorm);
                         strip->setFilterFrequency(mixedFreq);
                         if (stepSampler != nullptr)
                         {
                             stepSampler->setFilterEnabled(true);
-                            stepSampler->setFilterFrequency(juce::jmap(depth, originalStepFilterFreq, targetFreq));
+                            const float stepBaseNorm = filterCutoffToNormalized(originalStepFilterFreq);
+                            const float stepTargetNorm = juce::jlimit(0.0f, 1.0f, stepBaseNorm + offsetNorm);
+                            stepSampler->setFilterFrequency(normalizedToFilterCutoff(stepTargetNorm));
                         }
                         break;
                     }
                     case ModTarget::Resonance:
                     {
-                        const float targetRes = juce::jmap(juce::jlimit(0.0f, 1.0f, modNorm), 0.1f, 10.0f);
-                        const float mixedRes = juce::jmap(depth, originalFilterRes, targetRes);
+                        const float baseNorm = filterResonanceToNormalized(originalFilterRes);
+                        const float offsetNorm = ((controlRaw * 2.0f) - 1.0f) * depth;
+                        const float targetNorm = juce::jlimit(0.0f, 1.0f, baseNorm + offsetNorm);
+                        const float mixedRes = normalizedToFilterResonance(targetNorm);
                         strip->setFilterResonance(mixedRes);
                         if (stepSampler != nullptr)
                         {
                             stepSampler->setFilterEnabled(true);
-                            stepSampler->setFilterResonance(juce::jmap(depth, originalStepFilterRes, targetRes));
+                            const float stepBaseNorm = filterResonanceToNormalized(originalStepFilterRes);
+                            const float stepTargetNorm = juce::jlimit(0.0f, 1.0f, stepBaseNorm + offsetNorm);
+                            stepSampler->setFilterResonance(normalizedToFilterResonance(stepTargetNorm));
                         }
                         break;
                     }
@@ -12244,10 +12745,45 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                         }
                         break;
                     }
+                    case ModTarget::DelayMix:
+                    {
+                        const float targetMix = juce::jlimit(0.0f, 1.0f, originalDelayMix + modSigned);
+                        strip->setDelayMix(targetMix);
+                        break;
+                    }
+                    case ModTarget::DelayTime:
+                    {
+                        const float baseNorm = delayTimeRange().convertTo0to1(
+                            juce::jlimit(0.25f, 4.0f, originalDelayTimeBeats));
+                        const float targetNorm = juce::jlimit(0.0f, 1.0f, baseNorm + modSigned);
+                        strip->setDelayTimeBeats(delayTimeRange().convertFrom0to1(targetNorm));
+                        break;
+                    }
+                    case ModTarget::DelayFeedback:
+                    {
+                        const float baseNorm = juce::jlimit(0.0f, 1.0f, originalDelayFeedback / 0.97f);
+                        const float targetNorm = juce::jlimit(0.0f, 1.0f, baseNorm + modSigned);
+                        strip->setDelayFeedback(0.97f * targetNorm);
+                        break;
+                    }
+                    case ModTarget::DelayLowCut:
+                    {
+                        const float baseNorm = delayLowCutRange().convertTo0to1(
+                            juce::jlimit(20.0f, 12000.0f, originalDelayLowCutHz));
+                        const float targetNorm = juce::jlimit(0.0f, 1.0f, baseNorm + modSigned);
+                        strip->setDelayLowCutHz(delayLowCutRange().convertFrom0to1(targetNorm));
+                        break;
+                    }
+                    case ModTarget::DelayHighCut:
+                    {
+                        const float baseNorm = delayHighCutRange().convertTo0to1(
+                            juce::jlimit(200.0f, 20000.0f, originalDelayHighCutHz));
+                        const float targetNorm = juce::jlimit(0.0f, 1.0f, baseNorm + modSigned);
+                        strip->setDelayHighCutHz(delayHighCutRange().convertFrom0to1(targetNorm));
+                        break;
+                    }
                     case ModTarget::GrainSize:
                     {
-                        // Relative modulation around current grain size (not absolute lane->size mapping).
-                        // This preserves the knob as center/reference and makes depth meaningful in both step/curve modes.
                         const float sizeNorm = juce::jlimit(0.0f, 1.0f,
                             (originalGrainSize - kGrainMinSizeMs) / (kGrainMaxSizeMs - kGrainMinSizeMs));
                         const float rangeMs = juce::jmax(10.0f, (kGrainMaxSizeMs - kGrainMinSizeMs) * (0.08f + (0.42f * sizeNorm)));
@@ -12304,18 +12840,6 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     default:
                         break;
                 }
-
-                if (target != ModTarget::Rearrange && backgroundRearrangeActive)
-                    strip->setTraversalRearrange(backgroundRearrangeRaw, backgroundRearrangeDepth);
-            }
-            else
-            {
-                strip->clearGrainSizeModulation();
-                strip->clearTraversalSpeedOverride();
-                if (backgroundRearrangeActive)
-                    strip->setTraversalRearrange(backgroundRearrangeRaw, backgroundRearrangeDepth);
-                else
-                    strip->clearTraversalRearrange();
             }
 
             juce::AudioBuffer<float>* targetBuffer = useDuckProcessing
@@ -12366,18 +12890,25 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 renderCurrentStrip();
             }
 
-            if (applyParamMod)
+            strip->clearGrainSizeModulation();
+            strip->clearTraversalSpeedOverride();
+            strip->clearTraversalRearrange();
+
+            if (anyParamModApplied)
             {
                 strip->setVolume(originalVol);
                 strip->setPan(originalPan);
                 strip->setPlaybackSpeedImmediate(originalSpeed);
-                strip->clearTraversalSpeedOverride();
                 strip->setPitchShift(originalPitch);
-                strip->clearTraversalRearrange();
                 strip->setFilterFrequency(originalFilterFreq);
                 strip->setFilterResonance(originalFilterRes);
                 strip->setFilterMorph(originalFilterMorph);
                 strip->setFilterEnabled(originalFilterEnabled);
+                strip->setDelayMix(originalDelayMix);
+                strip->setDelayTimeBeats(originalDelayTimeBeats);
+                strip->setDelayFeedback(originalDelayFeedback);
+                strip->setDelayLowCutHz(originalDelayLowCutHz);
+                strip->setDelayHighCutHz(originalDelayHighCutHz);
                 strip->setGrainDensity(originalGrainDensity);
                 strip->setGrainPitch(originalGrainPitch);
                 strip->setGrainPitchJitter(originalGrainPitchJitter);
@@ -12402,14 +12933,15 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     stepSampler->setFilterEnabled(originalStepFilterEnabled);
                 }
             }
-            else
+
+            if (!stripPlaying)
             {
-                strip->clearTraversalSpeedOverride();
-                strip->clearTraversalRearrange();
-                seq.smoothedRaw = 0.0f;
-                seq.grainDezipperedRaw = 0.0f;
-                seq.pitchDezipperedRaw = 0.0f;
-                seq.speedDezipperedTarget = -1.0f;
+                for (int slot = 0; slot < NumModSequencers; ++slot)
+                {
+                    auto& seq = modSequencers[i][static_cast<size_t>(slot)];
+                    resetLaneClock(seq);
+                    resetLaneRuntime(seq);
+                }
             }
         }
     };
@@ -12477,53 +13009,55 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             if (strip == nullptr || !strip->isPlaying())
                 continue;
 
-            const int seqSlot = getActiveModSequencerSlot(stripIdx);
-            const auto& seq = modSequencers[static_cast<size_t>(stripIdx)][static_cast<size_t>(seqSlot)];
-            const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
-            if (target != ModTarget::Retrigger)
-                continue;
-
-            const float depth = juce::jlimit(0.0f, 1.0f, seq.depth.load(std::memory_order_acquire));
-            if (depth <= 1.0e-4f)
-                continue;
-
-            const auto divisionAtPpq = [&](double ppq) -> double
+            const auto divisionAtPpq = [&](const ModSequencer& seq, double ppq, float depth) -> double
             {
                 const float stepValue = readModStepValueAtPpq(seq, ppq);
                 return retriggerDivisionFromAmount(stepValue * depth);
             };
 
-            double cursorPpq = blockStartPpq;
-            int lastOffsetSamples = -1;
-            int safety = 0;
-            while (cursorPpq < blockEndPpq && safety++ < 256)
+            for (int slot = 0; slot < NumModSequencers; ++slot)
             {
-                const double division = divisionAtPpq(cursorPpq);
-                if (division <= 0.0)
-                    break;
+                const auto& seq = modSequencers[static_cast<size_t>(stripIdx)][static_cast<size_t>(slot)];
+                const auto target = static_cast<ModTarget>(seq.target.load(std::memory_order_acquire));
+                if (target != ModTarget::Retrigger)
+                    continue;
 
-                double boundaryPpq = std::ceil((cursorPpq - 1.0e-12) / division) * division;
-                if (boundaryPpq <= cursorPpq + 1.0e-12)
-                    boundaryPpq += division;
-                if (boundaryPpq >= blockEndPpq)
-                    break;
+                const float depth = juce::jlimit(0.0f, 1.0f, seq.depth.load(std::memory_order_acquire));
+                if (depth <= 1.0e-4f)
+                    continue;
 
-                const int offsetSamples = juce::jlimit(
-                    0, numSamples - 1, static_cast<int>(std::llround((boundaryPpq - blockStartPpq) * samplesPerBeat)));
-                if (offsetSamples != lastOffsetSamples)
+                double cursorPpq = blockStartPpq;
+                int lastOffsetSamples = -1;
+                int safety = 0;
+                while (cursorPpq < blockEndPpq && safety++ < 256)
                 {
-                    QuantisedTrigger t;
-                    t.targetSample = blockStart + offsetSamples;
-                    t.targetPPQ = boundaryPpq;
-                    t.stripIndex = stripIdx;
-                    t.column = strip->getCurrentColumn();
-                    t.clearPendingOnFire = false;
-                    t.isSequencerRetrigger = true;
-                    eventsInBlock.push_back(t);
-                    lastOffsetSamples = offsetSamples;
-                }
+                    const double division = divisionAtPpq(seq, cursorPpq, depth);
+                    if (division <= 0.0)
+                        break;
 
-                cursorPpq = boundaryPpq + 1.0e-9;
+                    double boundaryPpq = std::ceil((cursorPpq - 1.0e-12) / division) * division;
+                    if (boundaryPpq <= cursorPpq + 1.0e-12)
+                        boundaryPpq += division;
+                    if (boundaryPpq >= blockEndPpq)
+                        break;
+
+                    const int offsetSamples = juce::jlimit(
+                        0, numSamples - 1, static_cast<int>(std::llround((boundaryPpq - blockStartPpq) * samplesPerBeat)));
+                    if (offsetSamples != lastOffsetSamples)
+                    {
+                        QuantisedTrigger t;
+                        t.targetSample = blockStart + offsetSamples;
+                        t.targetPPQ = boundaryPpq;
+                        t.stripIndex = stripIdx;
+                        t.column = strip->getCurrentColumn();
+                        t.clearPendingOnFire = false;
+                        t.isSequencerRetrigger = true;
+                        eventsInBlock.push_back(t);
+                        lastOffsetSamples = offsetSamples;
+                    }
+
+                    cursorPpq = boundaryPpq + 1.0e-9;
+                }
             }
         }
 
@@ -13274,6 +13808,11 @@ void ModernAudioEngine::setSampleModeStopCallback(SampleModeStopCallback callbac
     sampleModeStopCallback = std::move(callback);
 }
 
+void ModernAudioEngine::setPatternControlEventCallback(PatternControlEventCallback callback)
+{
+    patternControlEventCallback = std::move(callback);
+}
+
 void ModernAudioEngine::scheduleQuantizedTrigger(int stripIndex,
                                                  int column,
                                                  double currentPPQ,
@@ -13585,7 +14124,12 @@ void ModernAudioEngine::processPatterns()
                         if (!patternRecorderMatchesStrip(patternIndex, event.stripIndex))
                             return;
 
-                        if (event.isNoteOn)
+                        if (event.type == PatternRecorder::EventType::ControlChange)
+                        {
+                            if (patternControlEventCallback)
+                                patternControlEventCallback(event);
+                        }
+                        else if (event.isNoteOn)
                         {
                             // Use the same trigger path as live grid presses so pattern playback
                             // stays on the PPQ/sample timeline and respects group behavior.
@@ -13789,7 +14333,7 @@ void ModernAudioEngine::resetModSequencerSlotToDefaults(int stripIndex, int slot
     seq.curveMode.store(0, std::memory_order_release);
     seq.depth.store(1.0f, std::memory_order_release);
     seq.rate.store(1.0f, std::memory_order_release);
-    seq.transportMode.store(static_cast<int>(ModTransportMode::Free), std::memory_order_release);
+    seq.transportMode.store(static_cast<int>(ModTransportMode::Sync), std::memory_order_release);
     seq.offset.store(0, std::memory_order_release);
     seq.lengthBars.store(1, std::memory_order_release);
     seq.editPage.store(0, std::memory_order_release);

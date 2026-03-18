@@ -29,6 +29,11 @@ public:
     
     void paint(juce::Graphics& g) override;
     void resized() override;
+    void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
+    void mouseUp(const juce::MouseEvent& e) override;
+    void mouseDoubleClick(const juce::MouseEvent& e) override;
+    void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override;
     
     void setAudioBuffer(const juce::AudioBuffer<float>& buffer, double sampleRate);
     void setPlaybackPosition(double normalizedPosition);
@@ -52,8 +57,10 @@ public:
     void setLoopPitchOverlay(bool enabled, const juce::String& lineA, const juce::String& lineB);
     void setWaveformColor(juce::Colour color);
     void setVisualGainDb(float trimDb);
+    void setLoopInteractionEnabled(bool enabled);
     bool hasLoadedAudio() const noexcept { return hasAudio; }
     void clear();
+    std::function<void(double normalizedPosition)> onShiftSliceEdit;
     
 private:
     std::vector<float> thumbnail;
@@ -84,8 +91,17 @@ private:
     juce::String loopPitchOverlayLineA;
     juce::String loopPitchOverlayLineB;
     float visualGain = 1.0f;
+    bool loopInteractionEnabled = false;
+    float viewStartNorm = 0.0f;
+    float viewSpanNorm = 1.0f;
+    bool viewDragActive = false;
+    juce::Point<int> viewDragStart;
+    float viewDragStartNorm = 0.0f;
     
     void generateThumbnail(const juce::AudioBuffer<float>& buffer);
+    void resetView();
+    float normalizedPositionFromX(float x) const;
+    float xFromNormalizedPosition(float normalizedPosition, float width) const;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(WaveformDisplay)
 };
@@ -128,12 +144,25 @@ private:
     juce::Slider duckAttackSlider;
     juce::Slider duckReleaseSlider;
     juce::Slider duckGainCompSlider;
+    juce::ComboBox delayModeBox;
+    juce::ToggleButton delaySyncButton;
+    juce::Slider delayMixSlider;
+    juce::Slider delayTimeSlider;
+    juce::Slider delayFeedbackSlider;
+    juce::Slider delayLowCutSlider;
+    juce::Slider delayHighCutSlider;
     juce::Label duckSourceLabel;
     juce::Label duckThresholdLabel;
     juce::Label duckRatioLabel;
     juce::Label duckAttackLabel;
     juce::Label duckReleaseLabel;
     juce::Label duckGainCompLabel;
+    juce::Label delayModeLabel;
+    juce::Label delayMixLabel;
+    juce::Label delayTimeLabel;
+    juce::Label delayFeedbackLabel;
+    juce::Label delayLowCutLabel;
+    juce::Label delayHighCutLabel;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> duckEnableAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> duckFollowMasterAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> duckSourceAttachment;
@@ -142,6 +171,13 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> duckAttackAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> duckReleaseAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> duckGainCompAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> delayModeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> delaySyncAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> delayMixAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> delayTimeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> delayFeedbackAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> delayLowCutAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> delayHighCutAttachment;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FXStripControl)
 };
@@ -640,6 +676,7 @@ private:
     void updateGrainOverlayVisibility();
     void updateGrainTabButtons();
     void updateModSequencerTabButtons();
+    void handleWaveformShiftSliceEdit(double normalizedPosition);
 
     enum class ModTransformMode
     {
@@ -1308,7 +1345,7 @@ private:
     void setTooltipsEnabled(bool enabled);
     
     static constexpr int windowWidth = 1000;
-    static constexpr int windowHeight = 1020;
+    static constexpr int windowHeight = 1052;
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MlrVSTAudioProcessorEditor)
 };

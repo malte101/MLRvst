@@ -439,14 +439,11 @@ bool renderTimeStretchedBuffer(const juce::AudioBuffer<float>& sourceBuffer,
 
         case TimeStretchBackend::SoundTouch:
 #if MLRVST_ENABLE_SOUNDTOUCH
-            if (renderWithSoundTouch(sourceBuffer, sourceSampleRate, targetFrames, pitchSemitones, outputBuffer))
-                return true;
-#if MLRVST_ENABLE_BUNGEE
-            return renderWithBungee(sourceBuffer, sourceSampleRate, targetFrames, pitchSemitones, outputBuffer);
-#else
-            resampleBufferToLength(buildStereoSourceBuffer(sourceBuffer), targetFrames, outputBuffer);
-            return true;
-#endif
+            return renderWithSoundTouch(sourceBuffer,
+                                        sourceSampleRate,
+                                        targetFrames,
+                                        pitchSemitones,
+                                        outputBuffer);
 #else
             return false;
 #endif

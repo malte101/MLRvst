@@ -5,6 +5,7 @@ class EnhancedAudioStrip;
 namespace MonomeFilterActions
 {
 // subPage: 0 = Frequency, 1 = Resonance, 2 = Type
+void applyButtonPressLive(EnhancedAudioStrip& strip, int x, int subPage);
 void handleButtonPress(EnhancedAudioStrip& strip, int x, int subPage);
 void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][16], int subPage);
 } // namespace MonomeFilterActions

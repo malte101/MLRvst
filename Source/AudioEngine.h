@@ -171,6 +171,12 @@ private:
 class PatternRecorder
 {
 public:
+    enum class EventType
+    {
+        Note = 0,
+        ControlChange
+    };
+
     struct Event
     {
         int stripIndex;
@@ -178,7 +184,10 @@ public:
         int sampleSliceId = -1;
         int64_t sampleStartSample = -1;
         double time; // in beats (relative to pattern start)
-        bool isNoteOn;
+        bool isNoteOn = true;
+        EventType type = EventType::Note;
+        int controlMode = -1;
+        int controlRow = -1;
         
         bool operator<(const Event& other) const { return time < other.time; }
     };
@@ -199,6 +208,11 @@ public:
                      double currentBeat,
                      int sampleSliceId = -1,
                      int64_t sampleStartSample = -1);
+    void recordControlEvent(int strip,
+                            int controlMode,
+                            int controlRow,
+                            int column,
+                            double currentBeat);
     
     // Check if recording should auto-stop (returns true if stopped)
     bool updateRecording(double currentBeat);
@@ -437,7 +451,7 @@ public:
     std::unique_ptr<LadderFilterBase> moogLpL;
     std::unique_ptr<LadderFilterBase> moogLpR;
     FilterType filterType = FilterType::LowPass;
-    bool filterEnabled = false;  // Disabled by default, auto-enables on use
+    std::atomic<int> filterEnabled{0};  // Disabled by default, auto-enables on use
     std::atomic<float> swingAmount{0.0f};   // 0..1 transport swing depth
     std::atomic<int> swingDivision{static_cast<int>(SwingDivision::Eighth)};
     std::atomic<float> gateAmount{0.0f};    // 0..1 gate effect depth
@@ -638,6 +652,12 @@ public:
         Signalsmith,
         Bungee
     };
+    enum class DelayMode
+    {
+        Single = 0,
+        Dual,
+        PingPong
+    };
     void setPitchShift(float semitones);
     float getPitchShift() const { return pitchShiftSemitones.load(); }
     void setPitchShiftAlgorithm(PitchShiftAlgorithm algorithm);
@@ -700,6 +720,7 @@ public:
     double getLoopPhaseNormalized() const;
     std::array<int, 16> getSliceStartSamples(bool transientMode) const;
     std::array<int, 16> getCachedTransientSliceSamples() const;
+    void setTransientSliceMarkerSample(int sliceIndex, int sampleIndex);
     std::array<float, 128> getCachedRmsMap() const;
     std::array<int, 128> getCachedZeroCrossMap() const;
     bool hasSampleAnalysisCache() const { return analysisCacheValid && analysisSampleCount > 0; }
@@ -773,12 +794,20 @@ public:
     const StepSampler* getStepSampler() const { return &stepSampler; }
     
     // Filter (ZDF State Variable)
-    void setFilterEnabled(bool enabled) { filterEnabled = enabled; }
-    bool isFilterEnabled() const { return filterEnabled; }
+    void setFilterEnabled(bool enabled)
+    {
+        filterEnabled.store(enabled ? 1 : 0, std::memory_order_release);
+    }
+    bool isFilterEnabled() const
+    {
+        return filterEnabled.load(std::memory_order_acquire) != 0;
+    }
     void setFilterFrequency(float freq);
     float getFilterFrequency() const { return filterFrequency.load(); }
+    float getDisplayedFilterFrequency() const { return displayedFilterFrequency.load(std::memory_order_acquire); }
     void setFilterResonance(float res);
     float getFilterResonance() const { return filterResonance.load(); }
+    float getDisplayedFilterResonance() const { return displayedFilterResonance.load(std::memory_order_acquire); }
     void setFilterMorph(float morph);
     float getFilterMorph() const { return filterMorph.load(std::memory_order_acquire); }
     void setFilterType(FilterType type);
@@ -804,6 +833,31 @@ public:
     float getDuckGainCompDb() const { return duckGainCompDb.load(std::memory_order_acquire); }
     void setDuckFollowMaster(bool follow) { duckFollowMaster.store(follow ? 1 : 0, std::memory_order_release); }
     bool isDuckFollowMaster() const { return duckFollowMaster.load(std::memory_order_acquire) != 0; }
+    void setDelayMix(float mix) { delayMix.store(juce::jlimit(0.0f, 1.0f, mix), std::memory_order_release); }
+    float getDelayMix() const { return delayMix.load(std::memory_order_acquire); }
+    float getDisplayedDelayMix() const { return displayedDelayMix.load(std::memory_order_acquire); }
+    void setDelayTimeBeats(float beats) { delayTimeBeats.store(juce::jlimit(0.25f, 4.0f, beats), std::memory_order_release); }
+    float getDelayTimeBeats() const { return delayTimeBeats.load(std::memory_order_acquire); }
+    float getDisplayedDelayTimeBeats() const { return displayedDelayTimeBeats.load(std::memory_order_acquire); }
+    void setDelaySyncEnabled(bool enabled) { delaySyncEnabled.store(enabled ? 1 : 0, std::memory_order_release); }
+    bool isDelaySyncEnabled() const { return delaySyncEnabled.load(std::memory_order_acquire) != 0; }
+    void setDelayFeedback(float feedback) { delayFeedback.store(juce::jlimit(0.0f, 0.97f, feedback), std::memory_order_release); }
+    float getDelayFeedback() const { return delayFeedback.load(std::memory_order_acquire); }
+    float getDisplayedDelayFeedback() const { return displayedDelayFeedback.load(std::memory_order_acquire); }
+    void setDelayLowCutHz(float hz) { delayLowCutHz.store(juce::jlimit(20.0f, 12000.0f, hz), std::memory_order_release); }
+    float getDelayLowCutHz() const { return delayLowCutHz.load(std::memory_order_acquire); }
+    float getDisplayedDelayLowCutHz() const { return displayedDelayLowCutHz.load(std::memory_order_acquire); }
+    void setDelayHighCutHz(float hz) { delayHighCutHz.store(juce::jlimit(200.0f, 20000.0f, hz), std::memory_order_release); }
+    float getDelayHighCutHz() const { return delayHighCutHz.load(std::memory_order_acquire); }
+    float getDisplayedDelayHighCutHz() const { return displayedDelayHighCutHz.load(std::memory_order_acquire); }
+    void setDelayMode(DelayMode mode)
+    {
+        delayMode.store(juce::jlimit(0, 2, static_cast<int>(mode)), std::memory_order_release);
+    }
+    DelayMode getDelayMode() const
+    {
+        return static_cast<DelayMode>(juce::jlimit(0, 2, delayMode.load(std::memory_order_acquire)));
+    }
     int resolveDuckDetectorStripIndex(int selfStripIndex, int masterTriggerStripIndex) const;
     bool isDuckActiveForProcessing(int selfStripIndex, int masterTriggerStripIndex) const;
     void resetDuckGainSmoothing() { duckSmoothedGain = 1.0f; }
@@ -1182,10 +1236,35 @@ private:
     juce::SmoothedValue<float> smoothedFilterFrequency{20000.0f};
     juce::SmoothedValue<float> smoothedFilterResonance{0.707f};
     juce::SmoothedValue<float> smoothedFilterMorph{0.0f};
+    std::atomic<float> displayedFilterFrequency{20000.0f};
+    std::atomic<float> displayedFilterResonance{0.707f};
+    juce::SmoothedValue<float> smoothedDelayMix{0.0f};
+    juce::SmoothedValue<float> smoothedDelayTimeBeats{1.0f};
+    juce::SmoothedValue<float> smoothedDelayFeedback{0.35f};
+    juce::SmoothedValue<float> smoothedDelayLowCutHz{20.0f};
+    juce::SmoothedValue<float> smoothedDelayHighCutHz{12000.0f};
+    std::atomic<float> displayedDelayMix{0.0f};
+    std::atomic<float> displayedDelayTimeBeats{1.0f};
+    std::atomic<float> displayedDelayFeedback{0.35f};
+    std::atomic<float> displayedDelayLowCutHz{20.0f};
+    std::atomic<float> displayedDelayHighCutHz{12000.0f};
     float duckSmoothedGain = 1.0f;
     std::atomic<float> pitchShiftSemitones{0.0f};
     std::atomic<int> pitchShiftAlgorithm{0};
     std::atomic<int> signalsmithLiveMode{0};
+    std::atomic<float> delayMix{0.0f};
+    std::atomic<float> delayTimeBeats{1.0f};
+    std::atomic<int> delaySyncEnabled{1};
+    std::atomic<float> delayFeedback{0.35f};
+    std::atomic<float> delayLowCutHz{20.0f};
+    std::atomic<float> delayHighCutHz{12000.0f};
+    std::atomic<int> delayMode{0};
+    juce::AudioBuffer<float> stripDelayBuffer;
+    int stripDelayWritePos = 0;
+    juce::dsp::StateVariableTPTFilter<float> delayLowCutFilterL;
+    juce::dsp::StateVariableTPTFilter<float> delayLowCutFilterR;
+    juce::dsp::StateVariableTPTFilter<float> delayHighCutFilterL;
+    juce::dsp::StateVariableTPTFilter<float> delayHighCutFilterR;
     juce::AudioBuffer<float> pitchShiftDelayBuffer;
     int pitchShiftWritePos = 0;
     int pitchShiftDelaySize = 0;
@@ -1456,6 +1535,8 @@ public:
     void handleLooping();
     float getPanGain(int channel) const; // 0=left, 1=right
     void rebuildTransientSliceMap();
+    int getTransientSliceMinimumSpacingSamples(int totalSamples) const;
+    void commitTransientSlicePositionsLocked(const std::array<int, 16>& positions);
     void installPreparedAnalysisCacheLocked(const std::array<int, 16>& transientSlices,
                                             const std::array<float, 128>& rmsMap,
                                             const std::array<int, 128>& zeroCrossMap,
@@ -1533,6 +1614,9 @@ public:
     int processSignalsmithRealtimeAlignmentDelayBufferInPlace(juce::AudioBuffer<float>& buffer,
                                                               int startSample,
                                                               int numSamples);
+    void publishDisplayedControlState();
+    void processDelaySample(float& leftSample, float& rightSample, double tempo);
+    void resetDelayState();
     float readPitchDelaySample(int channel, double delaySamples) const;
     float readPitchDelaySampleWindowedSinc(int channel, double delaySamples, int taps) const;
     float readPitchDelaySampleOversampled(int channel, double delaySamples, int taps) const;
@@ -1660,6 +1744,7 @@ public:
                                                          const juce::AudioPlayHead::PositionInfo& positionInfo,
                                                          bool isMomentaryStutter)>;
     using SampleModeStopCallback = std::function<void(int stripIndex, bool immediateStop)>;
+    using PatternControlEventCallback = std::function<void(const PatternRecorder::Event&)>;
     
     ModernAudioEngine();
     
@@ -1706,6 +1791,7 @@ public:
     void setSampleModeRenderCallback(SampleModeRenderCallback callback);
     void setSampleModeTriggerCallback(SampleModeTriggerCallback callback);
     void setSampleModeStopCallback(SampleModeStopCallback callback);
+    void setPatternControlEventCallback(PatternControlEventCallback callback);
 
     // Pattern recording
     void startPatternRecording(int patternIndex);
@@ -1919,6 +2005,7 @@ private:
     SampleModeRenderCallback sampleModeRenderCallback;
     SampleModeTriggerCallback sampleModeTriggerCallback;
     SampleModeStopCallback sampleModeStopCallback;
+    PatternControlEventCallback patternControlEventCallback;
     std::array<std::atomic<double>, MaxStrips> momentaryStutterNextPpq{};
     std::atomic<int> masterDuckTriggerStrip{-1};
     std::unique_ptr<LiveRecorder> liveRecorder;

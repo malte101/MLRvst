@@ -3,7 +3,7 @@
 
 namespace MonomeFilterActions
 {
-void handleButtonPress(EnhancedAudioStrip& strip, int x, int subPage)
+void applyButtonPressLive(EnhancedAudioStrip& strip, int x, int subPage)
 {
     if (subPage == 0)
     {
@@ -79,6 +79,11 @@ void handleButtonPress(EnhancedAudioStrip& strip, int x, int subPage)
     }
 }
 
+void handleButtonPress(EnhancedAudioStrip& strip, int x, int subPage)
+{
+    applyButtonPressLive(strip, x, subPage);
+}
+
 void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][16], int subPage)
 {
     const bool isStepMode = (strip.playMode == EnhancedAudioStrip::PlayMode::Step);
@@ -89,7 +94,7 @@ void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][16], 
         // Filter frequency visualization (log scale: 20Hz - 20kHz)
         float freq = isStepMode && stepSampler
                    ? stepSampler->getFilterFrequency()
-                   : strip.getFilterFrequency();
+                   : strip.getDisplayedFilterFrequency();
 
         float t = std::log(freq / 20.0f) / std::log(1000.0f);
         t = juce::jlimit(0.0f, 1.0f, t);
@@ -110,7 +115,7 @@ void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][16], 
         // Filter resonance visualization (0.1 - 10.0 Q)
         float res = isStepMode && stepSampler
                   ? stepSampler->getFilterResonance()
-                  : strip.getFilterResonance();
+                  : strip.getDisplayedFilterResonance();
 
         float t = (res - 0.1f) / 9.9f;
         t = juce::jlimit(0.0f, 1.0f, t);
