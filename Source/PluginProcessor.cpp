@@ -8992,6 +8992,9 @@ void MlrVSTAudioProcessor::applyQueuedSceneExitTailFade(juce::AudioBuffer<float>
     if (buffer.getNumSamples() <= 0 || blockStartSample < 0)
         return;
 
+    if (activeSceneTransitionContext != nullptr)
+        return;
+
     if (pendingSceneApplySlot.load(std::memory_order_acquire) < 0
         || pendingSceneApplySequenceDriven.load(std::memory_order_acquire) == 0)
     {
@@ -9005,23 +9008,33 @@ void MlrVSTAudioProcessor::applyQueuedSceneExitTailFade(juce::AudioBuffer<float>
         return;
     }
 
+    const int targetOffset = juce::jlimit(0,
+                                          juce::jmax(0, buffer.getNumSamples()),
+                                          static_cast<int>(targetSample - blockStartSample));
     const double effectiveRate = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
     const float triggerFadeMs = triggerFadeInParam != nullptr
         ? juce::jlimit(0.01f, 120.0f, triggerFadeInParam->load(std::memory_order_acquire))
         : 12.0f;
     const double tailFadeMs = juce::jlimit(0.20, 0.75, juce::jmax(0.20, static_cast<double>(triggerFadeMs) * 0.08));
     const int fadeSamples = juce::jlimit(8,
-                                         juce::jmax(8, buffer.getNumSamples()),
+                                         juce::jmax(8, juce::jmax(1, targetOffset)),
                                          static_cast<int>(std::round(effectiveRate * 0.001 * tailFadeMs)));
-    const int fadeStartSample = juce::jmax(0, buffer.getNumSamples() - fadeSamples);
-    const int denom = juce::jmax(1, buffer.getNumSamples() - fadeStartSample - 1);
+    const int fadeEndSample = juce::jlimit(0, buffer.getNumSamples(), targetOffset);
+    const int fadeStartSample = juce::jmax(0, fadeEndSample - fadeSamples);
+    const int denom = juce::jmax(1, fadeEndSample - fadeStartSample - 1);
 
-    for (int sample = fadeStartSample; sample < buffer.getNumSamples(); ++sample)
+    for (int sample = fadeStartSample; sample < fadeEndSample; ++sample)
     {
         const float t = static_cast<float>(sample - fadeStartSample) / static_cast<float>(denom);
         const float gain = std::cos(juce::jlimit(0.0f, 1.0f, t) * juce::MathConstants<float>::halfPi);
         for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
             buffer.setSample(channel, sample, buffer.getSample(channel, sample) * gain);
+    }
+
+    for (int sample = fadeEndSample; sample < buffer.getNumSamples(); ++sample)
+    {
+        for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+            buffer.setSample(channel, sample, 0.0f);
     }
 }
 
@@ -9994,6 +10007,7 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
             std::fill_n(lastRenderedOutputTail[static_cast<size_t>(channel)].begin(), tailSamples, 0.0f);
         lastRenderedOutputTailLength = tailSamples;
     }
+
 }
 
 //==============================================================================

@@ -53,9 +53,9 @@ int computeSceneRecallBlendSamples(const MlrVSTAudioProcessor& processor)
 
 bool shouldUsePreloadedSceneTransitions(const MlrVSTAudioProcessor&)
 {
-    // The preloaded engine-to-engine handoff still regresses manual scene
-    // retrigger reliability. Keep scene recalls on the stable direct restore
-    // path until that transition engine is fixed end-to-end.
+    // The preloaded engine-to-engine handoff still regresses chain stability in
+    // host testing. Keep scene recalls on the stable direct restore path until
+    // that transition engine is fixed end-to-end.
     return false;
 }
 
