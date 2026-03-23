@@ -382,6 +382,7 @@ public:
 
     void setSliceMode(SampleSliceMode mode);
     SampleSliceMode getSliceMode() const;
+    void refreshTransientAnalysis();
     void setTriggerMode(SampleTriggerMode mode);
     SampleTriggerMode getTriggerMode() const;
     void setLegacyLoopEngineEnabled(bool enabled);

@@ -36,6 +36,38 @@ public:
     static int getSceneSequenceStepIndex(const MlrVSTAudioProcessor& processor, int sceneSlot);
     static int getQueuedSceneSlot(const MlrVSTAudioProcessor& processor);
     static juce::String getSceneSequenceSummaryText(const MlrVSTAudioProcessor& processor);
+    static int getSceneChainLength(const MlrVSTAudioProcessor& processor);
+    static int getSceneChainStepSceneSlot(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static int getSceneChainStepRepeatCount(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static int getSceneChainStepTransitionTypeIndex(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static int getSceneChainStepTransitionOptionIndex(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static float getSceneChainStepTransitionLengthBeats(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static bool getSceneChainStepTransitionSubtractsFromSceneLength(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static float getSceneChainStepTransitionIntensity(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static float getSceneChainStepTransitionDelayAmount(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static float getSceneChainStepTransitionFilterAmount(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static float getSceneChainStepTransitionChopAmount(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static void setSceneChainStep(MlrVSTAudioProcessor& processor, int stepIndex, int sceneSlot, int repeats);
+    static void setSceneChainStepTransitionTypeIndex(MlrVSTAudioProcessor& processor, int stepIndex, int typeIndex);
+    static void setSceneChainStepTransitionOptionIndex(MlrVSTAudioProcessor& processor, int stepIndex, int optionIndex);
+    static void setSceneChainStepTransitionLengthBeats(MlrVSTAudioProcessor& processor, int stepIndex, float beats);
+    static void setSceneChainStepTransitionSubtractsFromSceneLength(MlrVSTAudioProcessor& processor,
+                                                                    int stepIndex,
+                                                                    bool enabled);
+    static void setSceneChainStepTransitionIntensity(MlrVSTAudioProcessor& processor, int stepIndex, float amount);
+    static void setSceneChainStepTransitionDelayAmount(MlrVSTAudioProcessor& processor, int stepIndex, float amount);
+    static void setSceneChainStepTransitionFilterAmount(MlrVSTAudioProcessor& processor, int stepIndex, float amount);
+    static void setSceneChainStepTransitionChopAmount(MlrVSTAudioProcessor& processor, int stepIndex, float amount);
+    static void clearSceneChain(MlrVSTAudioProcessor& processor);
+    static bool isSceneChainLoopEnabled(const MlrVSTAudioProcessor& processor);
+    static void setSceneChainLoopEnabled(MlrVSTAudioProcessor& processor, bool enabled);
+    static int getSceneChainLoopStartStep(const MlrVSTAudioProcessor& processor);
+    static int getSceneChainLoopEndStep(const MlrVSTAudioProcessor& processor);
+    static void setSceneChainLoopRange(MlrVSTAudioProcessor& processor, int startStep, int endStep);
+    static bool isSceneChainPlaybackActive(const MlrVSTAudioProcessor& processor);
+    static int getSceneChainPlaybackStepIndex(const MlrVSTAudioProcessor& processor);
+    static bool startSceneChainPlayback(MlrVSTAudioProcessor& processor, int startStepIndex);
+    static void stopSceneChainPlayback(MlrVSTAudioProcessor& processor);
     static std::unique_ptr<juce::XmlElement> createSceneChainStateXml(const MlrVSTAudioProcessor& processor,
                                                                       int sceneSlotOverride);
     static void applySceneChainStateXml(MlrVSTAudioProcessor& processor,
@@ -71,7 +103,9 @@ public:
     static void requestSceneRecallQuantized(MlrVSTAudioProcessor& processor,
                                             int mainPresetIndex,
                                             int sceneSlot,
-                                            bool sequenceDriven);
+                                            bool sequenceDriven,
+                                            int sequenceStepIndex = -1,
+                                            bool useTriggerQuantization = false);
     static double getSceneRecallIntervalBeats(const MlrVSTAudioProcessor& processor);
     static void updateSceneQuantizedRecall(MlrVSTAudioProcessor& processor,
                                            const juce::AudioPlayHead::PositionInfo& posInfo,
@@ -86,4 +120,7 @@ public:
                                  int64_t hostGlobalSampleSnapshot);
     static void appendSceneModeStateToState(const MlrVSTAudioProcessor& processor, juce::ValueTree& state);
     static void loadSceneModeStateFromState(MlrVSTAudioProcessor& processor, const juce::ValueTree& state);
+
+private:
+    static void markSceneChainTransitionEdited(MlrVSTAudioProcessor& processor, int editedStepIndex);
 };

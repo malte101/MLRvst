@@ -7,6 +7,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <vector>
 
 namespace
 {
@@ -124,6 +125,16 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
     if (!shouldEnable && !momentaryStutterHoldActive && !startPending && !playbackActive)
         return;
 
+    const auto resolveRecordedStutterColumn = [this]() -> int
+    {
+        if (momentaryStutterActiveDivisionButton >= 9 && momentaryStutterActiveDivisionButton <= 15)
+            return momentaryStutterActiveDivisionButton;
+        if (momentaryStutterRecordedDivisionButton >= 9 && momentaryStutterRecordedDivisionButton <= 15)
+            return momentaryStutterRecordedDivisionButton;
+        return stutterColumnFromMask(static_cast<uint8_t>(
+            momentaryStutterButtonMask.load(std::memory_order_acquire) & 0x7f));
+    };
+
     const int64_t nowSample = audioEngine->getGlobalSampleCount();
     auto readHostTiming = [this](double& outPpq, double& outTempo)
     {
@@ -151,8 +162,11 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
         const int startQuantizeDivision = juce::jmax(1, getQuantizeDivision());
         pendingStutterStartQuantizeDivision.store(startQuantizeDivision, std::memory_order_release);
         const double entryDivision = juce::jlimit(0.03125, 4.0, momentaryStutterDivisionBeats);
+        const int currentColumn = resolveRecordedStutterColumn();
         pendingStutterStartDivisionBeats.store(entryDivision, std::memory_order_release);
         audioEngine->setMomentaryStutterDivision(entryDivision);
+        if (currentColumn >= 9 && currentColumn <= 15)
+            momentaryStutterRecordedDivisionButton = currentColumn;
 
         if (startPending && !playbackActive)
         {
@@ -161,7 +175,12 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
         }
 
         if (playbackActive)
+        {
+            recordMomentaryStutterSceneDivision(entryDivision,
+                                                momentaryStutterRecordedDivisionButton,
+                                                audioEngine->getTimelineBeat());
             audioEngine->setMomentaryStutterActive(true);
+        }
         return;
     }
 
@@ -174,6 +193,9 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
             if (fallbackBit != 0)
                 momentaryStutterButtonMask.store(fallbackBit, std::memory_order_release);
         }
+        const int currentColumn = resolveRecordedStutterColumn();
+        if (currentColumn >= 9 && currentColumn <= 15)
+            momentaryStutterRecordedDivisionButton = currentColumn;
 
         momentaryStutterMacroCapturePending = true;
         momentaryStutterMacroBaselineCaptured = false;
@@ -196,6 +218,7 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
             if (!std::isfinite(fallbackPpq))
             {
                 momentaryStutterHoldActive = false;
+                momentaryStutterRecordedDivisionButton = -1;
                 pendingStutterStartActive.store(0, std::memory_order_release);
                 pendingStutterStartPpq.store(-1.0, std::memory_order_release);
                 pendingStutterStartSampleTarget.store(-1, std::memory_order_release);
@@ -232,6 +255,7 @@ void MlrVSTAudioProcessor::setMomentaryStutterHold(bool shouldEnable)
 
     if (startPending && !playbackActive)
     {
+        momentaryStutterRecordedDivisionButton = -1;
         pendingStutterStartActive.store(0, std::memory_order_release);
         pendingStutterStartPpq.store(-1.0, std::memory_order_release);
         pendingStutterStartSampleTarget.store(-1, std::memory_order_release);
@@ -359,12 +383,29 @@ void MlrVSTAudioProcessor::performMomentaryStutterStartNow(double hostPpqNow, in
     pendingStutterStartActive.store(0, std::memory_order_release);
     pendingStutterStartPpq.store(-1.0, std::memory_order_release);
     pendingStutterStartSampleTarget.store(-1, std::memory_order_release);
+
+    int recordColumn = momentaryStutterRecordedDivisionButton;
+    if (recordColumn < 9 || recordColumn > 15)
+        recordColumn = stutterColumnFromMask(static_cast<uint8_t>(
+            momentaryStutterButtonMask.load(std::memory_order_acquire) & 0x7f));
+    if (recordColumn >= 9 && recordColumn <= 15)
+        momentaryStutterRecordedDivisionButton = recordColumn;
+
+    recordMomentaryStutterSceneDivision(entryDivision,
+                                        momentaryStutterRecordedDivisionButton,
+                                        entryPpq);
 }
 
 void MlrVSTAudioProcessor::performMomentaryStutterReleaseNow(double hostPpqNow, int64_t nowSample)
 {
     if (!audioEngine)
         return;
+
+    const int recordColumn = (momentaryStutterRecordedDivisionButton >= 9
+                              && momentaryStutterRecordedDivisionButton <= 15)
+        ? momentaryStutterRecordedDivisionButton
+        : momentaryStutterActiveDivisionButton;
+    recordSceneGlobalStutterEvent(0.0f, recordColumn, hostPpqNow);
 
     pendingStutterStartActive.store(0, std::memory_order_release);
     pendingStutterStartPpq.store(-1.0, std::memory_order_release);
@@ -380,6 +421,7 @@ void MlrVSTAudioProcessor::performMomentaryStutterReleaseNow(double hostPpqNow, 
     audioEngine->setMomentaryStutterReleasePpq(-1.0);
     audioEngine->clearMomentaryStutterStrips();
     momentaryStutterButtonMask.store(0, std::memory_order_release);
+    momentaryStutterRecordedDivisionButton = -1;
     for (int i = 0; i < MaxStrips; ++i)
     {
         auto* strip = audioEngine->getStrip(i);
@@ -455,6 +497,10 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
     {
         return gridY == 0 && gridX >= 0 && gridX < SceneSlots;
     };
+    const auto isSceneActionCell = [](int gridX, int gridY)
+    {
+        return gridY == 0 && gridX >= SceneSlots && gridX < (SceneSlots + 4);
+    };
     const bool presetModeActive = (controlModeActive && currentControlMode == ControlMode::Preset);
     const bool stepEditModeActive = (controlModeActive && currentControlMode == ControlMode::StepEdit);
     const bool sceneModeActive = isSceneModeEnabled();
@@ -462,6 +508,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         controlModeActive && monomeControlPageShowsPatternRecorder(currentControlMode);
     const bool topRowSceneMode = sceneModeActive
         && (presetModeActive || (!controlModeActive || currentControlMode == ControlMode::Normal));
+    const bool sceneRecorderVisible = sceneModeActive
+        && (topRowSceneMode || patternRecorderVisibleOnControlPage);
     const auto isDisplayedDataRow = [presetModeActive, lastDisplayedStripRow, lastPresetRow](int row)
     {
         if (row < 1)
@@ -470,6 +518,59 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         return presetModeActive
             ? (row <= lastPresetRow)
             : (row <= lastDisplayedStripRow);
+    };
+    const auto handleSceneActionCellPress = [&](int cellX)
+    {
+        if (!sceneModeActive || cellX < 4 || cellX > 7)
+            return false;
+
+        const uint32_t nowMs = juce::Time::getMillisecondCounter();
+        const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+        const int activeScene = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+
+        switch (cellX)
+        {
+            case 4:
+                if (captureSceneSlot(activeScene))
+                    scenePadActionBurstUntilMs[static_cast<size_t>(activeScene)] = nowMs + sceneActionBurstDurationMs;
+                break;
+            case 5:
+                if (sceneCopySourceSlot == activeScene && sceneCopyMainPresetIndex == mainPresetIndex)
+                {
+                    sceneCopySourceSlot = -1;
+                    sceneCopyMainPresetIndex = 0;
+                }
+                else if (sceneSlotExistsForMainPreset(mainPresetIndex, activeScene))
+                {
+                    sceneCopySourceSlot = activeScene;
+                    sceneCopyMainPresetIndex = mainPresetIndex;
+                }
+                else
+                {
+                    sceneCopySourceSlot = -1;
+                    sceneCopyMainPresetIndex = 0;
+                }
+                break;
+            case 6:
+                if (deleteSceneForMainPreset(mainPresetIndex, activeScene))
+                {
+                    if (sceneCopySourceSlot == activeScene && sceneCopyMainPresetIndex == mainPresetIndex)
+                    {
+                        sceneCopySourceSlot = -1;
+                        sceneCopyMainPresetIndex = 0;
+                    }
+                    scenePadActionBurstUntilMs[static_cast<size_t>(activeScene)] = nowMs + sceneActionBurstDurationMs;
+                }
+                break;
+            case 7:
+                handleMonomeSceneRecorderButtonPress(nowMs);
+                break;
+            default:
+                return false;
+        }
+
+        updateMonomeLEDs();
+        return true;
     };
     
     static int loopSetFirstButton = -1;
@@ -502,6 +603,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
                 scenePadHeld[slotIdx] = true;
                 scenePadHoldDeleteTriggered[slotIdx] = false;
+                scenePadLaunchConsumed[slotIdx] = false;
                 scenePadPressStartMs[slotIdx] = nowMs;
 
                 const bool copyArmed = sceneCopySourceSlot >= 0 && sceneCopyMainPresetIndex == mainPresetIndex;
@@ -522,19 +624,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                             scenePadActionBurstUntilMs[slotIdx] = nowMs + sceneActionBurstDurationMs;
                     }
 
-                    scenePadLastTapMs[slotIdx] = 0;
-                    updateMonomeLEDs();
-                    return;
-                }
-
-                const uint32_t tapDelta = nowMs - scenePadLastTapMs[slotIdx];
-                if (!anyHeldBefore && tapDelta <= sceneDoubleTapMs)
-                {
-                    if (sceneSlot == previousSceneSlot)
-                        saveSceneForMainPreset(mainPresetIndex, sceneSlot);
-
-                    sceneCopySourceSlot = sceneSlot;
-                    sceneCopyMainPresetIndex = mainPresetIndex;
+                    scenePadLaunchConsumed[slotIdx] = true;
                     scenePadLastTapMs[slotIdx] = 0;
                     updateMonomeLEDs();
                     return;
@@ -542,16 +632,6 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
                 if (!anyHeldBefore || !qualifiesForSequence)
                 {
-                    if (sceneSlot != previousSceneSlot)
-                    {
-                        const bool saved = saveSceneForMainPreset(mainPresetIndex, previousSceneSlot);
-                        if (!saved)
-                        {
-                            DBG("Scene auto-save failed while switching from slot "
-                                << (previousSceneSlot + 1) << " to " << (sceneSlot + 1));
-                        }
-                    }
-
                     for (int i = 0; i < SceneSlots; ++i)
                     {
                         if (i == sceneSlot)
@@ -559,25 +639,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                         const auto idx = static_cast<size_t>(i);
                         scenePadHeld[idx] = false;
                         scenePadHoldDeleteTriggered[idx] = false;
+                        scenePadLaunchConsumed[idx] = false;
                     }
-
-                    sceneSequenceSlots.clear();
-                    sceneSequenceSlots.push_back(sceneSlot);
-                    sceneSequenceActive = false;
-                    sceneSequenceStartPpqValid = false;
-                    if (pendingSceneRecall.sequenceDriven)
-                    {
-                        pendingSceneRecall.active = false;
-                        pendingSceneRecall.targetResolved = false;
-                        pendingSceneRecall.sequenceDriven = false;
-                    }
-                    pendingSceneApplyMainPreset.store(-1, std::memory_order_release);
-                    pendingSceneApplySlot.store(-1, std::memory_order_release);
-                    pendingSceneApplySequenceDriven.store(0, std::memory_order_release);
-                    pendingSceneApplyTargetPpq.store(-1.0, std::memory_order_release);
-                    pendingSceneApplyTargetTempo.store(120.0, std::memory_order_release);
-                    pendingSceneApplyTargetSample.store(-1, std::memory_order_release);
-                    requestSceneRecallQuantized(mainPresetIndex, sceneSlot, false);
                 }
                 else
                 {
@@ -603,49 +666,82 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
                         if (anchor >= 0)
                             return anchor;
-                        if (!sceneSequenceSlots.empty())
-                            return juce::jlimit(0, SceneSlots - 1, sceneSequenceSlots.front());
+                        const int firstChainSlot = getSceneChainStepSceneSlot(0);
+                        if (firstChainSlot >= 0)
+                            return firstChainSlot;
                         return sceneSlot;
                     };
 
-                    const int anchorSlot = resolveSequenceAnchor();
-                    sceneSequenceSlots.clear();
-                    const int step = (sceneSlot >= anchorSlot) ? 1 : -1;
-                    for (int slot = anchorSlot;; slot += step)
-                    {
-                        sceneSequenceSlots.push_back(juce::jlimit(0, SceneSlots - 1, slot));
-                        if (slot == sceneSlot)
-                            break;
+	                    const int anchorSlot = resolveSequenceAnchor();
+	                    const int step = (sceneSlot >= anchorSlot) ? 1 : -1;
+	                    std::vector<int> desiredChainSlots;
+	                    desiredChainSlots.reserve(static_cast<size_t>(SceneSlots));
+	                    for (int slot = anchorSlot;; slot += step)
+	                    {
+	                        desiredChainSlots.push_back(juce::jlimit(0, SceneSlots - 1, slot));
+	                        if (slot == sceneSlot)
+	                            break;
+	                    }
+
+	                    bool preserveExistingChainDefinition = getSceneChainLength()
+	                        == static_cast<int>(desiredChainSlots.size());
+	                    if (preserveExistingChainDefinition)
+	                    {
+	                        for (int stepIndex = 0; stepIndex < static_cast<int>(desiredChainSlots.size()); ++stepIndex)
+	                        {
+	                            if (getSceneChainStepSceneSlot(stepIndex)
+	                                != desiredChainSlots[static_cast<size_t>(stepIndex)])
+	                            {
+	                                preserveExistingChainDefinition = false;
+	                                break;
+	                            }
+	                        }
+	                    }
+
+	                    if (!preserveExistingChainDefinition)
+	                    {
+	                        clearSceneChain();
+	                        for (int stepIndex = 0; stepIndex < static_cast<int>(desiredChainSlots.size()); ++stepIndex)
+	                            setSceneChainStep(stepIndex, desiredChainSlots[static_cast<size_t>(stepIndex)], 1);
+	                    }
+	
+	                    for (int i = 0; i < SceneSlots; ++i)
+	                    {
+                        const auto idx = static_cast<size_t>(i);
+                        if (scenePadHeld[idx])
+                            scenePadLaunchConsumed[idx] = true;
                     }
 
-                    if (sceneSequenceSlots.size() >= 2)
+                    if (getSceneChainLength() >= 2)
                     {
-                        sceneSequenceActive = true;
-                        pendingSceneRecall.sequenceDriven = true;
-                        if (!pendingSceneRecall.active)
+                        const int firstSceneSlot = getSceneChainStepSceneSlot(0);
+                        if (firstSceneSlot == previousSceneSlot
+                            && activeSceneStartPpqValid
+                            && std::isfinite(activeSceneStartPpq))
                         {
-                            const int firstSceneSlot =
-                                juce::jlimit(0, SceneSlots - 1, sceneSequenceSlots.front());
-                            if (firstSceneSlot == previousSceneSlot
-                                && activeSceneStartPpqValid
-                                && std::isfinite(activeSceneStartPpq))
-                            {
-                                armNextSceneInSequence(
-                                    mainPresetIndex,
-                                    previousSceneSlot,
-                                    activeSceneStartPpq);
-                            }
-                            else
-                            {
-                                sceneSequenceStartPpqValid = false;
-                                requestSceneRecallQuantized(mainPresetIndex, firstSceneSlot, true);
-                            }
+                            sceneSequenceActive = true;
+                            sceneSequenceCurrentStepIndex = 0;
+                            sceneSequenceStartPpqValid = true;
+                            sceneSequenceStartPpq = activeSceneStartPpq;
+                            armNextSceneInSequence(mainPresetIndex,
+                                                   previousSceneSlot,
+                                                   activeSceneStartPpq);
+                        }
+                        else
+                        {
+                            startSceneChainPlayback(0);
                         }
                     }
                 }
 
                 updateMonomeLEDs();
                 return;
+            }
+
+            if (topRowSceneMode && isSceneActionCell(x, y))
+            {
+                if (handleSceneActionCellPress(x))
+                    return;
             }
 
             if (presetModeActive && isPresetCell(x, y))
@@ -789,7 +885,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
 
             // Row 0, cols 9-15: momentary stutter rates (timeline-synced):
-            // 9=1/4 ... 15=1/64.
+            // 9=1/2 ... 15=1/128.
             if (x >= 9 && x <= 15 && (!controlModeActive || currentControlMode == ControlMode::Normal))
             {
                 const uint8_t bit = stutterButtonBitForColumn(x);
@@ -823,8 +919,15 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     updateMonomeLEDs();
                     return;
                 }
-                // Buttons 4-7 (patterns) are disabled in Filter mode
-                return;  // Don't process any other buttons on GROUP_ROW in Filter mode
+
+                if (x < 4 || x > 7)
+                    return;
+            }
+
+            if (sceneRecorderVisible && x >= 4 && x <= 7)
+            {
+                if (handleSceneActionCellPress(x))
+                    return;
             }
 
             if (controlModeActive && currentControlMode == ControlMode::Modulation)
@@ -837,9 +940,14 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
                 if (x == kMonomeModCycleColumn)
                 {
-                    const int activeSlot = engine->getModSequencerSlot(targetStrip);
-                    const int nextSlot = (activeSlot + 1) % ModernAudioEngine::NumModSequencers;
-                    engine->setModSequencerSlot(targetStrip, nextSlot);
+                    if (isSceneModeEnabled())
+                        cycleSceneModLaneTarget(targetStrip);
+                    else
+                    {
+                        const int activeSlot = engine->getModSequencerSlot(targetStrip);
+                        const int nextSlot = (activeSlot + 1) % ModernAudioEngine::NumModSequencers;
+                        engine->setModSequencerSlot(targetStrip, nextSlot);
+                    }
                     updateMonomeLEDs();
                     return;
                 }
@@ -912,33 +1020,18 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                             }
                         }
                     }
+
+                    if (isSceneModeEnabled())
+                        queueActiveSceneAutosave();
                 }
             }
             // Columns 4-7: Pattern recorders (manual stop with auto-quantized length)
             else if (x >= 4 && x <= 7)
             {
                 int patternIndex = x - 4;  // 0-3 for patterns 0-3
-                auto* pattern = audioEngine->getPattern(patternIndex);
-                if (pattern)
+                if (handleMonomePatternButtonPress(patternIndex, juce::Time::getMillisecondCounter()))
                 {
                     DBG("Monome pattern button " << patternIndex << " pressed");
-                    
-                    if (pattern->isRecording())
-                    {
-                        // Stop/quantize/play behavior is handled centrally in audio engine.
-                        audioEngine->stopPatternRecording(patternIndex);
-                    }
-                    else if (pattern->isPlaying())
-                    {
-                        // Stop playback
-                        DBG("  Stopping playback");
-                        pattern->stopPlayback();
-                    }
-                    else
-                    {
-                        // Start recording with max duration; manual stop quantizes to bars.
-                        audioEngine->startPatternRecording(patternIndex);
-                    }
                 }
             }
         }
@@ -1287,7 +1380,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                         || (x == 1 && strip->isButtonHeld(0)));
                 if (stopRowComboPressed)
                 {
-                    stopStrip(stripIndex);
+                    stopStrip(stripIndex, false, strip->getHeldButton());
                     loopSetFirstButton = -1;
                     loopSetStrip = -1;
                     updateMonomeLEDs();
@@ -1368,6 +1461,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                             if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
                             {
                                 MonomeMixActions::handleGrainPageButtonPress(*targetStrip, stripIndex, x);
+                                queueActiveSceneAutosave();
                                 recordMonomeControlPatternEvent(currentControlMode, targetStripIndex, stripIndex, x);
                             }
                             break;
@@ -1486,12 +1580,13 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         {
             const int sceneSlot = juce::jlimit(0, SceneSlots - 1, x);
             const auto slotIdx = static_cast<size_t>(sceneSlot);
-            const bool holdDeleteTriggered = scenePadHoldDeleteTriggered[slotIdx];
-            const bool copyArmedSource = sceneCopySourceSlot == sceneSlot;
-            const uint32_t nowMs = juce::Time::getMillisecondCounter();
+            const bool shouldLaunchScene = scenePadHeld[slotIdx] && !scenePadLaunchConsumed[slotIdx];
             scenePadHeld[slotIdx] = false;
             scenePadHoldDeleteTriggered[slotIdx] = false;
-            scenePadLastTapMs[slotIdx] = (!holdDeleteTriggered && !copyArmedSource) ? nowMs : 0;
+            scenePadLaunchConsumed[slotIdx] = false;
+
+            if (shouldLaunchScene)
+                selectSceneSlotFromSurface(sceneSlot);
 
             updateMonomeLEDs();
             return;
@@ -1552,6 +1647,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         }
         if (y == GROUP_ROW && x >= 9 && x <= 15)
         {
+            const int releasedColumn = x;
+            const int previousActiveColumn = momentaryStutterActiveDivisionButton;
             const uint8_t bit = stutterButtonBitForColumn(x);
             uint8_t currentMask = momentaryStutterButtonMask.load(std::memory_order_acquire);
             currentMask = static_cast<uint8_t>(currentMask & static_cast<uint8_t>(~bit));
@@ -1559,6 +1656,10 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
             if (currentMask == 0)
             {
+                if (previousActiveColumn >= 9 && previousActiveColumn <= 15)
+                    momentaryStutterRecordedDivisionButton = previousActiveColumn;
+                else
+                    momentaryStutterRecordedDivisionButton = releasedColumn;
                 setMomentaryStutterHold(false);
             }
             else
@@ -1568,7 +1669,14 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 {
                     momentaryStutterActiveDivisionButton = activeColumn;
                     momentaryStutterDivisionBeats = stutterDivisionBeatsFromButton(activeColumn);
+                    momentaryStutterRecordedDivisionButton = activeColumn;
                     audioEngine->setMomentaryStutterDivision(momentaryStutterDivisionBeats);
+                    if (momentaryStutterPlaybackActive.load(std::memory_order_acquire) != 0)
+                    {
+                        recordMomentaryStutterSceneDivision(momentaryStutterDivisionBeats,
+                                                            activeColumn,
+                                                            audioEngine != nullptr ? audioEngine->getTimelineBeat() : 0.0);
+                    }
                 }
             }
             updateMonomeLEDs();
@@ -1614,7 +1722,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 auto* strip = audioEngine->getStrip(stripIndex);
                 if (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Gate)
                 {
-                    strip->stop(true);  // Immediate stop
+                    stopStrip(stripIndex, true, x);
                 }
             }
         }
@@ -1646,6 +1754,24 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 }
 void MlrVSTAudioProcessor::updateMonomeLEDs()
 {
+    if (monomeLedUpdateInProgress)
+    {
+        monomeLedUpdatePending = true;
+        return;
+    }
+
+    monomeLedUpdateInProgress = true;
+    const auto monomeLedUpdateGuard = juce::ScopeGuard{ [this]
+    {
+        monomeLedUpdateInProgress = false;
+
+        if (monomeLedUpdatePending)
+        {
+            monomeLedUpdatePending = false;
+            updateMonomeLEDs();
+        }
+    }};
+
     if (!monomeConnection.isConnected() || !audioEngine || !monomeConnection.supportsGrid())
         return;
     
@@ -1660,8 +1786,13 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     stepEditStripBank = juce::jlimit(0, maxStepEditBank, stepEditStripBank);
     const int maxVisibleStripIndex = juce::jmax(0, visibleStripCount - 1);
     const int modulationMaxRow = juce::jmax(1, visibleStripCount);
+    const bool presetModeActive = (controlModeActive && currentControlMode == ControlMode::Preset);
+    const bool sceneModeActive = isSceneModeEnabled();
     const bool patternRecorderVisibleOnControlPage =
         controlModeActive && monomeControlPageShowsPatternRecorder(currentControlMode);
+    const bool sceneRecorderVisible = sceneModeActive
+        && ((presetModeActive || (!controlModeActive || currentControlMode == ControlMode::Normal))
+            || patternRecorderVisibleOnControlPage);
     const auto clampVisibleStrip = [maxVisibleStripIndex](int index)
     {
         return juce::jlimit(0, maxVisibleStripIndex, index);
@@ -1701,36 +1832,56 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     const int metroBeatLevel = 10;
     const int metroDownbeatLevel = 15;
     const auto nowMs = juce::Time::getMillisecondCounter();
-    const bool sceneModeActive = isSceneModeEnabled();
     const int activeSceneMainPreset = getActiveMainPresetIndexForScenes();
+    auto getSceneRecorderLevel = [&]() -> int
+    {
+        const int sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+        const auto queuedRecorderAction = static_cast<SceneRecorderAction>(
+            pendingSceneRecorderApplyAction.load(std::memory_order_acquire));
+        const bool tapArmed = monomeSceneRecorderPendingAction != MonomeSceneRecorderTapAction::None
+            && monomeSceneRecorderPendingUntilMs != 0
+            && static_cast<int32_t>(monomeSceneRecorderPendingUntilMs - nowMs) >= 0;
+        const bool armed = pendingSceneRecorderAction.active
+            || queuedRecorderAction != SceneRecorderAction::None
+            || tapArmed;
+        const bool recording = isScenePerformanceRecording();
+        const bool overdubbing = isScenePerformanceOverdubbing();
+
+        if (armed)
+        {
+            if (recording || queuedRecorderAction == SceneRecorderAction::StopRecording)
+                return fastBlinkOn ? 15 : 3;
+
+            return slowBlinkOn ? 15 : 2;
+        }
+
+        if (recording)
+            return overdubbing ? (fastBlinkOn ? 15 : 8)
+                               : (metroPulseOn ? 15 : 11);
+
+        const double progress = getScenePerformancePlaybackProgress(sceneSlot, beatNow);
+        if (progress >= 0.0)
+            return slowBlinkOn ? 12 : 4;
+
+        return hasScenePerformanceClip(sceneSlot) ? 6 : 2;
+    };
     auto updateSceneSlotLeds = [&]()
     {
+        const bool chainPlaying = isSceneChainPlaybackActive();
+        const int chainPlaybackStep = getSceneChainPlaybackStepIndex();
+        const int chainPlaybackScene = chainPlaybackStep >= 0
+            ? getSceneChainStepSceneSlot(chainPlaybackStep)
+            : -1;
+        const int activeScene = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+
         for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
         {
             const auto slotIdx = static_cast<size_t>(sceneSlot);
-            if (scenePadHeld[slotIdx] && !scenePadHoldDeleteTriggered[slotIdx])
-            {
-                const uint32_t elapsed = nowMs - scenePadPressStartMs[slotIdx];
-                if (elapsed >= sceneHoldDeleteMs)
-                {
-                    const bool deleted = deleteSceneForMainPreset(activeSceneMainPreset, sceneSlot);
-                    scenePadHoldDeleteTriggered[slotIdx] = true;
-                    if (sceneCopySourceSlot == sceneSlot && sceneCopyMainPresetIndex == activeSceneMainPreset)
-                    {
-                        sceneCopySourceSlot = -1;
-                        sceneCopyMainPresetIndex = 0;
-                    }
-                    if (deleted)
-                        scenePadActionBurstUntilMs[slotIdx] = nowMs + sceneActionBurstDurationMs;
-                }
-            }
-
             const bool exists = sceneSlotExistsForMainPreset(activeSceneMainPreset, sceneSlot);
             const bool held = scenePadHeld[slotIdx];
             const bool active = (sceneSlot == activeSceneSlot);
-            const bool inSequence = sceneSequenceActive
-                && std::find(sceneSequenceSlots.begin(), sceneSequenceSlots.end(), sceneSlot)
-                    != sceneSequenceSlots.end();
+            const bool inSequence = chainPlaying && getSceneSequenceStepIndex(sceneSlot) >= 0;
+            const bool sequenceCurrent = chainPlaying && chainPlaybackScene == sceneSlot;
             const bool queued = pendingSceneRecall.active
                 && pendingSceneRecall.sceneSlot == sceneSlot;
             const bool burstActive = nowMs < scenePadActionBurstUntilMs[slotIdx];
@@ -1741,7 +1892,9 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             if (active)
                 level = 11;
             if (inSequence)
-                level = fastBlinkOn ? 15 : 6;
+                level = chainPlaying ? (fastBlinkOn ? 15 : 6) : juce::jmax(level, 5);
+            if (sequenceCurrent)
+                level = fastBlinkOn ? 15 : 9;
             if (queued)
                 level = slowBlinkOn ? 15 : 7;
             if (copyArmed)
@@ -1756,6 +1909,13 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
 
             newLedState[sceneSlot][GROUP_ROW] = level;
         }
+
+        newLedState[4][GROUP_ROW] = sceneSlotExistsForMainPreset(activeSceneMainPreset, activeScene) ? 7 : 3;
+        newLedState[5][GROUP_ROW] = (sceneCopySourceSlot >= 0 && sceneCopyMainPresetIndex == activeSceneMainPreset)
+            ? (slowBlinkOn ? 15 : 6)
+            : 3;
+        newLedState[6][GROUP_ROW] = sceneSlotExistsForMainPreset(activeSceneMainPreset, activeScene) ? 5 : 1;
+        newLedState[7][GROUP_ROW] = getSceneRecorderLevel();
     };
 
     if (controlModeActive && currentControlMode == ControlMode::FileBrowser)
@@ -1939,10 +2099,31 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         newLedState[1][GROUP_ROW] = (filterSubPage == FilterSubPage::Resonance) ? 15 : 5;  // Resonance
         newLedState[2][GROUP_ROW] = 0;  // Unused (skip button 2)
         newLedState[3][GROUP_ROW] = (filterSubPage == FilterSubPage::Type) ? 15 : 5;       // Type
-        
-        // Patterns disabled in Filter mode (columns 4-7 off)
-        for (int i = 4; i < 8; ++i)
-            newLedState[i][GROUP_ROW] = 0;
+
+        if (sceneRecorderVisible)
+        {
+            newLedState[4][GROUP_ROW] = getSceneRecorderLevel();
+            newLedState[5][GROUP_ROW] = 0;
+            newLedState[6][GROUP_ROW] = 0;
+            newLedState[7][GROUP_ROW] = 0;
+        }
+        else
+        {
+            for (int i = 0; i < 4; ++i)
+            {
+                const int col = i + 4;
+                auto* pattern = audioEngine->getPattern(i);
+                if (pattern == nullptr)
+                    continue;
+
+                if (pattern->isRecording())
+                    newLedState[col][GROUP_ROW] = fastBlinkOn ? 15 : 0;
+                else if (pattern->isPlaying())
+                    newLedState[col][GROUP_ROW] = slowBlinkOn ? 12 : 0;
+                else
+                    newLedState[col][GROUP_ROW] = 3;
+            }
+        }
     }
     else if (currentControlMode == ControlMode::Modulation && controlModeActive)
     {
@@ -2080,20 +2261,30 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                     newLedState[groupId][GROUP_ROW] = 0;
             }
         }
-    
-        // Row 0, columns 4-7: Pattern recorder status (normal mode only)
-        for (int i = 0; i < 4; ++i)
+
+        if (sceneRecorderVisible)
         {
-            int col = i + 4;  // Columns 4-7
-            auto* pattern = audioEngine->getPattern(i);
-            if (pattern)
+            newLedState[4][GROUP_ROW] = getSceneRecorderLevel();
+            newLedState[5][GROUP_ROW] = 0;
+            newLedState[6][GROUP_ROW] = 0;
+            newLedState[7][GROUP_ROW] = 0;
+        }
+        else
+        {
+            // Row 0, columns 4-7: Pattern recorder status (normal mode only)
+            for (int i = 0; i < 4; ++i)
             {
-                if (pattern->isRecording())
-                    newLedState[col][GROUP_ROW] = fastBlinkOn ? 15 : 0;  // Recording: Fast blink
-                else if (pattern->isPlaying())
-                    newLedState[col][GROUP_ROW] = slowBlinkOn ? 12 : 0;  // Playing: Slow blink
-                else
-                    newLedState[col][GROUP_ROW] = 3;   // Stopped/idle: Dim
+                int col = i + 4;  // Columns 4-7
+                auto* pattern = audioEngine->getPattern(i);
+                if (pattern)
+                {
+                    if (pattern->isRecording())
+                        newLedState[col][GROUP_ROW] = fastBlinkOn ? 15 : 0;  // Recording: Fast blink
+                    else if (pattern->isPlaying())
+                        newLedState[col][GROUP_ROW] = slowBlinkOn ? 12 : 0;  // Playing: Slow blink
+                    else
+                        newLedState[col][GROUP_ROW] = 3;   // Stopped/idle: Dim
+                }
             }
         }
     }  // End else (normal mode)

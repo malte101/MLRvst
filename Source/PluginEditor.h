@@ -988,6 +988,27 @@ private:
 };
 
 //==============================================================================
+class PatternRecordButton : public juce::TextButton,
+                            private juce::Timer
+{
+public:
+    PatternRecordButton() = default;
+
+    std::function<void()> onSingleTrigger;
+    std::function<void()> onDoubleTrigger;
+    void setSingleTriggerImmediate(bool shouldTriggerImmediately) { triggerSingleImmediately = shouldTriggerImmediately; }
+
+private:
+    void clicked(const juce::ModifierKeys& modifiers) override;
+    void timerCallback() override;
+
+    bool pendingSingleTrigger = false;
+    bool triggerSingleImmediately = false;
+    juce::uint32 lastClickMs = 0;
+    static constexpr int kDoubleClickWindowMs = 260;
+};
+
+//==============================================================================
 /**
  * PatternControlPanel - Pattern recording
  */
@@ -1000,6 +1021,10 @@ public:
     void paint(juce::Graphics& g) override;
     void resized() override;
     void timerCallback() override;
+    void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
+    void mouseUp(const juce::MouseEvent& e) override;
+    bool handleEditorKeyPress(const juce::KeyPress& key);
     
 private:
     MlrVSTAudioProcessor& processor;
@@ -1012,17 +1037,61 @@ private:
     struct PatternControls
     {
         juce::Label nameLabel;
-        juce::TextButton recordButton;
+        PatternRecordButton recordButton;
         juce::TextButton playButton;
         juce::TextButton stopButton;
         juce::TextButton clearButton;
         juce::Label statusLabel;
         juce::Label detailLabel;
+        std::vector<PatternRecorder::Event> events;
+        int triggerEventCount = 0;
+        int controlEventCount = 0;
+        float transportProgress = -1.0f;
+        bool transportRecording = false;
+    };
+
+    struct SceneControls
+    {
+        juce::Label nameLabel;
+        PatternRecordButton recordButton;
+        juce::TextButton clearButton;
+        juce::TextButton deleteButton;
+        juce::TextButton trimBeforeButton;
+        juce::TextButton trimAfterButton;
+        juce::TextButton clearTriggersButton;
+        juce::TextButton clearControlsButton;
+        juce::Label statusLabel;
+        juce::Label detailLabel;
+        juce::Label selectionLabel;
+        std::vector<ScenePerformanceEvent> events;
+        std::vector<ScenePerformanceEvent> dragBaseEvents;
+        int triggerEventCount = 0;
+        int controlEventCount = 0;
+        float transportProgress = -1.0f;
+        bool transportRecording = false;
+        int selectedEventIndex = -1;
+        int selectedSceneSlot = -1;
+        bool dragActive = false;
+        int dragEventIndex = -1;
     };
     
     PatternControls patterns[4];
+    SceneControls sceneControls;
     
+    bool isSceneRecorderView() const;
+    juce::Rectangle<int> getPatternCardBounds(int patternIndex) const;
+    juce::Rectangle<int> getSceneCardBounds() const;
+    juce::Rectangle<float> getSceneTimelineBounds() const;
+    void paintPatternTimeline(juce::Graphics& g, int patternIndex, juce::Rectangle<float> bounds) const;
+    void paintSceneTimeline(juce::Graphics& g, juce::Rectangle<float> bounds) const;
     void updatePatternStates();
+    void updateSceneState(double beat);
+    bool deleteSelectedSceneEvent();
+    bool trimSceneEventsToSelection(bool keepAfterSelection);
+    bool clearSceneEventsByType(ScenePerformanceEventType type);
+    bool applyEditedSceneEvents(std::vector<ScenePerformanceEvent> events,
+                                int preferredSelectedIndex = -1,
+                                const ScenePerformanceEvent* preferredSelectedEvent = nullptr);
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PatternControlPanel)
 };
@@ -1070,6 +1139,17 @@ class ModulationControlPanel : public juce::Component,
 {
 public:
     ModulationControlPanel(MlrVSTAudioProcessor& p);
+    void setPinnedStripAndSlot(int stripIndex, int slot, const juce::String& contextLabel = {});
+    void clearPinnedStripAndSlot();
+    juce::Rectangle<int> getEmbeddedSceneSelectionToolsBounds() const;
+    juce::Rectangle<int> getEmbeddedSceneOverlayToolsBounds() const;
+    std::function<void()> onPinnedSceneMotionChange;
+    std::function<void(int)> onSceneStripWrite;
+    std::function<void()> onSceneStripWriteAll;
+    std::function<void(int)> onSceneStripClear;
+    std::function<void(int)> onSceneStripDuplicate;
+    std::function<void(int, int)> onSceneStripCopyTo;
+    std::function<void(const juce::MouseEvent&, const juce::MouseWheelDetails&)> onMouseWheelPassthrough;
 
     void paint(juce::Graphics& g) override;
     void resized() override;
@@ -1077,6 +1157,7 @@ public:
     void mouseDown(const juce::MouseEvent& e) override;
     void mouseDrag(const juce::MouseEvent& e) override;
     void mouseUp(const juce::MouseEvent& e) override;
+    void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override;
 
 private:
     enum class EditGestureMode
@@ -1084,16 +1165,26 @@ private:
         None = 0,
         DuplicateCell,
         ShapeUpCell,
-        ShapeDownCell
+        ShapeDownCell,
+        DrawCells
     };
 
     MlrVSTAudioProcessor& processor;
     int selectedStrip = 0;
+    int selectedSlotOverride = -1;
+    bool pinnedContextActive = false;
+    juce::String pinnedContextLabel;
 
     juce::Label titleLabel;
     juce::Label stripLabel;
+    juce::Label sceneStripToolsLabel;
     juce::Label targetLabel;
     juce::ComboBox targetBox;
+    juce::TextButton sceneStripWriteButton;
+    juce::TextButton sceneStripWriteAllButton;
+    juce::TextButton sceneStripClearButton;
+    juce::TextButton sceneStripDuplicateButton;
+    juce::TextButton sceneStripCopyButton;
     juce::ToggleButton bipolarToggle;
     juce::Label depthLabel;
     juce::Slider depthSlider;
@@ -1103,6 +1194,12 @@ private:
     juce::ComboBox transportBox;
     juce::Label offsetLabel;
     juce::Slider offsetSlider;
+    juce::Label shapeLabel;
+    juce::ComboBox shapeBox;
+    juce::Label curveBendLabel;
+    juce::Slider curveBendSlider;
+    juce::Label curveTypeLabel;
+    juce::ComboBox curveTypeBox;
     juce::Label lengthLabel;
     juce::ComboBox lengthBox;
     juce::Label pageLabel;
@@ -1114,20 +1211,42 @@ private:
     juce::ToggleButton pitchScaleToggle;
     juce::Label pitchScaleLabel;
     juce::ComboBox pitchScaleBox;
-    std::array<juce::TextButton, ModernAudioEngine::ModSteps> stepButtons;
+    std::array<juce::TextButton, ModernAudioEngine::ModTotalSteps> stepButtons;
     EditGestureMode gestureMode = EditGestureMode::None;
     bool gestureActive = false;
+    bool pendingDrawGesture = false;
     bool suppressNextStepClick = false;
     int gestureStartY = 0;
     int gestureStep = -1;
     int gestureSourceSubdivision = 1;
     float gestureSourceValue = 0.0f;
     float gestureSourceEndValue = 0.0f;
+    juce::Point<float> pendingDrawStartPosition;
+    int pendingDrawVisibleStep = -1;
+    int lastDrawVisibleStep = -1;
+    juce::Rectangle<float> graphBounds;
+    juce::Rectangle<int> embeddedSceneSelectionToolsBounds;
+    juce::Rectangle<int> embeddedSceneOverlayToolsBounds;
 
     void refreshFromEngine();
+    int maxLengthBarsForCurrentContext() const;
+    void rebuildLengthAndPageBoxes(int maxBars);
     int stepIndexForComponent(juce::Component* c) const;
+    int visibleLegacyModStepCount() const;
+    int totalLegacyModStepCount() const;
+    int absoluteLegacyModStepForVisibleIndex(int visibleStep) const;
+    int absoluteLegacyModStepAtPosition(juce::Point<float> position) const;
+    int visibleLegacyModStepForComponent(juce::Component* c) const;
+    int visibleLegacyModStepAtPosition(juce::Point<float> position) const;
+    float normalizedLegacyModDrawValueAtPosition(juce::Point<float> position) const;
+    void ensurePinnedSlotSelected(ModernAudioEngine& engine) const;
+    void syncPinnedSceneMotionIfNeeded();
+    void beginDrawGesture(int absoluteStep, const juce::Point<float>& position);
+    void applyDrawGesture(juce::Point<float> position);
     void applyDuplicateGesture(int deltaY);
     void applyShapeGesture(int deltaY, bool rampUpMode);
+    void paintLegacyModulationGraph(juce::Graphics& g) const;
+    void showSceneStripCopyMenu();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ModulationControlPanel)
 };
@@ -1222,6 +1341,69 @@ private:
 };
 
 //==============================================================================
+class SceneControlPanel;
+
+class SceneTimelineCanvas : public juce::Component
+{
+public:
+    explicit SceneTimelineCanvas(SceneControlPanel& ownerIn)
+        : owner(ownerIn)
+    {
+    }
+
+    void paint(juce::Graphics& g) override;
+    void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDoubleClick(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
+    void mouseMove(const juce::MouseEvent& e) override;
+    void mouseExit(const juce::MouseEvent& e) override;
+    void mouseUp(const juce::MouseEvent& e) override;
+    void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override;
+
+private:
+    SceneControlPanel& owner;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SceneTimelineCanvas)
+};
+
+class SceneChainCanvas : public juce::Component
+{
+public:
+    explicit SceneChainCanvas(SceneControlPanel& ownerIn)
+        : owner(ownerIn)
+    {
+    }
+
+    void paint(juce::Graphics& g) override;
+    void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDoubleClick(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
+    void mouseMove(const juce::MouseEvent& e) override;
+    void mouseExit(const juce::MouseEvent& e) override;
+    void mouseUp(const juce::MouseEvent& e) override;
+    void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override;
+
+private:
+    SceneControlPanel& owner;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SceneChainCanvas)
+};
+
+class SceneEditorBackdrop : public juce::Component
+{
+public:
+    SceneEditorBackdrop() = default;
+
+    void paint(juce::Graphics& g) override
+    {
+        g.fillAll(juce::Colours::transparentBlack);
+    }
+
+private:
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SceneEditorBackdrop)
+};
+
+//==============================================================================
 /**
  * SceneControlPanel - Scene mode and scene chain settings
  */
@@ -1232,43 +1414,244 @@ public:
 
     void paint(juce::Graphics& g) override;
     void resized() override;
+    void visibilityChanged() override;
     void refreshFromProcessor();
+    bool handleEditorKeyPress(const juce::KeyPress& key);
 
 private:
+    friend class SceneTimelineCanvas;
+    friend class SceneChainCanvas;
+
+    static constexpr int SceneEditorVisibleStrips = ModernAudioEngine::MaxStrips;
+    static constexpr int SceneAutomationLaneCount = 26;
+
     class SceneComboLookAndFeel : public juce::LookAndFeel_V4
     {
     public:
         juce::Font getComboBoxFont(juce::ComboBox&) override
         {
-            return juce::Font(juce::FontOptions(13.75f, juce::Font::bold));
+            return juce::Font(juce::FontOptions(12.0f, juce::Font::bold));
         }
 
         juce::Font getPopupMenuFont() override
         {
-            return juce::Font(juce::FontOptions(16.5f, juce::Font::bold));
+            return juce::Font(juce::FontOptions(14.5f, juce::Font::bold));
         }
     };
 
     MlrVSTAudioProcessor& processor;
     SceneComboLookAndFeel sceneComboLookAndFeel;
 
+    struct SceneEditorState
+    {
+        std::vector<ScenePerformanceEvent> events;
+        std::vector<ScenePerformanceEvent> dragBaseEvents;
+        int triggerEventCount = 0;
+        int controlEventCount = 0;
+        float transportProgress = -1.0f;
+        bool transportRecording = false;
+        std::vector<int> selectedEventIndices;
+        int selectedEventIndex = -1;
+        int selectedSceneSlot = -1;
+        bool dragActive = false;
+        int dragEventIndex = -1;
+        bool dragTriggerMoveTime = true;
+        bool dragTriggerMoveOffset = true;
+        bool drawActive = false;
+        bool drawTriggerLane = false;
+        int drawStripIndex = -1;
+        int drawLaneIndex = -1;
+        double drawLastBeat = 0.0;
+        float drawLastValue = 0.0f;
+        bool drawHasLastPoint = false;
+        bool eraseActive = false;
+        bool eraseTriggerLane = false;
+        int eraseStripIndex = -1;
+        int eraseLaneIndex = -1;
+        bool marqueeActive = false;
+        juce::Point<float> marqueeAnchor;
+        juce::Rectangle<float> marqueeRect;
+        bool hoverActive = false;
+        bool hoverTriggerLane = false;
+        int hoverStripIndex = -1;
+        int hoverLaneIndex = -1;
+        int hoverEventIndex = -1;
+        bool hoverTriggerMoveTime = true;
+        bool hoverTriggerMoveOffset = true;
+        double hoverBeat = 0.0;
+        bool stepPatternPaintActive = false;
+        int stepPatternPaintStripIndex = -1;
+        int stepPatternPaintLastStep = -1;
+        bool stepPatternPaintEnabled = false;
+    };
+
     juce::Label titleLabel;
     juce::Label hintLabel;
     juce::ToggleButton sceneModeToggle;
     juce::Label sceneChangeModeLabel;
     juce::ComboBox sceneChangeModeBox;
-    juce::Label sceneAuthoringLabel;
-    juce::ComboBox sceneAuthoringTargetBox;
+    juce::Label sceneSlotHeaderLabel;
+    juce::TextButton sceneSceneCaptureButton;
+    juce::TextButton sceneSceneCopyButton;
+    juce::TextButton sceneScenePasteButton;
+    juce::TextButton sceneChainPlayButton;
+    juce::TextButton sceneChainClearButton;
     juce::TextButton sceneCaptureButton;
     juce::TextButton sceneInsertBeforeButton;
     juce::TextButton sceneInsertAfterButton;
     juce::Label sceneLengthHeaderLabel;
     juce::Label sceneBarsHeaderLabel;
     juce::Label sceneAnchorHeaderLabel;
-    std::array<juce::Label, MlrVSTAudioProcessor::SceneSlots> sceneRepeatSlotLabels;
+    juce::Label sceneTransitionHeaderLabel;
+    juce::Label sceneTransitionOptionsHeaderLabel;
+    juce::Label sceneTransitionLengthHeaderLabel;
+    juce::Label sceneTransitionMixHeaderLabel;
+    juce::Label sceneTransitionDelayHeaderLabel;
+    juce::Label sceneTransitionFilterHeaderLabel;
+    juce::Label sceneTransitionChopHeaderLabel;
+    juce::Label sceneAdvanceSummaryLabel;
+    juce::Label sceneTransitionSummaryLabel;
+    juce::Label sceneTransitionMetaLabel;
+    juce::TextButton sceneDuplicateLengthButton;
+    std::array<juce::TextButton, MlrVSTAudioProcessor::SceneSlots> sceneSelectorButtons;
     std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneLengthModeBoxes;
     std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneManualBarsBoxes;
     std::array<juce::ComboBox, MlrVSTAudioProcessor::SceneSlots> sceneAnchorStripBoxes;
+    juce::ComboBox sceneTransitionTypeBox;
+    juce::ComboBox sceneTransitionOptionsBox;
+    juce::ComboBox sceneTransitionLengthBox;
+    juce::Slider sceneTransitionMixSlider;
+    juce::Slider sceneTransitionDelaySlider;
+    juce::Slider sceneTransitionFilterSlider;
+    juce::Slider sceneTransitionChopSlider;
+    juce::TextButton sceneTransitionSubtractButton;
+    SceneChainCanvas sceneChainCanvas;
+    juce::Label sceneRecorderTitleLabel;
+    PatternRecordButton sceneRecordButton;
+    juce::TextButton sceneClearButton;
+    juce::TextButton sceneDeleteButton;
+    juce::TextButton sceneClearTriggersButton;
+    juce::TextButton sceneClearControlsButton;
+    juce::TextButton sceneGridToggleButton;
+    juce::ComboBox sceneGridDivisionBox;
+    juce::ComboBox sceneZoomBox;
+    juce::TextButton sceneFollowButton;
+    juce::TextButton sceneLaneOverlayButton;
+    juce::TextButton sceneMotionEditButton;
+    juce::TextButton sceneDuplicateButton;
+    juce::TextButton sceneNudgeLeftButton;
+    juce::TextButton sceneNudgeRightButton;
+    juce::TextButton sceneQuantizeButton;
+    juce::TextButton sceneExpandAllLanesButton;
+    juce::TextButton sceneCollapseAllLanesButton;
+    juce::Label sceneStatusLabel;
+    juce::Label sceneDetailLabel;
+    juce::Label sceneSelectionLabel;
+    juce::Viewport sceneViewport;
+    SceneTimelineCanvas sceneTimelineCanvas;
+    std::array<std::array<juce::ComboBox, SceneAutomationLaneCount>, SceneEditorVisibleStrips> sceneMotionTargetBoxes;
+    SceneEditorBackdrop sceneLegacyModBackdrop;
+    std::unique_ptr<ModulationControlPanel> sceneLegacyModEditor;
+    juce::TextButton sceneLegacyModCloseButton;
+    SceneEditorState sceneEditorState;
+    std::array<bool, SceneEditorVisibleStrips> stripAutomationExpanded;
+    std::array<bool, SceneEditorVisibleStrips> stripHeightExpanded;
+    int selectedSceneActionSlot = -1;
+    int selectedSceneChainStep = -1;
+    int sceneTimingLayoutFocusedSlot = -1;
+    int sceneTimingLayoutFocusedStep = -1;
+    bool sceneGlobalLaneExpanded = false;
+    int sceneSlotDragSource = -1;
+    int sceneSlotDragTarget = -1;
+    int sceneChainExternalDropStep = -1;
+    bool sceneSlotDragMoved = false;
+    bool sceneSlotDragSuppressClick = false;
+    int sceneChainHoverStep = -1;
+    int sceneChainHoverTransition = -1;
+    int sceneChainDragSourceStep = -1;
+    int sceneChainDragTargetStep = -1;
+    bool sceneChainDragMoved = false;
+    bool sceneGridEnabled = true;
+    int sceneGridDivision = 16;
+    int sceneZoomFactor = 1;
+    bool sceneDrawModeEnabled = false;
+    bool sceneFollowPlayheadEnabled = false;
+    bool sceneLaneOverlayEnabled = true;
+    bool sceneLegacyModEditorVisible = false;
+    int sceneLegacyModStripIndex = -1;
+    int sceneLegacyModSlotIndex = -1;
+
+    bool applyEditedSceneEvents(std::vector<ScenePerformanceEvent> events,
+                                int preferredSelectedIndex = -1,
+                                const ScenePerformanceEvent* preferredSelectedEvent = nullptr,
+                                const std::vector<ScenePerformanceEvent>* preferredSelectedEvents = nullptr);
+    bool applySceneDrawTrigger(int stripIndex, double timeBeats, int column);
+    bool applySceneDrawPoint(int stripIndex, int laneIndex, double timeBeats, float normalizedValue);
+    bool applySceneDrawCurveSegment(int stripIndex,
+                                    int laneIndex,
+                                    double startBeat,
+                                    float startValue,
+                                    double endBeat,
+                                    float endValue);
+    bool eraseSceneLaneEventAt(int stripIndex, int laneIndex, bool triggerLane, double timeBeats);
+    bool clearSceneLane(int stripIndex, int laneIndex, bool triggerLane);
+    bool thinSceneLane(int stripIndex, int laneIndex, bool triggerLane);
+    bool deleteSelectedSceneEvent();
+    bool trimSceneEventsToSelection(bool keepAfterSelection);
+    bool clearSceneEventsByType(ScenePerformanceEventType type);
+    bool duplicateSelectedSceneEvents();
+    bool nudgeSelectedSceneEvents(int direction);
+    bool quantizeSelectedSceneEvents();
+    bool clearStripSceneEvents(int stripIndex);
+    bool writeCurrentStripAutomation(int stripIndex);
+    bool writeAllStripsAutomation();
+    bool duplicateStripSceneEventsToNext(int stripIndex);
+    bool copyStripSceneEvents(int sourceStripIndex, int destStripIndex);
+    bool duplicateFocusedSceneLength();
+    int defaultStepTriggerColumnForStrip(int stripIndex) const;
+    bool assignSelectedStepTriggerColumn(int stripIndex, int column);
+    double getSceneTimelineLengthBeats(int sceneSlot) const;
+    double snapSceneBeatToGrid(double beat, double lengthBeats) const;
+    juce::Rectangle<int> getSceneViewportBounds() const;
+    int getFocusedSceneSlot() const;
+    int getFocusedSceneChainStep() const;
+    int getVisibleSceneStripCount() const;
+    int getSceneTimelineContentHeight() const;
+    bool isSceneEventIndexSelected(int eventIndex) const;
+    void setSceneSelectionIndices(std::vector<int> indices, int primaryIndex = -1);
+    void clearSceneSelection();
+    std::vector<ScenePerformanceEvent> getSelectedSceneEvents() const;
+    std::vector<int> collectSceneEventIndicesInMarquee(juce::Rectangle<float> selectionRect) const;
+    void updateSceneHoverState(const juce::Point<float>& position, bool snapToGrid);
+    void clearSceneHoverState();
+    void updateSceneViewportFollow();
+    void updateSceneTimelineContentSize();
+    void updateSceneEditorState(double beat);
+    int preferredLegacyModEditorSlotForLane(int stripIndex, int laneIndex) const;
+    bool shouldShowSceneMotionTargetSelectors(int stripIndex) const;
+    void openLegacyModEditorForSlot(int stripIndex, int slot);
+    void openLegacyModEditorForLane(int stripIndex, int laneIndex);
+    void closeLegacyModEditor();
+    bool isLegacyModEditorAvailableForLane(int stripIndex, int laneIndex) const;
+    void paintSceneChainCanvas(juce::Graphics& g) const;
+    void handleSceneChainMouseDown(const juce::MouseEvent& e);
+    void handleSceneChainMouseDoubleClick(const juce::MouseEvent& e);
+    void handleSceneChainMouseDrag(const juce::MouseEvent& e);
+    void handleSceneChainMouseMove(const juce::MouseEvent& e);
+    void handleSceneChainMouseExit(const juce::MouseEvent& e);
+    void handleSceneChainMouseUp(const juce::MouseEvent& e);
+    void handleSceneChainMouseWheel(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel);
+    void paintSceneTimelineCanvas(juce::Graphics& g) const;
+    void handleSceneTimelineMouseDown(const juce::MouseEvent& e);
+    void handleSceneTimelineMouseDoubleClick(const juce::MouseEvent& e);
+    void handleSceneTimelineMouseDrag(const juce::MouseEvent& e);
+    void handleSceneTimelineMouseMove(const juce::MouseEvent& e);
+    void handleSceneTimelineMouseExit(const juce::MouseEvent& e);
+    void handleSceneTimelineMouseUp(const juce::MouseEvent& e);
+    void handleSceneTimelineMouseWheel(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel);
+    void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
+    void mouseUp(const juce::MouseEvent& e) override;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SceneControlPanel)
 };
@@ -1347,6 +1730,8 @@ private:
     int activeGuiStripCount = 6;
     int lastTopTabIndex = -1;
     bool lastSceneModeEnabled = false;
+    int sceneModePreviousTopTabIndex = -1;
+    bool sceneModeForcedSceneTab = false;
 
     int getDetectedGuiStripCount() const;
     void setActiveGuiStripCount(int stripCount, bool forceRelayout);

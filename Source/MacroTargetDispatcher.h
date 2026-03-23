@@ -18,7 +18,6 @@ class MacroTargetDispatcher
 {
 public:
     static PerformanceTarget getDefaultMacroTarget(int macroIndex);
-    static int getDefaultModLaneSlotForMacroTarget(PerformanceTarget target);
     static float getDefaultMacroNormalizedValue(PerformanceTarget target);
 
     static float getNormalizedValueForTarget(const MlrVSTAudioProcessor& processor,

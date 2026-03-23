@@ -76,9 +76,9 @@ inline constexpr std::array<PerformanceTargetInfo, 31> kPerformanceTargetInfos{{
     { PerformanceTarget::GrainShape, "grain_shape", "Grain Shape", "G.Shape", true, true, true, false },
     { PerformanceTarget::FilterMorph, "filter_morph", "Filter Morph", "F.Morph", true, true, true, false },
     { PerformanceTarget::FilterEnable, "filter_enable", "Filter Enable", "F.En", true, false, false, false },
-    { PerformanceTarget::SliceLength, "slice_length", "Slice Length", "Slice", true, false, false, false },
-    { PerformanceTarget::Scratch, "scratch", "Scratch", "Scratch", true, false, false, false },
-    { PerformanceTarget::Rearrange, "rearrange", "Rearrange", "Rearr", false, true, false, false },
+    { PerformanceTarget::SliceLength, "slice_length", "Slice Length", "Slice", true, true, false, false },
+    { PerformanceTarget::Scratch, "scratch", "Scratch", "Scratch", true, true, false, false },
+    { PerformanceTarget::Rearrange, "rearrange", "Rearrange", "Rearr", false, false, false, false },
     { PerformanceTarget::DelayMix, "delay_mix", "Delay Mix", "D.Mix", true, true, true, false },
     { PerformanceTarget::DelayTime, "delay_time", "Delay Time", "D.Time", true, true, true, false },
     { PerformanceTarget::DelayFeedback, "delay_feedback", "Delay Feedback", "D.Fdbk", true, true, true, false },
@@ -119,15 +119,22 @@ inline constexpr std::array<PerformanceTarget, 30> kMacroPerformanceTargetOrder{
     PerformanceTarget::DelayHighCut
 }};
 
-inline constexpr std::array<PerformanceTarget, 28> kModPerformanceTargetOrder{{
+inline constexpr std::array<PerformanceTarget, 29> kModPerformanceTargetOrder{{
     PerformanceTarget::None,
     PerformanceTarget::Volume,
     PerformanceTarget::Pan,
     PerformanceTarget::Pitch,
     PerformanceTarget::Speed,
-    PerformanceTarget::Rearrange,
     PerformanceTarget::Cutoff,
     PerformanceTarget::Resonance,
+    PerformanceTarget::FilterMorph,
+    PerformanceTarget::SliceLength,
+    PerformanceTarget::Scratch,
+    PerformanceTarget::DelayMix,
+    PerformanceTarget::DelayTime,
+    PerformanceTarget::DelayFeedback,
+    PerformanceTarget::DelayLowCut,
+    PerformanceTarget::DelayHighCut,
     PerformanceTarget::GrainSize,
     PerformanceTarget::GrainDensity,
     PerformanceTarget::GrainPitch,
@@ -141,12 +148,6 @@ inline constexpr std::array<PerformanceTarget, 28> kModPerformanceTargetOrder{{
     PerformanceTarget::GrainEnvelope,
     PerformanceTarget::GrainPositionJitter,
     PerformanceTarget::GrainShape,
-    PerformanceTarget::FilterMorph,
-    PerformanceTarget::DelayMix,
-    PerformanceTarget::DelayTime,
-    PerformanceTarget::DelayFeedback,
-    PerformanceTarget::DelayLowCut,
-    PerformanceTarget::DelayHighCut,
     PerformanceTarget::Retrigger
 }};
 
@@ -246,6 +247,8 @@ inline PerformanceTarget sanitizeMacroPerformanceTarget(PerformanceTarget target
 inline PerformanceTarget sanitizeModPerformanceTarget(PerformanceTarget target)
 {
     const auto sanitized = performanceTargetFromRaw(static_cast<int>(target));
+    if (sanitized == PerformanceTarget::Rearrange)
+        return PerformanceTarget::None;
     return performanceTargetAllowsModLane(sanitized) ? sanitized : PerformanceTarget::None;
 }
 

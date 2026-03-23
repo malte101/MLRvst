@@ -136,6 +136,7 @@ public:
     
     void advance(int numSamples);
     void updateFromPPQ(double ppq, int numSamples); // NEW: Update from master PPQ clock
+    void seedTimelineState(int64_t samplePosition, double ppqPosition);
     int64_t getCurrentSample() const { return currentSample.load(std::memory_order_acquire); }
     void scheduleTrigger(int stripIndex,
                          int column,
@@ -143,6 +144,7 @@ public:
                          EnhancedAudioStrip* strip,
                          int sampleSliceId = -1,
                          int64_t sampleStartSample = -1); // NEW: Takes PPQ and strip
+    void queueExactTrigger(const QuantisedTrigger& trigger);
     bool hasPendingTrigger(int stripIndex) const;
     void clearPendingTriggers();
     void clearPendingTriggersForStrip(int stripIndex); // Clear all pending triggers for a specific strip
@@ -196,7 +198,9 @@ public:
     
     void setLength(int beats);
     void startRecording(double currentBeat);  // Start on next beat boundary
+    void startOverdub(double currentBeat);
     void stopRecording();
+    void extendOverdubRecording();
     void startPlayback();
     void startPlayback(double currentBeat);
     void stopPlayback();
@@ -235,10 +239,12 @@ public:
     
     bool isRecording() const { return recording.load(std::memory_order_acquire); }
     bool isPlaying() const { return playing.load(std::memory_order_acquire); }
+    bool isOverdubbing() const { return recordingOverdub.load(std::memory_order_acquire); }
     bool hasEvents() const { return !events.empty(); }
     int getEventCount() const { return static_cast<int>(events.size()); }
     int getLengthInBeats() const { return lengthInBeats.load(std::memory_order_acquire); }
     double getRecordingStartBeat() const { return recordingStartBeat.load(std::memory_order_acquire); }
+    double getPlaybackProgressForBeat(double currentBeat) const;
     void stop() { stopPlayback(); }
     std::vector<Event> getEventsSnapshot() const;
     void setEventsSnapshot(const std::vector<Event>& newEvents, int lengthBeats);
@@ -259,6 +265,8 @@ private:
     // Playback position within pattern (0.0 to lengthInBeats, loops)
     std::atomic<double> playbackPosition{0.0};
     std::atomic<double> playbackStartBeat{-1.0}; // Absolute beat where playback is anchored
+    std::atomic<bool> recordingOverdub{false};
+    std::atomic<bool> autoStartPlaybackAfterRecording{true};
     
     // Only used during recording (not in audio thread)
     mutable juce::CriticalSection recordLock;
@@ -540,7 +548,8 @@ public:
                                int fallbackColumn,
                                double tempo,
                                double currentTimelineBeat,
-                               int64_t currentGlobalSample);
+                               int64_t currentGlobalSample,
+                               bool shouldBlendPitchPath = true);
     
     // Step sequencer control
     void startStepSequencer();  // Start step sequencer playback (auto-runs with clock)
@@ -719,6 +728,8 @@ public:
     void clearTraversalSpeedOverride();
     void setTraversalRearrange(float value01, float depth01);
     void clearTraversalRearrange();
+    float getTraversalRearrangeValue() const { return traversalRearrangeValue.load(std::memory_order_acquire); }
+    bool isTraversalRearrangeActive() const { return traversalRearrangeActive.load(std::memory_order_acquire) != 0; }
     double getLoopPhaseNormalized() const;
     std::array<int, 16> getSliceStartSamples(bool transientMode) const;
     std::array<int, 16> getCachedTransientSliceSamples() const;
@@ -1434,6 +1445,13 @@ private:
     bool momentaryPhaseGuardValid = false;
     double momentaryPhaseOffsetBeats = 0.0;
     double momentaryPhaseBeatsForLoop = 4.0;
+    bool momentaryPhaseSavedPpqTimelineAnchored = false;
+    double momentaryPhaseSavedPpqTimelineOffsetBeats = 0.0;
+    int64_t momentaryPhaseSavedTriggerSample = 0;
+    double momentaryPhaseSavedTriggerPpqPosition = -1.0;
+    double momentaryPhaseSavedLastTriggerPpq = -999.0;
+    double momentaryPhaseSavedTriggerOffsetRatio = 0.0;
+    int momentaryPhaseSavedTriggerColumn = 0;
     std::atomic<int> grainLedHeldCount{0};
     std::atomic<int> grainLedAnchor{-1};
     std::atomic<int> grainLedSecondary{-1};
@@ -1683,7 +1701,8 @@ public:
     enum class ModTransportMode
     {
         Free = 0,
-        Sync
+        Sync,
+        Scene
     };
 
     struct ModSequencerState
@@ -1755,9 +1774,11 @@ public:
                      juce::MidiBuffer& midi,
                      const juce::AudioPlayHead::PositionInfo& positionInfo,
                      const std::array<juce::AudioBuffer<float>*, MaxStrips>* stripOutputs = nullptr);
+    void seedTransportState(int64_t globalSamplePosition, double ppqPosition);
     
     // Strip access
     EnhancedAudioStrip* getStrip(int index);
+    const EnhancedAudioStrip* getStrip(int index) const;
     bool loadSampleToStrip(int stripIndex, const juce::File& file);
     void setTransientDetectionConfig(int onsetMethodChoice,
                                      int sensitivityChoice,
@@ -1777,6 +1798,12 @@ public:
                                   double currentPPQ,
                                   int sampleSliceId = -1,
                                   int64_t sampleStartSample = -1);
+    void queueExactTrigger(int stripIndex,
+                           int column,
+                           double targetPPQ,
+                           int64_t targetSample,
+                           int sampleSliceId = -1,
+                           int64_t sampleStartSample = -1);
     void triggerStripWithQuantization(int stripIndex,
                                       int column,
                                       bool useQuantize,
@@ -1802,6 +1829,7 @@ public:
 
     // Pattern recording
     void startPatternRecording(int patternIndex);
+    void startPatternOverdub(int patternIndex);
     void stopPatternRecording(int patternIndex);
     void startPatternPlayback(int patternIndex) { playPattern(patternIndex); }
     void stopPatternPlayback(int patternIndex);
@@ -1846,6 +1874,7 @@ public:
     ModTransportMode getModTransportMode(int stripIndex) const;
     void setModTransportModeForSlot(int stripIndex, int slot, ModTransportMode mode);
     ModTransportMode getModTransportModeForSlot(int stripIndex, int slot) const;
+    void setSceneModulationContext(bool enabled, double sceneStartPpq, double sceneLengthBeats);
     void setModCurveMode(int stripIndex, bool curveMode);
     bool isModCurveMode(int stripIndex) const;
     void setModCurveModeForSlot(int stripIndex, int slot, bool curveMode);
@@ -1858,15 +1887,19 @@ public:
     float getModStepValue(int stripIndex, int step) const;
     void setModStepValueAbsolute(int stripIndex, int absoluteStep, float value01);
     float getModStepValueAbsolute(int stripIndex, int absoluteStep) const;
+    float getModStepValueAbsoluteForSlot(int stripIndex, int slot, int absoluteStep) const;
     void writeModStepNormalized(int stripIndex, int slot, int absoluteStep, float value01);
     void clearModStepsForSlot(int stripIndex, int slot, float value01);
     void setModStepShape(int stripIndex, int step, int subdivisions, float endValue01);
     void setModStepShapeAbsolute(int stripIndex, int absoluteStep, int subdivisions, float endValue01);
     int getModStepSubdivisionAbsolute(int stripIndex, int absoluteStep) const;
+    int getModStepSubdivisionAbsoluteForSlot(int stripIndex, int slot, int absoluteStep) const;
     float getModStepEndValueAbsolute(int stripIndex, int absoluteStep) const;
+    float getModStepEndValueAbsoluteForSlot(int stripIndex, int slot, int absoluteStep) const;
     void setModStepCurveShape(int stripIndex, int step, ModCurveShape shape);
     void setModStepCurveShapeAbsolute(int stripIndex, int absoluteStep, ModCurveShape shape);
     ModCurveShape getModStepCurveShapeAbsolute(int stripIndex, int absoluteStep) const;
+    ModCurveShape getModStepCurveShapeAbsoluteForSlot(int stripIndex, int slot, int absoluteStep) const;
     void toggleModStep(int stripIndex, int step);
     void clearModSteps(int stripIndex);
     int getModCurrentStep(int stripIndex) const;
@@ -1880,12 +1913,16 @@ public:
     int getModLengthBarsForSlot(int stripIndex, int slot) const;
     void setModEditPage(int stripIndex, int page);
     int getModEditPage(int stripIndex) const;
+    int getModEditPageForSlot(int stripIndex, int slot) const;
     void setModSmoothingMs(int stripIndex, float ms);
     float getModSmoothingMs(int stripIndex) const;
+    float getModSmoothingMsForSlot(int stripIndex, int slot) const;
     void setModCurveBend(int stripIndex, float bend);
     float getModCurveBend(int stripIndex) const;
+    float getModCurveBendForSlot(int stripIndex, int slot) const;
     void setModCurveShape(int stripIndex, ModCurveShape shape);
     ModCurveShape getModCurveShape(int stripIndex) const;
+    ModCurveShape getModCurveShapeForSlot(int stripIndex, int slot) const;
     void setModPitchScaleQuantize(int stripIndex, bool enabled);
     bool isModPitchScaleQuantize(int stripIndex) const;
     void setModPitchScaleQuantizeForSlot(int stripIndex, int slot, bool enabled);
@@ -1976,6 +2013,20 @@ private:
         std::array<std::atomic<int>, ModTotalSteps> stepSubdivisions;
         std::array<std::atomic<float>, ModTotalSteps> stepEndValues;
         std::array<std::atomic<int>, ModTotalSteps> stepCurveShapes;
+        std::atomic<float> runtimeRawSnapshot{0.0f};
+        std::atomic<float> runtimeGrainSnapshot{0.0f};
+        std::atomic<float> runtimePitchSnapshot{0.0f};
+        std::atomic<float> runtimeSpeedTargetSnapshot{-1.0f};
+        std::atomic<float> runtimeResetSeedRaw{0.0f};
+        std::atomic<float> runtimeResetSeedGrain{0.0f};
+        std::atomic<float> runtimeResetSeedPitch{0.0f};
+        std::atomic<float> runtimeResetSeedSpeedTarget{-1.0f};
+        std::atomic<std::uint32_t> runtimeResetGeneration{1u};
+        std::atomic<int> lastGlobalStep{0};
+    };
+
+    struct ModSequencerRuntime
+    {
         float smoothedRaw = 0.0f;
         float grainDezipperedRaw = 0.0f;
         float pitchDezipperedRaw = 0.0f;
@@ -1983,7 +2034,7 @@ private:
         double syncPhaseLast = -1.0;
         int64_t syncCycleCount = 0;
         bool syncPhaseValid = false;
-        std::atomic<int> lastGlobalStep{0};
+        std::uint32_t appliedResetGeneration = 0u;
     };
 
     int sanitizeModSequencerSlot(int slot) const;
@@ -1992,6 +2043,13 @@ private:
     const ModSequencer& getActiveModSequencer(int stripIndex) const;
     ModSequencer& getModSequencer(int stripIndex, int slot);
     const ModSequencer& getModSequencer(int stripIndex, int slot) const;
+    void queueModSequencerRuntimeReset(ModSequencer& seq,
+                                       float rawSeed,
+                                       float grainSeed,
+                                       float pitchSeed,
+                                       float speedTargetSeed);
+    void queueModSequencerRuntimeResetFromSnapshots(ModSequencer& seq,
+                                                    bool clearSpeedTarget);
     void setModTargetOnSequencer(ModSequencer& seq, ModTarget target);
     void setModBipolarOnSequencer(ModSequencer& seq, bool bipolar, ModBipolarToggleMode mode);
 
@@ -1999,7 +2057,11 @@ private:
     std::array<std::unique_ptr<StripGroup>, MaxGroups> groups;
     std::array<std::unique_ptr<PatternRecorder>, 4> patterns;
     std::array<std::array<ModSequencer, NumModSequencers>, MaxStrips> modSequencers;
+    std::array<std::array<ModSequencerRuntime, NumModSequencers>, MaxStrips> modSequencerRuntime{};
     std::array<std::atomic<int>, MaxStrips> activeModSequencerSlots{};
+    std::atomic<int> sceneModulationContextEnabled{0};
+    std::atomic<double> sceneModulationStartPpq{0.0};
+    std::atomic<double> sceneModulationLengthBeats{4.0};
     std::atomic<int> patternRecorderIgnoreGroups{0};
     std::atomic<int> momentaryStutterActive{0};
     std::atomic<double> momentaryStutterDivisionBeats{0.5}; // quarter-note units
@@ -2054,6 +2116,26 @@ private:
     void updateTempo(const juce::AudioPlayHead::PositionInfo& positionInfo);
     void advanceBeat(int numSamples, bool hasHostPpq);
     void processPatterns();
+    juce::AudioBuffer<float>* resolveFinalTargetBuffer(
+        juce::AudioBuffer<float>& mainBuffer,
+        const std::array<juce::AudioBuffer<float>*, MaxStrips>* stripOutputs,
+        size_t stripIndex) const;
+    size_t collectPostProcessBuffers(
+        juce::AudioBuffer<float>& mainBuffer,
+        const std::array<juce::AudioBuffer<float>*, MaxStrips>* stripOutputs,
+        std::array<juce::AudioBuffer<float>*, MaxStrips + 1>& buffers) const;
+    void applyDuckPostProcessing(
+        juce::AudioBuffer<float>& mainBuffer,
+        const std::array<juce::AudioBuffer<float>*, MaxStrips>* stripOutputs,
+        int numSamples,
+        int masterDuckTrigger);
+    void applyOutputPostProcessing(
+        juce::AudioBuffer<float>& mainBuffer,
+        const std::array<juce::AudioBuffer<float>*, MaxStrips>* stripOutputs,
+        const juce::AudioBuffer<float>& inputCopy,
+        int numSamples,
+        int numChannels,
+        float inputMonitorVol);
     
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ModernAudioEngine)
 };

@@ -14,9 +14,11 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_osc/juce_osc.h>
 #include <cstdint>
+#include <limits>
 #include "PerformanceTargets.h"
 #include "AudioEngine.h"
 #include "SampleMode.h"
+#include "ScenePerformanceRecorder.h"
 #include "StripControlState.h"
 
 class MacroTargetDispatcher;
@@ -212,6 +214,8 @@ public:
 
     void markPersistentGlobalUserChange();
     void queuePersistentGlobalControlsSave();
+    void queueActiveSceneAutosave();
+    void queueActiveSceneAutosave(uint32_t additionalDelayMs);
 
     //==============================================================================
     void getStateInformation(juce::MemoryBlock& destData) override;
@@ -220,6 +224,7 @@ public:
     //==============================================================================
     // Public API
     ModernAudioEngine* getAudioEngine() { return audioEngine.get(); }
+    const ModernAudioEngine* getAudioEngine() const { return audioEngine.get(); }
     MonomeConnection& getMonomeConnection() { return monomeConnection; }
     
     bool loadSampleToStrip(int stripIndex, const juce::File& file);
@@ -234,7 +239,7 @@ public:
     bool canChangeBarLengthNow(int stripIndex) const;
     void setPendingBarLengthApply(int stripIndex, bool pending);
     void triggerStrip(int stripIndex, int column);
-    void stopStrip(int stripIndex);
+    void stopStrip(int stripIndex, bool immediateStop = false, int sceneReleaseColumnHint = -1);
     bool copyFlipCurrentSlicesToMode(int stripIndex, EnhancedAudioStrip::PlayMode targetMode);
     bool copyFlipCurrentSlicesToMode(int sourceStripIndex, int targetStripIndex, EnhancedAudioStrip::PlayMode targetMode);
     void setSampleModeHeldVisibleSliceSlot(int stripIndex, int visibleSlot);
@@ -558,8 +563,16 @@ public:
     void setSceneModeEnabled(bool enabled);
     int getActiveSceneSlot() const { return juce::jlimit(0, SceneSlots - 1, activeSceneSlot); }
     static constexpr int SceneSlots = 4;
+    static constexpr int MaxSceneChainSteps = 8;
     static constexpr int MaxSceneRepeatCount = 32;
     static constexpr int MaxSceneManualBars = 32;
+    static constexpr float MinSceneTransitionLengthBeats = 0.25f;
+    static constexpr float MaxSceneTransitionLengthBeats = 8.0f;
+    static constexpr float DefaultSceneTransitionLengthBeats = 1.0f;
+    static constexpr float DefaultSceneTransitionIntensity = 0.72f;
+    static constexpr float DefaultSceneTransitionDelayAmount = 0.48f;
+    static constexpr float DefaultSceneTransitionFilterAmount = 0.42f;
+    static constexpr float DefaultSceneTransitionChopAmount = 0.18f;
 
     enum class SceneLengthMode
     {
@@ -577,6 +590,52 @@ public:
         Manual
     };
 
+    enum class SceneChainTransitionType
+    {
+        None = 0,
+        Fill,
+        Stutter,
+        FilterRise,
+        Drop,
+        MuteTail,
+        Break,
+        Return
+    };
+
+    enum class SceneChainTransitionOption
+    {
+        Tight = 0,
+        Default,
+        Wide,
+        Wash,
+        Snap,
+        Echo,
+        Sweep,
+        Gate
+    };
+
+    struct SceneChainStep
+    {
+        int sceneSlot = -1;
+        int repeats = 1;
+        SceneChainTransitionType transitionToNext = SceneChainTransitionType::None;
+        SceneChainTransitionOption transitionOption = SceneChainTransitionOption::Default;
+        float transitionLengthBeats = DefaultSceneTransitionLengthBeats;
+        bool transitionSubtractsFromSceneLength = false;
+        float transitionIntensity = DefaultSceneTransitionIntensity;
+        float transitionDelayAmount = DefaultSceneTransitionDelayAmount;
+        float transitionFilterAmount = DefaultSceneTransitionFilterAmount;
+        float transitionChopAmount = DefaultSceneTransitionChopAmount;
+    };
+
+    struct SceneChainState
+    {
+        std::array<SceneChainStep, MaxSceneChainSteps> steps{};
+        bool loopEnabled = false;
+        int loopStart = 0;
+        int loopEnd = 0;
+    };
+
     int getSceneRepeatCount(int sceneSlot) const;
     void setSceneRepeatCount(int sceneSlot, int repeats);
     SceneLengthMode getSceneLengthMode(int sceneSlot) const;
@@ -592,9 +651,93 @@ public:
     double getResolvedSceneLengthBeats(int sceneSlot) const;
     double getSceneAdvanceLengthBeats(int sceneSlot) const;
     bool persistSceneTimingForSlot(int sceneSlot);
+    void selectSceneSlotFromSurface(int sceneSlot);
     int getSceneSequenceStepIndex(int sceneSlot) const;
     int getQueuedSceneSlot() const;
     juce::String getSceneSequenceSummaryText() const;
+    int getSceneChainLength() const;
+    int getSceneChainStepSceneSlot(int stepIndex) const;
+    int getSceneChainStepRepeatCount(int stepIndex) const;
+    SceneChainTransitionType getSceneChainStepTransitionType(int stepIndex) const;
+    SceneChainTransitionOption getSceneChainStepTransitionOption(int stepIndex) const;
+    float getSceneChainStepTransitionLengthBeats(int stepIndex) const;
+    bool getSceneChainStepTransitionSubtractsFromSceneLength(int stepIndex) const;
+    float getSceneChainStepTransitionIntensity(int stepIndex) const;
+    float getSceneChainStepTransitionDelayAmount(int stepIndex) const;
+    float getSceneChainStepTransitionFilterAmount(int stepIndex) const;
+    float getSceneChainStepTransitionChopAmount(int stepIndex) const;
+    void setSceneChainStep(int stepIndex, int sceneSlot, int repeats);
+    void setSceneChainStepTransitionType(int stepIndex, SceneChainTransitionType type);
+    void setSceneChainStepTransitionOption(int stepIndex, SceneChainTransitionOption option);
+    void setSceneChainStepTransitionLengthBeats(int stepIndex, float beats);
+    void setSceneChainStepTransitionSubtractsFromSceneLength(int stepIndex, bool enabled);
+    void setSceneChainStepTransitionIntensity(int stepIndex, float amount);
+    void setSceneChainStepTransitionDelayAmount(int stepIndex, float amount);
+    void setSceneChainStepTransitionFilterAmount(int stepIndex, float amount);
+    void setSceneChainStepTransitionChopAmount(int stepIndex, float amount);
+    void clearSceneChain();
+    bool isSceneChainLoopEnabled() const;
+    void setSceneChainLoopEnabled(bool enabled);
+    int getSceneChainLoopStartStep() const;
+    int getSceneChainLoopEndStep() const;
+    void setSceneChainLoopRange(int startStep, int endStep);
+    bool isSceneChainPlaybackActive() const;
+    int getSceneChainPlaybackStepIndex() const;
+    bool startSceneChainPlayback(int startStepIndex = 0);
+    void stopSceneChainPlayback();
+    void recallSceneSlot(int sceneSlot);
+    void startScenePerformanceRecording(bool overdub = false);
+    void stopScenePerformanceRecording();
+    void extendScenePerformanceRecording();
+    void setGlobalSceneStutterAmount(float amount01);
+    float getGlobalSceneStutterAmount() const;
+    bool clearSceneSlot(int sceneSlot);
+    void clearScenePerformanceClip(int sceneSlot);
+    bool isScenePerformanceRecording() const;
+    bool isScenePerformanceOverdubbing() const;
+    int getScenePerformanceRecordingSceneSlot() const;
+    double getScenePerformanceRecordingStartBeat() const;
+    double getScenePerformanceRecordingEndBeat() const;
+    double getScenePerformanceClipLengthBeats(int sceneSlot) const;
+    bool hasScenePerformanceClip(int sceneSlot) const;
+    int getScenePerformanceEventCount(int sceneSlot) const;
+    double getScenePerformancePlaybackProgress(int sceneSlot, double currentBeat) const;
+    double getScenePerformanceRecordingProgress(double currentBeat) const;
+    std::vector<ScenePerformanceEvent> getScenePerformanceEventsSnapshot(int sceneSlot) const;
+    bool replaceScenePerformanceClipEvents(int sceneSlot, const std::vector<ScenePerformanceEvent>& events);
+    bool copySceneSlotToClipboard(int sceneSlot);
+    bool pasteSceneSlotFromClipboard(int sceneSlot);
+    bool hasSceneSlotClipboard() const;
+    int getSceneSlotClipboardSourceSlot() const;
+    bool copyScenePerformanceClipToClipboard(int sceneSlot);
+    bool pasteScenePerformanceClipFromClipboard(int sceneSlot);
+    bool duplicateScenePerformanceClip(int sourceSceneSlot, int destSceneSlot);
+    bool hasScenePerformanceClipboard() const;
+    int getScenePerformanceClipboardSourceSlot() const;
+    bool getSceneEditorGridEnabled() const { return sceneEditorGridEnabledState; }
+    int getSceneEditorGridDivision() const { return sceneEditorGridDivisionState; }
+    bool getSceneEditorDrawModeEnabled() const { return sceneEditorDrawModeEnabledState; }
+    bool getSceneEditorLaneOverlaysEnabled() const { return sceneEditorLaneOverlaysEnabledState; }
+    int getSceneEditorZoomFactor() const { return sceneEditorZoomFactorState; }
+    bool getSceneEditorFollowPlayheadEnabled() const { return sceneEditorFollowPlayheadState; }
+    bool getSceneEditorStripAutomationExpanded(int stripIndex) const;
+    bool getSceneEditorStripHeightExpanded(int stripIndex) const;
+    void setSceneEditorGridEnabled(bool enabled);
+    void setSceneEditorGridDivision(int division);
+    void setSceneEditorDrawModeEnabled(bool enabled);
+    void setSceneEditorLaneOverlaysEnabled(bool enabled);
+    void setSceneEditorZoomFactor(int factor);
+    void setSceneEditorFollowPlayheadEnabled(bool enabled);
+    void syncActiveSceneMotionState();
+    void setSceneEditorStripAutomationExpanded(int stripIndex, bool expanded);
+    void setSceneEditorStripHeightExpanded(int stripIndex, bool expanded);
+    void setSceneEditorStripAutomationExpandedAll(bool expanded);
+    bool stripUsesGrainSceneLanes(int stripIndex) const;
+    std::vector<ModernAudioEngine::ModTarget> getSceneVisibleModTargetsForStrip(int stripIndex) const;
+    ModernAudioEngine::ModTarget getSceneMotionTargetForSlot(int stripIndex, int laneSlot) const;
+    void setSceneMotionTargetForSlot(int stripIndex, int laneSlot, ModernAudioEngine::ModTarget target);
+    void clearSceneMotionStripState(int sceneSlot, int stripIndex);
+    void cycleSceneModLaneTarget(int stripIndex);
     bool captureSceneSlot(int sceneSlot);
     bool insertSceneSlot(int sceneSlot, bool insertAfter);
     uint32_t getPresetRefreshToken() const { return presetRefreshToken.load(std::memory_order_acquire); }
@@ -612,17 +755,6 @@ public:
         std::array<float, MacroCount> values{};
     };
 
-    struct MacroLaneRecordStatus
-    {
-        bool armed = false;
-        bool recording = false;
-        int stripIndex = -1;
-        int laneSlot = 0;
-        MacroTarget target = MacroTarget::None;
-        int stepsWritten = 0;
-        int totalSteps = 0;
-    };
-
     MacroState getMacroState() const;
     void setSelectedStripMacroValue(int macroIndex, float normalizedValue);
     int getMacroMidiCc(int macroIndex) const;
@@ -634,12 +766,8 @@ public:
     static int getDefaultMacroMidiCc(int macroIndex);
     void setMacroTarget(int macroIndex, MacroTarget target);
     static MacroTarget getDefaultMacroTarget(int macroIndex);
-    static int getDefaultModLaneSlotForMacroTarget(MacroTarget target);
     static float getDefaultMacroNormalizedValue(MacroTarget target);
-    MacroLaneRecordStatus getMacroLaneRecordStatus(int macroIndex) const;
-    void beginMacroLaneRecording(int macroIndex, int laneSlot);
-    void stopMacroLaneRecording(int macroIndex);
-    void cancelMacroLaneRecording(int macroIndex);
+    static bool macroTargetWritesToSceneLane(MacroTarget target);
     
     // Parameters
     juce::AudioProcessorValueTreeState parameters;
@@ -652,6 +780,10 @@ public:
 private:
     friend class MacroTargetDispatcher;
     friend class SceneScheduler;
+    friend int getSceneChainLengthInternal(const MlrVSTAudioProcessor& processor);
+    friend int resolveSceneChainNextStepIndex(const MlrVSTAudioProcessor& processor, int currentStepIndex);
+    friend void sanitizeSceneChainRuntimeState(MlrVSTAudioProcessor& processor);
+    friend void markSceneChainDefinitionChanged(MlrVSTAudioProcessor& processor);
 
     //==============================================================================
     enum class FilterSubPage
@@ -711,22 +843,6 @@ private:
         bool keyLockEnabled = false;
         bool shouldBuildKeyLockCache = false;
         bool preferHighQualityKeyLock = false;
-    };
-
-    struct MacroLaneRecordState
-    {
-        std::atomic<int> armed{0};
-        std::atomic<int> recording{0};
-        std::atomic<int> stripIndex{-1};
-        std::atomic<int> macroIndex{-1};
-        std::atomic<int> laneSlot{0};
-        std::atomic<int> target{static_cast<int>(MacroTarget::None)};
-        std::atomic<float> restoreDepth{1.0f};
-        std::atomic<double> startPpq{-1.0};
-        std::atomic<double> nextStepPpq{-1.0};
-        std::atomic<int> nextStepIndex{-1};
-        std::atomic<int> stepsWritten{0};
-        std::atomic<int> totalStepsToWrite{0};
     };
 
     ResolvedPitchControl resolvePitchControl(const EnhancedAudioStrip& strip,
@@ -894,6 +1010,11 @@ private:
     int pendingPersistentGlobalControlsRestoreRemaining = 0;
     std::atomic<int> persistentGlobalControlsReady{0};
     std::atomic<int> persistentGlobalUserTouched{0};
+    std::atomic<int> pendingActiveSceneAutosaveDirty{0};
+    std::atomic<int> pendingActiveSceneAutosaveMainPreset{-1};
+    std::atomic<int> pendingActiveSceneAutosaveSlot{-1};
+    std::atomic<uint32_t> pendingActiveSceneAutosaveQueuedMs{0};
+    std::atomic<int> sceneAutosaveSuppressionDepth{0};
     std::array<std::array<bool, BrowserFavoriteSlots>, MaxStrips> browserFavoritePadHeld{};
     std::array<std::array<bool, BrowserFavoriteSlots>, MaxStrips> browserFavoritePadHoldSaveTriggered{};
     std::array<std::array<uint32_t, BrowserFavoriteSlots>, MaxStrips> browserFavoritePadPressStartMs{};
@@ -902,7 +1023,6 @@ private:
     std::array<std::atomic<int>, MacroCount> macroMidiCcAssignments{};
     std::array<std::atomic<int>, MacroCount> macroTargetAssignments{};
     std::atomic<int> macroMidiLearnIndex{-1};
-    std::array<MacroLaneRecordState, MacroCount> macroLaneRecordStates{};
     std::array<int, 4> arcKeyHeld{};
     std::array<std::array<int, 64>, 4> arcRingCache{};
     ArcControlMode arcControlMode = ArcControlMode::SelectedStrip;
@@ -1048,6 +1168,29 @@ private:
                                          int controlRow,
                                          int column);
     void playbackMonomeControlPatternEvent(const PatternRecorder::Event& event);
+    bool handleMonomePatternButtonPress(int patternIndex, uint32_t nowMs);
+    void processPendingMonomePatternTapActions(uint32_t nowMs);
+    void clearPendingMonomePatternTap(int patternIndex);
+    enum class SceneRecorderAction
+    {
+        None = 0,
+        StartFreshRecording,
+        StartOverdub,
+        StopRecording
+    };
+    bool handleMonomeSceneRecorderButtonPress(uint32_t nowMs);
+    void processPendingMonomeSceneRecorderTapActions(uint32_t nowMs);
+    void clearPendingMonomeSceneRecorderTap();
+    void requestSceneRecorderActionQuantized(SceneRecorderAction action);
+    void updateSceneRecorderQuantizedAction(const juce::AudioPlayHead::PositionInfo& posInfo, int numSamples);
+    void processPendingSceneRecorderApply();
+    void clearPendingSceneRecorderAction();
+    void startScenePerformanceRecordingAt(bool overdub,
+                                          int sceneSlot,
+                                          double currentBeat,
+                                          double sceneStartBeat,
+                                          bool updateLeds = true);
+    void stopScenePerformanceRecordingNow(bool updateLeds = true);
     void updateMonomeLEDs();
     void updateMonomeArcRings();
     void renderSampleModeStrip(int stripIndex,
@@ -1131,6 +1274,7 @@ private:
     int getEffectiveLoopPitchMasterRootMidi(int stripIndex) const;
     void applyLoopPitchRoleStateToStrip(int stripIndex);
     void reapplyGlobalPitchQuantizationToAllStrips();
+    void resolveLoopPitchRecallStateImmediately();
     void applyLoopPitchSyncToAllStrips();
     int getPitchQuantizeReferenceRootMidiForStrip(int stripIndex) const;
     float getLoopPitchTempoMatchOffsetSemitones(int stripIndex) const;
@@ -1199,7 +1343,6 @@ private:
     void captureMomentaryStutterMacroBaseline();
     void applyMomentaryStutterMacro(const juce::AudioPlayHead::PositionInfo& posInfo);
     void restoreMomentaryStutterMacroBaseline();
-    void updateMacroLaneRecording(const juce::AudioPlayHead::PositionInfo& posInfo, int numSamples);
     bool getCurrentHostPositionInfo(juce::AudioPlayHead::PositionInfo& outPosition) const;
     bool getCurrentHostPpq(double& outPpq) const;
     bool isHostTransportPlaying() const;
@@ -1211,7 +1354,11 @@ private:
     bool copySceneForMainPreset(int mainPresetIndex, int sourceSceneSlot, int destSceneSlot);
     bool deleteSceneForMainPreset(int mainPresetIndex, int sceneSlot);
     bool sceneSlotExistsForMainPreset(int mainPresetIndex, int sceneSlot) const;
-    void requestSceneRecallQuantized(int mainPresetIndex, int sceneSlot, bool sequenceDriven);
+    void requestSceneRecallQuantized(int mainPresetIndex,
+                                     int sceneSlot,
+                                     bool sequenceDriven,
+                                     int sequenceStepIndex = -1,
+                                     bool useTriggerQuantization = false);
     double getSceneRecallIntervalBeats() const;
     void updateSceneQuantizedRecall(const juce::AudioPlayHead::PositionInfo& posInfo, int numSamples);
     void processPendingSceneApply();
@@ -1232,6 +1379,14 @@ private:
     void armNextSceneInSequence(int mainPresetIndex, int currentSceneSlot, double sceneStartPpq);
     std::unique_ptr<juce::XmlElement> createSceneChainStateXml(int sceneSlotOverride) const;
     void applySceneChainStateXml(const juce::XmlElement* xml, int sceneSlotOverride);
+    juce::MemoryBlock createScenePerformanceStateData(int sceneSlotOverride) const;
+    bool applyScenePerformanceStateData(const juce::MemoryBlock& data, int sceneSlotOverride);
+    void syncScenePerformanceClipLengthToResolvedLength(int sceneSlot);
+    void syncAllScenePerformanceClipLengthsToResolvedLengths();
+    bool sceneSlotHasMotionState(int sceneSlot) const;
+    void syncSceneMotionStateFromEngine(int sceneSlot);
+    void applySceneMotionStateToEngine(int sceneSlot);
+    void updateAudioEngineSceneModulationContext() const;
     void syncSceneModeFromParameters();
     void applySceneModeState(bool enabled);
     void captureSceneModeGroupSnapshot();
@@ -1239,6 +1394,55 @@ private:
     void clearAllStripGroupsForSceneMode();
     void appendSceneModeStateToState(juce::ValueTree& state) const;
     void loadSceneModeStateFromState(const juce::ValueTree& state);
+    void processScenePerformancePlayback(const juce::AudioPlayHead::PositionInfo& posInfo, int numSamples);
+    void clearSceneBoundaryTransitionState(bool clearBlendSuppression = true);
+    void armSceneBoundaryTransition(SceneChainTransitionType type,
+                                    SceneChainTransitionOption option,
+                                    float lengthBeats,
+                                    float intensity,
+                                    float delayAmount,
+                                    float filterAmount,
+                                    float chopAmount,
+                                    int fromStepIndex,
+                                    int toStepIndex,
+                                    double targetPpq,
+                                    double targetTempo,
+                                    double leadBeats,
+                                    int64_t targetSample);
+    void applySceneBoundaryTransitionOverlay(const juce::AudioPlayHead::PositionInfo& posInfo, int numSamples);
+    void setSceneTransitionStutterOverlayAmount(float amount01);
+    void updateEffectiveSceneStutterAmount();
+    void armSceneChainReturnOverride(int sourceStepIndex, int triggerStepIndex);
+    void clearSceneChainReturnOverride();
+    bool consumeSceneChainReturnOverrideForStep(int currentStepIndex, int& outNextStepIndex);
+    void recordSceneTriggerEvent(int stripIndex,
+                                 int column,
+                                 double eventBeat,
+                                 int sampleSliceId,
+                                 int64_t sampleStartSample,
+                                 bool noteOn = true);
+    void clearPendingSceneTriggerRecord(int stripIndex);
+    void rememberPendingSceneTriggerRecord(int stripIndex, int column, double eventBeat);
+    void cancelPendingSceneTriggerRecord(int stripIndex);
+    void captureSceneTriggerRelease(int stripIndex, int columnHint);
+    void recordMonomeControlSceneEvent(ControlMode mode,
+                                       int targetStripIndex,
+                                       int controlRow,
+                                       int column);
+    bool resolveScenePerformanceControlEvent(ControlMode mode,
+                                             int stripIndex,
+                                             int controlRow,
+                                             int column,
+                                             ScenePerformanceEvent& outEvent) const;
+    bool resolveScenePerformanceMacroEvent(int stripIndex,
+                                           MacroTarget target,
+                                           float normalizedValue,
+                                           ScenePerformanceEvent& outEvent) const;
+    void recordMacroSceneEvent(int stripIndex, MacroTarget target, float normalizedValue);
+    void recordSceneGlobalStutterEvent(float normalizedValue, int columnHint, double eventBeat);
+    void recordMomentaryStutterSceneDivision(double divisionBeats, int columnHint, double eventBeat);
+    void playbackScenePerformanceEvent(const ScenePerformanceEvent& event);
+    void copyScenePerformanceClip(int sourceSceneSlot, int destSceneSlot);
     void handleIncomingMacroCc(const juce::MidiBuffer& midiMessages);
     int getMacroTargetStripIndex() const;
     float getMacroNormalizedValueForTarget(int stripIndex, const EnhancedAudioStrip& strip, MacroTarget target) const;
@@ -1263,12 +1467,78 @@ private:
                                  std::atomic<float>* rawParam,
                                  StripControlWriteMode writeMode);
     void applyOwnedStripControlsFromParameters(int stripIndex, EnhancedAudioStrip& strip);
-    void resetMacroLaneRecordState(int macroIndex);
-    void finishMacroLaneRecording(int macroIndex, bool activateLane);
-    static int snapMacroLaneRecordingLengthBars(double recordedBeats);
-    bool initializeMacroLaneRecording(int macroIndex, const juce::AudioPlayHead::PositionInfo& posInfo);
-    float getMacroLaneRecordedValue(int macroIndex) const;
     void performPresetLoad(int presetIndex, double hostPpqSnapshot, double hostTempoSnapshot);
+    struct SceneRenderContext
+    {
+        std::unique_ptr<ModernAudioEngine> engine;
+        std::array<std::unique_ptr<SampleModeEngine>, MaxStrips> sampleModeEngines;
+        std::array<juce::AudioBuffer<float>, MaxStrips> sampleModeScratchBuffers;
+        std::array<bool, MaxStrips> sampleModeRenderedLastBlock{};
+        std::array<juce::File, MaxStrips> currentStripFiles;
+        std::array<juce::File, MaxStrips> recentLoopDirectories;
+        std::array<juce::File, MaxStrips> recentStepDirectories;
+        std::array<juce::File, MaxStrips> recentFlipDirectories;
+        std::array<std::unique_ptr<juce::XmlElement>, MaxStrips> loopPitchStateXml;
+        std::unique_ptr<juce::XmlElement> sceneTimingStateXml;
+        juce::MemoryBlock scenePerformanceStateData;
+        juce::ValueTree parameterState;
+        SceneChainTransitionType transitionType = SceneChainTransitionType::None;
+        int mainPresetIndex = 0;
+        int sceneSlot = 0;
+        int sequenceStepIndex = -1;
+        bool sequenceDriven = false;
+        bool sceneStartPpqValid = false;
+        double sceneStartPpq = 0.0;
+        double sceneTempo = 120.0;
+        int64_t sceneStartSample = -1;
+        double lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+        int lastScenePerformanceProcessSceneSlot = -1;
+        double lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
+    };
+    void configureAudioEngineCallbacks(ModernAudioEngine& engine);
+    bool loadSampleFileIntoSampleModeEngine(SampleModeEngine& engine, const juce::File& file) const;
+    bool applyFlipPresetStateXmlToSceneContext(SceneRenderContext& context,
+                                               int stripIndex,
+                                               const juce::XmlElement* flipStateXml);
+    bool buildSceneRenderContext(SceneRenderContext& context,
+                                 int mainPresetIndex,
+                                 int sceneSlot,
+                                 double hostPpqSnapshot,
+                                 double hostTempoSnapshot,
+                                 int64_t hostGlobalSampleSnapshot,
+                                 SceneChainTransitionType transitionType,
+                                 bool sequenceDriven,
+                                 int sequenceStepIndex);
+    void requestScenePreload(int mainPresetIndex,
+                             int sceneSlot,
+                             bool sequenceDriven,
+                             int sequenceStepIndex,
+                             double targetPpq,
+                             double targetTempo,
+                             int64_t targetSample,
+                             SceneChainTransitionType transitionType);
+    void servicePendingScenePreloadRequest();
+    bool tryStartPreloadedSceneTransition(int mainPresetIndex,
+                                          int sceneSlot,
+                                          bool sequenceDriven,
+                                          int sequenceStepIndex,
+                                          double targetPpq,
+                                          double targetTempo,
+                                          int64_t targetSample,
+                                          int sampleOffset,
+                                          SceneChainTransitionType transitionType);
+    void renderActiveSceneAudio(juce::AudioBuffer<float>& buffer,
+                                juce::MidiBuffer& midiMessages,
+                                const juce::AudioPlayHead::PositionInfo& posInfo,
+                                bool allowSeparateStripRouting,
+                                bool applySceneTransitionOverlay);
+    void renderSceneTransitionBlock(juce::AudioBuffer<float>& buffer,
+                                    juce::MidiBuffer& midiMessages,
+                                    const juce::AudioPlayHead::PositionInfo& posInfo);
+    void applySceneRenderContext(SceneRenderContext context);
+    void commitSceneTransitionIfReady();
+    void queuePendingSceneParameterState(const juce::ValueTree& state);
+    void applyPendingSceneParameterState();
     struct PresetSaveRequest
     {
         int presetIndex = -1;
@@ -1289,6 +1559,19 @@ private:
     void pushPresetSaveResult(const PresetSaveResult& result);
     void applyCompletedPresetSaves();
     void resetRuntimePresetStateToDefaults();
+public:
+    void processPendingSceneAutosave();
+    bool flushPendingActiveSceneAutosaveIfCurrent();
+    void clearPendingActiveSceneAutosave();
+    bool canPersistActiveSceneSnapshotSafely() const;
+    void beginSceneAutosaveSuppression();
+    void endSceneAutosaveSuppression();
+    bool isSceneAutosaveSuppressed() const;
+    int getActiveSceneBoundaryTransitionStep() const
+    {
+        return sceneBoundaryTransitionFromStep.load(std::memory_order_acquire);
+    }
+private:
 
     // Row 0, col 8: global momentary scratch modifier.
     bool momentaryScratchHoldActive = false;
@@ -1325,6 +1608,7 @@ private:
     bool momentaryStutterMacroBaselineCaptured = false;
     bool momentaryStutterMacroCapturePending = false;
     double momentaryStutterMacroStartPpq = 0.0;
+    int momentaryStutterRecordedDivisionButton = -1;
     uint8_t momentaryStutterLastComboMask = 0;
     bool momentaryStutterTwoButtonStepBaseValid = false;
     int momentaryStutterTwoButtonStepBase = 0;
@@ -1348,10 +1632,52 @@ private:
     std::array<uint32_t, MaxPresetSlots> presetPadSaveBurstUntilMs{};
     std::atomic<uint32_t> presetRefreshToken{0};
     std::array<uint32_t, MaxPresetSlots> presetPadLastTapMs{};
+    enum class MonomePatternTapAction
+    {
+        None = 0,
+        StartFreshRecording,
+        StopPlayback,
+        StopRecording
+    };
+    enum class MonomeSceneRecorderTapAction
+    {
+        None = 0,
+        StartFreshRecording,
+        StopRecording
+    };
+    std::array<uint32_t, ModernAudioEngine::MaxPatterns> monomePatternPadPendingUntilMs{};
+    std::array<MonomePatternTapAction, ModernAudioEngine::MaxPatterns> monomePatternPadPendingAction{};
+    uint32_t monomeSceneRecorderPendingUntilMs = 0;
+    MonomeSceneRecorderTapAction monomeSceneRecorderPendingAction = MonomeSceneRecorderTapAction::None;
+    struct PendingSceneRecorderAction
+    {
+        bool active = false;
+        bool targetResolved = false;
+        bool patternEndPhaseSignatureValid = false;
+        SceneRecorderAction action = SceneRecorderAction::None;
+        int sceneSlot = -1;
+        double targetPpq = 0.0;
+        double intervalBeats = 4.0;
+        uint64_t patternEndPhaseSignature = 0;
+    };
+    PendingSceneRecorderAction pendingSceneRecorderAction;
+    struct PendingSceneTriggerRecord
+    {
+        bool active = false;
+        int sceneSlot = -1;
+        int column = -1;
+        double eventBeat = std::numeric_limits<double>::quiet_NaN();
+    };
+    std::array<PendingSceneTriggerRecord, MaxStrips> pendingSceneTriggerRecords{};
+    ScenePerformanceRecorder scenePerformanceRecorder;
+    double lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+    int lastScenePerformanceProcessSceneSlot = -1;
+    double lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
     std::atomic<int> sceneModeEnabled{0};
     std::atomic<float>* sceneModeParam = nullptr;
     int activeSceneMainPresetIndex = 0;
     int activeSceneSlot = 0;
+    bool activeSceneNeedsCaptureBeforeManualRecall = true;
     struct SceneModeGroupSnapshot
     {
         bool valid = false;
@@ -1364,10 +1690,12 @@ private:
     {
         bool active = false;
         bool sequenceDriven = false;
+        bool useTriggerQuantization = false;
         bool targetResolved = false;
         bool patternEndPhaseSignatureValid = false;
         int mainPresetIndex = 0;
         int sceneSlot = 0;
+        int sequenceStepIndex = -1;
         double targetPpq = 0.0;
         double intervalBeats = 4.0;
         uint64_t patternEndPhaseSignature = 0;
@@ -1377,15 +1705,30 @@ private:
     std::array<int, SceneSlots> sceneLengthModes{};
     std::array<int, SceneSlots> sceneManualBars{};
     std::array<int, SceneSlots> sceneAnchorStrips{};
+    SceneChainState sceneChainState;
+    bool sceneEditorGridEnabledState = true;
+    int sceneEditorGridDivisionState = 16;
+    bool sceneEditorDrawModeEnabledState = false;
+    bool sceneEditorLaneOverlaysEnabledState = true;
+    int sceneEditorZoomFactorState = 1;
+    bool sceneEditorFollowPlayheadState = false;
+    std::array<bool, MaxStrips> sceneEditorStripAutomationExpanded{};
+    std::array<bool, MaxStrips> sceneEditorStripHeightExpanded{};
     std::array<bool, SceneSlots> scenePadHeld{};
     std::array<bool, SceneSlots> scenePadHoldDeleteTriggered{};
+    std::array<bool, SceneSlots> scenePadLaunchConsumed{};
     std::array<uint32_t, SceneSlots> scenePadPressStartMs{};
     std::array<uint32_t, SceneSlots> scenePadActionBurstUntilMs{};
     std::array<uint32_t, SceneSlots> scenePadLastTapMs{};
+    int sceneSlotClipboardSourceSlot = -1;
+    int sceneSlotClipboardMainPresetIndex = 0;
     int sceneCopySourceSlot = -1;
     int sceneCopyMainPresetIndex = 0;
-    std::vector<int> sceneSequenceSlots;
+    bool monomeLedUpdateInProgress = false;
+    bool monomeLedUpdatePending = false;
+    juce::MemoryBlock scenePerformanceClipboardData;
     bool sceneSequenceActive = false;
+    int sceneSequenceCurrentStepIndex = -1;
     bool activeSceneStartPpqValid = false;
     double activeSceneStartPpq = 0.0;
     bool sceneSequenceStartPpqValid = false;
@@ -1393,18 +1736,70 @@ private:
     std::atomic<int> pendingSceneApplyMainPreset{-1};
     std::atomic<int> pendingSceneApplySlot{-1};
     std::atomic<int> pendingSceneApplySequenceDriven{0};
+    std::atomic<int> pendingSceneApplySequenceStep{-1};
     std::atomic<double> pendingSceneApplyTargetPpq{-1.0};
     std::atomic<double> pendingSceneApplyTargetTempo{120.0};
     std::atomic<int64_t> pendingSceneApplyTargetSample{-1};
+    std::atomic<int> pendingSceneRecorderApplyAction{static_cast<int>(SceneRecorderAction::None)};
+    std::atomic<int> pendingSceneRecorderApplySceneSlot{-1};
+    std::atomic<double> pendingSceneRecorderApplyTargetPpq{-1.0};
+    std::atomic<int64_t> pendingSceneRecorderApplyTargetSample{-1};
+    std::atomic<int> pendingScenePreloadDirty{0};
+    std::atomic<int> pendingScenePreloadMainPreset{-1};
+    std::atomic<int> pendingScenePreloadSceneSlot{-1};
+    std::atomic<int> pendingScenePreloadSequenceDriven{0};
+    std::atomic<int> pendingScenePreloadSequenceStep{-1};
+    std::atomic<double> pendingScenePreloadTargetPpq{-1.0};
+    std::atomic<double> pendingScenePreloadTargetTempo{120.0};
+    std::atomic<int64_t> pendingScenePreloadTargetSample{-1};
+    std::atomic<int> pendingScenePreloadTransitionType{static_cast<int>(SceneChainTransitionType::None)};
+    std::unique_ptr<SceneRenderContext> preparedSceneRenderContext;
+    std::unique_ptr<SceneRenderContext> activeSceneTransitionContext;
+    int sceneTransitionSamplesTotal = 0;
+    int sceneTransitionSamplesRendered = 0;
+    int sceneTransitionStartSampleOffset = 0;
+    bool sceneTransitionCommitPending = false;
+    std::atomic<int> suppressOwnedStripParameterSync{0};
+    juce::CriticalSection pendingSceneParameterStateLock;
+    juce::ValueTree pendingSceneParameterState;
+    std::atomic<int> pendingSceneParameterStateDirty{0};
+    juce::AudioBuffer<float> sceneTransitionOutgoingScratch;
+    juce::AudioBuffer<float> sceneTransitionIncomingScratch;
     static constexpr int kSceneRecallBlendMaxChannels = 32;
+    static constexpr int kSceneRecallBlendMaxSamples = 16384;
     std::array<float, kSceneRecallBlendMaxChannels> sceneRecallBlendStartSamples{};
+    std::array<std::array<float, kSceneRecallBlendMaxSamples>, kSceneRecallBlendMaxChannels> sceneRecallBlendStartTail{};
+    int sceneRecallBlendStartTailLength = 0;
     std::array<float, kSceneRecallBlendMaxChannels> lastRenderedOutputSamples{};
+    std::array<std::array<float, kSceneRecallBlendMaxSamples>, kSceneRecallBlendMaxChannels> lastRenderedOutputTail{};
+    int lastRenderedOutputTailLength = 0;
     int sceneRecallBlendSamplesRemaining = 0;
     int sceneRecallBlendTotalSamples = 0;
+    std::atomic<float> sceneGlobalStutterBaseAmount{0.0f};
+    std::atomic<float> sceneTransitionStutterOverlayAmount{0.0f};
+    std::atomic<int> sceneBoundaryTransitionType{static_cast<int>(SceneChainTransitionType::None)};
+    std::atomic<int> sceneBoundaryTransitionOption{static_cast<int>(SceneChainTransitionOption::Default)};
+    std::atomic<int> sceneBoundaryTransitionFromStep{-1};
+    std::atomic<int> sceneBoundaryTransitionToStep{-1};
+    std::atomic<double> sceneBoundaryTransitionStartPpq{-1.0};
+    std::atomic<double> sceneBoundaryTransitionTargetPpq{-1.0};
+    std::atomic<int64_t> sceneBoundaryTransitionStartSample{-1};
+    std::atomic<int64_t> sceneBoundaryTransitionTargetSample{-1};
+    std::atomic<double> sceneBoundaryTransitionTempo{120.0};
+    std::atomic<float> sceneBoundaryTransitionLengthBeats{DefaultSceneTransitionLengthBeats};
+    std::atomic<float> sceneBoundaryTransitionIntensity{DefaultSceneTransitionIntensity};
+    std::atomic<float> sceneBoundaryTransitionDelayAmount{DefaultSceneTransitionDelayAmount};
+    std::atomic<float> sceneBoundaryTransitionFilterAmount{DefaultSceneTransitionFilterAmount};
+    std::atomic<float> sceneBoundaryTransitionChopAmount{DefaultSceneTransitionChopAmount};
+    std::atomic<int> suppressSceneRecallBlendOnNextLoad{0};
+    std::atomic<int> sceneChainReturnOverrideActive{0};
+    std::atomic<int> sceneChainReturnOverrideSourceStep{-1};
+    std::atomic<int> sceneChainReturnOverrideTriggerStep{-1};
     static constexpr uint32_t presetHoldSaveMs = 3000;
     static constexpr uint32_t presetDoubleTapMs = 350;
     static constexpr uint32_t presetSaveBurstDurationMs = 260;
     static constexpr uint32_t presetSaveBurstIntervalMs = 55;
+    static constexpr uint32_t monomePatternDoubleTapMs = 260;
     static constexpr uint32_t sceneHoldDeleteMs = 3000;
     static constexpr uint32_t sceneDoubleTapMs = 350;
     static constexpr uint32_t sceneActionBurstDurationMs = 260;

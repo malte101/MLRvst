@@ -209,12 +209,22 @@ target_sources(mlrVST
         Source/PluginEntry.cpp
         Source/PluginEditor.cpp
         Source/PluginEditor.h
+        Source/PluginEditorPanels.cpp
+        Source/PluginEditorPanelUtils.h
+        Source/PluginEditorStyle.h
         Source/AudioEngine.cpp
+        Source/AudioEngineFx.cpp
+        Source/AudioEngineModulation.cpp
+        Source/AudioEngineModulation.h
+        Source/AudioEnginePostProcess.cpp
+        Source/AudioEngineTransient.cpp
         Source/AudioEngine.h
         Source/MacroTargetDispatcher.cpp
         Source/MacroTargetDispatcher.h
         Source/SceneScheduler.cpp
         Source/SceneScheduler.h
+        Source/ScenePerformanceRecorder.cpp
+        Source/ScenePerformanceRecorder.h
         Source/StripControlState.cpp
         Source/StripControlState.h
         Source/PresetStore.cpp

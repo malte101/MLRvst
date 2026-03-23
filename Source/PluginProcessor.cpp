@@ -8,6 +8,7 @@
 */
 
 #include "PluginProcessor.h"
+#include "AudioEngineModulation.h"
 #include "MacroTargetDispatcher.h"
 #include "MonomeFilterActions.h"
 #include "MonomeMixActions.h"
@@ -104,6 +105,35 @@ float snapBungeePitchCacheSemitones(float semitones) noexcept
     return juce::jlimit(-24.0f,
                         24.0f,
                         std::round(semitones / step) * step);
+}
+
+bool isValidSceneStoredSamplePath(const juce::File& file)
+{
+    const auto path = file.getFullPathName().trim();
+    if (path.isEmpty() || path.length() > 4096)
+        return false;
+    if (!juce::File::isAbsolutePath(path))
+        return false;
+    if (path.contains("\n") || path.contains("\r") || path.contains("://"))
+        return false;
+    if (path.startsWith("//") || path.startsWith("\\\\"))
+        return false;
+    return file.hasFileExtension("wav;aif;aiff;mp3;ogg;flac");
+}
+
+bool canEmbedSceneAudioBuffer(const juce::AudioBuffer<float>& buffer)
+{
+    const int channels = buffer.getNumChannels();
+    const int samples = buffer.getNumSamples();
+    if (channels <= 0 || samples <= 0)
+        return false;
+
+    constexpr uint64_t kMaxEmbeddedWavBytes = 48ULL * 1024ULL * 1024ULL;
+    const uint64_t estimatedWavBytes = static_cast<uint64_t>(channels)
+        * static_cast<uint64_t>(samples)
+        * 3ULL
+        + 4096ULL;
+    return estimatedWavBytes <= kMaxEmbeddedWavBytes;
 }
 
 constexpr int kSoundTouchPitchCacheStableTimerTicks = 6;
@@ -1534,6 +1564,23 @@ MacroTarget sanitizeMacroTarget(int rawTarget)
     return sanitizeMacroPerformanceTarget(performanceTargetFromRaw(rawTarget));
 }
 
+float denormalizeMacroLinearValue(float normalized, float minValue, float maxValue)
+{
+    return juce::jmap(juce::jlimit(0.0f, 1.0f, normalized), 0.0f, 1.0f, minValue, maxValue);
+}
+
+float denormalizeMacroCutoffValue(float normalized)
+{
+    juce::NormalisableRange<float> range(20.0f, 20000.0f, 1.0f);
+    range.setSkewForCentre(1000.0f);
+    return juce::jlimit(20.0f, 20000.0f, range.convertFrom0to1(juce::jlimit(0.0f, 1.0f, normalized)));
+}
+
+float denormalizeMacroPitchValue(float normalized)
+{
+    return denormalizeMacroLinearValue(normalized, -24.0f, 24.0f);
+}
+
 constexpr std::array<int, MlrVSTAudioProcessor::MacroCount> kAkaiMpkMiniMacroCcs {
     70, 71, 72, 73, -1, -1, -1, -1
 };
@@ -1634,6 +1681,20 @@ std::unique_ptr<juce::XmlElement> loadGlobalSettingsXml()
     return nullptr;
 }
 
+void appendSceneDebugLog(const juce::String& message)
+{
+    const auto logFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
+        .getChildFile("mlrvst_scene_debug.log");
+    juce::FileOutputStream out(logFile);
+    if (!out.openedOk())
+        return;
+
+    out.setPosition(logFile.existsAsFile() ? logFile.getSize() : 0);
+    const auto timestamp = juce::Time::getCurrentTime().formatted("%Y-%m-%d %H:%M:%S.%3Q");
+    out.writeText(timestamp + " " + message + "\n", false, false, "\n");
+    out.flush();
+}
+
 void saveGlobalSettingsXml(const juce::XmlElement& xml)
 {
     auto settingsFile = getGlobalSettingsFile();
@@ -1658,8 +1719,9 @@ void saveGlobalSettingsXml(const juce::XmlElement& xml)
 }
 
 constexpr juce::int64 kPersistentGlobalControlsSaveDebounceMs = 350;
+constexpr uint32_t kSceneAutosaveDebounceMs = 180;
 
-constexpr std::array<const char*, 20> kPersistentGlobalControlParameterIds {
+constexpr std::array<const char*, 21> kPersistentGlobalControlParameterIds {
     "masterVolume",
     "limiterThreshold",
     "limiterEnabled",
@@ -1675,11 +1737,96 @@ constexpr std::array<const char*, 20> kPersistentGlobalControlParameterIds {
     "flipTempoMatchMode",
     "stretchBackend",
     "continuousTraversal",
+    "sceneMode",
     "soundTouchEnabled",
     "transientOnsetMethod",
     "transientSensitivity",
     "transientSnap",
     "transientSpacing"
+};
+
+template <typename Fn>
+void forEachSceneAutosaveParameterId(Fn&& fn)
+{
+    for (int stripIndex = 0; stripIndex < MlrVSTAudioProcessor::MaxStrips; ++stripIndex)
+    {
+        const auto suffix = juce::String(stripIndex);
+        fn("stripVolume" + suffix);
+        fn("stripTrimDb" + suffix);
+        fn("stripPan" + suffix);
+        fn("stripSpeed" + suffix);
+        fn("stripPitch" + suffix);
+        fn("stripSliceLength" + suffix);
+        fn("stripPitchControlMode" + suffix);
+        fn("stripTempoMatchMode" + suffix);
+        fn("stripFilterEnabled" + suffix);
+        fn("stripFilterFrequency" + suffix);
+        fn("stripFilterResonance" + suffix);
+        fn("stripFilterMorph" + suffix);
+        fn("stripFilterAlgorithm" + suffix);
+        fn("stripDuckEnabled" + suffix);
+        fn("stripDuckSource" + suffix);
+        fn("stripDuckThreshold" + suffix);
+        fn("stripDuckRatio" + suffix);
+        fn("stripDuckAttack" + suffix);
+        fn("stripDuckRelease" + suffix);
+        fn("stripDuckGainComp" + suffix);
+        fn("stripDuckFollowMaster" + suffix);
+        fn("stripDelayMix" + suffix);
+        fn("stripDelayTime" + suffix);
+        fn("stripDelaySync" + suffix);
+        fn("stripDelayFeedback" + suffix);
+        fn("stripDelayLowCut" + suffix);
+        fn("stripDelayHighCut" + suffix);
+        fn("stripDelayMode" + suffix);
+    }
+}
+
+bool isSceneAutosaveParameterId(const juce::String& parameterID)
+{
+    return parameterID.startsWith("stripVolume")
+        || parameterID.startsWith("stripTrimDb")
+        || parameterID.startsWith("stripPan")
+        || parameterID.startsWith("stripSpeed")
+        || parameterID.startsWith("stripPitch")
+        || parameterID.startsWith("stripSliceLength")
+        || parameterID.startsWith("stripPitchControlMode")
+        || parameterID.startsWith("stripTempoMatchMode")
+        || parameterID.startsWith("stripFilterEnabled")
+        || parameterID.startsWith("stripFilterFrequency")
+        || parameterID.startsWith("stripFilterResonance")
+        || parameterID.startsWith("stripFilterMorph")
+        || parameterID.startsWith("stripFilterAlgorithm")
+        || parameterID.startsWith("stripDuckEnabled")
+        || parameterID.startsWith("stripDuckSource")
+        || parameterID.startsWith("stripDuckThreshold")
+        || parameterID.startsWith("stripDuckRatio")
+        || parameterID.startsWith("stripDuckAttack")
+        || parameterID.startsWith("stripDuckRelease")
+        || parameterID.startsWith("stripDuckGainComp")
+        || parameterID.startsWith("stripDuckFollowMaster")
+        || parameterID.startsWith("stripDelayMix")
+        || parameterID.startsWith("stripDelayTime")
+        || parameterID.startsWith("stripDelaySync")
+        || parameterID.startsWith("stripDelayFeedback")
+        || parameterID.startsWith("stripDelayLowCut")
+        || parameterID.startsWith("stripDelayHighCut")
+        || parameterID.startsWith("stripDelayMode");
+}
+
+struct ScopedSceneAutosaveSuppression
+{
+    explicit ScopedSceneAutosaveSuppression(MlrVSTAudioProcessor& p) : processor(p)
+    {
+        processor.beginSceneAutosaveSuppression();
+    }
+
+    ~ScopedSceneAutosaveSuppression()
+    {
+        processor.endSceneAutosaveSuppression();
+    }
+
+    MlrVSTAudioProcessor& processor;
 };
 
 bool isPersistentGlobalControlParameterId(const juce::String& parameterID)
@@ -3012,71 +3159,27 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
 {
     // Initialize audio engine
     audioEngine = std::make_unique<ModernAudioEngine>();
-    audioEngine->setSampleModeRenderCallback(
-        [this](int stripIndex,
-               juce::AudioBuffer<float>& output,
-               int startSample,
-               int numSamples,
-               const juce::AudioPlayHead::PositionInfo& positionInfo,
-               int64_t globalSampleStart,
-               double tempo,
-               double quantizeBeats)
-        {
-            renderSampleModeStrip(stripIndex,
-                                  output,
-                                  startSample,
-                                  numSamples,
-                                  positionInfo,
-                                  globalSampleStart,
-                                  tempo,
-                                  quantizeBeats);
-        });
-    audioEngine->setSampleModeTriggerCallback(
-        [this](int stripIndex,
-               int column,
-               int sampleSliceId,
-               int64_t sampleStartSample,
-               int64_t triggerSample,
-               const juce::AudioPlayHead::PositionInfo& positionInfo,
-               bool isMomentaryStutter)
-        {
-            triggerSampleModeStripAtSample(stripIndex,
-                                           column,
-                                           sampleSliceId,
-                                           sampleStartSample,
-                                           triggerSample,
-                                           positionInfo,
-                                           isMomentaryStutter);
-        });
-    audioEngine->setSampleModeStopCallback(
-        [this](int stripIndex, bool immediateStop)
-        {
-            stopSampleModeStrip(stripIndex, immediateStop);
-        });
-    audioEngine->setPatternControlEventCallback(
-        [this](const PatternRecorder::Event& event)
-        {
-            playbackMonomeControlPatternEvent(event);
-        });
+    configureAudioEngineCallbacks(*audioEngine);
     for (int i = 0; i < MacroCount; ++i)
     {
         macroMidiCcAssignments[static_cast<size_t>(i)].store(getDefaultMacroMidiCc(i), std::memory_order_release);
         macroTargetAssignments[static_cast<size_t>(i)].store(static_cast<int>(getDefaultMacroTarget(i)),
                                                              std::memory_order_release);
-        resetMacroLaneRecordState(i);
     }
     cacheParameterPointers();
     sceneModeEnabled.store(sceneModeParam != nullptr && sceneModeParam->load(std::memory_order_acquire) > 0.5f ? 1 : 0,
                            std::memory_order_release);
     if (audioEngine)
-        audioEngine->setPatternRecorderIgnoreGroups(isSceneModeEnabled());
+        audioEngine->setPatternRecorderIgnoreGroups(false);
     sceneModeGroupSnapshot.stripGroups.fill(-1);
     sceneModeGroupSnapshot.groupVolumes.fill(1.0f);
     sceneModeGroupSnapshot.groupMuted.fill(false);
     sceneRepeatCounts.fill(1);
-    sceneLengthModes.fill(static_cast<int>(SceneLengthMode::LongestStrip));
+    sceneLengthModes.fill(static_cast<int>(SceneLengthMode::ManualBars));
     sceneManualBars.fill(4);
     sceneAnchorStrips.fill(0);
+    sceneEditorStripAutomationExpanded.fill(true);
+    sceneEditorStripHeightExpanded.fill(false);
     loadPersistentDefaultPaths();
     loadPersistentControlPages();
     loadPersistentGlobalControls();
@@ -3086,6 +3189,10 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
     pendingPersistentGlobalControlsRestoreRemaining = 5;
     for (const auto* id : kPersistentGlobalControlParameterIds)
         parameters.addParameterListener(id, this);
+    forEachSceneAutosaveParameterId([this](const juce::String& id)
+    {
+        parameters.addParameterListener(id, this);
+    });
     setSwingDivisionSelection(swingDivisionSelection.load(std::memory_order_acquire));
     resetStepEditVelocityGestures();
 
@@ -3186,8 +3293,366 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
         if (isTimerRunning())
             startTimer(kGridRefreshMs);
     };
+
+    resetRuntimePresetStateToDefaults();
+    loadedPresetIndex = -1;
+    updateMonomeLEDs();
     
     // Don't connect yet - wait for prepareToPlay
+}
+
+void MlrVSTAudioProcessor::configureAudioEngineCallbacks(ModernAudioEngine& engine)
+{
+    engine.setSampleModeRenderCallback(
+        [this](int stripIndex,
+               juce::AudioBuffer<float>& output,
+               int startSample,
+               int numSamples,
+               const juce::AudioPlayHead::PositionInfo& positionInfo,
+               int64_t globalSampleStart,
+               double tempo,
+               double quantizeBeats)
+        {
+            renderSampleModeStrip(stripIndex,
+                                  output,
+                                  startSample,
+                                  numSamples,
+                                  positionInfo,
+                                  globalSampleStart,
+                                  tempo,
+                                  quantizeBeats);
+        });
+    engine.setSampleModeTriggerCallback(
+        [this](int stripIndex,
+               int column,
+               int sampleSliceId,
+               int64_t sampleStartSample,
+               int64_t triggerSample,
+               const juce::AudioPlayHead::PositionInfo& positionInfo,
+               bool isMomentaryStutter)
+        {
+            triggerSampleModeStripAtSample(stripIndex,
+                                           column,
+                                           sampleSliceId,
+                                           sampleStartSample,
+                                           triggerSample,
+                                           positionInfo,
+                                           isMomentaryStutter);
+        });
+    engine.setSampleModeStopCallback(
+        [this](int stripIndex, bool immediateStop)
+        {
+            stopSampleModeStrip(stripIndex, immediateStop);
+        });
+    engine.setPatternControlEventCallback(
+        [this](const PatternRecorder::Event& event)
+        {
+            playbackMonomeControlPatternEvent(event);
+        });
+}
+
+bool MlrVSTAudioProcessor::loadSampleFileIntoSampleModeEngine(SampleModeEngine& engine,
+                                                              const juce::File& file) const
+{
+    if (!safeFileExistsAsFile(file))
+        return false;
+
+    juce::AudioFormatManager formatManager;
+    formatManager.registerBasicFormats();
+    std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(file));
+    if (reader == nullptr || reader->lengthInSamples <= 0)
+        return false;
+
+    const int numSamples = juce::jlimit<int>(1,
+                                             std::numeric_limits<int>::max(),
+                                             static_cast<int>(reader->lengthInSamples));
+    const int sourceChannels = juce::jmax(1, static_cast<int>(reader->numChannels));
+    const int decodeChannels = juce::jmin(2, sourceChannels);
+    juce::AudioBuffer<float> sourceBuffer(decodeChannels, numSamples);
+    sourceBuffer.clear();
+    if (!reader->read(&sourceBuffer, 0, numSamples, 0, true, decodeChannels > 1))
+        return false;
+
+    juce::AudioBuffer<float> stereoBuffer(2, numSamples);
+    if (decodeChannels == 1)
+    {
+        stereoBuffer.copyFrom(0, 0, sourceBuffer, 0, 0, numSamples);
+        stereoBuffer.copyFrom(1, 0, sourceBuffer, 0, 0, numSamples);
+    }
+    else
+    {
+        stereoBuffer.copyFrom(0, 0, sourceBuffer, 0, 0, numSamples);
+        stereoBuffer.copyFrom(1, 0, sourceBuffer, 1, 0, numSamples);
+    }
+
+    return engine.loadSampleFromBuffer(stereoBuffer,
+                                       reader->sampleRate,
+                                       file.getFullPathName(),
+                                       file.getFileNameWithoutExtension());
+}
+
+bool MlrVSTAudioProcessor::applyFlipPresetStateXmlToSceneContext(SceneRenderContext& context,
+                                                                 int stripIndex,
+                                                                 const juce::XmlElement* flipStateXml)
+{
+    if (flipStateXml == nullptr
+        || context.engine == nullptr
+        || stripIndex < 0
+        || stripIndex >= MaxStrips)
+    {
+        return false;
+    }
+
+    auto* strip = context.engine->getStrip(stripIndex);
+    if (strip == nullptr)
+        return false;
+
+    strip->setPlayMode(EnhancedAudioStrip::PlayMode::Sample);
+    auto& sampleEngine = context.sampleModeEngines[static_cast<size_t>(stripIndex)];
+    if (sampleEngine == nullptr)
+    {
+        sampleEngine = std::make_unique<SampleModeEngine>();
+        if (currentSampleRate > 0.0)
+            sampleEngine->prepare(currentSampleRate, juce::jmax(1, getBlockSize()));
+    }
+
+    const auto persistentState = SampleModePersistentState::fromXml(*flipStateXml);
+    const juce::File sampleFile(persistentState.samplePath);
+    if (persistentState.samplePath.isNotEmpty())
+        context.currentStripFiles[static_cast<size_t>(stripIndex)] = sampleFile;
+
+    bool loaded = false;
+    const auto embeddedSample = flipStateXml->getStringAttribute(kEmbeddedFlipSampleAttr);
+    if (embeddedSample.isNotEmpty())
+    {
+        juce::AudioBuffer<float> buffer;
+        double sampleRate = 0.0;
+        if (decodeWavBase64ToBuffer(embeddedSample, buffer, sampleRate))
+            loaded = sampleEngine->loadSampleFromBuffer(buffer, sampleRate, {}, "Embedded Flip Sample");
+    }
+    else if (safeFileExistsAsFile(sampleFile))
+    {
+        loaded = loadSampleFileIntoSampleModeEngine(*sampleEngine, sampleFile);
+    }
+
+    if (!loaded && embeddedSample.isEmpty() && persistentState.samplePath.isNotEmpty())
+        return false;
+
+    sampleEngine->applyPersistentState(persistentState);
+    return true;
+}
+
+bool MlrVSTAudioProcessor::buildSceneRenderContext(SceneRenderContext& context,
+                                                   int mainPresetIndex,
+                                                   int sceneSlot,
+                                                   double hostPpqSnapshot,
+                                                   double hostTempoSnapshot,
+                                                   int64_t hostGlobalSampleSnapshot,
+                                                   SceneChainTransitionType transitionType,
+                                                   bool sequenceDriven,
+                                                   int sequenceStepIndex)
+{
+    context = {};
+    context.mainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
+    context.sceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    context.sequenceDriven = sequenceDriven;
+    context.sequenceStepIndex = sequenceStepIndex;
+    context.sceneStartPpqValid = std::isfinite(hostPpqSnapshot);
+    context.sceneStartPpq = context.sceneStartPpqValid ? hostPpqSnapshot : 0.0;
+    context.sceneTempo = (std::isfinite(hostTempoSnapshot) && hostTempoSnapshot > 0.0) ? hostTempoSnapshot : 120.0;
+    context.sceneStartSample = hostGlobalSampleSnapshot;
+    context.transitionType = transitionType;
+
+    context.engine = std::make_unique<ModernAudioEngine>();
+    configureAudioEngineCallbacks(*context.engine);
+    if (currentSampleRate > 0.0)
+        context.engine->prepareToPlay(currentSampleRate, juce::jmax(1, getBlockSize()));
+    context.engine->setPatternRecorderIgnoreGroups(false);
+
+    juce::AudioProcessorValueTreeState shadowParameters(*this,
+                                                        nullptr,
+                                                        juce::Identifier("MlrVSTScenePreload"),
+                                                        createParameterLayout());
+    shadowParameters.replaceState(parameters.copyState());
+
+    const int storageIndex = getSceneStoragePresetIndex(context.mainPresetIndex, context.sceneSlot);
+    if (!PresetStore::presetExists(storageIndex))
+        return false;
+
+    const bool loadSucceeded = PresetStore::loadPreset(
+        storageIndex,
+        MaxStrips,
+        context.engine.get(),
+        shadowParameters,
+        [&context](int stripIndex, const juce::File& sampleFile)
+        {
+            return context.engine != nullptr && context.engine->loadSampleToStrip(stripIndex, sampleFile);
+        },
+        [&context](int stripIndex, const juce::File& sampleFile)
+        {
+            if (stripIndex >= 0 && stripIndex < MaxStrips)
+                context.currentStripFiles[static_cast<size_t>(stripIndex)] = sampleFile;
+        },
+        [&context](int stripIndex,
+                   const juce::File& loopDir,
+                   const juce::File& stepDir,
+                   const juce::File& flipDir)
+        {
+            if (stripIndex < 0 || stripIndex >= MaxStrips)
+                return;
+
+            const auto idx = static_cast<size_t>(stripIndex);
+            context.recentLoopDirectories[idx] = loopDir;
+            context.recentStepDirectories[idx] = stepDir;
+            context.recentFlipDirectories[idx] = flipDir;
+        },
+        [this, &context](int stripIndex, const juce::XmlElement* flipStateXml)
+        {
+            applyFlipPresetStateXmlToSceneContext(context, stripIndex, flipStateXml);
+        },
+        [&context](int stripIndex, const juce::XmlElement* loopPitchStateXml)
+        {
+            if (stripIndex < 0 || stripIndex >= MaxStrips || loopPitchStateXml == nullptr)
+                return;
+
+            context.loopPitchStateXml[static_cast<size_t>(stripIndex)] =
+                std::make_unique<juce::XmlElement>(*loopPitchStateXml);
+        },
+        [&context](const juce::XmlElement& presetXml)
+        {
+            if (auto* sceneXml = presetXml.getChildByName("SceneChainState"))
+                context.sceneTimingStateXml = std::make_unique<juce::XmlElement>(*sceneXml);
+        },
+        [&context](const juce::MemoryBlock& scenePerformanceData)
+        {
+            context.scenePerformanceStateData = scenePerformanceData;
+        },
+        hostPpqSnapshot,
+        hostTempoSnapshot,
+        true,
+        hostGlobalSampleSnapshot);
+
+    if (!loadSucceeded || context.engine == nullptr)
+    {
+        context = {};
+        return false;
+    }
+
+    context.parameterState = shadowParameters.copyState();
+    context.engine->seedTransportState(hostGlobalSampleSnapshot >= 0 ? hostGlobalSampleSnapshot : 0,
+                                       hostPpqSnapshot);
+    return true;
+}
+
+void MlrVSTAudioProcessor::requestScenePreload(int mainPresetIndex,
+                                               int sceneSlot,
+                                               bool sequenceDriven,
+                                               int sequenceStepIndex,
+                                               double targetPpq,
+                                               double targetTempo,
+                                               int64_t targetSample,
+                                               SceneChainTransitionType transitionType)
+{
+    pendingScenePreloadMainPreset.store(mainPresetIndex, std::memory_order_release);
+    pendingScenePreloadSceneSlot.store(sceneSlot, std::memory_order_release);
+    pendingScenePreloadSequenceDriven.store(sequenceDriven ? 1 : 0, std::memory_order_release);
+    pendingScenePreloadSequenceStep.store(sequenceStepIndex, std::memory_order_release);
+    pendingScenePreloadTargetPpq.store(targetPpq, std::memory_order_release);
+    pendingScenePreloadTargetTempo.store(targetTempo, std::memory_order_release);
+    pendingScenePreloadTargetSample.store(targetSample, std::memory_order_release);
+    pendingScenePreloadTransitionType.store(static_cast<int>(transitionType), std::memory_order_release);
+    pendingScenePreloadDirty.store(1, std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::servicePendingScenePreloadRequest()
+{
+    if (pendingScenePreloadDirty.load(std::memory_order_acquire) == 0)
+        return;
+
+    const int mainPresetIndex = pendingScenePreloadMainPreset.load(std::memory_order_acquire);
+    const int sceneSlot = pendingScenePreloadSceneSlot.load(std::memory_order_acquire);
+    const bool sequenceDriven = pendingScenePreloadSequenceDriven.load(std::memory_order_acquire) != 0;
+    const int sequenceStepIndex = pendingScenePreloadSequenceStep.load(std::memory_order_acquire);
+    const double targetPpq = pendingScenePreloadTargetPpq.load(std::memory_order_acquire);
+    const double targetTempo = pendingScenePreloadTargetTempo.load(std::memory_order_acquire);
+    const int64_t targetSample = pendingScenePreloadTargetSample.load(std::memory_order_acquire);
+    const auto transitionType = static_cast<SceneChainTransitionType>(juce::jlimit(
+        0,
+        static_cast<int>(SceneChainTransitionType::Return),
+        pendingScenePreloadTransitionType.load(std::memory_order_acquire)));
+
+    auto matchesPreparedContext = [&](const std::unique_ptr<SceneRenderContext>& context) -> bool
+    {
+        const bool sampleMatches = context != nullptr
+            && ((context->sceneStartSample < 0 && targetSample < 0)
+                || (context->sceneStartSample >= 0
+                    && targetSample >= 0
+                    && (context->sceneStartSample - targetSample) >= -64
+                    && (context->sceneStartSample - targetSample) <= 64));
+        return context != nullptr
+            && context->mainPresetIndex == mainPresetIndex
+            && context->sceneSlot == sceneSlot
+            && context->sequenceDriven == sequenceDriven
+            && context->sequenceStepIndex == sequenceStepIndex
+            && context->transitionType == transitionType
+            && sampleMatches
+            && ((!std::isfinite(targetPpq) && !context->sceneStartPpqValid)
+                || (context->sceneStartPpqValid && std::abs(context->sceneStartPpq - targetPpq) <= 1.0e-9));
+    };
+
+    if (matchesPreparedContext(preparedSceneRenderContext))
+    {
+        pendingScenePreloadDirty.store(0, std::memory_order_release);
+        return;
+    }
+
+    if (mainPresetIndex < 0 || sceneSlot < 0 || currentSampleRate <= 0.0)
+        return;
+
+    auto preloaded = std::make_unique<SceneRenderContext>();
+    if (!buildSceneRenderContext(*preloaded,
+                                 mainPresetIndex,
+                                 sceneSlot,
+                                 targetPpq,
+                                 targetTempo,
+                                 targetSample,
+                                 transitionType,
+                                 sequenceDriven,
+                                 sequenceStepIndex))
+    {
+        preparedSceneRenderContext.reset();
+        return;
+    }
+
+    preparedSceneRenderContext = std::move(preloaded);
+    pendingScenePreloadDirty.store(0, std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::queuePendingSceneParameterState(const juce::ValueTree& state)
+{
+    const juce::ScopedLock lock(pendingSceneParameterStateLock);
+    pendingSceneParameterState = state.createCopy();
+    pendingSceneParameterStateDirty.store(pendingSceneParameterState.isValid() ? 1 : 0,
+                                          std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::applyPendingSceneParameterState()
+{
+    if (pendingSceneParameterStateDirty.load(std::memory_order_acquire) == 0)
+        return;
+
+    juce::ValueTree stateToApply;
+    {
+        const juce::ScopedLock lock(pendingSceneParameterStateLock);
+        stateToApply = pendingSceneParameterState;
+        pendingSceneParameterState = {};
+        pendingSceneParameterStateDirty.store(0, std::memory_order_release);
+    }
+
+    if (stateToApply.isValid())
+        parameters.replaceState(stateToApply);
+
+    suppressOwnedStripParameterSync.store(0, std::memory_order_release);
 }
 
 void MlrVSTAudioProcessor::cacheParameterPointers()
@@ -3255,6 +3720,23 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
 
 void MlrVSTAudioProcessor::parameterChanged(const juce::String& parameterID, float /*newValue*/)
 {
+    if (parameterID == "limiterThreshold")
+    {
+        if (auto* param = parameters.getParameter("limiterThreshold"))
+        {
+            const float currentValue = param->convertFrom0to1(param->getValue());
+            if (std::abs(currentValue) > 1.0e-4f)
+            {
+                suppressPersistentGlobalControlsSave.store(1, std::memory_order_release);
+                param->setValueNotifyingHost(param->convertTo0to1(0.0f));
+                suppressPersistentGlobalControlsSave.store(0, std::memory_order_release);
+            }
+        }
+    }
+
+    if (isSceneAutosaveParameterId(parameterID))
+        queueActiveSceneAutosave();
+
     if (!isPersistentGlobalControlParameterId(parameterID))
         return;
     persistentGlobalUserTouched.store(1, std::memory_order_release);
@@ -3266,6 +3748,124 @@ void MlrVSTAudioProcessor::markPersistentGlobalUserChange()
     persistentGlobalUserTouched.store(1, std::memory_order_release);
     persistentGlobalControlsReady.store(1, std::memory_order_release);
     queuePersistentGlobalControlsSave();
+}
+
+void MlrVSTAudioProcessor::queueActiveSceneAutosave()
+{
+    queueActiveSceneAutosave(0);
+}
+
+void MlrVSTAudioProcessor::queueActiveSceneAutosave(uint32_t additionalDelayMs)
+{
+    if (isSceneAutosaveSuppressed())
+        return;
+
+    const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    const uint32_t nowMs = juce::Time::getMillisecondCounter();
+    const uint32_t clampedDelayMs = juce::jmin<uint32_t>(additionalDelayMs, 8000u);
+    const uint32_t readyMs = nowMs + kSceneAutosaveDebounceMs + clampedDelayMs;
+
+    pendingActiveSceneAutosaveMainPreset.store(mainPresetIndex, std::memory_order_release);
+    pendingActiveSceneAutosaveSlot.store(safeSceneSlot, std::memory_order_release);
+    pendingActiveSceneAutosaveQueuedMs.store(readyMs, std::memory_order_release);
+    pendingActiveSceneAutosaveDirty.store(1, std::memory_order_release);
+
+    if (activeSceneMainPresetIndex == mainPresetIndex && activeSceneSlot == safeSceneSlot)
+        activeSceneNeedsCaptureBeforeManualRecall = true;
+}
+
+void MlrVSTAudioProcessor::clearPendingActiveSceneAutosave()
+{
+    pendingActiveSceneAutosaveDirty.store(0, std::memory_order_release);
+    pendingActiveSceneAutosaveMainPreset.store(-1, std::memory_order_release);
+    pendingActiveSceneAutosaveSlot.store(-1, std::memory_order_release);
+    pendingActiveSceneAutosaveQueuedMs.store(0, std::memory_order_release);
+}
+
+bool MlrVSTAudioProcessor::canPersistActiveSceneSnapshotSafely() const
+{
+    if (audioEngine == nullptr)
+        return false;
+
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        const auto* strip = audioEngine->getStrip(stripIndex);
+        if (strip == nullptr)
+            continue;
+
+        const auto playMode = strip->getPlayMode();
+        if (!(strip->hasAudio() || playMode == EnhancedAudioStrip::PlayMode::Sample))
+            continue;
+
+        const auto& sourceFile = currentStripFiles[static_cast<size_t>(stripIndex)];
+        if (isValidSceneStoredSamplePath(sourceFile))
+            continue;
+
+        const auto* audioBuffer = strip->getAudioBuffer();
+        if (audioBuffer != nullptr && canEmbedSceneAudioBuffer(*audioBuffer))
+            continue;
+
+        return false;
+    }
+
+    return true;
+}
+
+bool MlrVSTAudioProcessor::flushPendingActiveSceneAutosaveIfCurrent()
+{
+    if (pendingActiveSceneAutosaveDirty.load(std::memory_order_acquire) == 0)
+        return true;
+    if (isSceneAutosaveSuppressed())
+        return false;
+
+    const int queuedMainPreset = pendingActiveSceneAutosaveMainPreset.load(std::memory_order_acquire);
+    const int queuedSceneSlot = pendingActiveSceneAutosaveSlot.load(std::memory_order_acquire);
+    const int currentMainPreset = juce::jlimit(0, MaxPresetSlots - 1, activeSceneMainPresetIndex);
+    const int currentSceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    if (queuedMainPreset != currentMainPreset || queuedSceneSlot != currentSceneSlot)
+        return true;
+    if (!canPersistActiveSceneSnapshotSafely())
+        return false;
+
+    return saveSceneForMainPreset(currentMainPreset, currentSceneSlot);
+}
+
+void MlrVSTAudioProcessor::processPendingSceneAutosave()
+{
+    if (pendingActiveSceneAutosaveDirty.load(std::memory_order_acquire) == 0)
+        return;
+    if (isSceneAutosaveSuppressed() || activeSceneTransitionContext != nullptr || scenePerformanceRecorder.isRecording())
+        return;
+
+    const int queuedMainPreset = pendingActiveSceneAutosaveMainPreset.load(std::memory_order_acquire);
+    const int queuedSceneSlot = pendingActiveSceneAutosaveSlot.load(std::memory_order_acquire);
+    const int currentMainPreset = juce::jlimit(0, MaxPresetSlots - 1, activeSceneMainPresetIndex);
+    const int currentSceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    if (queuedMainPreset != currentMainPreset || queuedSceneSlot != currentSceneSlot)
+        return;
+
+    const uint32_t queuedMs = pendingActiveSceneAutosaveQueuedMs.load(std::memory_order_acquire);
+    const uint32_t nowMs = juce::Time::getMillisecondCounter();
+    if (queuedMs != 0 && static_cast<int32_t>(nowMs - queuedMs) < 0)
+        return;
+
+    flushPendingActiveSceneAutosaveIfCurrent();
+}
+
+void MlrVSTAudioProcessor::beginSceneAutosaveSuppression()
+{
+    sceneAutosaveSuppressionDepth.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void MlrVSTAudioProcessor::endSceneAutosaveSuppression()
+{
+    sceneAutosaveSuppressionDepth.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+bool MlrVSTAudioProcessor::isSceneAutosaveSuppressed() const
+{
+    return sceneAutosaveSuppressionDepth.load(std::memory_order_acquire) > 0;
 }
 
 void MlrVSTAudioProcessor::setGatePageMode(GatePageMode mode)
@@ -3310,6 +3910,10 @@ MlrVSTAudioProcessor::~MlrVSTAudioProcessor()
 {
     for (const auto* id : kPersistentGlobalControlParameterIds)
         parameters.removeParameterListener(id, this);
+    forEachSceneAutosaveParameterId([this](const juce::String& id)
+    {
+        parameters.removeParameterListener(id, this);
+    });
     if (persistentGlobalControlsDirty.load(std::memory_order_acquire) != 0)
         savePersistentControlPages();
     presetSaveThreadPool.removeAllJobs(true, 4000);
@@ -3398,11 +4002,6 @@ MlrVSTAudioProcessor::MacroTarget MlrVSTAudioProcessor::getDefaultMacroTarget(in
     return MacroTargetDispatcher::getDefaultMacroTarget(macroIndex);
 }
 
-int MlrVSTAudioProcessor::getDefaultModLaneSlotForMacroTarget(MacroTarget target)
-{
-    return MacroTargetDispatcher::getDefaultModLaneSlotForMacroTarget(target);
-}
-
 MlrVSTAudioProcessor::MacroTarget MlrVSTAudioProcessor::getMacroTarget(int macroIndex) const
 {
     if (macroIndex < 0 || macroIndex >= MacroCount)
@@ -3418,7 +4017,7 @@ void MlrVSTAudioProcessor::setMacroTarget(int macroIndex, MacroTarget target)
 
     const auto previousTarget = getMacroTarget(macroIndex);
     if (previousTarget == MacroTarget::Retrigger && audioEngine != nullptr)
-        audioEngine->setMacroRetriggerAmount(getMacroTargetStripIndex(), 0.0f);
+        setGlobalSceneStutterAmount(0.0f);
 
     macroTargetAssignments[static_cast<size_t>(macroIndex)].store(static_cast<int>(sanitizeMacroTarget(static_cast<int>(target))),
                                                                   std::memory_order_release);
@@ -3430,159 +4029,45 @@ float MlrVSTAudioProcessor::getDefaultMacroNormalizedValue(MacroTarget target)
     return MacroTargetDispatcher::getDefaultMacroNormalizedValue(target);
 }
 
-MlrVSTAudioProcessor::MacroLaneRecordStatus MlrVSTAudioProcessor::getMacroLaneRecordStatus(int macroIndex) const
+bool MlrVSTAudioProcessor::macroTargetWritesToSceneLane(MacroTarget target)
 {
-    MacroLaneRecordStatus status{};
-    if (macroIndex < 0 || macroIndex >= MacroCount)
-        return status;
-
-    const auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
-    status.armed = state.armed.load(std::memory_order_acquire) != 0;
-    status.recording = state.recording.load(std::memory_order_acquire) != 0;
-    status.stripIndex = state.stripIndex.load(std::memory_order_acquire);
-    status.laneSlot = state.laneSlot.load(std::memory_order_acquire);
-    status.target = sanitizeMacroPerformanceTarget(
-        performanceTargetFromRaw(state.target.load(std::memory_order_acquire)));
-    status.stepsWritten = state.stepsWritten.load(std::memory_order_acquire);
-    status.totalSteps = state.totalStepsToWrite.load(std::memory_order_acquire);
-    return status;
-}
-
-void MlrVSTAudioProcessor::resetMacroLaneRecordState(int macroIndex)
-{
-    if (macroIndex < 0 || macroIndex >= MacroCount)
-        return;
-
-    auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
-    state.armed.store(0, std::memory_order_release);
-    state.recording.store(0, std::memory_order_release);
-    state.stripIndex.store(-1, std::memory_order_release);
-    state.macroIndex.store(-1, std::memory_order_release);
-    state.laneSlot.store(0, std::memory_order_release);
-    state.target.store(static_cast<int>(MacroTarget::None), std::memory_order_release);
-    state.restoreDepth.store(1.0f, std::memory_order_release);
-    state.startPpq.store(-1.0, std::memory_order_release);
-    state.nextStepPpq.store(-1.0, std::memory_order_release);
-    state.nextStepIndex.store(-1, std::memory_order_release);
-    state.stepsWritten.store(0, std::memory_order_release);
-    state.totalStepsToWrite.store(0, std::memory_order_release);
-}
-
-int MlrVSTAudioProcessor::snapMacroLaneRecordingLengthBars(double recordedBeats)
-{
-    const double safeBeats = juce::jmax(0.0, recordedBeats);
-    const double recordedBars = safeBeats / 4.0;
-    return juce::jlimit(1, ModernAudioEngine::MaxModBars, static_cast<int>(std::round(recordedBars)));
-}
-
-void MlrVSTAudioProcessor::finishMacroLaneRecording(int macroIndex, bool activateLane)
-{
-    if (macroIndex < 0 || macroIndex >= MacroCount)
-        return;
-
-    auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
-    const int stripIndex = state.stripIndex.load(std::memory_order_acquire);
-    const int laneSlot = state.laneSlot.load(std::memory_order_acquire);
-    const float restoreDepth = juce::jlimit(0.0f, 1.0f, state.restoreDepth.load(std::memory_order_acquire));
-    if (audioEngine && stripIndex >= 0 && stripIndex < MaxStrips)
+    switch (sanitizeMacroPerformanceTarget(target))
     {
-        const double stepLengthBeats = audioEngine->getModStepLengthBeats(stripIndex, laneSlot);
-        const int stepsWritten = juce::jmax(0, state.stepsWritten.load(std::memory_order_acquire));
-        double recordedBeats = static_cast<double>(stepsWritten) * juce::jmax(0.0, stepLengthBeats);
-
-        const double startPpq = state.startPpq.load(std::memory_order_acquire);
-        const double endPpq = audioEngine->getTimelineBeat();
-        if (std::isfinite(startPpq) && std::isfinite(endPpq))
-            recordedBeats = juce::jmax(recordedBeats, juce::jmax(stepLengthBeats, endPpq - startPpq));
-
-        audioEngine->setModLengthBarsForSlot(stripIndex,
-                                             laneSlot,
-                                             snapMacroLaneRecordingLengthBars(recordedBeats));
-
-        if (activateLane)
-            audioEngine->setModDepthForSlot(stripIndex, laneSlot, restoreDepth > 0.0f ? restoreDepth : 1.0f);
+        case MacroTarget::Speed:
+        case MacroTarget::Pitch:
+        case MacroTarget::Pan:
+        case MacroTarget::Volume:
+        case MacroTarget::Cutoff:
+        case MacroTarget::Resonance:
+        case MacroTarget::FilterMorph:
+        case MacroTarget::SliceLength:
+        case MacroTarget::Retrigger:
+        case MacroTarget::Scratch:
+        case MacroTarget::DelayMix:
+        case MacroTarget::DelayTime:
+        case MacroTarget::DelayFeedback:
+        case MacroTarget::DelayLowCut:
+        case MacroTarget::DelayHighCut:
+        case MacroTarget::GrainSize:
+        case MacroTarget::GrainDensity:
+        case MacroTarget::GrainPitch:
+        case MacroTarget::GrainPitchJitter:
+        case MacroTarget::GrainSpread:
+        case MacroTarget::GrainJitter:
+        case MacroTarget::GrainPositionJitter:
+        case MacroTarget::GrainRandom:
+        case MacroTarget::GrainArp:
+        case MacroTarget::GrainCloud:
+        case MacroTarget::GrainEmitter:
+        case MacroTarget::GrainEnvelope:
+        case MacroTarget::GrainShape:
+            return true;
+        case MacroTarget::FilterEnable:
+        case MacroTarget::Rearrange:
+        case MacroTarget::None:
+        default:
+            return false;
     }
-
-    resetMacroLaneRecordState(macroIndex);
-}
-
-void MlrVSTAudioProcessor::beginMacroLaneRecording(int macroIndex, int laneSlot)
-{
-    if (!audioEngine || macroIndex < 0 || macroIndex >= MacroCount)
-        return;
-
-    const auto target = getMacroTarget(macroIndex);
-    if (target == MacroTarget::None || !performanceTargetAllowsModLane(target))
-    {
-        cancelMacroLaneRecording(macroIndex);
-        return;
-    }
-
-    const int stripIndex = getMacroTargetStripIndex();
-    if (stripIndex < 0 || stripIndex >= MaxStrips || audioEngine->getStrip(stripIndex) == nullptr)
-        return;
-
-    const int linkedLane = getDefaultModLaneSlotForMacroTarget(target);
-    const int safeLane = linkedLane >= 0
-        ? linkedLane
-        : juce::jlimit(0, ModernAudioEngine::NumModSequencers - 1, laneSlot);
-    for (int i = 0; i < MacroCount; ++i)
-    {
-        if (i == macroIndex)
-            continue;
-
-        const auto status = getMacroLaneRecordStatus(i);
-        if ((status.armed || status.recording)
-            && status.stripIndex == stripIndex
-            && status.laneSlot == safeLane)
-        {
-            if (status.recording)
-                stopMacroLaneRecording(i);
-            else
-                cancelMacroLaneRecording(i);
-        }
-    }
-
-    resetMacroLaneRecordState(macroIndex);
-    auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
-    state.stripIndex.store(stripIndex, std::memory_order_release);
-    state.macroIndex.store(macroIndex, std::memory_order_release);
-    state.laneSlot.store(safeLane, std::memory_order_release);
-    state.target.store(static_cast<int>(target), std::memory_order_release);
-    state.armed.store(1, std::memory_order_release);
-}
-
-void MlrVSTAudioProcessor::stopMacroLaneRecording(int macroIndex)
-{
-    if (macroIndex < 0 || macroIndex >= MacroCount)
-        return;
-
-    const auto status = getMacroLaneRecordStatus(macroIndex);
-    if (status.recording)
-    {
-        finishMacroLaneRecording(macroIndex, true);
-        return;
-    }
-
-    cancelMacroLaneRecording(macroIndex);
-}
-
-void MlrVSTAudioProcessor::cancelMacroLaneRecording(int macroIndex)
-{
-    if (macroIndex < 0 || macroIndex >= MacroCount)
-        return;
-
-    const auto status = getMacroLaneRecordStatus(macroIndex);
-    if (status.recording && audioEngine && status.stripIndex >= 0 && status.stripIndex < MaxStrips)
-    {
-        const auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
-        const float restoreDepth = juce::jlimit(0.0f, 1.0f, state.restoreDepth.load(std::memory_order_acquire));
-        audioEngine->setModDepthForSlot(status.stripIndex,
-                                        status.laneSlot,
-                                        restoreDepth > 0.0f ? restoreDepth : 1.0f);
-    }
-
-    resetMacroLaneRecordState(macroIndex);
 }
 
 void MlrVSTAudioProcessor::beginMacroMidiLearn(int macroIndex)
@@ -3614,6 +4099,595 @@ int MlrVSTAudioProcessor::getMacroTargetStripIndex() const
     const int activeStripCount = getMonomeActiveStripCount();
     const int maxStripIndex = (activeStripCount > 0) ? (activeStripCount - 1) : (MaxStrips - 1);
     return juce::jlimit(0, juce::jmax(0, maxStripIndex), getLastMonomePressedStripRow());
+}
+
+namespace
+{
+float smoothSceneTransitionProgress(float progress)
+{
+    const float clamped = juce::jlimit(0.0f, 1.0f, progress);
+    return clamped * clamped * (3.0f - (2.0f * clamped));
+}
+
+double sceneChainTransitionLeadBeatsRuntime(MlrVSTAudioProcessor::SceneChainTransitionType type,
+                                            float lengthBeats)
+{
+    float safeLengthBeats = lengthBeats;
+    if (!std::isfinite(safeLengthBeats))
+        safeLengthBeats = MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats;
+    safeLengthBeats = juce::jlimit(MlrVSTAudioProcessor::MinSceneTransitionLengthBeats,
+                                   MlrVSTAudioProcessor::MaxSceneTransitionLengthBeats,
+                                   safeLengthBeats);
+    const double requestedLength = static_cast<double>(safeLengthBeats);
+    const auto safeType = static_cast<MlrVSTAudioProcessor::SceneChainTransitionType>(juce::jlimit(
+        0,
+        static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionType::Return),
+        static_cast<int>(type)));
+
+    switch (safeType)
+    {
+        case MlrVSTAudioProcessor::SceneChainTransitionType::Fill:       return juce::jlimit(0.25, 8.0, requestedLength);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::Stutter:    return juce::jlimit(0.25, 6.0, requestedLength);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::FilterRise: return juce::jlimit(0.25, 8.0, requestedLength);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::Drop:       return juce::jlimit(0.25, 6.0, requestedLength);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::MuteTail:   return juce::jlimit(0.25, 4.0, requestedLength);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::Break:      return juce::jlimit(0.25, 8.0, requestedLength);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::None:
+        case MlrVSTAudioProcessor::SceneChainTransitionType::Return:
+        default:
+            return 0.0;
+    }
+}
+
+float sceneTransitionRhythmicPulse(double beatsSinceStart,
+                                   double subdivisionBeats,
+                                   float sharpness)
+{
+    if (!std::isfinite(beatsSinceStart) || !std::isfinite(subdivisionBeats) || subdivisionBeats <= 1.0e-6)
+        return 0.0f;
+
+    double cycle = std::fmod(beatsSinceStart / subdivisionBeats, 1.0);
+    if (cycle < 0.0)
+        cycle += 1.0;
+
+    const float triangle = 1.0f - std::abs(static_cast<float>((cycle * 2.0) - 1.0));
+    return std::pow(juce::jlimit(0.0f, 1.0f, triangle),
+                    juce::jlimit(0.4f, 6.0f, sharpness));
+}
+
+MlrVSTAudioProcessor::SceneChainTransitionType sanitizeRuntimeSceneChainTransitionType(int rawType)
+{
+    return static_cast<MlrVSTAudioProcessor::SceneChainTransitionType>(juce::jlimit(
+        0,
+        static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionType::Return),
+        rawType));
+}
+
+MlrVSTAudioProcessor::SceneChainTransitionOption sanitizeRuntimeSceneChainTransitionOption(int rawOption)
+{
+    return static_cast<MlrVSTAudioProcessor::SceneChainTransitionOption>(juce::jlimit(
+        0,
+        static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionOption::Gate),
+        rawOption));
+}
+
+float sanitizeRuntimeSceneChainTransitionLengthBeats(float beats)
+{
+    if (!std::isfinite(beats))
+        beats = MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats;
+    return juce::jlimit(MlrVSTAudioProcessor::MinSceneTransitionLengthBeats,
+                        MlrVSTAudioProcessor::MaxSceneTransitionLengthBeats,
+                        beats);
+}
+
+float sanitizeRuntimeSceneChainTransitionAmount(float amount, float fallback)
+{
+    if (!std::isfinite(amount))
+        amount = fallback;
+    return juce::jlimit(0.0f, 1.0f, amount);
+}
+
+struct SceneChainTransitionRuntimeProfile
+{
+    float depthScale = 1.0f;
+    float delayScale = 1.0f;
+    float filterScale = 1.0f;
+    float stutterScale = 1.0f;
+    float gateScale = 1.0f;
+};
+
+SceneChainTransitionRuntimeProfile sceneChainTransitionRuntimeProfile(MlrVSTAudioProcessor::SceneChainTransitionOption option)
+{
+    switch (sanitizeRuntimeSceneChainTransitionOption(static_cast<int>(option)))
+    {
+        case MlrVSTAudioProcessor::SceneChainTransitionOption::Snap:    return { 0.62f, 0.42f, 0.68f, 0.82f, 0.88f };
+        case MlrVSTAudioProcessor::SceneChainTransitionOption::Tight:   return { 0.78f, 0.58f, 0.82f, 0.88f, 0.92f };
+        case MlrVSTAudioProcessor::SceneChainTransitionOption::Wide:    return { 1.10f, 0.96f, 1.08f, 0.96f, 0.92f };
+        case MlrVSTAudioProcessor::SceneChainTransitionOption::Wash:    return { 1.30f, 1.48f, 1.18f, 0.76f, 0.70f };
+        case MlrVSTAudioProcessor::SceneChainTransitionOption::Echo:    return { 1.04f, 1.86f, 0.90f, 0.72f, 0.76f };
+        case MlrVSTAudioProcessor::SceneChainTransitionOption::Sweep:   return { 1.02f, 0.86f, 1.72f, 0.74f, 0.80f };
+        case MlrVSTAudioProcessor::SceneChainTransitionOption::Gate:    return { 0.96f, 0.56f, 0.78f, 1.18f, 1.26f };
+        case MlrVSTAudioProcessor::SceneChainTransitionOption::Default:
+        default:
+            return { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+    }
+}
+
+double sceneChainTransitionCrossfadeSeconds(MlrVSTAudioProcessor::SceneChainTransitionType type,
+                                            float lengthBeats,
+                                            float intensity,
+                                            double tempo)
+{
+    const double safeTempo = (std::isfinite(tempo) && tempo > 0.0) ? tempo : 120.0;
+    const double requestedLengthSeconds
+        = (sceneChainTransitionLeadBeatsRuntime(type, lengthBeats) * 60.0) / safeTempo;
+    const double intensityScale = 0.45 + (0.85 * static_cast<double>(sanitizeRuntimeSceneChainTransitionAmount(
+        intensity,
+        MlrVSTAudioProcessor::DefaultSceneTransitionIntensity)));
+    const double baseSeconds = 0.05 + (requestedLengthSeconds * (0.38 + (0.34 * intensityScale)));
+
+    switch (sanitizeRuntimeSceneChainTransitionType(static_cast<int>(type)))
+    {
+        case MlrVSTAudioProcessor::SceneChainTransitionType::Fill:
+            return juce::jlimit(0.16, 2.80, baseSeconds * 1.08);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::Stutter:
+            return juce::jlimit(0.12, 1.70, baseSeconds * 0.86);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::FilterRise:
+            return juce::jlimit(0.18, 3.00, baseSeconds * 1.22);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::Drop:
+            return juce::jlimit(0.14, 2.20, baseSeconds * 1.00);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::MuteTail:
+            return juce::jlimit(0.12, 1.50, baseSeconds * 0.74);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::Break:
+            return juce::jlimit(0.16, 2.40, baseSeconds * 1.04);
+        case MlrVSTAudioProcessor::SceneChainTransitionType::None:
+        case MlrVSTAudioProcessor::SceneChainTransitionType::Return:
+        default:
+            return juce::jlimit(0.09, 0.32, baseSeconds * 0.62);
+    }
+}
+} // namespace
+
+void MlrVSTAudioProcessor::updateEffectiveSceneStutterAmount()
+{
+    if (audioEngine == nullptr)
+        return;
+
+    const float baseAmount = juce::jlimit(0.0f, 1.0f, sceneGlobalStutterBaseAmount.load(std::memory_order_acquire));
+    const float overlayAmount = juce::jlimit(0.0f, 1.0f, sceneTransitionStutterOverlayAmount.load(std::memory_order_acquire));
+    const float effectiveAmount = juce::jmax(baseAmount, overlayAmount);
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+        audioEngine->setMacroRetriggerAmount(stripIndex, effectiveAmount);
+}
+
+void MlrVSTAudioProcessor::setSceneTransitionStutterOverlayAmount(float amount01)
+{
+    const float clamped = juce::jlimit(0.0f, 1.0f, amount01);
+    const float previous = sceneTransitionStutterOverlayAmount.load(std::memory_order_acquire);
+    if (std::abs(previous - clamped) <= 1.0e-4f)
+        return;
+
+    sceneTransitionStutterOverlayAmount.store(clamped, std::memory_order_release);
+    updateEffectiveSceneStutterAmount();
+}
+
+void MlrVSTAudioProcessor::setGlobalSceneStutterAmount(float amount01)
+{
+    const float clamped = juce::jlimit(0.0f, 1.0f, amount01);
+    sceneGlobalStutterBaseAmount.store(clamped, std::memory_order_release);
+    if (audioEngine == nullptr)
+        return;
+
+    updateEffectiveSceneStutterAmount();
+}
+
+float MlrVSTAudioProcessor::getGlobalSceneStutterAmount() const
+{
+    const float baseAmount = juce::jlimit(0.0f, 1.0f, sceneGlobalStutterBaseAmount.load(std::memory_order_acquire));
+    const float overlayAmount = juce::jlimit(0.0f, 1.0f, sceneTransitionStutterOverlayAmount.load(std::memory_order_acquire));
+    return juce::jmax(baseAmount, overlayAmount);
+}
+
+void MlrVSTAudioProcessor::clearSceneBoundaryTransitionState(bool clearBlendSuppression)
+{
+    sceneBoundaryTransitionType.store(static_cast<int>(SceneChainTransitionType::None), std::memory_order_release);
+    sceneBoundaryTransitionOption.store(static_cast<int>(SceneChainTransitionOption::Default), std::memory_order_release);
+    sceneBoundaryTransitionFromStep.store(-1, std::memory_order_release);
+    sceneBoundaryTransitionToStep.store(-1, std::memory_order_release);
+    sceneBoundaryTransitionStartPpq.store(-1.0, std::memory_order_release);
+    sceneBoundaryTransitionTargetPpq.store(-1.0, std::memory_order_release);
+    sceneBoundaryTransitionStartSample.store(-1, std::memory_order_release);
+    sceneBoundaryTransitionTargetSample.store(-1, std::memory_order_release);
+    sceneBoundaryTransitionTempo.store(120.0, std::memory_order_release);
+    sceneBoundaryTransitionLengthBeats.store(DefaultSceneTransitionLengthBeats, std::memory_order_release);
+    sceneBoundaryTransitionIntensity.store(DefaultSceneTransitionIntensity, std::memory_order_release);
+    sceneBoundaryTransitionDelayAmount.store(DefaultSceneTransitionDelayAmount, std::memory_order_release);
+    sceneBoundaryTransitionFilterAmount.store(DefaultSceneTransitionFilterAmount, std::memory_order_release);
+    sceneBoundaryTransitionChopAmount.store(DefaultSceneTransitionChopAmount, std::memory_order_release);
+    if (clearBlendSuppression)
+        suppressSceneRecallBlendOnNextLoad.store(0, std::memory_order_release);
+    setSceneTransitionStutterOverlayAmount(0.0f);
+}
+
+void MlrVSTAudioProcessor::armSceneBoundaryTransition(SceneChainTransitionType type,
+                                                      SceneChainTransitionOption option,
+                                                      float lengthBeats,
+                                                      float intensity,
+                                                      float delayAmount,
+                                                      float filterAmount,
+                                                      float chopAmount,
+                                                      int fromStepIndex,
+                                                      int toStepIndex,
+                                                      double targetPpq,
+                                                      double targetTempo,
+                                                      double leadBeats,
+                                                      int64_t targetSample)
+{
+    const auto safeType = sanitizeRuntimeSceneChainTransitionType(static_cast<int>(type));
+    if (safeType == SceneChainTransitionType::None || safeType == SceneChainTransitionType::Return)
+    {
+        clearSceneBoundaryTransitionState();
+        return;
+    }
+
+    const double safeLeadBeats = juce::jlimit(0.0, 16.0, leadBeats);
+    const double safeTargetPpq = (std::isfinite(targetPpq) && targetPpq >= 0.0) ? targetPpq : -1.0;
+    double startPpq = -1.0;
+    if (safeTargetPpq >= 0.0)
+        startPpq = juce::jmax(0.0, safeTargetPpq - safeLeadBeats);
+
+    int64_t startSample = -1;
+    if (targetSample >= 0 && currentSampleRate > 0.0 && std::isfinite(targetTempo) && targetTempo > 0.0)
+    {
+        const double leadSeconds = (safeLeadBeats * 60.0) / targetTempo;
+        const int64_t leadSamples = static_cast<int64_t>(std::llround(leadSeconds * currentSampleRate));
+        startSample = juce::jmax<int64_t>(0, targetSample - juce::jmax<int64_t>(0, leadSamples));
+    }
+
+    sceneBoundaryTransitionType.store(static_cast<int>(safeType), std::memory_order_release);
+    sceneBoundaryTransitionOption.store(static_cast<int>(sanitizeRuntimeSceneChainTransitionOption(static_cast<int>(option))),
+                                        std::memory_order_release);
+    sceneBoundaryTransitionLengthBeats.store(sanitizeRuntimeSceneChainTransitionLengthBeats(lengthBeats),
+                                             std::memory_order_release);
+    sceneBoundaryTransitionIntensity.store(sanitizeRuntimeSceneChainTransitionAmount(
+                                               intensity,
+                                               DefaultSceneTransitionIntensity),
+                                           std::memory_order_release);
+    sceneBoundaryTransitionDelayAmount.store(sanitizeRuntimeSceneChainTransitionAmount(
+                                                 delayAmount,
+                                                 DefaultSceneTransitionDelayAmount),
+                                             std::memory_order_release);
+    sceneBoundaryTransitionFilterAmount.store(sanitizeRuntimeSceneChainTransitionAmount(
+                                                  filterAmount,
+                                                  DefaultSceneTransitionFilterAmount),
+                                              std::memory_order_release);
+    sceneBoundaryTransitionChopAmount.store(sanitizeRuntimeSceneChainTransitionAmount(
+                                                chopAmount,
+                                                DefaultSceneTransitionChopAmount),
+                                            std::memory_order_release);
+    sceneBoundaryTransitionFromStep.store(fromStepIndex, std::memory_order_release);
+    sceneBoundaryTransitionToStep.store(toStepIndex, std::memory_order_release);
+    sceneBoundaryTransitionStartPpq.store(startPpq, std::memory_order_release);
+    sceneBoundaryTransitionTargetPpq.store(safeTargetPpq, std::memory_order_release);
+    sceneBoundaryTransitionStartSample.store(startSample, std::memory_order_release);
+    sceneBoundaryTransitionTargetSample.store(targetSample, std::memory_order_release);
+    sceneBoundaryTransitionTempo.store((std::isfinite(targetTempo) && targetTempo > 0.0) ? targetTempo : 120.0,
+                                       std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::armSceneChainReturnOverride(int sourceStepIndex, int triggerStepIndex)
+{
+    sceneChainReturnOverrideSourceStep.store(sourceStepIndex, std::memory_order_release);
+    sceneChainReturnOverrideTriggerStep.store(triggerStepIndex, std::memory_order_release);
+    sceneChainReturnOverrideActive.store((sourceStepIndex >= 0 && triggerStepIndex >= 0) ? 1 : 0,
+                                         std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::clearSceneChainReturnOverride()
+{
+    sceneChainReturnOverrideActive.store(0, std::memory_order_release);
+    sceneChainReturnOverrideSourceStep.store(-1, std::memory_order_release);
+    sceneChainReturnOverrideTriggerStep.store(-1, std::memory_order_release);
+}
+
+bool MlrVSTAudioProcessor::consumeSceneChainReturnOverrideForStep(int currentStepIndex, int& outNextStepIndex)
+{
+    if (sceneChainReturnOverrideActive.load(std::memory_order_acquire) == 0)
+        return false;
+
+    const int triggerStepIndex = sceneChainReturnOverrideTriggerStep.load(std::memory_order_acquire);
+    if (currentStepIndex != triggerStepIndex)
+        return false;
+
+    outNextStepIndex = sceneChainReturnOverrideSourceStep.load(std::memory_order_acquire);
+    clearSceneChainReturnOverride();
+    return outNextStepIndex >= 0;
+}
+
+void MlrVSTAudioProcessor::applySceneBoundaryTransitionOverlay(const juce::AudioPlayHead::PositionInfo& posInfo,
+                                                               int /*numSamples*/)
+{
+    if (audioEngine == nullptr)
+    {
+        setSceneTransitionStutterOverlayAmount(0.0f);
+        return;
+    }
+
+    const auto transitionType = sanitizeRuntimeSceneChainTransitionType(
+        sceneBoundaryTransitionType.load(std::memory_order_acquire));
+    const auto transitionOption = sanitizeRuntimeSceneChainTransitionOption(
+        sceneBoundaryTransitionOption.load(std::memory_order_acquire));
+    const auto transitionProfile = sceneChainTransitionRuntimeProfile(transitionOption);
+    const float transitionLengthBeats = sanitizeRuntimeSceneChainTransitionLengthBeats(
+        sceneBoundaryTransitionLengthBeats.load(std::memory_order_acquire));
+    const float transitionIntensity = sanitizeRuntimeSceneChainTransitionAmount(
+        sceneBoundaryTransitionIntensity.load(std::memory_order_acquire),
+        DefaultSceneTransitionIntensity);
+    const float transitionDelayAmount = sanitizeRuntimeSceneChainTransitionAmount(
+        sceneBoundaryTransitionDelayAmount.load(std::memory_order_acquire),
+        DefaultSceneTransitionDelayAmount);
+    const float transitionFilterAmount = sanitizeRuntimeSceneChainTransitionAmount(
+        sceneBoundaryTransitionFilterAmount.load(std::memory_order_acquire),
+        DefaultSceneTransitionFilterAmount);
+    const float transitionChopAmount = sanitizeRuntimeSceneChainTransitionAmount(
+        sceneBoundaryTransitionChopAmount.load(std::memory_order_acquire),
+        DefaultSceneTransitionChopAmount);
+    if (transitionType == SceneChainTransitionType::None
+        || transitionType == SceneChainTransitionType::Return)
+    {
+        setSceneTransitionStutterOverlayAmount(0.0f);
+        return;
+    }
+
+    double currentPpq = audioEngine->getTimelineBeat();
+    if (posInfo.getPpqPosition().hasValue())
+        currentPpq = *posInfo.getPpqPosition();
+    const int64_t currentSample = audioEngine->getGlobalSampleCount();
+
+    const double targetPpq = sceneBoundaryTransitionTargetPpq.load(std::memory_order_acquire);
+    const int64_t targetSample = sceneBoundaryTransitionTargetSample.load(std::memory_order_acquire);
+    const double transitionTempo = sceneBoundaryTransitionTempo.load(std::memory_order_acquire);
+    const double leadBeats = sceneChainTransitionLeadBeatsRuntime(transitionType, transitionLengthBeats);
+    double startPpq = sceneBoundaryTransitionStartPpq.load(std::memory_order_acquire);
+    if (std::isfinite(targetPpq) && targetPpq >= 0.0 && leadBeats > 0.0)
+        startPpq = juce::jmax(0.0, targetPpq - leadBeats);
+
+    int64_t startSample = sceneBoundaryTransitionStartSample.load(std::memory_order_acquire);
+    if (targetSample >= 0
+        && currentSampleRate > 0.0
+        && std::isfinite(transitionTempo)
+        && transitionTempo > 0.0
+        && leadBeats > 0.0)
+    {
+        const double leadSeconds = (leadBeats * 60.0) / transitionTempo;
+        const int64_t leadSamples = static_cast<int64_t>(std::llround(leadSeconds * currentSampleRate));
+        startSample = juce::jmax<int64_t>(0, targetSample - juce::jmax<int64_t>(0, leadSamples));
+    }
+
+    float progress = 0.0f;
+    if (std::isfinite(currentPpq)
+        && std::isfinite(startPpq)
+        && std::isfinite(targetPpq)
+        && targetPpq >= startPpq
+        && targetPpq >= 0.0)
+    {
+        if (currentPpq >= targetPpq - 1.0e-6)
+            progress = 1.0f;
+        else if (currentPpq > startPpq + 1.0e-6)
+            progress = static_cast<float>((currentPpq - startPpq)
+                                          / juce::jmax(1.0e-9, targetPpq - startPpq));
+    }
+    else if (startSample >= 0 && targetSample >= startSample && currentSample >= 0)
+    {
+        if (currentSample >= targetSample)
+            progress = 1.0f;
+        else if (currentSample > startSample)
+            progress = static_cast<float>(
+                static_cast<double>(currentSample - startSample)
+                / static_cast<double>(juce::jmax<int64_t>(1, targetSample - startSample)));
+    }
+
+    progress = juce::jlimit(0.0f, 1.0f, progress);
+    if (progress <= 0.0f)
+    {
+        setSceneTransitionStutterOverlayAmount(0.0f);
+        return;
+    }
+
+    const float eased = smoothSceneTransitionProgress(progress);
+    const float attackWindow = smoothSceneTransitionProgress(juce::jlimit(0.0f, 1.0f, progress / 0.16f));
+    const float releaseWindow = 1.0f
+        - smoothSceneTransitionProgress(juce::jlimit(0.0f, 1.0f, (progress - 0.84f) / 0.16f));
+    const float overlayWindow = juce::jlimit(0.0f, 1.0f, attackWindow * releaseWindow);
+    const float baseBody = juce::jlimit(0.0f,
+                                        1.0f,
+                                        juce::jmax(eased,
+                                                   juce::jmax(std::pow(progress, 0.62f),
+                                                              std::sin(progress * juce::MathConstants<float>::pi))));
+    const float body = juce::jlimit(0.0f, 1.0f, baseBody * overlayWindow);
+    double beatsSinceStart = std::numeric_limits<double>::quiet_NaN();
+    if (std::isfinite(currentPpq) && std::isfinite(startPpq))
+        beatsSinceStart = juce::jmax(0.0, currentPpq - startPpq);
+    else if (currentSample >= 0
+             && startSample >= 0
+             && std::isfinite(transitionTempo)
+             && transitionTempo > 0.0
+             && currentSampleRate > 0.0)
+        beatsSinceStart = (static_cast<double>(currentSample - startSample) * transitionTempo)
+            / (60.0 * currentSampleRate);
+
+    const double pulseSpacingBeats = juce::jmax(
+        1.0 / 16.0,
+        leadBeats / juce::jlimit(2.0, 12.0, 2.0 + (10.0 * static_cast<double>(transitionChopAmount))));
+    const float rhythmicPulse = sceneTransitionRhythmicPulse(
+        beatsSinceStart,
+        pulseSpacingBeats,
+        0.8f + (3.4f * transitionChopAmount));
+    const float gatePulse = juce::jlimit(0.0f, 1.0f, 0.18f + (0.82f * rhythmicPulse));
+    const float transitionDrive = juce::jlimit(0.0f, 1.0f,
+                                               (0.24f + (0.76f * transitionIntensity))
+                                                   * transitionProfile.depthScale);
+    const float delayEffect = juce::jlimit(0.0f, 1.0f,
+                                           body * transitionProfile.delayScale
+                                               * transitionDrive
+                                               * (0.22f + (0.78f * transitionDelayAmount)));
+    const float filterEffect = juce::jlimit(0.0f, 1.0f,
+                                            body * transitionProfile.filterScale
+                                                * transitionDrive
+                                                * (0.22f + (0.78f * transitionFilterAmount)));
+    const float chopEffect = juce::jlimit(0.0f, 1.0f,
+                                          body * transitionProfile.stutterScale
+                                              * transitionDrive
+                                              * (0.18f + (0.82f * transitionChopAmount)));
+    const float duckEffect = juce::jlimit(0.0f, 1.0f,
+                                          body * transitionProfile.gateScale
+                                              * transitionDrive
+                                              * (0.18f + (0.82f * transitionChopAmount)));
+    float stutterOverlayAmount = 0.0f;
+
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        auto* strip = audioEngine->getStrip(stripIndex);
+        if (strip == nullptr)
+            continue;
+
+        const bool stepMode = strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step;
+        auto* stepSampler = stepMode ? strip->getStepSampler() : nullptr;
+        const bool hasPlayableContent = strip->hasAudio() || (stepSampler != nullptr && stepSampler->getHasAudio());
+        if (!hasPlayableContent)
+            continue;
+
+        float targetVolume = strip->getVolume();
+        float targetFilterFrequency = strip->getFilterFrequency();
+        float targetFilterResonance = strip->getFilterResonance();
+        float targetDelayMix = strip->getDelayMix();
+        float targetDelayFeedback = strip->getDelayFeedback();
+        bool applyFilter = false;
+
+        switch (transitionType)
+        {
+            case SceneChainTransitionType::Fill:
+                targetVolume = juce::jlimit(0.0f, 1.0f,
+                                            targetVolume * (1.0f - ((0.05f + (0.12f * transitionDrive)) * duckEffect)));
+                targetFilterFrequency = juce::jmap(filterEffect, 20000.0f, 1200.0f);
+                targetFilterResonance = juce::jmap(filterEffect, 0.82f, 1.92f);
+                targetDelayMix = juce::jlimit(0.0f, 1.0f,
+                                              targetDelayMix + ((0.30f + (0.40f * transitionDrive)) * delayEffect));
+                targetDelayFeedback = juce::jlimit(0.0f,
+                                                   0.97f,
+                                                   targetDelayFeedback + ((0.20f + (0.34f * transitionDrive)) * delayEffect));
+                stutterOverlayAmount = juce::jmax(stutterOverlayAmount,
+                                                  juce::jlimit(0.0f,
+                                                               1.0f,
+                                                               (0.04f + (0.14f * transitionDrive)) * chopEffect * gatePulse));
+                applyFilter = true;
+                break;
+            case SceneChainTransitionType::Stutter:
+                targetVolume = juce::jlimit(0.0f, 1.0f,
+                                            targetVolume * juce::jlimit(0.14f,
+                                                                        1.0f,
+                                                                        (0.34f + (0.66f * gatePulse))
+                                                                            * (1.0f - ((0.08f + (0.18f * transitionDrive)) * duckEffect))));
+                targetFilterFrequency = juce::jmap(filterEffect, 18000.0f, 4200.0f);
+                targetFilterResonance = juce::jmap(filterEffect, 0.82f, 1.52f);
+                targetDelayMix = juce::jlimit(0.0f, 1.0f,
+                                              targetDelayMix + ((0.08f + (0.18f * transitionDrive)) * delayEffect));
+                targetDelayFeedback = juce::jlimit(0.0f,
+                                                   0.97f,
+                                                   targetDelayFeedback + ((0.10f + (0.16f * transitionDrive)) * delayEffect));
+                stutterOverlayAmount = juce::jmax(stutterOverlayAmount,
+                                                  juce::jlimit(0.0f,
+                                                               1.0f,
+                                                               (0.24f + (0.50f * transitionDrive)) * chopEffect));
+                applyFilter = filterEffect > 0.02f;
+                break;
+            case SceneChainTransitionType::FilterRise:
+                targetVolume = juce::jlimit(0.0f, 1.0f,
+                                            targetVolume * (1.0f - ((0.04f + (0.10f * transitionDrive)) * duckEffect)));
+                targetFilterFrequency = juce::jmap(filterEffect, 140.0f, 19500.0f);
+                targetFilterResonance = juce::jmap(filterEffect, 0.92f, 2.10f);
+                targetDelayMix = juce::jlimit(0.0f, 1.0f,
+                                              targetDelayMix + ((0.06f + (0.12f * transitionDrive)) * delayEffect));
+                targetDelayFeedback = juce::jlimit(0.0f,
+                                                   0.97f,
+                                                   targetDelayFeedback + ((0.04f + (0.12f * transitionDrive)) * delayEffect));
+                applyFilter = true;
+                break;
+            case SceneChainTransitionType::Drop:
+                targetVolume = juce::jlimit(0.0f, 1.0f,
+                                            targetVolume * (1.0f - ((0.24f + (0.36f * transitionDrive)) * duckEffect)));
+                targetFilterFrequency = juce::jmap(filterEffect, 17000.0f, 520.0f);
+                targetFilterResonance = juce::jmap(filterEffect, 0.84f, 1.78f);
+                targetDelayMix = juce::jlimit(0.0f, 1.0f,
+                                              targetDelayMix + ((0.14f + (0.24f * transitionDrive)) * delayEffect));
+                targetDelayFeedback = juce::jlimit(0.0f,
+                                                   0.97f,
+                                                   targetDelayFeedback + ((0.10f + (0.18f * transitionDrive)) * delayEffect));
+                applyFilter = filterEffect > 0.01f;
+                break;
+            case SceneChainTransitionType::MuteTail:
+                targetVolume = juce::jlimit(0.0f, 1.0f,
+                                            targetVolume * juce::jmax(0.0f,
+                                                                      1.0f - ((0.52f + (0.42f * transitionDrive)) * duckEffect)));
+                targetDelayMix = juce::jlimit(0.0f,
+                                              1.0f,
+                                              targetDelayMix * (1.0f - juce::jmin(1.0f,
+                                                                                  delayEffect * (0.82f + (0.16f * transitionDrive)))));
+                targetDelayFeedback = juce::jlimit(0.0f,
+                                                   0.97f,
+                                                   targetDelayFeedback * (1.0f - juce::jmin(1.0f,
+                                                                                           delayEffect * (0.86f + (0.12f * transitionDrive)))));
+                break;
+            case SceneChainTransitionType::Break:
+                targetVolume = juce::jlimit(0.0f,
+                                            1.0f,
+                                            targetVolume * juce::jlimit(0.08f,
+                                                                        1.0f,
+                                                                        (0.18f + (0.82f * gatePulse))
+                                                                            * juce::jmax(0.0f,
+                                                                                         1.0f - ((0.28f + (0.34f * transitionDrive)) * duckEffect))));
+                targetFilterFrequency = juce::jmap(filterEffect, 18000.0f, 2200.0f);
+                targetFilterResonance = juce::jmap(filterEffect, 0.82f, 1.72f);
+                targetDelayMix = juce::jlimit(0.0f,
+                                              1.0f,
+                                              targetDelayMix + ((0.14f + (0.28f * transitionDrive)) * delayEffect));
+                targetDelayFeedback = juce::jlimit(0.0f,
+                                                   0.97f,
+                                                   targetDelayFeedback + ((0.16f + (0.24f * transitionDrive)) * delayEffect));
+                stutterOverlayAmount = juce::jmax(stutterOverlayAmount,
+                                                  juce::jlimit(0.0f,
+                                                               1.0f,
+                                                               (0.08f + (0.22f * transitionDrive)) * chopEffect));
+                applyFilter = filterEffect > 0.02f;
+                break;
+            case SceneChainTransitionType::None:
+            case SceneChainTransitionType::Return:
+            default:
+                break;
+        }
+
+        strip->setVolume(targetVolume);
+        if (stepSampler != nullptr)
+            stepSampler->setVolume(targetVolume);
+
+        if (applyFilter)
+        {
+            strip->setFilterEnabled(true);
+            strip->setFilterFrequency(targetFilterFrequency);
+            strip->setFilterResonance(targetFilterResonance);
+            if (stepSampler != nullptr)
+            {
+                stepSampler->setFilterEnabled(true);
+                stepSampler->setFilterFrequency(targetFilterFrequency);
+                stepSampler->setFilterResonance(targetFilterResonance);
+            }
+        }
+
+        strip->setDelayMix(targetDelayMix);
+        strip->setDelayFeedback(targetDelayFeedback);
+    }
+
+    setSceneTransitionStutterOverlayAmount(stutterOverlayAmount);
 }
 
 void MlrVSTAudioProcessor::setStripParameterValueFromMacro(int stripIndex,
@@ -4166,187 +5240,9 @@ void MlrVSTAudioProcessor::setSelectedStripMacroValue(int macroIndex, float norm
     if (strip == nullptr)
         return;
 
-    applyMacroTargetValue(stripIndex, *strip, getMacroTarget(macroIndex), normalizedValue);
-}
-
-float MlrVSTAudioProcessor::getMacroLaneRecordedValue(int macroIndex) const
-{
-    if (!audioEngine || macroIndex < 0 || macroIndex >= MacroCount)
-        return 0.0f;
-
-    const auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
-    const int stripIndex = state.stripIndex.load(std::memory_order_acquire);
-    if (stripIndex < 0 || stripIndex >= MaxStrips)
-        return getDefaultMacroNormalizedValue(getMacroTarget(macroIndex));
-
-    auto* strip = audioEngine->getStrip(stripIndex);
-    if (strip == nullptr)
-        return getDefaultMacroNormalizedValue(getMacroTarget(macroIndex));
-
-    const auto target = sanitizeMacroPerformanceTarget(
-        performanceTargetFromRaw(state.target.load(std::memory_order_acquire)));
-    return getMacroNormalizedValueForTarget(stripIndex, *strip, target);
-}
-
-bool MlrVSTAudioProcessor::initializeMacroLaneRecording(int macroIndex,
-                                                        const juce::AudioPlayHead::PositionInfo& posInfo)
-{
-    if (!audioEngine || macroIndex < 0 || macroIndex >= MacroCount || !posInfo.getIsPlaying())
-        return false;
-
-    const auto ppqOpt = posInfo.getPpqPosition();
-    if (!ppqOpt.hasValue() || !std::isfinite(*ppqOpt))
-        return false;
-
-    auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
-    const int stripIndex = state.stripIndex.load(std::memory_order_acquire);
-    const int laneSlot = state.laneSlot.load(std::memory_order_acquire);
-    const auto target = sanitizeMacroPerformanceTarget(
-        performanceTargetFromRaw(state.target.load(std::memory_order_acquire)));
-    auto* strip = audioEngine->getStrip(stripIndex);
-    if (strip == nullptr || !performanceTargetAllowsModLane(target))
-        return false;
-
-    const int totalSteps = ModernAudioEngine::ModTotalSteps;
-    const double stepLengthBeats = audioEngine->getModStepLengthBeats(stripIndex, laneSlot);
-    if (totalSteps <= 0 || !std::isfinite(stepLengthBeats) || stepLengthBeats <= 0.0)
-        return false;
-
-    state.restoreDepth.store(audioEngine->getModDepthForSlot(stripIndex, laneSlot), std::memory_order_release);
-    audioEngine->setModTargetForSlot(stripIndex, laneSlot, target);
-    if (performanceTargetSupportsPitchScaleQuantize(target))
-    {
-        const int detectedScaleIndex = getLoopStripDetectedScaleIndex(stripIndex);
-        const auto resolvedScale = static_cast<ModernAudioEngine::PitchScale>(juce::jlimit(
-            0,
-            static_cast<int>(ModernAudioEngine::PitchScale::PentatonicMinor),
-            detectedScaleIndex >= 0 ? detectedScaleIndex : static_cast<int>(getGlobalPitchScale())));
-        audioEngine->setModPitchScaleQuantizeForSlot(stripIndex, laneSlot, true);
-        audioEngine->setModPitchScaleForSlot(stripIndex, laneSlot, resolvedScale);
-    }
-    else
-    {
-        audioEngine->setModPitchScaleQuantizeForSlot(stripIndex, laneSlot, false);
-    }
-    audioEngine->setModCurveModeForSlot(stripIndex, laneSlot, false);
-    audioEngine->setModDepthForSlot(stripIndex, laneSlot, 0.0f);
-    audioEngine->clearModStepsForSlot(stripIndex, laneSlot,
-                                      ModernAudioEngine::defaultModStepValueForTarget(target));
-
-    const double currentPpq = *ppqOpt;
-    const double stepsPerBeat = 1.0 / stepLengthBeats;
-    const int absoluteStepNow = juce::jmax(0, static_cast<int>(std::floor(currentPpq * stepsPerBeat)));
-    const int stepIndexNow = absoluteStepNow % totalSteps;
-    const int recordOffset = -stepIndexNow;
-    audioEngine->setModOffsetForSlot(stripIndex, laneSlot, recordOffset);
-
-    const double stepsPos = (currentPpq * stepsPerBeat) + static_cast<double>(recordOffset);
-    const double wrapped = std::fmod(stepsPos, static_cast<double>(totalSteps));
-    const double wrappedPos = wrapped < 0.0 ? (wrapped + static_cast<double>(totalSteps)) : wrapped;
-    const double stepPhase = juce::jlimit(0.0, 0.999999999, wrappedPos);
-    const int currentStep = 0;
-
-    audioEngine->writeModStepNormalized(stripIndex, laneSlot, currentStep, getMacroLaneRecordedValue(macroIndex));
-
-    state.startPpq.store(currentPpq, std::memory_order_release);
-    state.stepsWritten.store(1, std::memory_order_release);
-    state.totalStepsToWrite.store(totalSteps, std::memory_order_release);
-
-    if (totalSteps <= 1)
-    {
-        finishMacroLaneRecording(macroIndex, true);
-        return true;
-    }
-
-    state.nextStepIndex.store((currentStep + 1) % totalSteps, std::memory_order_release);
-    state.nextStepPpq.store(currentPpq + ((1.0 - stepPhase) * stepLengthBeats), std::memory_order_release);
-    state.recording.store(1, std::memory_order_release);
-    return true;
-}
-
-void MlrVSTAudioProcessor::updateMacroLaneRecording(const juce::AudioPlayHead::PositionInfo& posInfo,
-                                                    int numSamples)
-{
-    if (!audioEngine)
-        return;
-
-    const auto ppqOpt = posInfo.getPpqPosition();
-    const auto bpmOpt = posInfo.getBpm();
-    const bool transportValid = posInfo.getIsPlaying()
-        && ppqOpt.hasValue()
-        && bpmOpt.hasValue()
-        && std::isfinite(*ppqOpt)
-        && std::isfinite(*bpmOpt)
-        && *bpmOpt > 0.0
-        && currentSampleRate > 0.0;
-
-    if (!transportValid)
-    {
-        for (int macroIndex = 0; macroIndex < MacroCount; ++macroIndex)
-        {
-            if (macroLaneRecordStates[static_cast<size_t>(macroIndex)].recording.load(std::memory_order_acquire) != 0)
-                finishMacroLaneRecording(macroIndex, true);
-        }
-        return;
-    }
-
-    const double currentPpq = *ppqOpt;
-    const double ppqPerSample = (*bpmOpt / 60.0) / currentSampleRate;
-    const double blockEndPpq = currentPpq + (ppqPerSample * static_cast<double>(juce::jmax(1, numSamples)));
-
-    for (int macroIndex = 0; macroIndex < MacroCount; ++macroIndex)
-    {
-        auto& state = macroLaneRecordStates[static_cast<size_t>(macroIndex)];
-        if (state.armed.load(std::memory_order_acquire) == 0
-            && state.recording.load(std::memory_order_acquire) == 0)
-        {
-            continue;
-        }
-
-        if (state.recording.load(std::memory_order_acquire) == 0)
-        {
-            const bool initialized = initializeMacroLaneRecording(macroIndex, posInfo);
-            if (!initialized && state.armed.load(std::memory_order_acquire) != 0)
-            {
-                const auto target = performanceTargetFromRaw(state.target.load(std::memory_order_acquire));
-                const int stripIndex = state.stripIndex.load(std::memory_order_acquire);
-                if (stripIndex < 0 || stripIndex >= MaxStrips || !performanceTargetAllowsModLane(target))
-                    resetMacroLaneRecordState(macroIndex);
-            }
-            if (state.recording.load(std::memory_order_acquire) == 0)
-                continue;
-        }
-
-        const int stripIndex = state.stripIndex.load(std::memory_order_acquire);
-        const int laneSlot = state.laneSlot.load(std::memory_order_acquire);
-        const int totalSteps = juce::jmax(1, state.totalStepsToWrite.load(std::memory_order_acquire));
-        const double stepLengthBeats = audioEngine->getModStepLengthBeats(stripIndex, laneSlot);
-        int stepsWritten = state.stepsWritten.load(std::memory_order_acquire);
-        int nextStepIndex = state.nextStepIndex.load(std::memory_order_acquire);
-        double nextStepPpq = state.nextStepPpq.load(std::memory_order_acquire);
-
-        while (stepsWritten < totalSteps
-               && std::isfinite(nextStepPpq)
-               && nextStepPpq <= blockEndPpq + 1.0e-9)
-        {
-            audioEngine->writeModStepNormalized(stripIndex,
-                                                laneSlot,
-                                                nextStepIndex,
-                                                getMacroLaneRecordedValue(macroIndex));
-            ++stepsWritten;
-            state.stepsWritten.store(stepsWritten, std::memory_order_release);
-            if (stepsWritten >= totalSteps)
-                break;
-
-            nextStepIndex = (nextStepIndex + 1) % totalSteps;
-            nextStepPpq += stepLengthBeats;
-            state.nextStepIndex.store(nextStepIndex, std::memory_order_release);
-            state.nextStepPpq.store(nextStepPpq, std::memory_order_release);
-        }
-
-        if (stepsWritten >= totalSteps)
-            finishMacroLaneRecording(macroIndex, true);
-    }
+    const auto target = getMacroTarget(macroIndex);
+    applyMacroTargetValue(stripIndex, *strip, target, normalizedValue);
+    recordMacroSceneEvent(stripIndex, target, normalizedValue);
 }
 
 void MlrVSTAudioProcessor::handleIncomingMacroCc(const juce::MidiBuffer& midiMessages)
@@ -4545,10 +5441,8 @@ MlrVSTAudioProcessor::ResolvedPitchControl MlrVSTAudioProcessor::resolvePitchCon
 
     if (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
     {
-        const float stepSpeedSemitones = (resolved.globalScale == ModernAudioEngine::PitchScale::Chromatic)
-            ? (resolved.quantizedSemitones * 1.5f)
-            : resolved.quantizedSemitones;
-        resolved.stepSamplerRatio = juce::jlimit(0.125f, 8.0f, std::pow(2.0f, stepSpeedSemitones / 12.0f));
+        resolved.quantizedSemitones = clampedSemitones;
+        resolved.stepSamplerRatio = juce::jlimit(0.125f, 8.0f, std::pow(2.0f, resolved.quantizedSemitones / 12.0f));
         resolved.updatesStepSampler = true;
         return resolved;
     }
@@ -4759,6 +5653,14 @@ float MlrVSTAudioProcessor::getPitchSemitonesForDisplay(const EnhancedAudioStrip
 float MlrVSTAudioProcessor::quantizePitchSemitonesForStripControl(int stripIndex, float semitones) const
 {
     const float clampedSemitones = juce::jlimit(-24.0f, 24.0f, semitones);
+    if (audioEngine != nullptr)
+    {
+        if (const auto* strip = audioEngine->getStrip(stripIndex))
+        {
+            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step)
+                return clampedSemitones;
+        }
+    }
     return ModernAudioEngine::quantizePitchSemitonesToScale(clampedSemitones,
                                                             getPitchQuantizeReferenceRootMidiForStrip(stripIndex),
                                                             getGlobalPitchScale());
@@ -6064,6 +6966,38 @@ void MlrVSTAudioProcessor::applyLoopPitchSyncToAllStrips()
     }
 }
 
+void MlrVSTAudioProcessor::resolveLoopPitchRecallStateImmediately()
+{
+    if (audioEngine == nullptr)
+        return;
+
+    normalizeLoopPitchMasterRoles();
+
+    const int masterStripIndex = getLoopPitchMasterStripIndex();
+    if (masterStripIndex >= 0)
+    {
+        const int effectiveMidi = getEffectiveLoopPitchMasterRootMidi(masterStripIndex);
+        if (effectiveMidi >= 0)
+            globalRootNoteMidi.store(juce::jlimit(0, 127, effectiveMidi), std::memory_order_release);
+    }
+
+    const int rootMidi = getGlobalRootNoteMidi();
+    const auto scale = getGlobalPitchScale();
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        if (auto* strip = audioEngine->getStrip(stripIndex))
+            strip->setGlobalPitchContext(rootMidi, static_cast<int>(scale));
+
+        if (getLoopPitchRole(stripIndex) == LoopPitchRole::Sync)
+            applyLoopPitchRoleStateToStrip(stripIndex);
+        else
+            loopPitchPendingRetune[static_cast<size_t>(stripIndex)].store(0, std::memory_order_release);
+    }
+
+    loopPitchLastObservedColumns.fill(-1);
+    loopPitchLastObservedHostBar = -1;
+}
+
 MlrVSTAudioProcessor::ControlPageOrder MlrVSTAudioProcessor::getControlPageOrder() const
 {
     const juce::ScopedLock lock(controlPageOrderLock);
@@ -6134,18 +7068,15 @@ void MlrVSTAudioProcessor::setInnerLoopLengthSelection(int choiceIndex)
 
 void MlrVSTAudioProcessor::syncTransientDetectionSettingsFromParameters(bool refreshSlicesNow)
 {
-    if (audioEngine == nullptr)
-        return;
-
     const int onsetMethod = transientOnsetMethodParam != nullptr
         ? juce::jlimit(0, 2, static_cast<int>(std::round(transientOnsetMethodParam->load(std::memory_order_acquire))))
-        : 0;
+        : 2;
     const int sensitivity = transientSensitivityParam != nullptr
         ? juce::jlimit(0, 4, static_cast<int>(std::round(transientSensitivityParam->load(std::memory_order_acquire))))
         : 2;
     const int snap = transientSnapParam != nullptr
         ? juce::jlimit(0, 4, static_cast<int>(std::round(transientSnapParam->load(std::memory_order_acquire))))
-        : 2;
+        : 3;
     const int spacing = transientSpacingParam != nullptr
         ? juce::jlimit(0, 4, static_cast<int>(std::round(transientSpacingParam->load(std::memory_order_acquire))))
         : 2;
@@ -6158,19 +7089,31 @@ void MlrVSTAudioProcessor::syncTransientDetectionSettingsFromParameters(bool ref
     if (!changed && !refreshSlicesNow)
         return;
 
-    audioEngine->setTransientDetectionConfig(onsetMethod, sensitivity, snap, spacing);
+    if (audioEngine != nullptr)
+        audioEngine->setTransientDetectionConfig(onsetMethod, sensitivity, snap, spacing);
     lastAppliedTransientOnsetMethod = onsetMethod;
     lastAppliedTransientSensitivity = sensitivity;
     lastAppliedTransientSnap = snap;
     lastAppliedTransientSpacing = spacing;
 
     if (refreshSlicesNow)
-        audioEngine->refreshTransientSliceMaps();
+    {
+        if (audioEngine != nullptr)
+            audioEngine->refreshTransientSliceMaps();
+
+        for (auto& engine : sampleModeEngines)
+        {
+            if (engine != nullptr)
+                engine->refreshTransientAnalysis();
+        }
+    }
 }
 
 void MlrVSTAudioProcessor::setControlModeFromGui(ControlMode mode, bool shouldBeActive)
 {
-    if (isSceneModeEnabled() && mode == ControlMode::GroupAssign)
+    if (isSceneModeEnabled()
+        && (mode == ControlMode::GroupAssign
+            || mode == ControlMode::Modulation))
     {
         currentControlMode = ControlMode::Normal;
         controlModeActive = false;
@@ -6203,9 +7146,9 @@ bool MlrVSTAudioProcessor::monomeControlPageShowsPatternRecorder(ControlMode mod
         case ControlMode::GrainSize:
         case ControlMode::Swing:
         case ControlMode::Delay:
+        case ControlMode::Filter:
             return true;
         case ControlMode::Normal:
-        case ControlMode::Filter:
         case ControlMode::Gate:
         case ControlMode::FileBrowser:
         case ControlMode::GroupAssign:
@@ -6217,6 +7160,1833 @@ bool MlrVSTAudioProcessor::monomeControlPageShowsPatternRecorder(ControlMode mod
     }
 }
 
+bool MlrVSTAudioProcessor::handleMonomePatternButtonPress(int patternIndex, uint32_t nowMs)
+{
+    if (audioEngine == nullptr)
+        return false;
+
+    auto* pattern = audioEngine->getPattern(patternIndex);
+    if (pattern == nullptr)
+        return false;
+
+    const auto idx = static_cast<size_t>(patternIndex);
+    const auto pendingAction = monomePatternPadPendingAction[idx];
+    const uint32_t pendingUntilMs = monomePatternPadPendingUntilMs[idx];
+    const bool pendingActive = pendingAction != MonomePatternTapAction::None
+        && pendingUntilMs != 0
+        && static_cast<int32_t>(pendingUntilMs - nowMs) >= 0;
+
+    if (pendingActive)
+    {
+        clearPendingMonomePatternTap(patternIndex);
+        audioEngine->startPatternOverdub(patternIndex);
+        return true;
+    }
+
+    clearPendingMonomePatternTap(patternIndex);
+
+    if (pattern->isRecording())
+    {
+        if (pattern->isOverdubbing())
+        {
+            monomePatternPadPendingAction[idx] = MonomePatternTapAction::StopRecording;
+            monomePatternPadPendingUntilMs[idx] = nowMs + monomePatternDoubleTapMs;
+        }
+        else
+        {
+            audioEngine->stopPatternRecording(patternIndex);
+        }
+
+        return true;
+    }
+
+    if (pattern->getEventCount() <= 0)
+    {
+        audioEngine->startPatternRecording(patternIndex);
+        return true;
+    }
+
+    monomePatternPadPendingAction[idx] = pattern->isPlaying()
+        ? MonomePatternTapAction::StopPlayback
+        : MonomePatternTapAction::StartFreshRecording;
+    monomePatternPadPendingUntilMs[idx] = nowMs + monomePatternDoubleTapMs;
+    return true;
+}
+
+void MlrVSTAudioProcessor::processPendingMonomePatternTapActions(uint32_t nowMs)
+{
+    if (audioEngine == nullptr)
+    {
+        for (int patternIndex = 0; patternIndex < ModernAudioEngine::MaxPatterns; ++patternIndex)
+            clearPendingMonomePatternTap(patternIndex);
+        return;
+    }
+
+    for (int patternIndex = 0; patternIndex < ModernAudioEngine::MaxPatterns; ++patternIndex)
+    {
+        const auto idx = static_cast<size_t>(patternIndex);
+        const auto action = monomePatternPadPendingAction[idx];
+        const uint32_t pendingUntilMs = monomePatternPadPendingUntilMs[idx];
+        const bool stillWaiting = action != MonomePatternTapAction::None
+            && pendingUntilMs != 0
+            && static_cast<int32_t>(pendingUntilMs - nowMs) > 0;
+        if (stillWaiting)
+            continue;
+
+        clearPendingMonomePatternTap(patternIndex);
+
+        switch (action)
+        {
+            case MonomePatternTapAction::StartFreshRecording:
+                audioEngine->startPatternRecording(patternIndex);
+                break;
+            case MonomePatternTapAction::StopPlayback:
+                audioEngine->stopPatternPlayback(patternIndex);
+                break;
+            case MonomePatternTapAction::StopRecording:
+                audioEngine->stopPatternRecording(patternIndex);
+                break;
+            case MonomePatternTapAction::None:
+            default:
+                break;
+        }
+    }
+}
+
+void MlrVSTAudioProcessor::clearPendingMonomePatternTap(int patternIndex)
+{
+    if (patternIndex < 0 || patternIndex >= ModernAudioEngine::MaxPatterns)
+        return;
+
+    const auto idx = static_cast<size_t>(patternIndex);
+    monomePatternPadPendingUntilMs[idx] = 0;
+    monomePatternPadPendingAction[idx] = MonomePatternTapAction::None;
+}
+
+bool MlrVSTAudioProcessor::handleMonomeSceneRecorderButtonPress(uint32_t nowMs)
+{
+    if (!isSceneModeEnabled())
+        return false;
+
+    const auto pendingAction = monomeSceneRecorderPendingAction;
+    const uint32_t pendingUntilMs = monomeSceneRecorderPendingUntilMs;
+    const bool pendingActive = pendingAction != MonomeSceneRecorderTapAction::None
+        && pendingUntilMs != 0
+        && static_cast<int32_t>(pendingUntilMs - nowMs) >= 0;
+
+    if (pendingActive)
+    {
+        clearPendingMonomeSceneRecorderTap();
+        if (scenePerformanceRecorder.isRecording() && scenePerformanceRecorder.isOverdubbing())
+            extendScenePerformanceRecording();
+        else
+            requestSceneRecorderActionQuantized(SceneRecorderAction::StartOverdub);
+        return true;
+    }
+
+    clearPendingMonomeSceneRecorderTap();
+
+    if (scenePerformanceRecorder.isRecording())
+    {
+        if (scenePerformanceRecorder.isOverdubbing())
+        {
+            monomeSceneRecorderPendingAction = MonomeSceneRecorderTapAction::StopRecording;
+            monomeSceneRecorderPendingUntilMs = nowMs + monomePatternDoubleTapMs;
+        }
+        else
+        {
+            requestSceneRecorderActionQuantized(SceneRecorderAction::StopRecording);
+        }
+
+        return true;
+    }
+
+    const int sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    if (!scenePerformanceRecorder.hasEvents(sceneSlot))
+    {
+        requestSceneRecorderActionQuantized(SceneRecorderAction::StartFreshRecording);
+        return true;
+    }
+
+    monomeSceneRecorderPendingAction = MonomeSceneRecorderTapAction::StartFreshRecording;
+    monomeSceneRecorderPendingUntilMs = nowMs + monomePatternDoubleTapMs;
+    return true;
+}
+
+void MlrVSTAudioProcessor::processPendingMonomeSceneRecorderTapActions(uint32_t nowMs)
+{
+    const auto action = monomeSceneRecorderPendingAction;
+    const uint32_t pendingUntilMs = monomeSceneRecorderPendingUntilMs;
+    const bool stillWaiting = action != MonomeSceneRecorderTapAction::None
+        && pendingUntilMs != 0
+        && static_cast<int32_t>(pendingUntilMs - nowMs) > 0;
+    if (stillWaiting)
+        return;
+
+    clearPendingMonomeSceneRecorderTap();
+
+    switch (action)
+    {
+        case MonomeSceneRecorderTapAction::StartFreshRecording:
+            requestSceneRecorderActionQuantized(SceneRecorderAction::StartFreshRecording);
+            break;
+        case MonomeSceneRecorderTapAction::StopRecording:
+            requestSceneRecorderActionQuantized(SceneRecorderAction::StopRecording);
+            break;
+        case MonomeSceneRecorderTapAction::None:
+        default:
+            break;
+    }
+}
+
+void MlrVSTAudioProcessor::clearPendingMonomeSceneRecorderTap()
+{
+    monomeSceneRecorderPendingUntilMs = 0;
+    monomeSceneRecorderPendingAction = MonomeSceneRecorderTapAction::None;
+}
+
+void MlrVSTAudioProcessor::requestSceneRecorderActionQuantized(SceneRecorderAction action)
+{
+    if (!isSceneModeEnabled() || audioEngine == nullptr || action == SceneRecorderAction::None)
+        return;
+
+    const int sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    const bool hostTransportPlaying = isHostTransportPlaying();
+    const bool immediateAction = !hostTransportPlaying || getSceneRecallMode() == SceneRecallMode::Manual;
+    const double currentBeat = audioEngine->getTimelineBeat();
+    const double sceneStartBeat = activeSceneStartPpqValid && std::isfinite(activeSceneStartPpq)
+        ? activeSceneStartPpq
+        : currentBeat;
+
+    if (immediateAction)
+    {
+        clearPendingSceneRecorderAction();
+        switch (action)
+        {
+            case SceneRecorderAction::StartFreshRecording:
+                startScenePerformanceRecordingAt(false, sceneSlot, currentBeat, sceneStartBeat);
+                break;
+            case SceneRecorderAction::StartOverdub:
+                startScenePerformanceRecordingAt(true, sceneSlot, currentBeat, sceneStartBeat);
+                break;
+            case SceneRecorderAction::StopRecording:
+                stopScenePerformanceRecordingNow();
+                break;
+            case SceneRecorderAction::None:
+            default:
+                break;
+        }
+        return;
+    }
+
+    pendingSceneRecorderAction.active = true;
+    pendingSceneRecorderAction.targetResolved = false;
+    pendingSceneRecorderAction.patternEndPhaseSignatureValid = false;
+    pendingSceneRecorderAction.action = action;
+    pendingSceneRecorderAction.sceneSlot = sceneSlot;
+    pendingSceneRecorderAction.targetPpq = 0.0;
+    pendingSceneRecorderAction.intervalBeats = 4.0;
+    pendingSceneRecorderAction.patternEndPhaseSignature = 0;
+    refreshUtilityTimerCadence();
+    updateMonomeLEDs();
+}
+
+void MlrVSTAudioProcessor::updateSceneRecorderQuantizedAction(const juce::AudioPlayHead::PositionInfo& posInfo,
+                                                              int numSamples)
+{
+    if (!pendingSceneRecorderAction.active || audioEngine == nullptr)
+        return;
+
+    if (pendingSceneRecorderApplyAction.load(std::memory_order_acquire) != static_cast<int>(SceneRecorderAction::None))
+        return;
+
+    const int sceneSlot = juce::jlimit(0, SceneSlots - 1, pendingSceneRecorderAction.sceneSlot);
+    if (sceneSlot != juce::jlimit(0, SceneSlots - 1, activeSceneSlot))
+    {
+        clearPendingSceneRecorderAction();
+        return;
+    }
+
+    if (!posInfo.getIsPlaying())
+    {
+        pendingSceneRecorderAction.targetResolved = false;
+        pendingSceneRecorderAction.patternEndPhaseSignatureValid = false;
+        pendingSceneRecorderAction.patternEndPhaseSignature = 0;
+        return;
+    }
+
+    const auto ppqOpt = posInfo.getPpqPosition();
+    const auto bpmOpt = posInfo.getBpm();
+    if (!ppqOpt.hasValue() || !bpmOpt.hasValue()
+        || !std::isfinite(*ppqOpt) || !std::isfinite(*bpmOpt)
+        || *bpmOpt <= 0.0 || currentSampleRate <= 1.0)
+    {
+        return;
+    }
+
+    const double currentPpq = *ppqOpt;
+    const auto sceneRecallMode = getSceneRecallMode();
+    const bool patternEndEnabled = sceneRecallMode == SceneRecallMode::PatternEnd;
+    const bool sceneEndEnabled = sceneRecallMode == SceneRecallMode::SceneEnd;
+    uint64_t phaseAlignedPatternEndSignature = 0;
+    const double currentSceneDurationBeats = juce::jlimit(0.25, 4096.0, computeCurrentSceneSequenceLengthBeats());
+    const double phaseAlignedPatternEndPpq = patternEndEnabled
+        ? computeNextScenePatternEndPpq(sceneSlot,
+                                        currentPpq,
+                                        currentSceneDurationBeats,
+                                        &phaseAlignedPatternEndSignature)
+        : std::numeric_limits<double>::quiet_NaN();
+    const bool phaseAlignedTimingReady = patternEndEnabled && std::isfinite(phaseAlignedPatternEndPpq);
+    const bool sceneEndTimingReady = sceneEndEnabled
+        && activeSceneStartPpqValid
+        && std::isfinite(activeSceneStartPpq);
+    const bool useSceneDurationTiming = phaseAlignedTimingReady || sceneEndTimingReady;
+    double intervalBeatsNow = getSceneRecallIntervalBeats();
+    if (useSceneDurationTiming)
+        intervalBeatsNow = currentSceneDurationBeats;
+
+    if (pendingSceneRecorderAction.targetResolved
+        && std::abs(intervalBeatsNow - pendingSceneRecorderAction.intervalBeats) > 1.0e-9)
+    {
+        pendingSceneRecorderAction.targetResolved = false;
+        pendingSceneRecorderAction.targetPpq = 0.0;
+    }
+
+    if (patternEndEnabled)
+    {
+        if (phaseAlignedTimingReady)
+        {
+            if (!pendingSceneRecorderAction.patternEndPhaseSignatureValid
+                || pendingSceneRecorderAction.patternEndPhaseSignature != phaseAlignedPatternEndSignature)
+            {
+                pendingSceneRecorderAction.targetResolved = false;
+                pendingSceneRecorderAction.targetPpq = 0.0;
+            }
+
+            pendingSceneRecorderAction.patternEndPhaseSignatureValid = true;
+            pendingSceneRecorderAction.patternEndPhaseSignature = phaseAlignedPatternEndSignature;
+        }
+        else if (pendingSceneRecorderAction.patternEndPhaseSignatureValid)
+        {
+            pendingSceneRecorderAction.patternEndPhaseSignatureValid = false;
+            pendingSceneRecorderAction.patternEndPhaseSignature = 0;
+            pendingSceneRecorderAction.targetResolved = false;
+            pendingSceneRecorderAction.targetPpq = 0.0;
+        }
+
+        if (!phaseAlignedTimingReady)
+        {
+            pendingSceneRecorderAction.targetResolved = false;
+            pendingSceneRecorderAction.targetPpq = 0.0;
+            return;
+        }
+    }
+    else if (pendingSceneRecorderAction.patternEndPhaseSignatureValid)
+    {
+        pendingSceneRecorderAction.patternEndPhaseSignatureValid = false;
+        pendingSceneRecorderAction.patternEndPhaseSignature = 0;
+    }
+
+    if (!pendingSceneRecorderAction.targetResolved)
+    {
+        pendingSceneRecorderAction.intervalBeats = intervalBeatsNow;
+        if (phaseAlignedTimingReady)
+        {
+            pendingSceneRecorderAction.targetPpq = phaseAlignedPatternEndPpq;
+        }
+        else if (useSceneDurationTiming)
+        {
+            double nextTarget = activeSceneStartPpq + intervalBeatsNow;
+            if (nextTarget <= currentPpq + 1.0e-9)
+            {
+                const double elapsed = juce::jmax(0.0, currentPpq - activeSceneStartPpq);
+                const double completedCycles = std::floor(elapsed / juce::jmax(1.0e-9, intervalBeatsNow));
+                nextTarget = activeSceneStartPpq + ((completedCycles + 1.0) * intervalBeatsNow);
+            }
+            pendingSceneRecorderAction.targetPpq = nextTarget;
+        }
+        else
+        {
+            double nextBoundary = std::ceil(currentPpq / intervalBeatsNow) * intervalBeatsNow;
+            if (nextBoundary <= currentPpq + 1.0e-9)
+                nextBoundary += intervalBeatsNow;
+            pendingSceneRecorderAction.targetPpq = std::round(nextBoundary / intervalBeatsNow) * intervalBeatsNow;
+        }
+        pendingSceneRecorderAction.targetResolved = true;
+    }
+
+    const double ppqPerSecond = *bpmOpt / 60.0;
+    const double ppqPerSample = ppqPerSecond / currentSampleRate;
+    const double blockEndPpq = currentPpq + (ppqPerSample * static_cast<double>(juce::jmax(1, numSamples)));
+    if (blockEndPpq + 1.0e-9 < pendingSceneRecorderAction.targetPpq)
+        return;
+
+    const double targetPpq = pendingSceneRecorderAction.targetPpq;
+    const double samplesToTarget = (targetPpq - currentPpq) / juce::jmax(1.0e-12, ppqPerSample);
+    const int sampleOffset = juce::jlimit(0,
+                                          juce::jmax(0, numSamples - 1),
+                                          static_cast<int>(std::llround(samplesToTarget)));
+    const int64_t targetGlobalSample = audioEngine->getGlobalSampleCount() + static_cast<int64_t>(sampleOffset);
+
+    pendingSceneRecorderApplyAction.store(static_cast<int>(pendingSceneRecorderAction.action), std::memory_order_release);
+    pendingSceneRecorderApplySceneSlot.store(sceneSlot, std::memory_order_release);
+    pendingSceneRecorderApplyTargetPpq.store(targetPpq, std::memory_order_release);
+    pendingSceneRecorderApplyTargetSample.store(targetGlobalSample, std::memory_order_release);
+    pendingSceneRecorderAction.active = false;
+    pendingSceneRecorderAction.targetResolved = false;
+}
+
+void MlrVSTAudioProcessor::processPendingSceneRecorderApply()
+{
+    const auto action = static_cast<SceneRecorderAction>(
+        pendingSceneRecorderApplyAction.exchange(static_cast<int>(SceneRecorderAction::None), std::memory_order_acq_rel));
+    if (action == SceneRecorderAction::None || audioEngine == nullptr || !isSceneModeEnabled())
+        return;
+
+    const int queuedSceneSlot = pendingSceneRecorderApplySceneSlot.exchange(-1, std::memory_order_acq_rel);
+    const double queuedTargetPpq = pendingSceneRecorderApplyTargetPpq.exchange(-1.0, std::memory_order_acq_rel);
+    const int64_t queuedTargetSample = pendingSceneRecorderApplyTargetSample.exchange(-1, std::memory_order_acq_rel);
+
+    auto requeuePendingApply = [&](SceneRecorderAction requeueAction)
+    {
+        pendingSceneRecorderApplyAction.store(static_cast<int>(requeueAction), std::memory_order_release);
+        pendingSceneRecorderApplySceneSlot.store(queuedSceneSlot, std::memory_order_release);
+        pendingSceneRecorderApplyTargetPpq.store(queuedTargetPpq, std::memory_order_release);
+        pendingSceneRecorderApplyTargetSample.store(queuedTargetSample, std::memory_order_release);
+    };
+
+    const int64_t currentGlobalSample = audioEngine->getGlobalSampleCount();
+    if (queuedTargetSample >= 0
+        && currentGlobalSample >= 0
+        && isHostTransportPlaying()
+        && currentGlobalSample + 1 < queuedTargetSample)
+    {
+        requeuePendingApply(action);
+        return;
+    }
+
+    const int sceneSlot = juce::jlimit(0, SceneSlots - 1, queuedSceneSlot >= 0 ? queuedSceneSlot : activeSceneSlot);
+    if (sceneSlot != juce::jlimit(0, SceneSlots - 1, activeSceneSlot))
+        return;
+
+    const double currentBeat = (std::isfinite(queuedTargetPpq) && queuedTargetPpq >= 0.0)
+        ? queuedTargetPpq
+        : audioEngine->getTimelineBeat();
+    const double sceneStartBeat = activeSceneStartPpqValid && std::isfinite(activeSceneStartPpq)
+        ? activeSceneStartPpq
+        : currentBeat;
+
+    switch (action)
+    {
+        case SceneRecorderAction::StartFreshRecording:
+            startScenePerformanceRecordingAt(false, sceneSlot, currentBeat, sceneStartBeat);
+            break;
+        case SceneRecorderAction::StartOverdub:
+            startScenePerformanceRecordingAt(true, sceneSlot, currentBeat, sceneStartBeat);
+            break;
+        case SceneRecorderAction::StopRecording:
+            stopScenePerformanceRecordingNow();
+            break;
+        case SceneRecorderAction::None:
+        default:
+            break;
+    }
+}
+
+void MlrVSTAudioProcessor::clearPendingSceneRecorderAction()
+{
+    pendingSceneRecorderAction = {};
+    pendingSceneRecorderApplyAction.store(static_cast<int>(SceneRecorderAction::None), std::memory_order_release);
+    pendingSceneRecorderApplySceneSlot.store(-1, std::memory_order_release);
+    pendingSceneRecorderApplyTargetPpq.store(-1.0, std::memory_order_release);
+    pendingSceneRecorderApplyTargetSample.store(-1, std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::clearPendingSceneTriggerRecord(int stripIndex)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    pendingSceneTriggerRecords[static_cast<size_t>(stripIndex)] = {};
+}
+
+void MlrVSTAudioProcessor::rememberPendingSceneTriggerRecord(int stripIndex, int column, double eventBeat)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    auto& pending = pendingSceneTriggerRecords[static_cast<size_t>(stripIndex)];
+    pending.active = std::isfinite(eventBeat);
+    pending.sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    pending.column = juce::jlimit(0, MaxColumns - 1, column);
+    pending.eventBeat = eventBeat;
+}
+
+void MlrVSTAudioProcessor::cancelPendingSceneTriggerRecord(int stripIndex)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || audioEngine == nullptr)
+        return;
+
+    auto& pending = pendingSceneTriggerRecords[static_cast<size_t>(stripIndex)];
+    if (pending.active
+        && isSceneModeEnabled()
+        && scenePerformanceRecorder.isRecording()
+        && audioEngine->hasPendingTrigger(stripIndex))
+    {
+        scenePerformanceRecorder.cancelTriggerEvent(pending.sceneSlot,
+                                                    stripIndex,
+                                                    pending.column,
+                                                    true,
+                                                    pending.eventBeat);
+    }
+
+    pending = {};
+}
+
+void MlrVSTAudioProcessor::captureSceneTriggerRelease(int stripIndex, int columnHint)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || audioEngine == nullptr)
+        return;
+
+    auto* strip = audioEngine->getStrip(stripIndex);
+    if (strip == nullptr)
+    {
+        clearPendingSceneTriggerRecord(stripIndex);
+        return;
+    }
+
+    cancelPendingSceneTriggerRecord(stripIndex);
+
+    if (!isSceneModeEnabled() || !scenePerformanceRecorder.isRecording() || !strip->isPlaying())
+        return;
+
+    int releaseColumn = columnHint;
+    if (releaseColumn < 0 || releaseColumn >= MaxColumns)
+        releaseColumn = strip->getHeldButton();
+    if (releaseColumn < 0 || releaseColumn >= MaxColumns)
+        releaseColumn = 0;
+
+    recordSceneTriggerEvent(stripIndex,
+                            releaseColumn,
+                            audioEngine->getTimelineBeat(),
+                            -1,
+                            -1,
+                            false);
+}
+
+void MlrVSTAudioProcessor::recordSceneTriggerEvent(int stripIndex,
+                                                   int column,
+                                                   double eventBeat,
+                                                   int sampleSliceId,
+                                                   int64_t sampleStartSample,
+                                                   bool noteOn)
+{
+    if (!isSceneModeEnabled() || !scenePerformanceRecorder.isRecording())
+        return;
+
+    const int sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    scenePerformanceRecorder.recordTriggerEvent(sceneSlot,
+                                                juce::jlimit(0, MaxStrips - 1, stripIndex),
+                                                juce::jlimit(0, MaxColumns - 1, column),
+                                                noteOn,
+                                                eventBeat,
+                                                sampleSliceId,
+                                                sampleStartSample);
+}
+
+bool MlrVSTAudioProcessor::resolveScenePerformanceControlEvent(ControlMode mode,
+                                                               int stripIndex,
+                                                               int controlRow,
+                                                               int column,
+                                                               ScenePerformanceEvent& outEvent) const
+{
+    if (audioEngine == nullptr)
+        return false;
+
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    const int safeColumn = juce::jlimit(0, MaxColumns - 1, column);
+    auto* strip = audioEngine->getStrip(safeStripIndex);
+    if (strip == nullptr)
+        return false;
+
+    outEvent = {};
+    outEvent.type = ScenePerformanceEventType::ControlPoint;
+    outEvent.stripIndex = safeStripIndex;
+    outEvent.column = safeColumn;
+    outEvent.controlMode = static_cast<int>(mode);
+    outEvent.controlRow = controlRow;
+
+    switch (mode)
+    {
+        case ControlMode::Speed:
+            outEvent.controlTarget = ScenePerformanceControlTarget::Speed;
+            outEvent.value = PlayheadSpeedQuantizer::ratioFromColumn(safeColumn);
+            return true;
+
+        case ControlMode::Pitch:
+        {
+            static constexpr std::array<float, 16> kMusicalPitchSemitones{
+                -24.0f, -21.0f, -18.0f, -15.0f, -12.0f, -9.0f, -6.0f, -3.0f,
+                  0.0f,   3.0f,   6.0f,   9.0f,  12.0f, 15.0f, 18.0f, 24.0f
+            };
+            outEvent.controlTarget = ScenePerformanceControlTarget::Pitch;
+            outEvent.value = kMusicalPitchSemitones[static_cast<size_t>(safeColumn)];
+            return true;
+        }
+
+        case ControlMode::Pan:
+            outEvent.controlTarget = ScenePerformanceControlTarget::Pan;
+            outEvent.value = juce::jlimit(-1.0f, 1.0f, (safeColumn - 8) / 8.0f);
+            return true;
+
+        case ControlMode::Volume:
+            outEvent.controlTarget = ScenePerformanceControlTarget::Volume;
+            outEvent.value = juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f);
+            return true;
+
+        case ControlMode::Swing:
+            return false;
+
+        case ControlMode::GrainSize:
+        {
+            const float unit = juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f);
+            switch (juce::jlimit(0, 5, controlRow))
+            {
+                case 0:
+                    outEvent.controlTarget = ScenePerformanceControlTarget::GrainSize;
+                    outEvent.value = 5.0f + (unit * (2400.0f - 5.0f));
+                    return true;
+                case 1:
+                    outEvent.controlTarget = ScenePerformanceControlTarget::GrainDensity;
+                    outEvent.value = 0.05f + (unit * (0.9f - 0.05f));
+                    return true;
+                case 2:
+                    outEvent.controlTarget = ScenePerformanceControlTarget::Pitch;
+                    outEvent.value = -24.0f + (unit * 48.0f);
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        case ControlMode::Delay:
+        {
+            switch (juce::jlimit(0, 5, controlRow))
+            {
+                case 0:
+                    outEvent.controlTarget = ScenePerformanceControlTarget::DelayMix;
+                    outEvent.value = juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f);
+                    return true;
+                case 1:
+                {
+                    const bool syncEnabled = strip->isDelaySyncEnabled();
+                    const juce::NormalisableRange<float> syncRange(0.25f, 4.0f, 0.001f, 0.45f);
+                    const juce::NormalisableRange<float> freeRange(0.25f, 4.0f, 0.001f, 0.4f);
+                    outEvent.controlTarget = ScenePerformanceControlTarget::DelayTime;
+                    outEvent.value = (syncEnabled ? syncRange : freeRange).convertFrom0to1(
+                        juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f));
+                    return true;
+                }
+                case 2:
+                    outEvent.controlTarget = ScenePerformanceControlTarget::DelayFeedback;
+                    outEvent.value = 0.97f * juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f);
+                    return true;
+                case 3:
+                {
+                    const juce::NormalisableRange<float> range(20.0f, 12000.0f, 1.0f, 0.25f);
+                    outEvent.controlTarget = ScenePerformanceControlTarget::DelayLowCut;
+                    outEvent.value = range.convertFrom0to1(juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f));
+                    return true;
+                }
+                case 4:
+                {
+                    const juce::NormalisableRange<float> range(200.0f, 20000.0f, 1.0f, 0.3f);
+                    outEvent.controlTarget = ScenePerformanceControlTarget::DelayHighCut;
+                    outEvent.value = range.convertFrom0to1(juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f));
+                    return true;
+                }
+                case 5:
+                    if (safeColumn <= 2)
+                    {
+                        outEvent.controlTarget = ScenePerformanceControlTarget::DelayMode;
+                        outEvent.value = static_cast<float>(safeColumn);
+                        return true;
+                    }
+                    if (safeColumn >= 12)
+                    {
+                        outEvent.controlTarget = ScenePerformanceControlTarget::DelaySyncEnabled;
+                        outEvent.value = safeColumn >= 14 ? 1.0f : 0.0f;
+                        return true;
+                    }
+                    return false;
+                default:
+                    return false;
+            }
+        }
+
+        case ControlMode::Filter:
+            if (controlRow == 0)
+            {
+                const float t = juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f);
+                outEvent.controlTarget = ScenePerformanceControlTarget::FilterFrequency;
+                outEvent.value = 20.0f * std::pow(1000.0f, t);
+                return true;
+            }
+            if (controlRow == 1)
+            {
+                outEvent.controlTarget = ScenePerformanceControlTarget::FilterResonance;
+                outEvent.value = 0.1f + (juce::jlimit(0.0f, 15.0f, static_cast<float>(safeColumn)) / 15.0f) * 9.9f;
+                return true;
+            }
+            if (controlRow == 2 && safeColumn <= 2)
+            {
+                outEvent.controlTarget = ScenePerformanceControlTarget::FilterMorph;
+                outEvent.value = (safeColumn <= 0) ? 0.0f : (safeColumn == 1 ? 0.5f : 1.0f);
+                return true;
+            }
+            return false;
+
+        case ControlMode::Normal:
+        case ControlMode::Gate:
+        case ControlMode::FileBrowser:
+        case ControlMode::GroupAssign:
+        case ControlMode::Modulation:
+        case ControlMode::Preset:
+        case ControlMode::StepEdit:
+        default:
+            return false;
+    }
+}
+
+bool MlrVSTAudioProcessor::resolveScenePerformanceMacroEvent(int stripIndex,
+                                                             MacroTarget target,
+                                                             float normalizedValue,
+                                                             ScenePerformanceEvent& outEvent) const
+{
+    if (audioEngine == nullptr)
+        return false;
+
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    auto* strip = audioEngine->getStrip(safeStripIndex);
+    if (strip == nullptr)
+        return false;
+
+    const auto safeTarget = sanitizeMacroPerformanceTarget(target);
+    const float clamped = juce::jlimit(0.0f, 1.0f, normalizedValue);
+
+    outEvent = {};
+    outEvent.type = ScenePerformanceEventType::ControlPoint;
+    outEvent.stripIndex = safeStripIndex;
+    outEvent.column = juce::jlimit(0, MaxColumns - 1, static_cast<int>(std::round(clamped * 15.0f)));
+
+    switch (safeTarget)
+    {
+        case MacroTarget::Speed:
+            outEvent.controlMode = static_cast<int>(ControlMode::Speed);
+            outEvent.controlTarget = ScenePerformanceControlTarget::Speed;
+            outEvent.value = denormalizeMacroLinearValue(clamped, 0.125f, 8.0f);
+            return true;
+
+        case MacroTarget::Pitch:
+            outEvent.controlMode = static_cast<int>(ControlMode::Pitch);
+            outEvent.controlTarget = ScenePerformanceControlTarget::Pitch;
+            outEvent.value = denormalizeMacroPitchValue(clamped);
+            return true;
+
+        case MacroTarget::Pan:
+            outEvent.controlMode = static_cast<int>(ControlMode::Pan);
+            outEvent.controlTarget = ScenePerformanceControlTarget::Pan;
+            outEvent.value = denormalizeMacroLinearValue(clamped, -1.0f, 1.0f);
+            return true;
+
+        case MacroTarget::Volume:
+            outEvent.controlMode = static_cast<int>(ControlMode::Volume);
+            outEvent.controlTarget = ScenePerformanceControlTarget::Volume;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::Cutoff:
+            outEvent.controlMode = static_cast<int>(ControlMode::Filter);
+            outEvent.controlRow = 0;
+            outEvent.controlTarget = ScenePerformanceControlTarget::FilterFrequency;
+            outEvent.value = denormalizeMacroCutoffValue(clamped);
+            return true;
+
+        case MacroTarget::Resonance:
+            outEvent.controlMode = static_cast<int>(ControlMode::Filter);
+            outEvent.controlRow = 1;
+            outEvent.controlTarget = ScenePerformanceControlTarget::FilterResonance;
+            outEvent.value = denormalizeMacroLinearValue(clamped, 0.1f, 10.0f);
+            return true;
+
+        case MacroTarget::FilterMorph:
+            outEvent.controlMode = static_cast<int>(ControlMode::Filter);
+            outEvent.controlRow = 2;
+            outEvent.controlTarget = ScenePerformanceControlTarget::FilterMorph;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::FilterEnable:
+            return false;
+
+        case MacroTarget::SliceLength:
+            outEvent.controlMode = static_cast<int>(ControlMode::Normal);
+            outEvent.controlRow = 0;
+            outEvent.controlTarget = ScenePerformanceControlTarget::SliceLength;
+            outEvent.value = juce::jlimit(0.02f, 1.0f, clamped);
+            return true;
+
+        case MacroTarget::Scratch:
+            outEvent.controlMode = static_cast<int>(ControlMode::Normal);
+            outEvent.controlRow = 1;
+            outEvent.controlTarget = ScenePerformanceControlTarget::Scratch;
+            outEvent.value = clamped * 100.0f;
+            return true;
+
+        case MacroTarget::DelayMix:
+            outEvent.controlMode = static_cast<int>(ControlMode::Delay);
+            outEvent.controlRow = 0;
+            outEvent.controlTarget = ScenePerformanceControlTarget::DelayMix;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::DelayTime:
+            outEvent.controlMode = static_cast<int>(ControlMode::Delay);
+            outEvent.controlRow = 1;
+            outEvent.controlTarget = ScenePerformanceControlTarget::DelayTime;
+            outEvent.value = denormalizeMacroLinearValue(clamped, 0.25f, 4.0f);
+            return true;
+
+        case MacroTarget::DelayFeedback:
+            outEvent.controlMode = static_cast<int>(ControlMode::Delay);
+            outEvent.controlRow = 2;
+            outEvent.controlTarget = ScenePerformanceControlTarget::DelayFeedback;
+            outEvent.value = denormalizeMacroLinearValue(clamped, 0.0f, 0.97f);
+            return true;
+
+        case MacroTarget::DelayLowCut:
+            outEvent.controlMode = static_cast<int>(ControlMode::Delay);
+            outEvent.controlRow = 3;
+            outEvent.controlTarget = ScenePerformanceControlTarget::DelayLowCut;
+            outEvent.value = denormalizeMacroLinearValue(clamped, 20.0f, 12000.0f);
+            return true;
+
+        case MacroTarget::DelayHighCut:
+            outEvent.controlMode = static_cast<int>(ControlMode::Delay);
+            outEvent.controlRow = 4;
+            outEvent.controlTarget = ScenePerformanceControlTarget::DelayHighCut;
+            outEvent.value = denormalizeMacroLinearValue(clamped, 200.0f, 20000.0f);
+            return true;
+
+        case MacroTarget::GrainSize:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 0;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainSize;
+            outEvent.value = denormalizeMacroLinearValue(clamped, 5.0f, 2400.0f);
+            return true;
+
+        case MacroTarget::GrainDensity:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 1;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainDensity;
+            outEvent.value = denormalizeMacroLinearValue(clamped, 0.05f, 0.9f);
+            return true;
+
+        case MacroTarget::GrainPitch:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 2;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainPitch;
+            outEvent.value = denormalizeMacroLinearValue(clamped, -48.0f, 48.0f);
+            return true;
+
+        case MacroTarget::GrainPitchJitter:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 3;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainPitchJitter;
+            outEvent.value = denormalizeMacroLinearValue(clamped, 0.0f, 48.0f);
+            return true;
+
+        case MacroTarget::GrainSpread:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 3;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainSpread;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::GrainJitter:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 4;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainJitter;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::GrainPositionJitter:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 4;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainPositionJitter;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::GrainRandom:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 4;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainRandomDepth;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::GrainArp:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 4;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainArp;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::GrainCloud:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 4;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainCloud;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::GrainEmitter:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 4;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainEmitter;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::GrainEnvelope:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 5;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainEnvelope;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::GrainShape:
+            outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
+            outEvent.controlRow = 5;
+            outEvent.controlTarget = ScenePerformanceControlTarget::GrainShape;
+            outEvent.value = denormalizeMacroLinearValue(clamped, -1.0f, 1.0f);
+            return true;
+
+        case MacroTarget::Retrigger:
+            outEvent.controlMode = static_cast<int>(ControlMode::Normal);
+            outEvent.controlRow = 2;
+            outEvent.stripIndex = -1;
+            outEvent.controlTarget = ScenePerformanceControlTarget::Retrigger;
+            outEvent.value = clamped;
+            return true;
+
+        case MacroTarget::Rearrange:
+            return false;
+
+        case MacroTarget::None:
+        default:
+            return false;
+    }
+}
+
+void MlrVSTAudioProcessor::recordMacroSceneEvent(int stripIndex, MacroTarget target, float normalizedValue)
+{
+    if (!isSceneModeEnabled() || !scenePerformanceRecorder.isRecording() || audioEngine == nullptr)
+        return;
+
+    if (!macroTargetWritesToSceneLane(target))
+        return;
+
+    ScenePerformanceEvent event;
+    if (!resolveScenePerformanceMacroEvent(stripIndex, target, normalizedValue, event))
+        return;
+
+    const int sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    scenePerformanceRecorder.recordControlEvent(sceneSlot,
+                                                event.stripIndex,
+                                                event.controlMode,
+                                                event.controlRow,
+                                                event.column,
+                                                event.controlTarget,
+                                                event.value,
+                                                audioEngine->getTimelineBeat());
+}
+
+namespace
+{
+float sceneStutterAmountFromDivisionBeats(double divisionBeats)
+{
+    const double v = juce::jlimit(0.03125, 2.0, divisionBeats);
+    if (v >= 1.5) return 0.0625f;       // 1/2
+    if (v >= 0.75) return 0.1875f;      // 1/4
+    if (v >= 0.375) return 0.3125f;     // 1/8
+    if (v >= 0.1875) return 0.4375f;    // 1/16
+    if (v >= 0.09375) return 0.625f;    // 1/32
+    if (v >= 0.046875) return 0.875f;   // 1/64
+    return 1.0f;                        // 1/128 folds into the top lane bucket
+}
+} // namespace
+
+void MlrVSTAudioProcessor::recordSceneGlobalStutterEvent(float normalizedValue, int columnHint, double eventBeat)
+{
+    if (!isSceneModeEnabled() || !scenePerformanceRecorder.isRecording())
+        return;
+
+    int sceneSlot = scenePerformanceRecorder.getRecordingSceneSlot();
+    if (sceneSlot < 0 || sceneSlot >= SceneSlots)
+        sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+
+    double safeBeat = eventBeat;
+    if (!std::isfinite(safeBeat))
+        safeBeat = (audioEngine != nullptr) ? audioEngine->getTimelineBeat() : 0.0;
+
+    scenePerformanceRecorder.recordControlEvent(sceneSlot,
+                                                -1,
+                                                static_cast<int>(ControlMode::Normal),
+                                                2,
+                                                juce::jlimit(-1, MaxColumns - 1, columnHint),
+                                                ScenePerformanceControlTarget::Retrigger,
+                                                juce::jlimit(0.0f, 1.0f, normalizedValue),
+                                                safeBeat);
+}
+
+void MlrVSTAudioProcessor::recordMomentaryStutterSceneDivision(double divisionBeats,
+                                                               int columnHint,
+                                                               double eventBeat)
+{
+    recordSceneGlobalStutterEvent(sceneStutterAmountFromDivisionBeats(divisionBeats), columnHint, eventBeat);
+}
+
+void MlrVSTAudioProcessor::recordMonomeControlSceneEvent(ControlMode mode,
+                                                         int targetStripIndex,
+                                                         int controlRow,
+                                                         int column)
+{
+    if (!isSceneModeEnabled() || !scenePerformanceRecorder.isRecording())
+        return;
+
+    ScenePerformanceEvent event;
+    if (!resolveScenePerformanceControlEvent(mode, targetStripIndex, controlRow, column, event))
+        return;
+
+    const int sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    scenePerformanceRecorder.recordControlEvent(sceneSlot,
+                                                event.stripIndex,
+                                                event.controlMode,
+                                                event.controlRow,
+                                                event.column,
+                                                event.controlTarget,
+                                                event.value,
+                                                audioEngine != nullptr ? audioEngine->getTimelineBeat() : 0.0);
+}
+
+void MlrVSTAudioProcessor::playbackScenePerformanceEvent(const ScenePerformanceEvent& event)
+{
+    if (audioEngine == nullptr)
+        return;
+
+    if (event.type == ScenePerformanceEventType::ControlPoint
+        && event.controlTarget == ScenePerformanceControlTarget::Retrigger)
+    {
+        setGlobalSceneStutterAmount(event.value);
+        return;
+    }
+
+    const int stripIndex = juce::jlimit(0, MaxStrips - 1, event.stripIndex);
+    auto* strip = audioEngine->getStrip(stripIndex);
+    if (strip == nullptr)
+        return;
+
+    if (event.type == ScenePerformanceEventType::Trigger)
+    {
+        if (event.isNoteOn)
+        {
+            audioEngine->triggerStripWithQuantization(stripIndex,
+                                                      juce::jlimit(0, MaxColumns - 1, event.column),
+                                                      false,
+                                                      event.sampleSliceId,
+                                                      event.sampleStartSample);
+        }
+        else if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
+        {
+            stopSampleModeStrip(stripIndex, false);
+        }
+        else
+        {
+            strip->stop(false);
+        }
+        return;
+    }
+
+    switch (event.controlTarget)
+    {
+        case ScenePerformanceControlTarget::Speed:
+            setStripSpeedControlValue(stripIndex, event.value, StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::Pitch:
+            if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
+                strip->setGrainPitch(event.value);
+            else
+                applyUserPitchControlToStrip(stripIndex, event.value);
+            break;
+        case ScenePerformanceControlTarget::Pan:
+            setStripPanControlValue(stripIndex, event.value, StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::Volume:
+            setStripVolumeControlValue(stripIndex, event.value, StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::Swing:
+            strip->setSwingAmount(juce::jlimit(0.0f, 1.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::GrainSize:
+            strip->setGrainSizeMs(event.value);
+            break;
+        case ScenePerformanceControlTarget::GrainDensity:
+            strip->setGrainDensity(event.value);
+            break;
+        case ScenePerformanceControlTarget::GrainPitch:
+            strip->setGrainPitch(event.value);
+            break;
+        case ScenePerformanceControlTarget::GrainPitchJitter:
+            strip->setGrainPitchJitter(juce::jlimit(0.0f, 48.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::GrainSpread:
+            strip->setGrainSpread(juce::jlimit(0.0f, 1.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::GrainJitter:
+            strip->setGrainJitter(juce::jlimit(0.0f, 1.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::GrainPositionJitter:
+            strip->setGrainPositionJitter(juce::jlimit(0.0f, 1.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::GrainRandomDepth:
+            strip->setGrainRandomDepth(juce::jlimit(0.0f, 1.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::GrainArp:
+            strip->setGrainArpDepth(juce::jlimit(0.0f, 1.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::GrainCloud:
+            strip->setGrainCloudDepth(juce::jlimit(0.0f, 1.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::GrainEmitter:
+            strip->setGrainEmitterDepth(juce::jlimit(0.0f, 1.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::GrainEnvelope:
+            strip->setGrainEnvelope(juce::jlimit(0.0f, 1.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::GrainShape:
+            strip->setGrainShape(juce::jlimit(-1.0f, 1.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::FilterFrequency:
+            setStripFilterFrequencyControlValue(stripIndex, event.value, StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::FilterResonance:
+            setStripFilterResonanceControlValue(stripIndex, event.value, StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::FilterEnabled:
+            setStripFilterEnabledControlValue(stripIndex,
+                                              event.value >= 0.5f,
+                                              StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::FilterMorph:
+            setStripFilterMorphControlValue(stripIndex, event.value, StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::SliceLength:
+            writeStripFloatParameter("stripSliceLength" + juce::String(stripIndex),
+                                     juce::jlimit(0.02f, 1.0f, event.value),
+                                     stripSliceLengthParams[static_cast<size_t>(stripIndex)],
+                                     StripControlWriteMode::CacheOnly);
+            strip->setLoopSliceLength(event.value);
+            break;
+        case ScenePerformanceControlTarget::Scratch:
+            strip->setScratchAmount(juce::jlimit(0.0f, 100.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::DelayMix:
+            setStripDelayMixControlValue(stripIndex, event.value, StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::DelayTime:
+            setStripDelayTimeControlValue(stripIndex, event.value, StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::DelayFeedback:
+            setStripDelayFeedbackControlValue(stripIndex, event.value, StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::DelayLowCut:
+            setStripDelayLowCutControlValue(stripIndex, event.value, StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::DelayHighCut:
+            setStripDelayHighCutControlValue(stripIndex, event.value, StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::DelayMode:
+            setStripDelayModeControlValue(stripIndex,
+                                          static_cast<EnhancedAudioStrip::DelayMode>(
+                                              juce::jlimit(0, 2, static_cast<int>(std::round(event.value)))),
+                                          StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::DelaySyncEnabled:
+            setStripDelaySyncEnabledControlValue(stripIndex,
+                                                 event.value >= 0.5f,
+                                                 StripControlWriteMode::CacheOnly);
+            break;
+        case ScenePerformanceControlTarget::Retrigger:
+            audioEngine->setMacroRetriggerAmount(stripIndex, juce::jlimit(0.0f, 1.0f, event.value));
+            break;
+        case ScenePerformanceControlTarget::Rearrange:
+            break;
+        case ScenePerformanceControlTarget::None:
+        default:
+            break;
+    }
+}
+
+void MlrVSTAudioProcessor::processScenePerformancePlayback(const juce::AudioPlayHead::PositionInfo& posInfo,
+                                                           int numSamples)
+{
+    if (!isSceneModeEnabled() || audioEngine == nullptr)
+    {
+        lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+        lastScenePerformanceProcessSceneSlot = -1;
+        lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
+        return;
+    }
+
+    const int sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    if (!activeSceneStartPpqValid || !std::isfinite(activeSceneStartPpq))
+    {
+        lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+        lastScenePerformanceProcessSceneSlot = sceneSlot;
+        lastScenePerformanceProcessSceneStartBeat = activeSceneStartPpq;
+        return;
+    }
+
+    const double blockStartBeat = posInfo.getPpqPosition().hasValue()
+        ? *posInfo.getPpqPosition()
+        : audioEngine->getTimelineBeat();
+    const int64_t blockStartSample = audioEngine->getGlobalSampleCount();
+    const double bpm = posInfo.getBpm().hasValue()
+        ? juce::jmax(1.0, *posInfo.getBpm())
+        : juce::jmax(1.0, audioEngine->getCurrentTempo());
+    const double beatDeltaPerSample = bpm / (60.0 * juce::jmax(1.0, currentSampleRate));
+    const double samplesPerBeat = 1.0 / beatDeltaPerSample;
+    const double blockEndBeat = blockStartBeat + (beatDeltaPerSample * static_cast<double>(juce::jmax(0, numSamples)));
+
+    scenePerformanceRecorder.updateRecording(blockEndBeat);
+
+    if (!scenePerformanceRecorder.hasEvents(sceneSlot))
+    {
+        lastScenePerformanceProcessBeat = blockEndBeat;
+        lastScenePerformanceProcessSceneSlot = sceneSlot;
+        lastScenePerformanceProcessSceneStartBeat = activeSceneStartPpq;
+        return;
+    }
+
+    const bool sceneChanged = sceneSlot != lastScenePerformanceProcessSceneSlot
+        || !std::isfinite(lastScenePerformanceProcessSceneStartBeat)
+        || std::abs(lastScenePerformanceProcessSceneStartBeat - activeSceneStartPpq) > 1.0e-9;
+
+    double fromBeat = sceneChanged ? juce::jmax(blockStartBeat, activeSceneStartPpq) : lastScenePerformanceProcessBeat;
+    if (!std::isfinite(fromBeat))
+        fromBeat = blockStartBeat;
+
+    if (fromBeat < blockStartBeat - 1.0 || fromBeat > blockEndBeat + 1.0)
+        fromBeat = blockStartBeat;
+
+    const double clipLengthBeats = juce::jmax(1.0, scenePerformanceRecorder.getClipLengthBeats(sceneSlot));
+    const double beatDelta = blockEndBeat - fromBeat;
+    if (beatDelta > 0.0 && beatDelta <= clipLengthBeats)
+    {
+        scenePerformanceRecorder.processEventsForBeatWindow(sceneSlot,
+                                                            activeSceneStartPpq,
+                                                            fromBeat,
+                                                            blockEndBeat,
+                                                            [this, blockStartBeat, blockStartSample, numSamples, samplesPerBeat]
+                                                            (const ScenePerformanceEvent& event, double occurrenceBeat)
+                                                            {
+                                                                if (event.type == ScenePerformanceEventType::Trigger
+                                                                    && event.isNoteOn
+                                                                    && std::isfinite(occurrenceBeat))
+                                                                {
+                                                                    const int maxOffset = juce::jmax(0, numSamples - 1);
+                                                                    const int offsetSamples = juce::jlimit(
+                                                                        0,
+                                                                        maxOffset,
+                                                                        static_cast<int>(std::llround(
+                                                                            (occurrenceBeat - blockStartBeat) * samplesPerBeat)));
+                                                                    audioEngine->queueExactTrigger(event.stripIndex,
+                                                                                                  juce::jlimit(0, MaxColumns - 1, event.column),
+                                                                                                  occurrenceBeat,
+                                                                                                  blockStartSample + offsetSamples,
+                                                                                                  event.sampleSliceId,
+                                                                                                  event.sampleStartSample);
+                                                                    return;
+                                                                }
+
+                                                                playbackScenePerformanceEvent(event);
+                                                            });
+    }
+
+    lastScenePerformanceProcessBeat = blockEndBeat;
+    lastScenePerformanceProcessSceneSlot = sceneSlot;
+    lastScenePerformanceProcessSceneStartBeat = activeSceneStartPpq;
+}
+
+void MlrVSTAudioProcessor::renderActiveSceneAudio(juce::AudioBuffer<float>& buffer,
+                                                  juce::MidiBuffer& midiMessages,
+                                                  const juce::AudioPlayHead::PositionInfo& posInfo,
+                                                  bool allowSeparateStripRouting,
+                                                  bool applySceneTransitionOverlay)
+{
+    if (audioEngine == nullptr)
+    {
+        buffer.clear();
+        return;
+    }
+
+    if (masterVolumeParam)
+        audioEngine->setMasterVolume(*masterVolumeParam);
+    if (limiterThresholdParam)
+        audioEngine->setLimiterThresholdDb(limiterThresholdParam->load(std::memory_order_acquire));
+    if (limiterEnabledParam)
+        audioEngine->setLimiterEnabled(limiterEnabledParam->load(std::memory_order_acquire) > 0.5f);
+    if (quantizeParam)
+    {
+        const int quantizeChoice = static_cast<int>(*quantizeParam);
+        const int divisionMap[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32};
+        const int division = (quantizeChoice >= 0 && quantizeChoice < 10) ? divisionMap[quantizeChoice] : 8;
+        audioEngine->setQuantization(division);
+    }
+    if (pitchSmoothingParam)
+        audioEngine->setPitchSmoothingTime(*pitchSmoothingParam);
+    if (inputMonitorParam)
+        audioEngine->setInputMonitorVolume(*inputMonitorParam);
+    if (crossfadeLengthParam)
+        audioEngine->setCrossfadeLengthMs(*crossfadeLengthParam);
+    if (triggerFadeInParam)
+        audioEngine->setTriggerFadeInMs(*triggerFadeInParam);
+    audioEngine->setGlobalStretchBackend(getStretchBackend());
+    audioEngine->setGlobalContinuousTraversal(usesContinuousTraversal());
+    syncTransientDetectionSettingsFromParameters(false);
+    audioEngine->setGlobalTempoMatchBackend(getLoopTempoMatchBackend());
+    if (masterDuckTriggerStripParam)
+    {
+        const int triggerChoice = juce::jlimit(0,
+                                               MaxStrips,
+                                               static_cast<int>(masterDuckTriggerStripParam->load(std::memory_order_acquire)));
+        audioEngine->setMasterDuckTriggerStrip(triggerChoice - 1);
+    }
+
+    applyMomentaryStutterMacro(posInfo);
+    processScenePerformancePlayback(posInfo, buffer.getNumSamples());
+    updateAudioEngineSceneModulationContext();
+    const auto transitionOverlayType = sanitizeRuntimeSceneChainTransitionType(
+        sceneBoundaryTransitionType.load(std::memory_order_acquire));
+    const bool shouldRestoreTransitionOverlay = applySceneTransitionOverlay
+        && transitionOverlayType != SceneChainTransitionType::None
+        && transitionOverlayType != SceneChainTransitionType::Return;
+    std::array<StripControlState::ResolvedOwnedStripControlState, MaxStrips> transitionOverlayOriginalStates{};
+    std::array<bool, MaxStrips> transitionOverlayOriginalStateValid{};
+    if (shouldRestoreTransitionOverlay)
+    {
+        const StripControlState::ParameterView emptyView;
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+        {
+            auto* strip = audioEngine->getStrip(stripIndex);
+            if (strip == nullptr)
+                continue;
+
+            const bool stepMode = strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Step;
+            auto* stepSampler = stepMode ? strip->getStepSampler() : nullptr;
+            const bool hasPlayableContent = strip->hasAudio()
+                || (stepSampler != nullptr && stepSampler->getHasAudio());
+            if (!hasPlayableContent)
+                continue;
+
+            transitionOverlayOriginalStates[static_cast<size_t>(stripIndex)] =
+                StripControlState::resolveFromParameters(emptyView, *strip);
+            transitionOverlayOriginalStateValid[static_cast<size_t>(stripIndex)] = true;
+        }
+
+        applySceneBoundaryTransitionOverlay(posInfo, buffer.getNumSamples());
+    }
+
+    auto restoreSceneTransitionOverlay = [this,
+                                          &transitionOverlayOriginalStates,
+                                          &transitionOverlayOriginalStateValid]()
+    {
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+        {
+            if (!transitionOverlayOriginalStateValid[static_cast<size_t>(stripIndex)])
+                continue;
+
+            auto* strip = audioEngine != nullptr ? audioEngine->getStrip(stripIndex) : nullptr;
+            if (strip == nullptr)
+                continue;
+
+            const auto& originalState = transitionOverlayOriginalStates[static_cast<size_t>(stripIndex)];
+            applyResolvedOwnedStripControlState(*strip, originalState);
+            applyResolvedStripFilterState(*strip, originalState);
+            applyResolvedStripDelayState(*strip, originalState);
+        }
+    };
+
+    const bool separateStripRouting = allowSeparateStripRouting
+        && (outputRoutingParam != nullptr && *outputRoutingParam > 0.5f)
+        && getBusCount(false) > 1;
+    if (separateStripRouting)
+    {
+        std::array<std::array<float*, 2>, MaxStrips> stripBusChannels{};
+        std::array<juce::AudioBuffer<float>, MaxStrips> stripBusViews;
+        std::array<juce::AudioBuffer<float>*, MaxStrips> stripBusTargets{};
+        stripBusTargets.fill(nullptr);
+
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+        {
+            const int busIndex = stripIndex;
+            if (busIndex >= getBusCount(false))
+                continue;
+
+            auto busBuffer = getBusBuffer(buffer, false, busIndex);
+            if (busBuffer.getNumChannels() <= 0 || busBuffer.getNumSamples() <= 0)
+                continue;
+
+            auto& channelPtrs = stripBusChannels[static_cast<size_t>(stripIndex)];
+            channelPtrs.fill(nullptr);
+            channelPtrs[0] = busBuffer.getWritePointer(0);
+            channelPtrs[1] = busBuffer.getNumChannels() > 1
+                ? busBuffer.getWritePointer(1)
+                : busBuffer.getWritePointer(0);
+
+            stripBusViews[static_cast<size_t>(stripIndex)].setDataToReferTo(
+                channelPtrs.data(), 2, busBuffer.getNumSamples());
+            stripBusTargets[static_cast<size_t>(stripIndex)] =
+                &stripBusViews[static_cast<size_t>(stripIndex)];
+        }
+
+        auto* mainTarget = stripBusTargets[0];
+        if (mainTarget == nullptr)
+            mainTarget = &buffer;
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+        {
+            if (stripBusTargets[static_cast<size_t>(stripIndex)] == nullptr)
+                stripBusTargets[static_cast<size_t>(stripIndex)] = mainTarget;
+        }
+
+        audioEngine->processBlock(buffer, midiMessages, posInfo, &stripBusTargets);
+        if (shouldRestoreTransitionOverlay)
+            restoreSceneTransitionOverlay();
+        return;
+    }
+
+    audioEngine->processBlock(buffer, midiMessages, posInfo, nullptr);
+    if (shouldRestoreTransitionOverlay)
+        restoreSceneTransitionOverlay();
+}
+
+bool MlrVSTAudioProcessor::tryStartPreloadedSceneTransition(int mainPresetIndex,
+                                                            int sceneSlot,
+                                                            bool sequenceDriven,
+                                                            int sequenceStepIndex,
+                                                            double targetPpq,
+                                                            double targetTempo,
+                                                            int64_t targetSample,
+                                                            int sampleOffset,
+                                                            SceneChainTransitionType transitionType)
+{
+    const bool separateStripRouting = outputRoutingParam != nullptr && *outputRoutingParam > 0.5f;
+    if (separateStripRouting || preparedSceneRenderContext == nullptr || activeSceneTransitionContext != nullptr)
+        return false;
+
+    auto matchesPrepared = [&](const SceneRenderContext& context) -> bool
+    {
+        const bool sampleMatches =
+            ((context.sceneStartSample < 0 && targetSample < 0)
+             || (context.sceneStartSample >= 0
+                 && targetSample >= 0
+                 && (context.sceneStartSample - targetSample) >= -64
+                 && (context.sceneStartSample - targetSample) <= 64));
+        return context.mainPresetIndex == mainPresetIndex
+            && context.sceneSlot == sceneSlot
+            && context.sequenceDriven == sequenceDriven
+            && context.sequenceStepIndex == sequenceStepIndex
+            && context.transitionType == transitionType
+            && sampleMatches
+            && ((!std::isfinite(targetPpq) && !context.sceneStartPpqValid)
+                || (context.sceneStartPpqValid && std::abs(context.sceneStartPpq - targetPpq) <= 1.0e-9));
+    };
+
+    if (!matchesPrepared(*preparedSceneRenderContext))
+        return false;
+
+    scenePerformanceRecorder.stopRecording();
+    clearPendingMonomeSceneRecorderTap();
+    clearPendingSceneRecorderAction();
+
+    auto context = std::move(preparedSceneRenderContext);
+    context->sceneStartPpqValid = std::isfinite(targetPpq);
+    context->sceneStartPpq = context->sceneStartPpqValid ? targetPpq : 0.0;
+    context->sceneTempo = (std::isfinite(targetTempo) && targetTempo > 0.0) ? targetTempo : 120.0;
+    context->sceneStartSample = targetSample;
+    context->transitionType = transitionType;
+    if (context->engine != nullptr)
+        context->engine->seedTransportState(targetSample >= 0 ? targetSample : 0, targetPpq);
+
+    if (context->sceneTimingStateXml != nullptr)
+        applySceneChainStateXml(context->sceneTimingStateXml.get(), context->sceneSlot);
+    if (context->scenePerformanceStateData.getSize() > 0)
+        applyScenePerformanceStateData(context->scenePerformanceStateData, context->sceneSlot);
+
+    const double effectiveRate = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
+    const float transitionLengthBeats = sanitizeRuntimeSceneChainTransitionLengthBeats(
+        sceneBoundaryTransitionLengthBeats.load(std::memory_order_acquire));
+    const float transitionIntensity = sanitizeRuntimeSceneChainTransitionAmount(
+        sceneBoundaryTransitionIntensity.load(std::memory_order_acquire),
+        DefaultSceneTransitionIntensity);
+    const float triggerFadeMs = triggerFadeInParam != nullptr
+        ? juce::jlimit(0.01f, 120.0f, triggerFadeInParam->load(std::memory_order_acquire))
+        : 12.0f;
+    const double transitionSeconds = juce::jmax(sceneChainTransitionCrossfadeSeconds(
+        transitionType,
+        transitionLengthBeats,
+        transitionIntensity,
+        context->sceneTempo),
+        static_cast<double>(triggerFadeMs) * 0.001);
+    const int transitionSamples = juce::jmax(32, static_cast<int>(std::round(effectiveRate * transitionSeconds)));
+    const int maxTransitionSamples = juce::jmax(8192, static_cast<int>(std::round(effectiveRate * 6.0)));
+
+    activeSceneTransitionContext = std::move(context);
+    sceneTransitionSamplesTotal = juce::jlimit(32, maxTransitionSamples, transitionSamples);
+    sceneTransitionSamplesRendered = 0;
+    sceneTransitionStartSampleOffset = juce::jlimit(0, juce::jmax(0, getBlockSize() - 1), sampleOffset);
+    sceneTransitionCommitPending = false;
+    sceneRecallBlendSamplesRemaining = 0;
+    sceneRecallBlendTotalSamples = 0;
+    sceneRecallBlendStartTailLength = 0;
+    return activeSceneTransitionContext != nullptr;
+}
+
+void MlrVSTAudioProcessor::renderSceneTransitionBlock(juce::AudioBuffer<float>& buffer,
+                                                      juce::MidiBuffer& midiMessages,
+                                                      const juce::AudioPlayHead::PositionInfo& posInfo)
+{
+    if (activeSceneTransitionContext == nullptr || audioEngine == nullptr)
+    {
+        renderActiveSceneAudio(buffer, midiMessages, posInfo, true, true);
+        return;
+    }
+
+    const int numChannels = juce::jmax(1, buffer.getNumChannels());
+    const int numSamples = juce::jmax(0, buffer.getNumSamples());
+    sceneTransitionOutgoingScratch.setSize(numChannels, numSamples, false, false, true);
+    sceneTransitionIncomingScratch.setSize(numChannels, numSamples, false, false, true);
+    sceneTransitionOutgoingScratch.clear();
+    sceneTransitionIncomingScratch.clear();
+
+    juce::MidiBuffer outgoingMidi(midiMessages);
+    renderActiveSceneAudio(sceneTransitionOutgoingScratch, outgoingMidi, posInfo, false, true);
+
+    auto renderIncomingContext = [this, &posInfo](SceneRenderContext& context,
+                                                  juce::AudioBuffer<float>& destination,
+                                                  int startOffset)
+    {
+        if (context.engine == nullptr || startOffset >= destination.getNumSamples())
+            return;
+
+        juce::AudioPlayHead::PositionInfo adjustedPos = posInfo;
+        if (startOffset > 0
+            && posInfo.getPpqPosition().hasValue()
+            && posInfo.getBpm().hasValue()
+            && *posInfo.getBpm() > 0.0
+            && currentSampleRate > 0.0)
+        {
+            const double ppqAdvance = (static_cast<double>(startOffset) * *posInfo.getBpm())
+                / (60.0 * currentSampleRate);
+            adjustedPos.setPpqPosition(*posInfo.getPpqPosition() + ppqAdvance);
+        }
+
+        std::array<float*, 2> subViewChannels{};
+        juce::AudioBuffer<float> subView;
+        juce::AudioBuffer<float>* targetBuffer = &destination;
+        if (startOffset > 0)
+        {
+            subViewChannels[0] = destination.getWritePointer(0, startOffset);
+            subViewChannels[1] = destination.getNumChannels() > 1
+                ? destination.getWritePointer(1, startOffset)
+                : destination.getWritePointer(0, startOffset);
+            subView.setDataToReferTo(subViewChannels.data(), 2, destination.getNumSamples() - startOffset);
+            targetBuffer = &subView;
+        }
+
+        std::swap(audioEngine, context.engine);
+        std::swap(sampleModeEngines, context.sampleModeEngines);
+        std::swap(sampleModeScratchBuffers, context.sampleModeScratchBuffers);
+        std::swap(sampleModeRenderedLastBlock, context.sampleModeRenderedLastBlock);
+        std::swap(currentStripFiles, context.currentStripFiles);
+
+        const int savedMainPreset = activeSceneMainPresetIndex;
+        const int savedSceneSlot = activeSceneSlot;
+        const bool savedSceneStartValid = activeSceneStartPpqValid;
+        const double savedSceneStartPpq = activeSceneStartPpq;
+        const double savedProcessBeat = lastScenePerformanceProcessBeat;
+        const int savedProcessSceneSlot = lastScenePerformanceProcessSceneSlot;
+        const double savedProcessSceneStartBeat = lastScenePerformanceProcessSceneStartBeat;
+
+        activeSceneMainPresetIndex = context.mainPresetIndex;
+        activeSceneSlot = context.sceneSlot;
+        activeSceneStartPpqValid = context.sceneStartPpqValid;
+        activeSceneStartPpq = context.sceneStartPpq;
+        lastScenePerformanceProcessBeat = context.lastScenePerformanceProcessBeat;
+        lastScenePerformanceProcessSceneSlot = context.lastScenePerformanceProcessSceneSlot;
+        lastScenePerformanceProcessSceneStartBeat = context.lastScenePerformanceProcessSceneStartBeat;
+
+        const int previousSuppress = suppressOwnedStripParameterSync.exchange(1, std::memory_order_acq_rel);
+        if (sceneSlotHasMotionState(activeSceneSlot))
+            applySceneMotionStateToEngine(activeSceneSlot);
+        else
+            syncSceneMotionStateFromEngine(activeSceneSlot);
+
+        juce::MidiBuffer incomingMidi;
+        renderActiveSceneAudio(*targetBuffer, incomingMidi, adjustedPos, false, false);
+
+        context.lastScenePerformanceProcessBeat = lastScenePerformanceProcessBeat;
+        context.lastScenePerformanceProcessSceneSlot = lastScenePerformanceProcessSceneSlot;
+        context.lastScenePerformanceProcessSceneStartBeat = lastScenePerformanceProcessSceneStartBeat;
+
+        suppressOwnedStripParameterSync.store(previousSuppress, std::memory_order_release);
+        activeSceneMainPresetIndex = savedMainPreset;
+        activeSceneSlot = savedSceneSlot;
+        activeSceneStartPpqValid = savedSceneStartValid;
+        activeSceneStartPpq = savedSceneStartPpq;
+        lastScenePerformanceProcessBeat = savedProcessBeat;
+        lastScenePerformanceProcessSceneSlot = savedProcessSceneSlot;
+        lastScenePerformanceProcessSceneStartBeat = savedProcessSceneStartBeat;
+
+        std::swap(currentStripFiles, context.currentStripFiles);
+        std::swap(sampleModeRenderedLastBlock, context.sampleModeRenderedLastBlock);
+        std::swap(sampleModeScratchBuffers, context.sampleModeScratchBuffers);
+        std::swap(sampleModeEngines, context.sampleModeEngines);
+        std::swap(audioEngine, context.engine);
+    };
+
+    const int incomingStartOffset = sceneTransitionSamplesRendered == 0 ? sceneTransitionStartSampleOffset : 0;
+    renderIncomingContext(*activeSceneTransitionContext, sceneTransitionIncomingScratch, incomingStartOffset);
+
+    auto evaluateChipGains = [](SceneChainTransitionType type,
+                                float progress,
+                                float& outgoingGain,
+                                float& incomingGain)
+    {
+        const float clamped = juce::jlimit(0.0f, 1.0f, progress);
+        const float eased = smoothSceneTransitionProgress(clamped);
+        outgoingGain = std::cos(eased * juce::MathConstants<float>::halfPi);
+        incomingGain = std::sin(eased * juce::MathConstants<float>::halfPi);
+
+        switch (type)
+        {
+            case SceneChainTransitionType::Fill:
+                outgoingGain *= 0.92f + (0.10f * (1.0f - eased));
+                incomingGain = std::pow(incomingGain, 0.82f);
+                break;
+            case SceneChainTransitionType::Stutter:
+            {
+                const float pulse = (std::fmod(clamped * 18.0f, 1.0f) < 0.5f) ? 0.62f : 1.0f;
+                outgoingGain *= pulse;
+                incomingGain = std::pow(incomingGain, 1.15f);
+                break;
+            }
+            case SceneChainTransitionType::FilterRise:
+                outgoingGain = std::pow(outgoingGain, 0.72f);
+                incomingGain = std::pow(incomingGain, 1.08f);
+                break;
+            case SceneChainTransitionType::Drop:
+                if (clamped < 0.50f)
+                    incomingGain = 0.0f;
+                else
+                    incomingGain = std::pow(juce::jlimit(0.0f, 1.0f, (clamped - 0.50f) / 0.50f), 0.65f);
+                outgoingGain *= (clamped < 0.60f ? 1.0f : juce::jlimit(0.0f, 1.0f, (1.0f - clamped) / 0.40f));
+                break;
+            case SceneChainTransitionType::MuteTail:
+                outgoingGain = std::pow(outgoingGain, 1.7f);
+                incomingGain = std::pow(incomingGain, 0.9f);
+                break;
+            case SceneChainTransitionType::Break:
+            {
+                const float fadeOutEnd = 0.34f;
+                const float fadeInStart = 0.64f;
+                if (clamped < fadeOutEnd)
+                {
+                    const float local = juce::jlimit(0.0f, 1.0f, clamped / fadeOutEnd);
+                    outgoingGain = std::cos(local * juce::MathConstants<float>::halfPi);
+                    incomingGain = 0.0f;
+                }
+                else if (clamped < fadeInStart)
+                {
+                    outgoingGain = 0.0f;
+                    incomingGain = 0.0f;
+                }
+                else
+                {
+                    const float local = juce::jlimit(0.0f, 1.0f, (clamped - fadeInStart) / (1.0f - fadeInStart));
+                    outgoingGain = 0.0f;
+                    incomingGain = std::sin(local * juce::MathConstants<float>::halfPi);
+                }
+                break;
+            }
+            case SceneChainTransitionType::None:
+            case SceneChainTransitionType::Return:
+            default:
+                break;
+        }
+    };
+
+    buffer.makeCopyOf(sceneTransitionOutgoingScratch, true);
+    int samplesConsumed = 0;
+    const auto transitionType = activeSceneTransitionContext->transitionType;
+    const int totalTransitionSamples = juce::jmax(1, sceneTransitionSamplesTotal);
+    for (int sample = 0; sample < numSamples; ++sample)
+    {
+        const bool beforeIncomingStart = (sceneTransitionSamplesRendered == 0 && sample < incomingStartOffset);
+        if (beforeIncomingStart)
+            continue;
+
+        const int transitionSampleIndex = juce::jmax(0, sceneTransitionSamplesRendered + samplesConsumed);
+        if (transitionSampleIndex >= totalTransitionSamples)
+        {
+            for (int channel = 0; channel < numChannels; ++channel)
+                buffer.setSample(channel, sample, sceneTransitionIncomingScratch.getSample(channel, sample));
+            continue;
+        }
+
+        const float progress = totalTransitionSamples > 1
+            ? static_cast<float>(transitionSampleIndex) / static_cast<float>(totalTransitionSamples - 1)
+            : 1.0f;
+        float outgoingGain = 1.0f;
+        float incomingGain = 1.0f;
+        evaluateChipGains(transitionType, progress, outgoingGain, incomingGain);
+
+        for (int channel = 0; channel < numChannels; ++channel)
+        {
+            const float outgoingSample = sceneTransitionOutgoingScratch.getSample(channel, sample);
+            const float incomingSample = sceneTransitionIncomingScratch.getSample(channel, sample);
+            buffer.setSample(channel,
+                             sample,
+                             (outgoingSample * outgoingGain) + (incomingSample * incomingGain));
+        }
+
+        ++samplesConsumed;
+    }
+
+    sceneTransitionSamplesRendered = juce::jmin(totalTransitionSamples,
+                                                sceneTransitionSamplesRendered + samplesConsumed);
+    sceneTransitionStartSampleOffset = 0;
+    sceneTransitionCommitPending = sceneTransitionSamplesRendered >= totalTransitionSamples;
+}
+
+void MlrVSTAudioProcessor::applySceneRenderContext(SceneRenderContext context)
+{
+    if (context.engine == nullptr)
+        return;
+
+    for (auto& inFlight : loopStripLoadInFlight)
+        inFlight.store(0, std::memory_order_release);
+    for (auto& requestId : loopStripLoadRequestIds)
+        requestId.store(0, std::memory_order_release);
+    for (auto& progress : loopStripLoadProgressPermille)
+        progress.store(0, std::memory_order_release);
+    pendingLoopStripFiles.fill({});
+    loopStripLoadStatusTexts.fill({});
+
+    for (auto& inFlight : loopPitchAnalysisInFlight)
+        inFlight.store(0, std::memory_order_release);
+    for (auto& requestId : loopPitchAnalysisRequestIds)
+        requestId.store(0, std::memory_order_release);
+    for (auto& progress : loopPitchAnalysisProgressPermille)
+        progress.store(0, std::memory_order_release);
+    loopPitchAnalysisStatusTexts.fill({});
+
+    audioEngine = std::move(context.engine);
+    configureAudioEngineCallbacks(*audioEngine);
+    sampleModeEngines = std::move(context.sampleModeEngines);
+    sampleModeScratchBuffers = std::move(context.sampleModeScratchBuffers);
+    sampleModeRenderedLastBlock = context.sampleModeRenderedLastBlock;
+    currentStripFiles = std::move(context.currentStripFiles);
+    recentLoopDirectories = std::move(context.recentLoopDirectories);
+    recentStepDirectories = std::move(context.recentStepDirectories);
+    recentFlipDirectories = std::move(context.recentFlipDirectories);
+
+    activeSceneMainPresetIndex = context.mainPresetIndex;
+    activeSceneSlot = context.sceneSlot;
+    activeSceneNeedsCaptureBeforeManualRecall = false;
+    activeSceneStartPpqValid = context.sceneStartPpqValid;
+    activeSceneStartPpq = context.sceneStartPpq;
+    lastScenePerformanceProcessBeat = context.lastScenePerformanceProcessBeat;
+    lastScenePerformanceProcessSceneSlot = context.lastScenePerformanceProcessSceneSlot;
+    lastScenePerformanceProcessSceneStartBeat = context.lastScenePerformanceProcessSceneStartBeat;
+
+    if (context.sceneTimingStateXml != nullptr)
+        applySceneChainStateXml(context.sceneTimingStateXml.get(), context.sceneSlot);
+    if (context.scenePerformanceStateData.getSize() > 0)
+        applyScenePerformanceStateData(context.scenePerformanceStateData, context.sceneSlot);
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        if (context.loopPitchStateXml[static_cast<size_t>(stripIndex)] != nullptr)
+            applyLoopPitchPresetStateXml(stripIndex,
+                                         context.loopPitchStateXml[static_cast<size_t>(stripIndex)].get());
+    }
+    resolveLoopPitchRecallStateImmediately();
+
+    if (context.sequenceDriven && getSceneChainLength() >= 2)
+    {
+        sceneSequenceActive = true;
+        sceneSequenceCurrentStepIndex = juce::jlimit(0,
+                                                     getSceneChainLength() - 1,
+                                                     juce::jmax(0, context.sequenceStepIndex));
+    }
+    else
+    {
+        sceneSequenceActive = false;
+        sceneSequenceCurrentStepIndex = -1;
+    }
+
+    if (isSceneModeEnabled() && audioEngine != nullptr)
+    {
+        if (sceneSlotHasMotionState(activeSceneSlot))
+            applySceneMotionStateToEngine(activeSceneSlot);
+        else
+            syncSceneMotionStateFromEngine(activeSceneSlot);
+    }
+
+    if (PresetStore::presetExists(activeSceneMainPresetIndex))
+        loadedPresetIndex = activeSceneMainPresetIndex;
+    if (context.sequenceDriven)
+        armNextSceneInSequence(activeSceneMainPresetIndex, activeSceneSlot, activeSceneStartPpq);
+    else
+        sceneSequenceStartPpqValid = false;
+
+    if (context.parameterState.isValid())
+    {
+        suppressOwnedStripParameterSync.store(1, std::memory_order_release);
+        queuePendingSceneParameterState(context.parameterState);
+    }
+    else
+    {
+        suppressOwnedStripParameterSync.store(0, std::memory_order_release);
+    }
+
+    sceneTransitionSamplesTotal = 0;
+    sceneTransitionSamplesRendered = 0;
+    sceneTransitionStartSampleOffset = 0;
+    sceneTransitionCommitPending = false;
+    presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
+    updateMonomeLEDs();
+}
+
+void MlrVSTAudioProcessor::commitSceneTransitionIfReady()
+{
+    if (!sceneTransitionCommitPending || activeSceneTransitionContext == nullptr)
+        return;
+
+    clearSceneBoundaryTransitionState();
+
+    auto context = std::move(activeSceneTransitionContext);
+    applySceneRenderContext(std::move(*context));
+}
+
 void MlrVSTAudioProcessor::recordMonomeControlPatternEvent(ControlMode mode,
                                                            int targetStripIndex,
                                                            int controlRow,
@@ -6225,26 +8995,8 @@ void MlrVSTAudioProcessor::recordMonomeControlPatternEvent(ControlMode mode,
     if (!audioEngine || !monomeControlPageShowsPatternRecorder(mode))
         return;
 
-    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, targetStripIndex);
-    const int safeColumn = juce::jlimit(0, MaxColumns - 1, column);
-    const double eventBeat = audioEngine->getTimelineBeat();
-
-    for (int i = 0; i < ModernAudioEngine::MaxPatterns; ++i)
-    {
-        auto* pattern = audioEngine->getPattern(i);
-        if (pattern == nullptr
-            || !pattern->isRecording()
-            || !audioEngine->patternRecorderMatchesStrip(i, safeStripIndex))
-        {
-            continue;
-        }
-
-        pattern->recordControlEvent(safeStripIndex,
-                                    static_cast<int>(mode),
-                                    controlRow,
-                                    safeColumn,
-                                    eventBeat);
-    }
+    if (isSceneModeEnabled())
+        recordMonomeControlSceneEvent(mode, targetStripIndex, controlRow, column);
 }
 
 void MlrVSTAudioProcessor::playbackMonomeControlPatternEvent(const PatternRecorder::Event& event)
@@ -6497,7 +9249,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         "triggerFadeIn",
         "Trigger Fade In (ms)",
-        juce::NormalisableRange<float>(0.1f, 120.0f, 0.1f),
+        juce::NormalisableRange<float>(0.01f, 120.0f, 0.01f),
         12.0f,
         globalFloatAttrs));
 
@@ -6550,7 +9302,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         "transientOnsetMethod",
         "Transient Onset Method",
         juce::StringArray{"Hybrid", "HFC", "SpecFlux"},
-        0,
+        2,
         globalChoiceAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterChoice>(
@@ -6564,7 +9316,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         "transientSnap",
         "Transient Snap",
         juce::StringArray{"Soft", "Loose", "Norm", "Tight", "Exact"},
-        2,
+        3,
         globalChoiceAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterChoice>(
@@ -6584,7 +9336,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MlrVSTAudioProcessor::create
         "sceneRecallMode",
         "Scene Change",
         juce::StringArray{"Grid", "Pattern End", "Scene End", "Manual"},
-        1,
+        3,
         globalChoiceAttrs));
 
     layout.add(std::make_unique<juce::AudioParameterBool>(
@@ -6794,8 +9546,19 @@ void MlrVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate;
     audioEngine->prepareToPlay(sampleRate, samplesPerBlock);
+    updateEffectiveSceneStutterAmount();
     for (auto& scratch : sampleModeScratchBuffers)
         scratch.setSize(2, samplesPerBlock, false, false, true);
+    sceneTransitionOutgoingScratch.setSize(juce::jmax(1, getTotalNumOutputChannels()),
+                                           juce::jmax(1, samplesPerBlock),
+                                           false,
+                                           false,
+                                           true);
+    sceneTransitionIncomingScratch.setSize(juce::jmax(1, getTotalNumOutputChannels()),
+                                           juce::jmax(1, samplesPerBlock),
+                                           false,
+                                           false,
+                                           true);
     sampleModeRenderedLastBlock.fill(false);
     for (auto& engine : sampleModeEngines)
     {
@@ -7013,51 +9776,71 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     applyPendingStutterRelease(posInfo);
     applyPendingStutterStart(posInfo);
     updateSceneQuantizedRecall(posInfo, buffer.getNumSamples());
+    updateSceneRecorderQuantizedAction(posInfo, buffer.getNumSamples());
 
     // Update strip parameters
     const int globalRootMidi = getGlobalRootNoteMidi();
     const auto globalScale = getGlobalPitchScale();
     const auto currentPpq = posInfo.getPpqPosition();
     const int64_t currentGlobalSample = audioEngine != nullptr ? audioEngine->getGlobalSampleCount() : -1;
+    const bool allowOwnedStripParameterSync = suppressOwnedStripParameterSync.load(std::memory_order_acquire) == 0;
     for (int i = 0; i < MaxStrips; ++i)
     {
         auto* strip = audioEngine->getStrip(i);
         if (strip)
         {
             strip->setGlobalPitchContext(globalRootMidi, static_cast<int>(globalScale));
-            applyOwnedStripControlsFromParameters(i, *strip);
-
-            auto* pitchParam = stripPitchParams[static_cast<size_t>(i)];
-            if (pitchParam)
+            if (allowOwnedStripParameterSync)
             {
-                const bool hadResamplePitch = strip->isResamplePitchEnabled();
-                const float previousResampleRatio = strip->getResamplePitchRatio();
-                const bool syncRoleActive = getLoopPitchRole(i) == LoopPitchRole::Sync;
-                const bool syncRetunePending =
-                    loopPitchPendingRetune[static_cast<size_t>(i)].load(std::memory_order_acquire) != 0;
+                applyOwnedStripControlsFromParameters(i, *strip);
 
-                if (syncRoleActive)
+                auto* pitchParam = stripPitchParams[static_cast<size_t>(i)];
+                if (pitchParam)
                 {
-                    if (syncRetunePending)
-                        applyPitchControlToStrip(i, *strip, getPitchSemitonesForDisplay(*strip));
+                    const bool hadResamplePitch = strip->isResamplePitchEnabled();
+                    const float previousResampleRatio = strip->getResamplePitchRatio();
+                    const bool syncRoleActive = getLoopPitchRole(i) == LoopPitchRole::Sync;
+                    const bool syncRetunePending =
+                        loopPitchPendingRetune[static_cast<size_t>(i)].load(std::memory_order_acquire) != 0;
+
+                    if (syncRoleActive)
+                    {
+                        if (syncRetunePending)
+                            applyPitchControlToStrip(i, *strip, getPitchSemitonesForDisplay(*strip));
+                        else
+                            applyLoopPitchRoleStateToStrip(i);
+                    }
                     else
-                        applyLoopPitchRoleStateToStrip(i);
-                }
-                else
-                {
-                    applyPitchControlToStrip(i, *strip, pitchParam->load(std::memory_order_acquire));
+                    {
+                        applyPitchControlToStrip(i, *strip, pitchParam->load(std::memory_order_acquire));
+                    }
+
+                    const bool hasResamplePitch = strip->isResamplePitchEnabled();
+                    const float currentResampleRatio = strip->getResamplePitchRatio();
+                    const bool resamplePitchStateChanged = hadResamplePitch != hasResamplePitch
+                        || ((hadResamplePitch || hasResamplePitch)
+                            && std::abs(previousResampleRatio - currentResampleRatio) > 1.0e-5f);
+
+                    if (resamplePitchStateChanged
+                        && strip->isPlaying()
+                        && strip->isPpqTimelineAnchored()
+                        && currentPpq.hasValue()
+                        && std::isfinite(*currentPpq)
+                        && currentGlobalSample >= 0)
+                    {
+                        strip->realignToPpqAnchor(*currentPpq, currentGlobalSample);
+                    }
                 }
 
-                const bool hasResamplePitch = strip->isResamplePitchEnabled();
-                const float currentResampleRatio = strip->getResamplePitchRatio();
-                const bool resamplePitchStateChanged = hadResamplePitch != hasResamplePitch
-                    || ((hadResamplePitch || hasResamplePitch)
-                        && std::abs(previousResampleRatio - currentResampleRatio) > 1.0e-5f);
+                auto* sliceLengthParam = stripSliceLengthParams[static_cast<size_t>(i)];
+                if (sliceLengthParam)
+                    strip->setLoopSliceLength(sliceLengthParam->load(std::memory_order_acquire));
 
-                // When a running loop strip switches its resample pitch path, rebuild the
-                // trigger/fallback references from the current PPQ anchor immediately so
-                // the strip stays locked to the same musical phase.
-                if (resamplePitchStateChanged
+                const auto previousTempoMatchBackend = strip->getTempoMatchBackend();
+                const auto resolvedTempoMatchBackend = resolveLoopTempoMatchBackendForStrip(i);
+                strip->setTempoMatchBackend(resolvedTempoMatchBackend);
+
+                if (previousTempoMatchBackend != resolvedTempoMatchBackend
                     && strip->isPlaying()
                     && strip->isPpqTimelineAnchored()
                     && currentPpq.hasValue()
@@ -7066,132 +9849,80 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
                 {
                     strip->realignToPpqAnchor(*currentPpq, currentGlobalSample);
                 }
+
+                auto* duckEnabledParam = stripDuckEnabledParams[static_cast<size_t>(i)];
+                if (duckEnabledParam)
+                    strip->setDuckEnabled(duckEnabledParam->load(std::memory_order_acquire) > 0.5f);
+
+                auto* duckSourceParam = stripDuckSourceParams[static_cast<size_t>(i)];
+                if (duckSourceParam)
+                    strip->setDuckSourceSelection(static_cast<int>(duckSourceParam->load(std::memory_order_acquire)));
+
+                auto* duckThresholdParam = stripDuckThresholdParams[static_cast<size_t>(i)];
+                if (duckThresholdParam)
+                    strip->setDuckThresholdDb(duckThresholdParam->load(std::memory_order_acquire));
+
+                auto* duckRatioParam = stripDuckRatioParams[static_cast<size_t>(i)];
+                if (duckRatioParam)
+                    strip->setDuckRatio(duckRatioParam->load(std::memory_order_acquire));
+
+                auto* duckAttackParam = stripDuckAttackParams[static_cast<size_t>(i)];
+                if (duckAttackParam)
+                    strip->setDuckAttackMs(duckAttackParam->load(std::memory_order_acquire));
+
+                auto* duckReleaseParam = stripDuckReleaseParams[static_cast<size_t>(i)];
+                if (duckReleaseParam)
+                    strip->setDuckReleaseMs(duckReleaseParam->load(std::memory_order_acquire));
+
+                auto* duckGainCompParam = stripDuckGainCompParams[static_cast<size_t>(i)];
+                if (duckGainCompParam)
+                    strip->setDuckGainCompDb(duckGainCompParam->load(std::memory_order_acquire));
+
+                auto* duckFollowMasterParam = stripDuckFollowMasterParams[static_cast<size_t>(i)];
+                if (duckFollowMasterParam)
+                    strip->setDuckFollowMaster(duckFollowMasterParam->load(std::memory_order_acquire) > 0.5f);
             }
-
-            auto* sliceLengthParam = stripSliceLengthParams[static_cast<size_t>(i)];
-            if (sliceLengthParam)
-                strip->setLoopSliceLength(sliceLengthParam->load(std::memory_order_acquire));
-
-            const auto previousTempoMatchBackend = strip->getTempoMatchBackend();
-            const auto resolvedTempoMatchBackend = resolveLoopTempoMatchBackendForStrip(i);
-            strip->setTempoMatchBackend(resolvedTempoMatchBackend);
-
-            if (previousTempoMatchBackend != resolvedTempoMatchBackend
-                && strip->isPlaying()
-                && strip->isPpqTimelineAnchored()
-                && currentPpq.hasValue()
-                && std::isfinite(*currentPpq)
-                && currentGlobalSample >= 0)
-            {
-                strip->realignToPpqAnchor(*currentPpq, currentGlobalSample);
-            }
-
-            auto* duckEnabledParam = stripDuckEnabledParams[static_cast<size_t>(i)];
-            if (duckEnabledParam)
-                strip->setDuckEnabled(duckEnabledParam->load(std::memory_order_acquire) > 0.5f);
-
-            auto* duckSourceParam = stripDuckSourceParams[static_cast<size_t>(i)];
-            if (duckSourceParam)
-                strip->setDuckSourceSelection(static_cast<int>(duckSourceParam->load(std::memory_order_acquire)));
-
-            auto* duckThresholdParam = stripDuckThresholdParams[static_cast<size_t>(i)];
-            if (duckThresholdParam)
-                strip->setDuckThresholdDb(duckThresholdParam->load(std::memory_order_acquire));
-
-            auto* duckRatioParam = stripDuckRatioParams[static_cast<size_t>(i)];
-            if (duckRatioParam)
-                strip->setDuckRatio(duckRatioParam->load(std::memory_order_acquire));
-
-            auto* duckAttackParam = stripDuckAttackParams[static_cast<size_t>(i)];
-            if (duckAttackParam)
-                strip->setDuckAttackMs(duckAttackParam->load(std::memory_order_acquire));
-
-            auto* duckReleaseParam = stripDuckReleaseParams[static_cast<size_t>(i)];
-            if (duckReleaseParam)
-                strip->setDuckReleaseMs(duckReleaseParam->load(std::memory_order_acquire));
-
-            auto* duckGainCompParam = stripDuckGainCompParams[static_cast<size_t>(i)];
-            if (duckGainCompParam)
-                strip->setDuckGainCompDb(duckGainCompParam->load(std::memory_order_acquire));
-
-            auto* duckFollowMasterParam = stripDuckFollowMasterParams[static_cast<size_t>(i)];
-            if (duckFollowMasterParam)
-                strip->setDuckFollowMaster(duckFollowMasterParam->load(std::memory_order_acquire) > 0.5f);
-
         }
     }
 
     handleIncomingMacroCc(midiMessages);
-    updateMacroLaneRecording(posInfo, buffer.getNumSamples());
-
-    applyMomentaryStutterMacro(posInfo);
-    
-    const bool separateStripRouting = (outputRoutingParam != nullptr && *outputRoutingParam > 0.5f);
-    if (separateStripRouting && getBusCount(false) > 1)
-    {
-        std::array<std::array<float*, 2>, MaxStrips> stripBusChannels{};
-        std::array<juce::AudioBuffer<float>, MaxStrips> stripBusViews;
-        std::array<juce::AudioBuffer<float>*, MaxStrips> stripBusTargets{};
-        stripBusTargets.fill(nullptr);
-
-        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
-        {
-            const int busIndex = stripIndex; // Strip 1 => main bus, others => aux buses.
-            if (busIndex >= getBusCount(false))
-                continue;
-
-            auto busBuffer = getBusBuffer(buffer, false, busIndex);
-            if (busBuffer.getNumChannels() <= 0 || busBuffer.getNumSamples() <= 0)
-                continue;
-
-            auto& channelPtrs = stripBusChannels[static_cast<size_t>(stripIndex)];
-            channelPtrs.fill(nullptr);
-            channelPtrs[0] = busBuffer.getWritePointer(0);
-            channelPtrs[1] = (busBuffer.getNumChannels() > 1)
-                                 ? busBuffer.getWritePointer(1)
-                                 : busBuffer.getWritePointer(0);
-
-            stripBusViews[static_cast<size_t>(stripIndex)].setDataToReferTo(
-                channelPtrs.data(), 2, busBuffer.getNumSamples());
-            stripBusTargets[static_cast<size_t>(stripIndex)] = &stripBusViews[static_cast<size_t>(stripIndex)];
-        }
-
-        // Keep playback robust if some aux buses are disabled in host: fallback to main bus.
-        auto* mainTarget = stripBusTargets[0];
-        if (mainTarget == nullptr)
-            mainTarget = &buffer;
-        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
-        {
-            if (stripBusTargets[static_cast<size_t>(stripIndex)] == nullptr)
-                stripBusTargets[static_cast<size_t>(stripIndex)] = mainTarget;
-        }
-
-        audioEngine->processBlock(buffer, midiMessages, posInfo, &stripBusTargets);
-    }
+    if (activeSceneTransitionContext != nullptr)
+        renderSceneTransitionBlock(buffer, midiMessages, posInfo);
     else
-    {
-        // Process audio
-        audioEngine->processBlock(buffer, midiMessages, posInfo, nullptr);
-    }
+        renderActiveSceneAudio(buffer, midiMessages, posInfo, true, true);
+    commitSceneTransitionIfReady();
 
     if (sceneRecallBlendSamplesRemaining > 0 && sceneRecallBlendTotalSamples > 0)
     {
         const int blendChannels = juce::jmin(buffer.getNumChannels(), kSceneRecallBlendMaxChannels);
+        const int totalBlendSamples = juce::jmax(1, sceneRecallBlendTotalSamples);
+        const int sourceTailLength = juce::jlimit(0, kSceneRecallBlendMaxSamples, sceneRecallBlendStartTailLength);
         for (int sample = 0;
              sample < buffer.getNumSamples() && sceneRecallBlendSamplesRemaining > 0;
              ++sample)
         {
-            const float progress = 1.0f
-                - (static_cast<float>(sceneRecallBlendSamplesRemaining)
-                   / static_cast<float>(sceneRecallBlendTotalSamples));
-            const float t = juce::jlimit(0.0f, 1.0f, progress);
-            const float smoothT = t * t * (3.0f - (2.0f * t));
+            const int completedSamples = juce::jmax(0, totalBlendSamples - sceneRecallBlendSamplesRemaining);
+            const float t = totalBlendSamples > 1
+                ? static_cast<float>(completedSamples) / static_cast<float>(totalBlendSamples - 1)
+                : 1.0f;
+            const float clampedT = juce::jlimit(0.0f, 1.0f, t);
+            const float fadeOut = std::cos(clampedT * juce::MathConstants<float>::halfPi);
+            const float fadeIn = std::sin(clampedT * juce::MathConstants<float>::halfPi);
+            const int sourceIndex = sourceTailLength > 1 && totalBlendSamples > 1
+                ? juce::jlimit(0,
+                               sourceTailLength - 1,
+                               static_cast<int>(std::llround(
+                                   (static_cast<double>(completedSamples) * static_cast<double>(sourceTailLength - 1))
+                                   / static_cast<double>(totalBlendSamples - 1))))
+                : juce::jmax(0, sourceTailLength - 1);
 
             for (int channel = 0; channel < blendChannels; ++channel)
             {
                 const float in = buffer.getSample(channel, sample);
-                const float start = sceneRecallBlendStartSamples[static_cast<size_t>(channel)];
-                buffer.setSample(channel, sample, (start * (1.0f - smoothT)) + (in * smoothT));
+                const float start = sourceTailLength > 0
+                    ? sceneRecallBlendStartTail[static_cast<size_t>(channel)][static_cast<size_t>(sourceIndex)]
+                    : sceneRecallBlendStartSamples[static_cast<size_t>(channel)];
+                buffer.setSample(channel, sample, (start * fadeOut) + (in * fadeIn));
             }
 
             --sceneRecallBlendSamplesRemaining;
@@ -7201,16 +9932,28 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         {
             sceneRecallBlendSamplesRemaining = 0;
             sceneRecallBlendTotalSamples = 0;
+            sceneRecallBlendStartTailLength = 0;
         }
     }
 
     lastRenderedOutputSamples.fill(0.0f);
+    lastRenderedOutputTailLength = 0;
     if (buffer.getNumSamples() > 0)
     {
         const int lastSample = buffer.getNumSamples() - 1;
         const int captureChannels = juce::jmin(buffer.getNumChannels(), kSceneRecallBlendMaxChannels);
+        const int tailSamples = juce::jmin(buffer.getNumSamples(), kSceneRecallBlendMaxSamples);
+        const int tailOffset = buffer.getNumSamples() - tailSamples;
         for (int channel = 0; channel < captureChannels; ++channel)
+        {
             lastRenderedOutputSamples[static_cast<size_t>(channel)] = buffer.getSample(channel, lastSample);
+            std::copy_n(buffer.getReadPointer(channel, tailOffset),
+                        tailSamples,
+                        lastRenderedOutputTail[static_cast<size_t>(channel)].begin());
+        }
+        for (int channel = captureChannels; channel < kSceneRecallBlendMaxChannels; ++channel)
+            std::fill_n(lastRenderedOutputTail[static_cast<size_t>(channel)].begin(), tailSamples, 0.0f);
+        lastRenderedOutputTailLength = tailSamples;
     }
 }
 
@@ -7230,6 +9973,9 @@ void MlrVSTAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
     try
     {
+        if (isSceneModeEnabled() && audioEngine != nullptr)
+            syncSceneMotionStateFromEngine(activeSceneSlot);
+
         auto state = parameters.copyState();
         stripPersistentGlobalControlsFromState(state);
         appendDefaultPathsToState(state);
@@ -7258,7 +10004,10 @@ void MlrVSTAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 void MlrVSTAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
     std::unique_ptr<juce::XmlElement> xmlState(getXmlFromBinary(data, sizeInBytes));
-    
+
+    resetRuntimePresetStateToDefaults();
+    loadedPresetIndex = -1;
+
     if (xmlState != nullptr)
         if (xmlState->hasTagName(parameters.state.getType()))
         {
@@ -7279,6 +10028,11 @@ void MlrVSTAudioProcessor::setStateInformation(const void* data, int sizeInBytes
             suppressPersistentGlobalControlsSave.store(0, std::memory_order_release);
             persistentGlobalControlsReady.store(1, std::memory_order_release);
             syncSceneModeFromParameters();
+            lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+            lastScenePerformanceProcessSceneSlot = -1;
+            lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
+            if (isSceneModeEnabled())
+                clearAllStripGroupsForSceneMode();
         }
 }
 
@@ -7308,7 +10062,10 @@ bool MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& f
         if (auto* strip = audioEngine != nullptr ? audioEngine->getStrip(stripIndex) : nullptr)
         {
             if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
-                return loadSampleToSampleModeStrip(stripIndex, file);
+            {
+                const bool loaded = loadSampleToSampleModeStrip(stripIndex, file);
+                return loaded;
+            }
         }
 
         if (audioEngine != nullptr)
@@ -7317,6 +10074,7 @@ bool MlrVSTAudioProcessor::loadSampleToStrip(int stripIndex, const juce::File& f
         const bool loaded = audioEngine->loadSampleToStrip(stripIndex, file);
         if (loaded)
         {
+            queueActiveSceneAutosave();
             loopPitchDetectedMidi[static_cast<size_t>(stripIndex)].store(-1, std::memory_order_release);
             loopPitchDetectedHz[static_cast<size_t>(stripIndex)].store(0.0f, std::memory_order_release);
             loopPitchDetectedPitchConfidence[static_cast<size_t>(stripIndex)].store(0.0f, std::memory_order_release);
@@ -7457,7 +10215,10 @@ bool MlrVSTAudioProcessor::loadSampleToSampleModeStrip(int stripIndex, const juc
         invalidateFlipLegacyLoopSync(stripIndex);
         const int requestId = engine->loadSampleAsync(file);
         if (requestId > 0)
+        {
+            queueActiveSceneAutosave();
             return true;
+        }
     }
 
     return false;
@@ -8618,6 +11379,7 @@ void MlrVSTAudioProcessor::captureRecentAudioToStrip(int stripIndex)
         // Recording stop auto-trigger must still respect group choke behavior.
         audioEngine->triggerStripWithQuantization(stripIndex, 0, false);
         updateMonomeLEDs();
+        queueActiveSceneAutosave();
     }
 }
 
@@ -8664,6 +11426,7 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
         strip->setBeatsPerLoop(selection.beatsPerLoop);
         const juce::ScopedLock lock(pendingBarChangeLock);
         pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
+        queueActiveSceneAutosave();
         return;
     }
 
@@ -8673,6 +11436,7 @@ void MlrVSTAudioProcessor::requestBarLengthChange(int stripIndex, int bars)
         strip->setBeatsPerLoop(selection.beatsPerLoop);
         const juce::ScopedLock lock(pendingBarChangeLock);
         pendingBarChanges[static_cast<size_t>(stripIndex)].active = false;
+        queueActiveSceneAutosave();
         return;
     }
 
@@ -8735,7 +11499,7 @@ int MlrVSTAudioProcessor::getSceneStoragePresetIndex(int mainPresetIndex, int sc
 
 bool MlrVSTAudioProcessor::sceneSlotExistsForMainPreset(int mainPresetIndex, int sceneSlot) const
 {
-    return PresetStore::presetExists(getSceneStoragePresetIndex(mainPresetIndex, sceneSlot));
+    return PresetStore::presetHasLaunchableSceneContent(getSceneStoragePresetIndex(mainPresetIndex, sceneSlot));
 }
 
 int MlrVSTAudioProcessor::getSceneRepeatCount(int sceneSlot) const
@@ -8828,6 +11592,805 @@ juce::String MlrVSTAudioProcessor::getSceneSequenceSummaryText() const
     return SceneScheduler::getSceneSequenceSummaryText(*this);
 }
 
+int MlrVSTAudioProcessor::getSceneChainLength() const
+{
+    return SceneScheduler::getSceneChainLength(*this);
+}
+
+int MlrVSTAudioProcessor::getSceneChainStepSceneSlot(int stepIndex) const
+{
+    return SceneScheduler::getSceneChainStepSceneSlot(*this, stepIndex);
+}
+
+int MlrVSTAudioProcessor::getSceneChainStepRepeatCount(int stepIndex) const
+{
+    return SceneScheduler::getSceneChainStepRepeatCount(*this, stepIndex);
+}
+
+MlrVSTAudioProcessor::SceneChainTransitionType MlrVSTAudioProcessor::getSceneChainStepTransitionType(int stepIndex) const
+{
+    return static_cast<SceneChainTransitionType>(
+        SceneScheduler::getSceneChainStepTransitionTypeIndex(*this, stepIndex));
+}
+
+MlrVSTAudioProcessor::SceneChainTransitionOption MlrVSTAudioProcessor::getSceneChainStepTransitionOption(int stepIndex) const
+{
+    return static_cast<SceneChainTransitionOption>(
+        SceneScheduler::getSceneChainStepTransitionOptionIndex(*this, stepIndex));
+}
+
+float MlrVSTAudioProcessor::getSceneChainStepTransitionLengthBeats(int stepIndex) const
+{
+    return SceneScheduler::getSceneChainStepTransitionLengthBeats(*this, stepIndex);
+}
+
+bool MlrVSTAudioProcessor::getSceneChainStepTransitionSubtractsFromSceneLength(int stepIndex) const
+{
+    return SceneScheduler::getSceneChainStepTransitionSubtractsFromSceneLength(*this, stepIndex);
+}
+
+float MlrVSTAudioProcessor::getSceneChainStepTransitionIntensity(int stepIndex) const
+{
+    return SceneScheduler::getSceneChainStepTransitionIntensity(*this, stepIndex);
+}
+
+float MlrVSTAudioProcessor::getSceneChainStepTransitionDelayAmount(int stepIndex) const
+{
+    return SceneScheduler::getSceneChainStepTransitionDelayAmount(*this, stepIndex);
+}
+
+float MlrVSTAudioProcessor::getSceneChainStepTransitionFilterAmount(int stepIndex) const
+{
+    return SceneScheduler::getSceneChainStepTransitionFilterAmount(*this, stepIndex);
+}
+
+float MlrVSTAudioProcessor::getSceneChainStepTransitionChopAmount(int stepIndex) const
+{
+    return SceneScheduler::getSceneChainStepTransitionChopAmount(*this, stepIndex);
+}
+
+void MlrVSTAudioProcessor::setSceneChainStep(int stepIndex, int sceneSlot, int repeats)
+{
+    SceneScheduler::setSceneChainStep(*this, stepIndex, sceneSlot, repeats);
+}
+
+void MlrVSTAudioProcessor::setSceneChainStepTransitionType(int stepIndex, SceneChainTransitionType type)
+{
+    SceneScheduler::setSceneChainStepTransitionTypeIndex(*this, stepIndex, static_cast<int>(type));
+}
+
+void MlrVSTAudioProcessor::setSceneChainStepTransitionOption(int stepIndex, SceneChainTransitionOption option)
+{
+    SceneScheduler::setSceneChainStepTransitionOptionIndex(*this, stepIndex, static_cast<int>(option));
+}
+
+void MlrVSTAudioProcessor::setSceneChainStepTransitionLengthBeats(int stepIndex, float beats)
+{
+    SceneScheduler::setSceneChainStepTransitionLengthBeats(*this, stepIndex, beats);
+}
+
+void MlrVSTAudioProcessor::setSceneChainStepTransitionSubtractsFromSceneLength(int stepIndex, bool enabled)
+{
+    SceneScheduler::setSceneChainStepTransitionSubtractsFromSceneLength(*this, stepIndex, enabled);
+}
+
+void MlrVSTAudioProcessor::setSceneChainStepTransitionIntensity(int stepIndex, float amount)
+{
+    SceneScheduler::setSceneChainStepTransitionIntensity(*this, stepIndex, amount);
+}
+
+void MlrVSTAudioProcessor::setSceneChainStepTransitionDelayAmount(int stepIndex, float amount)
+{
+    SceneScheduler::setSceneChainStepTransitionDelayAmount(*this, stepIndex, amount);
+}
+
+void MlrVSTAudioProcessor::setSceneChainStepTransitionFilterAmount(int stepIndex, float amount)
+{
+    SceneScheduler::setSceneChainStepTransitionFilterAmount(*this, stepIndex, amount);
+}
+
+void MlrVSTAudioProcessor::setSceneChainStepTransitionChopAmount(int stepIndex, float amount)
+{
+    SceneScheduler::setSceneChainStepTransitionChopAmount(*this, stepIndex, amount);
+}
+
+void MlrVSTAudioProcessor::clearSceneChain()
+{
+    SceneScheduler::clearSceneChain(*this);
+}
+
+bool MlrVSTAudioProcessor::isSceneChainLoopEnabled() const
+{
+    return SceneScheduler::isSceneChainLoopEnabled(*this);
+}
+
+void MlrVSTAudioProcessor::setSceneChainLoopEnabled(bool enabled)
+{
+    SceneScheduler::setSceneChainLoopEnabled(*this, enabled);
+}
+
+int MlrVSTAudioProcessor::getSceneChainLoopStartStep() const
+{
+    return SceneScheduler::getSceneChainLoopStartStep(*this);
+}
+
+int MlrVSTAudioProcessor::getSceneChainLoopEndStep() const
+{
+    return SceneScheduler::getSceneChainLoopEndStep(*this);
+}
+
+void MlrVSTAudioProcessor::setSceneChainLoopRange(int startStep, int endStep)
+{
+    SceneScheduler::setSceneChainLoopRange(*this, startStep, endStep);
+}
+
+bool MlrVSTAudioProcessor::isSceneChainPlaybackActive() const
+{
+    return SceneScheduler::isSceneChainPlaybackActive(*this);
+}
+
+int MlrVSTAudioProcessor::getSceneChainPlaybackStepIndex() const
+{
+    return SceneScheduler::getSceneChainPlaybackStepIndex(*this);
+}
+
+bool MlrVSTAudioProcessor::startSceneChainPlayback(int startStepIndex)
+{
+    return SceneScheduler::startSceneChainPlayback(*this, startStepIndex);
+}
+
+void MlrVSTAudioProcessor::stopSceneChainPlayback()
+{
+    SceneScheduler::stopSceneChainPlayback(*this);
+}
+
+void MlrVSTAudioProcessor::selectSceneSlotFromSurface(int sceneSlot)
+{
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const bool exitingSceneChain = sceneSequenceActive;
+    if (exitingSceneChain)
+    {
+        appendSceneDebugLog("surface_select stop_chain slot=" + juce::String(safeSceneSlot));
+        stopSceneChainPlayback();
+    }
+    const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+    const bool targetsCurrentLiveScene = !sceneSequenceActive
+        && activeSceneMainPresetIndex == mainPresetIndex
+        && activeSceneSlot == safeSceneSlot;
+    appendSceneDebugLog("surface_select slot=" + juce::String(safeSceneSlot)
+        + " mainPreset=" + juce::String(mainPresetIndex)
+        + " activeScene=" + juce::String(activeSceneSlot)
+        + " activeMain=" + juce::String(activeSceneMainPresetIndex)
+        + " targetsCurrent=" + juce::String(targetsCurrentLiveScene ? 1 : 0)
+        + " needsCapture=" + juce::String(activeSceneNeedsCaptureBeforeManualRecall ? 1 : 0)
+        + " exists=" + juce::String(sceneSlotExistsForMainPreset(mainPresetIndex, safeSceneSlot) ? 1 : 0));
+
+    if (targetsCurrentLiveScene)
+    {
+        if (activeSceneNeedsCaptureBeforeManualRecall)
+        {
+            const bool captured = captureSceneSlot(safeSceneSlot);
+            appendSceneDebugLog("surface_select capture_current slot=" + juce::String(safeSceneSlot)
+                + " success=" + juce::String(captured ? 1 : 0));
+            updateMonomeLEDs();
+            if (!captured)
+                return;
+        }
+    }
+
+    pendingSceneApplyMainPreset.store(-1, std::memory_order_release);
+    pendingSceneApplySlot.store(-1, std::memory_order_release);
+    pendingSceneApplySequenceDriven.store(0, std::memory_order_release);
+    pendingSceneApplySequenceStep.store(-1, std::memory_order_release);
+    pendingSceneApplyTargetPpq.store(-1.0, std::memory_order_release);
+    pendingSceneApplyTargetTempo.store(120.0, std::memory_order_release);
+    pendingSceneApplyTargetSample.store(-1, std::memory_order_release);
+    pendingScenePreloadDirty.store(0, std::memory_order_release);
+    pendingScenePreloadMainPreset.store(-1, std::memory_order_release);
+    pendingScenePreloadSceneSlot.store(-1, std::memory_order_release);
+    pendingScenePreloadSequenceDriven.store(0, std::memory_order_release);
+    pendingScenePreloadSequenceStep.store(-1, std::memory_order_release);
+    pendingScenePreloadTargetPpq.store(-1.0, std::memory_order_release);
+    pendingScenePreloadTargetTempo.store(120.0, std::memory_order_release);
+    pendingScenePreloadTargetSample.store(-1, std::memory_order_release);
+    pendingScenePreloadTransitionType.store(static_cast<int>(SceneChainTransitionType::None),
+                                            std::memory_order_release);
+    preparedSceneRenderContext.reset();
+
+    requestSceneRecallQuantized(mainPresetIndex, safeSceneSlot, false, -1, true);
+    appendSceneDebugLog("surface_select queued_recall slot=" + juce::String(safeSceneSlot)
+        + " mainPreset=" + juce::String(mainPresetIndex));
+    updateMonomeLEDs();
+}
+
+void MlrVSTAudioProcessor::recallSceneSlot(int sceneSlot)
+{
+    const int targetSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const bool exitingSceneChain = sceneSequenceActive;
+    if (exitingSceneChain)
+    {
+        appendSceneDebugLog("recall_slot stop_chain slot=" + juce::String(targetSceneSlot));
+        stopSceneChainPlayback();
+    }
+    const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+    appendSceneDebugLog("recall_slot slot=" + juce::String(targetSceneSlot)
+        + " mainPreset=" + juce::String(mainPresetIndex)
+        + " activeScene=" + juce::String(activeSceneSlot)
+        + " activeMain=" + juce::String(activeSceneMainPresetIndex)
+        + " needsCapture=" + juce::String(activeSceneNeedsCaptureBeforeManualRecall ? 1 : 0)
+        + " exists=" + juce::String(sceneSlotExistsForMainPreset(mainPresetIndex, targetSceneSlot) ? 1 : 0));
+    if (!sceneSequenceActive
+        && activeSceneMainPresetIndex == mainPresetIndex
+        && activeSceneSlot == targetSceneSlot)
+    {
+        if (activeSceneNeedsCaptureBeforeManualRecall)
+        {
+            const bool captured = captureSceneSlot(targetSceneSlot);
+            appendSceneDebugLog("recall_slot capture_current slot=" + juce::String(targetSceneSlot)
+                + " success=" + juce::String(captured ? 1 : 0));
+            updateMonomeLEDs();
+            if (!captured)
+                return;
+        }
+    }
+
+    requestSceneRecallQuantized(mainPresetIndex, targetSceneSlot, false, -1);
+    appendSceneDebugLog("recall_slot queued_recall slot=" + juce::String(targetSceneSlot)
+        + " mainPreset=" + juce::String(mainPresetIndex));
+}
+
+void MlrVSTAudioProcessor::startScenePerformanceRecordingAt(bool overdub,
+                                                            int sceneSlot,
+                                                            double currentBeat,
+                                                            double sceneStartBeat,
+                                                            bool updateLeds)
+{
+    if (!isSceneModeEnabled() || audioEngine == nullptr)
+        return;
+
+    clearPendingSceneRecorderAction();
+    pendingSceneTriggerRecords.fill({});
+
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const double lengthBeats = getResolvedSceneLengthBeats(safeSceneSlot);
+    const double safeCurrentBeat = std::isfinite(currentBeat) ? currentBeat : audioEngine->getTimelineBeat();
+    const double safeSceneStartBeat = std::isfinite(sceneStartBeat) ? sceneStartBeat : safeCurrentBeat;
+
+    if (overdub)
+        scenePerformanceRecorder.startOverdub(safeSceneSlot, lengthBeats, safeCurrentBeat, safeSceneStartBeat);
+    else
+        scenePerformanceRecorder.startRecording(safeSceneSlot, lengthBeats, safeCurrentBeat, safeSceneStartBeat);
+
+    lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+    lastScenePerformanceProcessSceneSlot = safeSceneSlot;
+    lastScenePerformanceProcessSceneStartBeat = safeSceneStartBeat;
+    if (updateLeds)
+        updateMonomeLEDs();
+}
+
+void MlrVSTAudioProcessor::startScenePerformanceRecording(bool overdub)
+{
+    if (!isSceneModeEnabled() || audioEngine == nullptr)
+        return;
+
+    requestSceneRecorderActionQuantized(overdub ? SceneRecorderAction::StartOverdub
+                                                : SceneRecorderAction::StartFreshRecording);
+}
+
+void MlrVSTAudioProcessor::stopScenePerformanceRecording()
+{
+    if (!isSceneModeEnabled() || audioEngine == nullptr)
+        return;
+
+    requestSceneRecorderActionQuantized(SceneRecorderAction::StopRecording);
+}
+
+void MlrVSTAudioProcessor::stopScenePerformanceRecordingNow(bool updateLeds)
+{
+    clearPendingSceneRecorderAction();
+    pendingSceneTriggerRecords.fill({});
+    scenePerformanceRecorder.stopRecording();
+    queueActiveSceneAutosave();
+    if (updateLeds)
+        updateMonomeLEDs();
+}
+
+void MlrVSTAudioProcessor::extendScenePerformanceRecording()
+{
+    scenePerformanceRecorder.extendRecording();
+    updateMonomeLEDs();
+}
+
+void MlrVSTAudioProcessor::clearScenePerformanceClip(int sceneSlot)
+{
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    scenePerformanceRecorder.clear(safeSceneSlot);
+    syncScenePerformanceClipLengthToResolvedLength(safeSceneSlot);
+
+    if (safeSceneSlot == activeSceneSlot)
+    {
+        lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+        lastScenePerformanceProcessSceneSlot = -1;
+        lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
+
+        if (isSceneModeEnabled() && audioEngine != nullptr)
+        {
+            for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+            {
+                for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+                    audioEngine->resetModSequencerSlotToDefaults(stripIndex, slot);
+                audioEngine->setModSequencerSlot(stripIndex, 0);
+            }
+        }
+    }
+
+    updateMonomeLEDs();
+    if (safeSceneSlot == activeSceneSlot)
+        queueActiveSceneAutosave();
+}
+
+bool MlrVSTAudioProcessor::isScenePerformanceRecording() const
+{
+    return scenePerformanceRecorder.isRecording();
+}
+
+bool MlrVSTAudioProcessor::isScenePerformanceOverdubbing() const
+{
+    return scenePerformanceRecorder.isOverdubbing();
+}
+
+int MlrVSTAudioProcessor::getScenePerformanceRecordingSceneSlot() const
+{
+    return scenePerformanceRecorder.getRecordingSceneSlot();
+}
+
+double MlrVSTAudioProcessor::getScenePerformanceRecordingStartBeat() const
+{
+    return scenePerformanceRecorder.getRecordingStartBeat();
+}
+
+double MlrVSTAudioProcessor::getScenePerformanceRecordingEndBeat() const
+{
+    return scenePerformanceRecorder.getRecordingEndBeat();
+}
+
+double MlrVSTAudioProcessor::getScenePerformanceClipLengthBeats(int sceneSlot) const
+{
+    return getResolvedSceneLengthBeats(sceneSlot);
+}
+
+bool MlrVSTAudioProcessor::hasScenePerformanceClip(int sceneSlot) const
+{
+    return scenePerformanceRecorder.hasEvents(sceneSlot);
+}
+
+int MlrVSTAudioProcessor::getScenePerformanceEventCount(int sceneSlot) const
+{
+    return scenePerformanceRecorder.getEventCount(sceneSlot);
+}
+
+double MlrVSTAudioProcessor::getScenePerformancePlaybackProgress(int sceneSlot, double currentBeat) const
+{
+    if (!activeSceneStartPpqValid || !std::isfinite(activeSceneStartPpq))
+        return -1.0;
+
+    return scenePerformanceRecorder.getPlaybackProgressForBeat(sceneSlot, activeSceneStartPpq, currentBeat);
+}
+
+double MlrVSTAudioProcessor::getScenePerformanceRecordingProgress(double currentBeat) const
+{
+    return scenePerformanceRecorder.getRecordingProgressForBeat(currentBeat);
+}
+
+std::vector<ScenePerformanceEvent> MlrVSTAudioProcessor::getScenePerformanceEventsSnapshot(int sceneSlot) const
+{
+    return scenePerformanceRecorder.getEventsSnapshot(sceneSlot);
+}
+
+bool MlrVSTAudioProcessor::copySceneSlotToClipboard(int sceneSlot)
+{
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+
+    if (safeSceneSlot == activeSceneSlot)
+    {
+        if (!captureSceneSlot(safeSceneSlot))
+            return false;
+    }
+
+    if (!sceneSlotExistsForMainPreset(mainPresetIndex, safeSceneSlot))
+        return false;
+
+    sceneSlotClipboardSourceSlot = safeSceneSlot;
+    sceneSlotClipboardMainPresetIndex = mainPresetIndex;
+    return true;
+}
+
+bool MlrVSTAudioProcessor::pasteSceneSlotFromClipboard(int sceneSlot)
+{
+    if (sceneSlotClipboardSourceSlot < 0)
+        return false;
+
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+    if (sceneSlotClipboardMainPresetIndex != mainPresetIndex)
+        return false;
+
+    const bool pastingIntoActiveScene = isSceneModeEnabled()
+        && audioEngine != nullptr
+        && activeSceneMainPresetIndex == juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex)
+        && activeSceneSlot == safeSceneSlot;
+
+    const bool pasted = copySceneForMainPreset(mainPresetIndex,
+                                               sceneSlotClipboardSourceSlot,
+                                               safeSceneSlot);
+    if (!pasted)
+        return false;
+
+    if (sceneSlotHasMotionState(sceneSlotClipboardSourceSlot))
+    {
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+        {
+            scenePerformanceRecorder.setMotionStripState(
+                safeSceneSlot,
+                stripIndex,
+                scenePerformanceRecorder.getMotionStripState(sceneSlotClipboardSourceSlot, stripIndex));
+        }
+
+        if (safeSceneSlot == activeSceneSlot && isSceneModeEnabled())
+            applySceneMotionStateToEngine(safeSceneSlot);
+    }
+    else
+    {
+        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+            clearSceneMotionStripState(safeSceneSlot, stripIndex);
+    }
+
+    if (pastingIntoActiveScene)
+    {
+        double hostPpqSnapshot = std::numeric_limits<double>::quiet_NaN();
+        double hostTempoSnapshot = 120.0;
+        if (!getHostSyncSnapshot(hostPpqSnapshot, hostTempoSnapshot) && audioEngine != nullptr)
+        {
+            const double fallbackPpq = audioEngine->getTimelineBeat();
+            const double fallbackTempo = juce::jmax(1.0, audioEngine->getCurrentTempo());
+            if (std::isfinite(fallbackPpq) && std::isfinite(fallbackTempo) && fallbackTempo > 0.0)
+            {
+                hostPpqSnapshot = fallbackPpq;
+                hostTempoSnapshot = fallbackTempo;
+            }
+        }
+
+        performSceneLoad(mainPresetIndex,
+                         safeSceneSlot,
+                         hostPpqSnapshot,
+                         hostTempoSnapshot,
+                         audioEngine != nullptr ? audioEngine->getGlobalSampleCount() : -1);
+    }
+
+    updateMonomeLEDs();
+    return true;
+}
+
+bool MlrVSTAudioProcessor::hasSceneSlotClipboard() const
+{
+    return sceneSlotClipboardSourceSlot >= 0;
+}
+
+int MlrVSTAudioProcessor::getSceneSlotClipboardSourceSlot() const
+{
+    return sceneSlotClipboardSourceSlot;
+}
+
+bool MlrVSTAudioProcessor::clearSceneSlot(int sceneSlot)
+{
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+    const bool clearingActiveScene = isSceneModeEnabled()
+        && audioEngine != nullptr
+        && activeSceneMainPresetIndex == juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex)
+        && activeSceneSlot == safeSceneSlot;
+    ScopedSceneAutosaveSuppression suppressSceneAutosave(*this);
+
+    setSceneRepeatCount(safeSceneSlot, 1);
+    setSceneLengthMode(safeSceneSlot, SceneLengthMode::ManualBars);
+    setSceneLengthCount(safeSceneSlot, 4);
+    setSceneAnchorStrip(safeSceneSlot, 0);
+
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+        clearSceneMotionStripState(safeSceneSlot, stripIndex);
+    clearScenePerformanceClip(safeSceneSlot);
+
+    const auto preservedSceneTimingState = createSceneChainStateXml(-1);
+    const auto preservedScenePerformanceState = createScenePerformanceStateData(-1);
+
+    deleteSceneForMainPreset(mainPresetIndex, safeSceneSlot);
+
+    if (safeSceneSlot == activeSceneSlot)
+    {
+        clearPendingActiveSceneAutosave();
+        activeSceneNeedsCaptureBeforeManualRecall = false;
+    }
+
+    if (!clearingActiveScene)
+        return true;
+
+    struct ScopedSuspendProcessing
+    {
+        explicit ScopedSuspendProcessing(MlrVSTAudioProcessor& p) : processor(p) { processor.suspendProcessing(true); }
+        ~ScopedSuspendProcessing() { processor.suspendProcessing(false); }
+        MlrVSTAudioProcessor& processor;
+    } scopedSuspend(*this);
+
+    resetRuntimePresetStateToDefaults();
+    activeSceneMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
+    activeSceneSlot = safeSceneSlot;
+    activeSceneNeedsCaptureBeforeManualRecall = false;
+
+    if (preservedSceneTimingState != nullptr)
+        applySceneChainStateXml(preservedSceneTimingState.get(), -1);
+
+    if (preservedScenePerformanceState.getSize() > 0)
+        applyScenePerformanceStateData(preservedScenePerformanceState, -1);
+    else
+        applyScenePerformanceStateData({}, -1);
+
+    clearPendingActiveSceneAutosave();
+    saveSceneForMainPreset(mainPresetIndex, safeSceneSlot);
+    updateMonomeLEDs();
+    return true;
+}
+
+bool MlrVSTAudioProcessor::copyScenePerformanceClipToClipboard(int sceneSlot)
+{
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    if (isSceneModeEnabled() && audioEngine != nullptr && safeSceneSlot == activeSceneSlot)
+        syncSceneMotionStateFromEngine(safeSceneSlot);
+    syncScenePerformanceClipLengthToResolvedLength(safeSceneSlot);
+    scenePerformanceClipboardData = createScenePerformanceStateData(safeSceneSlot);
+    sceneCopySourceSlot = safeSceneSlot;
+    sceneCopyMainPresetIndex = getActiveMainPresetIndexForScenes();
+    return scenePerformanceClipboardData.getSize() > 0;
+}
+
+bool MlrVSTAudioProcessor::pasteScenePerformanceClipFromClipboard(int sceneSlot)
+{
+    if (scenePerformanceClipboardData.getSize() == 0)
+        return false;
+
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    if (!applyScenePerformanceStateData(scenePerformanceClipboardData, safeSceneSlot))
+        return false;
+
+    if (safeSceneSlot == activeSceneSlot)
+    {
+        lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+        lastScenePerformanceProcessSceneSlot = -1;
+        lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
+        queueActiveSceneAutosave();
+    }
+
+    updateMonomeLEDs();
+    return true;
+}
+
+bool MlrVSTAudioProcessor::duplicateScenePerformanceClip(int sourceSceneSlot, int destSceneSlot)
+{
+    const int safeSourceSlot = juce::jlimit(0, SceneSlots - 1, sourceSceneSlot);
+    const int safeDestSlot = juce::jlimit(0, SceneSlots - 1, destSceneSlot);
+    if (safeSourceSlot == safeDestSlot)
+        return false;
+
+    if (loadedPresetIndex >= 0)
+    {
+        const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+        activeSceneMainPresetIndex = mainPresetIndex;
+        if (isSceneModeEnabled() && safeSourceSlot == activeSceneSlot)
+            captureSceneSlot(safeSourceSlot);
+        return SceneScheduler::copySceneForMainPreset(*this, mainPresetIndex, safeSourceSlot, safeDestSlot);
+    }
+
+    if (isSceneModeEnabled() && audioEngine != nullptr && safeSourceSlot == activeSceneSlot)
+        syncSceneMotionStateFromEngine(safeSourceSlot);
+    syncScenePerformanceClipLengthToResolvedLength(safeSourceSlot);
+
+    const auto stateData = createScenePerformanceStateData(safeSourceSlot);
+    if (stateData.getSize() == 0)
+        return false;
+
+    if (!applyScenePerformanceStateData(stateData, safeDestSlot))
+        return false;
+
+    if (safeDestSlot == activeSceneSlot)
+    {
+        lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+        lastScenePerformanceProcessSceneSlot = -1;
+        lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
+        queueActiveSceneAutosave();
+    }
+
+    updateMonomeLEDs();
+    return true;
+}
+
+bool MlrVSTAudioProcessor::hasScenePerformanceClipboard() const
+{
+    return scenePerformanceClipboardData.getSize() > 0;
+}
+
+int MlrVSTAudioProcessor::getScenePerformanceClipboardSourceSlot() const
+{
+    return sceneCopySourceSlot;
+}
+
+bool MlrVSTAudioProcessor::getSceneEditorStripAutomationExpanded(int stripIndex) const
+{
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    return sceneEditorStripAutomationExpanded[static_cast<size_t>(safeStripIndex)];
+}
+
+bool MlrVSTAudioProcessor::getSceneEditorStripHeightExpanded(int stripIndex) const
+{
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    return sceneEditorStripHeightExpanded[static_cast<size_t>(safeStripIndex)];
+}
+
+void MlrVSTAudioProcessor::setSceneEditorGridEnabled(bool enabled)
+{
+    if (sceneEditorGridEnabledState == enabled)
+        return;
+
+    sceneEditorGridEnabledState = enabled;
+    markPersistentGlobalUserChange();
+}
+
+void MlrVSTAudioProcessor::setSceneEditorGridDivision(int division)
+{
+    const int safeDivision = juce::jlimit(1, 64, division);
+    if (sceneEditorGridDivisionState == safeDivision)
+        return;
+
+    sceneEditorGridDivisionState = safeDivision;
+    markPersistentGlobalUserChange();
+}
+
+void MlrVSTAudioProcessor::setSceneEditorDrawModeEnabled(bool enabled)
+{
+    if (sceneEditorDrawModeEnabledState == enabled)
+        return;
+
+    sceneEditorDrawModeEnabledState = enabled;
+    markPersistentGlobalUserChange();
+}
+
+void MlrVSTAudioProcessor::setSceneEditorLaneOverlaysEnabled(bool enabled)
+{
+    if (sceneEditorLaneOverlaysEnabledState == enabled)
+        return;
+
+    sceneEditorLaneOverlaysEnabledState = enabled;
+    markPersistentGlobalUserChange();
+}
+
+void MlrVSTAudioProcessor::setSceneEditorZoomFactor(int factor)
+{
+    static constexpr std::array<int, 7> kZoomChoices{ 1, 2, 3, 4, 5, 6, 8 };
+    int safeFactor = kZoomChoices.front();
+    int bestDelta = std::abs(factor - safeFactor);
+    for (const int candidate : kZoomChoices)
+    {
+        const int delta = std::abs(factor - candidate);
+        if (delta < bestDelta)
+        {
+            bestDelta = delta;
+            safeFactor = candidate;
+        }
+    }
+    if (sceneEditorZoomFactorState == safeFactor)
+        return;
+
+    sceneEditorZoomFactorState = safeFactor;
+    markPersistentGlobalUserChange();
+}
+
+void MlrVSTAudioProcessor::setSceneEditorFollowPlayheadEnabled(bool enabled)
+{
+    if (sceneEditorFollowPlayheadState == enabled)
+        return;
+
+    sceneEditorFollowPlayheadState = enabled;
+    markPersistentGlobalUserChange();
+}
+
+void MlrVSTAudioProcessor::syncActiveSceneMotionState()
+{
+    if (!isSceneModeEnabled())
+        return;
+
+    syncSceneMotionStateFromEngine(getActiveSceneSlot());
+    queueActiveSceneAutosave();
+}
+
+void MlrVSTAudioProcessor::setSceneEditorStripAutomationExpanded(int stripIndex, bool expanded)
+{
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    auto& state = sceneEditorStripAutomationExpanded[static_cast<size_t>(safeStripIndex)];
+    if (state == expanded)
+        return;
+
+    state = expanded;
+    markPersistentGlobalUserChange();
+}
+
+void MlrVSTAudioProcessor::setSceneEditorStripHeightExpanded(int stripIndex, bool expanded)
+{
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    auto& state = sceneEditorStripHeightExpanded[static_cast<size_t>(safeStripIndex)];
+    if (state == expanded)
+        return;
+
+    state = expanded;
+    markPersistentGlobalUserChange();
+}
+
+void MlrVSTAudioProcessor::setSceneEditorStripAutomationExpandedAll(bool expanded)
+{
+    bool anyChanged = false;
+    for (auto& state : sceneEditorStripAutomationExpanded)
+    {
+        if (state == expanded)
+            continue;
+        state = expanded;
+        anyChanged = true;
+    }
+
+    if (anyChanged)
+        markPersistentGlobalUserChange();
+}
+
+bool MlrVSTAudioProcessor::replaceScenePerformanceClipEvents(int sceneSlot,
+                                                             const std::vector<ScenePerformanceEvent>& events)
+{
+    if (scenePerformanceRecorder.isRecording())
+        return false;
+
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const double resolvedLengthBeats = getResolvedSceneLengthBeats(safeSceneSlot);
+    const bool replaced = scenePerformanceRecorder.replaceClipEvents(safeSceneSlot, events, resolvedLengthBeats);
+    if (!replaced)
+        return false;
+
+    if (safeSceneSlot == activeSceneSlot)
+    {
+        lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+        lastScenePerformanceProcessSceneSlot = -1;
+        lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
+        queueActiveSceneAutosave();
+    }
+
+    updateMonomeLEDs();
+    return true;
+}
+
+void MlrVSTAudioProcessor::syncScenePerformanceClipLengthToResolvedLength(int sceneSlot)
+{
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    scenePerformanceRecorder.setClipLengthBeats(safeSceneSlot, getResolvedSceneLengthBeats(safeSceneSlot));
+
+    if (safeSceneSlot == activeSceneSlot)
+    {
+        lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+        lastScenePerformanceProcessSceneSlot = -1;
+        lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
+    }
+}
+
+void MlrVSTAudioProcessor::syncAllScenePerformanceClipLengthsToResolvedLengths()
+{
+    for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
+        syncScenePerformanceClipLengthToResolvedLength(sceneSlot);
+}
+
 std::unique_ptr<juce::XmlElement> MlrVSTAudioProcessor::createSceneChainStateXml(int sceneSlotOverride) const
 {
     return SceneScheduler::createSceneChainStateXml(*this, sceneSlotOverride);
@@ -8835,7 +12398,369 @@ std::unique_ptr<juce::XmlElement> MlrVSTAudioProcessor::createSceneChainStateXml
 
 void MlrVSTAudioProcessor::applySceneChainStateXml(const juce::XmlElement* xml, int sceneSlotOverride)
 {
+    ScopedSceneAutosaveSuppression suppressSceneAutosave(*this);
     SceneScheduler::applySceneChainStateXml(*this, xml, sceneSlotOverride);
+}
+
+juce::MemoryBlock MlrVSTAudioProcessor::createScenePerformanceStateData(int sceneSlotOverride) const
+{
+    std::array<double, SceneSlots> canonicalLengths{};
+    for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
+        canonicalLengths[static_cast<size_t>(sceneSlot)] = getResolvedSceneLengthBeats(sceneSlot);
+
+    return scenePerformanceRecorder.createData(sceneSlotOverride, &canonicalLengths);
+}
+
+bool MlrVSTAudioProcessor::applyScenePerformanceStateData(const juce::MemoryBlock& data, int sceneSlotOverride)
+{
+    const bool applied = scenePerformanceRecorder.applyData(data, sceneSlotOverride);
+    if (!applied)
+        return false;
+
+    if (sceneSlotOverride >= 0)
+        syncScenePerformanceClipLengthToResolvedLength(sceneSlotOverride);
+    else
+        syncAllScenePerformanceClipLengthsToResolvedLengths();
+
+    if (isSceneModeEnabled())
+    {
+        const int activeScene = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+        const int targetScene = sceneSlotOverride >= 0
+            ? juce::jlimit(0, SceneSlots - 1, sceneSlotOverride)
+            : activeScene;
+        if (targetScene == activeScene && sceneSlotHasMotionState(targetScene))
+            applySceneMotionStateToEngine(targetScene);
+    }
+
+    return true;
+}
+
+bool MlrVSTAudioProcessor::sceneSlotHasMotionState(int sceneSlot) const
+{
+    return scenePerformanceRecorder.hasMotionState(sceneSlot);
+}
+
+namespace
+{
+ScenePerformanceRecorder::MotionStripState makeDefaultSceneMotionStripState()
+{
+    ScenePerformanceRecorder::MotionStripState stripState;
+    stripState.activeSlot = 0;
+
+    for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+    {
+        auto& lane = stripState.lanes[static_cast<size_t>(slot)];
+        const auto target = ModernAudioEngine::defaultModTargetForSlot(slot);
+        const float defaultValue = ModernAudioEngine::defaultModStepValueForTarget(target);
+
+        lane = {};
+        lane.target = target;
+        lane.bipolar = ModernAudioEngine::modTargetSupportsBipolar(target)
+            && AudioEngineModulationInternal::modTargetAutoDefaultBipolar(target);
+        lane.curveMode = false;
+        lane.depth = 1.0f;
+        lane.rate = 1.0f;
+        lane.transportMode = ModernAudioEngine::ModTransportMode::Sync;
+        lane.offset = 0;
+        lane.lengthBars = 1;
+        lane.editPage = 0;
+        lane.smoothingMs = 0.0f;
+        lane.curveBend = 0.0f;
+        lane.curveShape = ModernAudioEngine::ModCurveShape::Linear;
+        lane.pitchScaleQuantize = false;
+        lane.pitchScale = ModernAudioEngine::PitchScale::Chromatic;
+        lane.steps.fill(defaultValue);
+        lane.stepSubdivisions.fill(1);
+        lane.stepEndValues.fill(defaultValue);
+        lane.stepCurveShapes.fill(ModernAudioEngine::ModCurveShape::Linear);
+    }
+
+    return stripState;
+}
+} // namespace
+
+void MlrVSTAudioProcessor::syncSceneMotionStateFromEngine(int sceneSlot)
+{
+    if (audioEngine == nullptr)
+        return;
+
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        ScenePerformanceRecorder::MotionStripState stripState;
+        stripState.activeSlot = audioEngine->getModSequencerSlot(stripIndex);
+
+        for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+        {
+            auto& lane = stripState.lanes[static_cast<size_t>(slot)];
+            lane.target = audioEngine->getModTargetForSlot(stripIndex, slot);
+            lane.bipolar = audioEngine->isModBipolarForSlot(stripIndex, slot);
+            lane.curveMode = audioEngine->isModCurveModeForSlot(stripIndex, slot);
+            lane.depth = audioEngine->getModDepthForSlot(stripIndex, slot);
+            lane.rate = audioEngine->getModRateForSlot(stripIndex, slot);
+            lane.transportMode = audioEngine->getModTransportModeForSlot(stripIndex, slot);
+            lane.offset = audioEngine->getModOffsetForSlot(stripIndex, slot);
+            lane.lengthBars = audioEngine->getModLengthBarsForSlot(stripIndex, slot);
+            lane.editPage = audioEngine->getModEditPageForSlot(stripIndex, slot);
+            lane.smoothingMs = audioEngine->getModSmoothingMsForSlot(stripIndex, slot);
+            lane.curveBend = audioEngine->getModCurveBendForSlot(stripIndex, slot);
+            lane.curveShape = audioEngine->getModCurveShapeForSlot(stripIndex, slot);
+            lane.pitchScaleQuantize = audioEngine->isModPitchScaleQuantizeForSlot(stripIndex, slot);
+            lane.pitchScale = audioEngine->getModPitchScaleForSlot(stripIndex, slot);
+
+            for (int stepIndex = 0; stepIndex < ModernAudioEngine::ModTotalSteps; ++stepIndex)
+            {
+                const auto index = static_cast<size_t>(stepIndex);
+                lane.steps[index] = audioEngine->getModStepValueAbsoluteForSlot(stripIndex, slot, stepIndex);
+                lane.stepSubdivisions[index] = audioEngine->getModStepSubdivisionAbsoluteForSlot(stripIndex, slot, stepIndex);
+                lane.stepEndValues[index] = audioEngine->getModStepEndValueAbsoluteForSlot(stripIndex, slot, stepIndex);
+                lane.stepCurveShapes[index] = audioEngine->getModStepCurveShapeAbsoluteForSlot(stripIndex, slot, stepIndex);
+            }
+        }
+
+        scenePerformanceRecorder.setMotionStripState(safeSceneSlot, stripIndex, stripState);
+    }
+}
+
+void MlrVSTAudioProcessor::applySceneMotionStateToEngine(int sceneSlot)
+{
+    if (audioEngine == nullptr)
+        return;
+
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    if (!scenePerformanceRecorder.hasMotionState(safeSceneSlot))
+        return;
+
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        const auto stripState = scenePerformanceRecorder.getMotionStripState(safeSceneSlot, stripIndex);
+
+        for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+        {
+            const auto& lane = stripState.lanes[static_cast<size_t>(slot)];
+            audioEngine->setModSequencerSlot(stripIndex, slot);
+            audioEngine->setModTarget(stripIndex, lane.target);
+            audioEngine->setModBipolar(stripIndex,
+                                       lane.bipolar,
+                                       ModernAudioEngine::ModBipolarToggleMode::Reinterpret);
+            audioEngine->setModCurveMode(stripIndex, lane.curveMode);
+            audioEngine->setModDepth(stripIndex, lane.depth);
+            audioEngine->setModRate(stripIndex, lane.rate);
+            audioEngine->setModTransportMode(stripIndex, lane.transportMode);
+            audioEngine->setModOffset(stripIndex, lane.offset);
+            audioEngine->setModLengthBars(stripIndex, lane.lengthBars);
+            audioEngine->setModEditPage(stripIndex, lane.editPage);
+            audioEngine->setModSmoothingMs(stripIndex, lane.smoothingMs);
+            audioEngine->setModCurveBend(stripIndex, lane.curveBend);
+            audioEngine->setModCurveShape(stripIndex, lane.curveShape);
+            audioEngine->setModPitchScaleQuantize(stripIndex, lane.pitchScaleQuantize);
+            audioEngine->setModPitchScale(stripIndex, lane.pitchScale);
+
+            for (int stepIndex = 0; stepIndex < ModernAudioEngine::ModTotalSteps; ++stepIndex)
+            {
+                const auto index = static_cast<size_t>(stepIndex);
+                audioEngine->setModStepValueAbsolute(stripIndex, stepIndex, lane.steps[index]);
+                audioEngine->setModStepShapeAbsolute(stripIndex,
+                                                    stepIndex,
+                                                    lane.stepSubdivisions[index],
+                                                    lane.stepEndValues[index]);
+                audioEngine->setModStepCurveShapeAbsolute(stripIndex,
+                                                         stepIndex,
+                                                         lane.stepCurveShapes[index]);
+            }
+        }
+
+        audioEngine->setModSequencerSlot(stripIndex, stripState.activeSlot);
+    }
+}
+
+void MlrVSTAudioProcessor::clearSceneMotionStripState(int sceneSlot, int stripIndex)
+{
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    scenePerformanceRecorder.setMotionStripState(safeSceneSlot,
+                                                 safeStripIndex,
+                                                 makeDefaultSceneMotionStripState());
+
+    if (audioEngine != nullptr
+        && isSceneModeEnabled()
+        && safeSceneSlot == juce::jlimit(0, SceneSlots - 1, activeSceneSlot))
+    {
+        for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+            audioEngine->resetModSequencerSlotToDefaults(safeStripIndex, slot);
+        audioEngine->setModSequencerSlot(safeStripIndex, 0);
+    }
+
+    if (safeSceneSlot == juce::jlimit(0, SceneSlots - 1, activeSceneSlot))
+        queueActiveSceneAutosave();
+}
+
+bool MlrVSTAudioProcessor::stripUsesGrainSceneLanes(int stripIndex) const
+{
+    if (audioEngine == nullptr)
+        return false;
+
+    auto* strip = audioEngine->getStrip(juce::jlimit(0, MaxStrips - 1, stripIndex));
+    return strip != nullptr && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain;
+}
+
+std::vector<ModernAudioEngine::ModTarget> MlrVSTAudioProcessor::getSceneVisibleModTargetsForStrip(int stripIndex) const
+{
+    std::vector<ModernAudioEngine::ModTarget> targets{
+        ModernAudioEngine::ModTarget::Speed,
+        stripUsesGrainSceneLanes(stripIndex) ? ModernAudioEngine::ModTarget::GrainPitch
+                                             : ModernAudioEngine::ModTarget::Pitch,
+        ModernAudioEngine::ModTarget::Pan,
+        ModernAudioEngine::ModTarget::Volume,
+        ModernAudioEngine::ModTarget::Cutoff,
+        ModernAudioEngine::ModTarget::Resonance,
+        ModernAudioEngine::ModTarget::FilterMorph,
+        ModernAudioEngine::ModTarget::SliceLength,
+        ModernAudioEngine::ModTarget::Scratch,
+        ModernAudioEngine::ModTarget::DelayMix,
+        ModernAudioEngine::ModTarget::DelayTime,
+        ModernAudioEngine::ModTarget::DelayFeedback
+    };
+
+    if (stripUsesGrainSceneLanes(stripIndex))
+    {
+        targets.push_back(ModernAudioEngine::ModTarget::GrainSize);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainDensity);
+    }
+
+    return targets;
+}
+
+ModernAudioEngine::ModTarget MlrVSTAudioProcessor::getSceneMotionTargetForSlot(int stripIndex, int laneSlot) const
+{
+    if (audioEngine == nullptr)
+        return ModernAudioEngine::ModTarget::None;
+
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    const int safeSlot = juce::jlimit(0, ModernAudioEngine::NumModSequencers - 1, laneSlot);
+    return audioEngine->getModTargetForSlot(safeStripIndex, safeSlot);
+}
+
+void MlrVSTAudioProcessor::setSceneMotionTargetForSlot(int stripIndex,
+                                                       int laneSlot,
+                                                       ModernAudioEngine::ModTarget target)
+{
+    if (audioEngine == nullptr)
+        return;
+
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    const int safeSlot = juce::jlimit(0, ModernAudioEngine::NumModSequencers - 1, laneSlot);
+    const auto safeTarget = sanitizeModPerformanceTarget(target);
+    auto matchesTarget = [](ModernAudioEngine::ModTarget lhs, ModernAudioEngine::ModTarget rhs)
+    {
+        return lhs == rhs
+            || (lhs == ModernAudioEngine::ModTarget::Pitch && rhs == ModernAudioEngine::ModTarget::GrainPitch)
+            || (lhs == ModernAudioEngine::ModTarget::GrainPitch && rhs == ModernAudioEngine::ModTarget::Pitch);
+    };
+    const auto currentTarget = sanitizeModPerformanceTarget(audioEngine->getModTargetForSlot(safeStripIndex, safeSlot));
+
+    if (matchesTarget(currentTarget, safeTarget))
+    {
+        audioEngine->setModSequencerSlot(safeStripIndex, safeSlot);
+        if (isSceneModeEnabled())
+            syncSceneMotionStateFromEngine(getActiveSceneSlot());
+        return;
+    }
+
+    int swapSlot = -1;
+    if (safeTarget != ModernAudioEngine::ModTarget::None)
+    {
+        for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+        {
+            if (slot == safeSlot)
+                continue;
+            if (!matchesTarget(audioEngine->getModTargetForSlot(safeStripIndex, slot), safeTarget))
+                continue;
+            swapSlot = slot;
+            break;
+        }
+    }
+
+    if (swapSlot >= 0)
+    {
+        audioEngine->setModSequencerSlot(safeStripIndex, swapSlot);
+        audioEngine->setModTarget(safeStripIndex, currentTarget);
+    }
+
+    audioEngine->setModSequencerSlot(safeStripIndex, safeSlot);
+    audioEngine->setModTarget(safeStripIndex, safeTarget);
+
+    if (isSceneModeEnabled())
+        syncSceneMotionStateFromEngine(getActiveSceneSlot());
+    queueActiveSceneAutosave();
+}
+
+void MlrVSTAudioProcessor::cycleSceneModLaneTarget(int stripIndex)
+{
+    if (audioEngine == nullptr)
+        return;
+
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    const auto targets = getSceneVisibleModTargetsForStrip(safeStripIndex);
+    if (targets.empty())
+        return;
+
+    const int activeSlot = juce::jlimit(0,
+                                        ModernAudioEngine::NumModSequencers - 1,
+                                        audioEngine->getModSequencerSlot(safeStripIndex));
+    const auto currentTarget = audioEngine->getModTargetForSlot(safeStripIndex, activeSlot);
+    auto matchesTarget = [](ModernAudioEngine::ModTarget lhs, ModernAudioEngine::ModTarget rhs)
+    {
+        return lhs == rhs
+            || (lhs == ModernAudioEngine::ModTarget::Pitch && rhs == ModernAudioEngine::ModTarget::GrainPitch)
+            || (lhs == ModernAudioEngine::ModTarget::GrainPitch && rhs == ModernAudioEngine::ModTarget::Pitch);
+    };
+
+    int currentIndex = -1;
+    for (int targetIndex = 0; targetIndex < static_cast<int>(targets.size()); ++targetIndex)
+    {
+        if (matchesTarget(currentTarget, targets[static_cast<size_t>(targetIndex)]))
+        {
+            currentIndex = targetIndex;
+            break;
+        }
+    }
+
+    const auto nextTarget = targets[static_cast<size_t>((currentIndex + 1 + static_cast<int>(targets.size()))
+                                                        % static_cast<int>(targets.size()))];
+
+    for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+    {
+        if (matchesTarget(audioEngine->getModTargetForSlot(safeStripIndex, slot), nextTarget))
+        {
+            audioEngine->setModSequencerSlot(safeStripIndex, slot);
+            if (isSceneModeEnabled())
+                syncSceneMotionStateFromEngine(getActiveSceneSlot());
+            queueActiveSceneAutosave();
+            return;
+        }
+    }
+
+    audioEngine->setModSequencerSlot(safeStripIndex, activeSlot);
+    audioEngine->setModTarget(safeStripIndex, nextTarget);
+    if (isSceneModeEnabled())
+        syncSceneMotionStateFromEngine(getActiveSceneSlot());
+    queueActiveSceneAutosave();
+}
+
+void MlrVSTAudioProcessor::updateAudioEngineSceneModulationContext() const
+{
+    if (audioEngine == nullptr)
+        return;
+
+    if (!isSceneModeEnabled() || !activeSceneStartPpqValid || !std::isfinite(activeSceneStartPpq))
+    {
+        audioEngine->setSceneModulationContext(false, 0.0, 4.0);
+        return;
+    }
+
+    const double sceneLengthBeats = juce::jmax(0.001, getResolvedSceneLengthBeats(getActiveSceneSlot()));
+    audioEngine->setSceneModulationContext(true, activeSceneStartPpq, sceneLengthBeats);
 }
 
 double MlrVSTAudioProcessor::computeStripSceneSequenceLengthBeats(int stripIndex) const
@@ -8930,9 +12855,25 @@ bool MlrVSTAudioProcessor::insertSceneSlot(int sceneSlot, bool insertAfter)
     return SceneScheduler::insertSceneSlot(*this, sceneSlot, insertAfter);
 }
 
-void MlrVSTAudioProcessor::requestSceneRecallQuantized(int mainPresetIndex, int sceneSlot, bool sequenceDriven)
+void MlrVSTAudioProcessor::copyScenePerformanceClip(int sourceSceneSlot, int destSceneSlot)
 {
-    SceneScheduler::requestSceneRecallQuantized(*this, mainPresetIndex, sceneSlot, sequenceDriven);
+    scenePerformanceRecorder.copyClip(sourceSceneSlot, destSceneSlot);
+    syncScenePerformanceClipLengthToResolvedLength(destSceneSlot);
+}
+
+void MlrVSTAudioProcessor::requestSceneRecallQuantized(int mainPresetIndex,
+                                                       int sceneSlot,
+                                                       bool sequenceDriven,
+                                                       int sequenceStepIndex,
+                                                       bool useTriggerQuantization)
+{
+    SceneScheduler::requestSceneRecallQuantized(
+        *this,
+        mainPresetIndex,
+        sceneSlot,
+        sequenceDriven,
+        sequenceStepIndex,
+        useTriggerQuantization);
 }
 
 double MlrVSTAudioProcessor::getSceneRecallIntervalBeats() const
@@ -9295,6 +13236,7 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
         currentTempo = *posInfo.getBpm();
 
     const int64_t currentGlobalSample = audioEngine->getGlobalSampleCount();
+    bool appliedAnyChanges = false;
     for (int i = 0; i < MaxStrips; ++i)
     {
         const auto& change = readyChanges[static_cast<size_t>(i)];
@@ -9324,7 +13266,11 @@ void MlrVSTAudioProcessor::applyPendingBarChanges(const juce::AudioPlayHead::Pos
         // After target-grid remap, force a hard lock to the *current* host PPQ
         // so trigger/fallback references are consistent within this audio block.
         strip->realignToPpqAnchor(currentPpq, currentGlobalSample);
+        appliedAnyChanges = true;
     }
+
+    if (appliedAnyChanges)
+        queueActiveSceneAutosave();
 }
 
 void MlrVSTAudioProcessor::applyPendingStutterStart(const juce::AudioPlayHead::PositionInfo& posInfo)
@@ -11571,7 +15517,7 @@ void MlrVSTAudioProcessor::loadPersistentGlobalControls()
 
     cancelMacroMidiLearn();
     anyRestored = restoreFloatParam("masterVolume", "masterVolume", 0.0, 1.0) || anyRestored;
-    anyRestored = restoreFloatParam("limiterThreshold", "limiterThreshold", -24.0, 0.0) || anyRestored;
+    anyRestored = restoreFloatParam("limiterThreshold", "limiterThreshold", 0.0, 0.0) || anyRestored;
     anyRestored = restoreBoolParam("limiterEnabled", "limiterEnabled") || anyRestored;
     anyRestored = restoreChoiceParam("quantize", "quantize", 0, 9) || anyRestored;
     anyRestored = restoreChoiceParam("innerLoopLength", "innerLoopLength", 0, 4) || anyRestored;
@@ -11583,16 +15529,75 @@ void MlrVSTAudioProcessor::loadPersistentGlobalControls()
     anyRestored = restoreFloatParam("pitchSmoothing", "pitchSmoothing", 0.0, 1.0) || anyRestored;
     anyRestored = restoreFloatParam("inputMonitor", "inputMonitor", 0.0, 1.0) || anyRestored;
     anyRestored = restoreFloatParam("crossfadeLength", "crossfadeLength", 1.0, 50.0) || anyRestored;
-    anyRestored = restoreFloatParam("triggerFadeIn", "triggerFadeIn", 0.1, 120.0) || anyRestored;
+    anyRestored = restoreFloatParam("triggerFadeIn", "triggerFadeIn", 0.01, 120.0) || anyRestored;
     anyRestored = restoreChoiceParam("outputRouting", "outputRouting", 0, 1) || anyRestored;
     anyRestored = restorePitchControlModeParam() || anyRestored;
     anyRestored = restoreChoiceParam("flipTempoMatchMode", "flipTempoMatchMode", 0, 1) || anyRestored;
     bool stretchBackendRestored = restoreChoiceParam("stretchBackend", "stretchBackend", 0, 2);
+    anyRestored = restoreBoolParam("sceneMode", "sceneMode") || anyRestored;
     anyRestored = restoreChoiceParam("transientOnsetMethod", "transientOnsetMethod", 0, 2) || anyRestored;
     anyRestored = restoreChoiceParam("transientSensitivity", "transientSensitivity", 0, 4) || anyRestored;
     anyRestored = restoreChoiceParam("transientSnap", "transientSnap", 0, 4) || anyRestored;
     anyRestored = restoreChoiceParam("transientSpacing", "transientSpacing", 0, 4) || anyRestored;
-    anyRestored = restoreChoiceParam("sceneRecallMode", "sceneRecallMode", 1, 3) || anyRestored;
+    anyRestored = restoreChoiceParam("sceneRecallMode", "sceneRecallMode", 0, 3) || anyRestored;
+    if (xml->hasAttribute("sceneEditorGridEnabled"))
+    {
+        sceneEditorGridEnabledState = xml->getBoolAttribute("sceneEditorGridEnabled", true);
+        anyRestored = true;
+    }
+    if (xml->hasAttribute("sceneEditorGridDivision"))
+    {
+        sceneEditorGridDivisionState = juce::jlimit(1, 64, xml->getIntAttribute("sceneEditorGridDivision", 16));
+        anyRestored = true;
+    }
+    if (xml->hasAttribute("sceneEditorDrawMode"))
+    {
+        sceneEditorDrawModeEnabledState = xml->getBoolAttribute("sceneEditorDrawMode", false);
+        anyRestored = true;
+    }
+    if (xml->hasAttribute("sceneEditorLaneOverlays"))
+    {
+        sceneEditorLaneOverlaysEnabledState = xml->getBoolAttribute("sceneEditorLaneOverlays", true);
+        anyRestored = true;
+    }
+    if (xml->hasAttribute("sceneEditorZoomFactor"))
+    {
+        const int restoredZoom = xml->getIntAttribute("sceneEditorZoomFactor", 1);
+        static constexpr std::array<int, 7> kZoomChoices{ 1, 2, 3, 4, 5, 6, 8 };
+        sceneEditorZoomFactorState = kZoomChoices.front();
+        int bestDelta = std::abs(restoredZoom - sceneEditorZoomFactorState);
+        for (const int candidate : kZoomChoices)
+        {
+            const int delta = std::abs(restoredZoom - candidate);
+            if (delta < bestDelta)
+            {
+                bestDelta = delta;
+                sceneEditorZoomFactorState = candidate;
+            }
+        }
+        anyRestored = true;
+    }
+    if (xml->hasAttribute("sceneEditorFollowPlayhead"))
+    {
+        sceneEditorFollowPlayheadState = xml->getBoolAttribute("sceneEditorFollowPlayhead", false);
+        anyRestored = true;
+    }
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        const auto automationKey = "sceneStripAutomationExpanded" + juce::String(stripIndex);
+        if (xml->hasAttribute(automationKey))
+        {
+            sceneEditorStripAutomationExpanded[static_cast<size_t>(stripIndex)] = xml->getBoolAttribute(automationKey, true);
+            anyRestored = true;
+        }
+
+        const auto heightKey = "sceneStripHeightExpanded" + juce::String(stripIndex);
+        if (xml->hasAttribute(heightKey))
+        {
+            sceneEditorStripHeightExpanded[static_cast<size_t>(stripIndex)] = xml->getBoolAttribute(heightKey, false);
+            anyRestored = true;
+        }
+    }
     if (!stretchBackendRestored && xml->hasAttribute("soundTouchEnabled"))
     {
         auto* param = parameters.getParameter("stretchBackend");
@@ -11621,6 +15626,7 @@ void MlrVSTAudioProcessor::loadPersistentGlobalControls()
     else
         saveGlobalSettingsXml(*xml);
 
+    syncSceneModeFromParameters();
     applyLoopPitchSyncToAllStrips();
     syncTransientDetectionSettingsFromParameters(true);
     persistentGlobalControlsReady.store(1, std::memory_order_release);
@@ -11642,7 +15648,7 @@ void MlrVSTAudioProcessor::savePersistentControlPages() const
     if (masterVolumeParam)
         xml.setAttribute("masterVolume", static_cast<double>(masterVolumeParam->load(std::memory_order_acquire)));
     if (limiterThresholdParam)
-        xml.setAttribute("limiterThreshold", static_cast<double>(limiterThresholdParam->load(std::memory_order_acquire)));
+        xml.setAttribute("limiterThreshold", 0.0);
     if (limiterEnabledParam)
         xml.setAttribute("limiterEnabled", limiterEnabledParam->load(std::memory_order_acquire) >= 0.5f);
     if (quantizeParam)
@@ -11672,6 +15678,8 @@ void MlrVSTAudioProcessor::savePersistentControlPages() const
         xml.setAttribute("flipTempoMatchMode", static_cast<int>(flipTempoMatchModeParam->load(std::memory_order_acquire)));
     if (stretchBackendParam)
         xml.setAttribute("stretchBackend", static_cast<int>(stretchBackendParam->load(std::memory_order_acquire)));
+    if (sceneModeParam)
+        xml.setAttribute("sceneMode", sceneModeParam->load(std::memory_order_acquire) > 0.5f);
     if (transientOnsetMethodParam)
         xml.setAttribute("transientOnsetMethod", static_cast<int>(transientOnsetMethodParam->load(std::memory_order_acquire)));
     if (transientSensitivityParam)
@@ -11682,6 +15690,19 @@ void MlrVSTAudioProcessor::savePersistentControlPages() const
         xml.setAttribute("transientSpacing", static_cast<int>(transientSpacingParam->load(std::memory_order_acquire)));
     if (sceneRecallModeParam)
         xml.setAttribute("sceneRecallMode", static_cast<int>(sceneRecallModeParam->load(std::memory_order_acquire)));
+    xml.setAttribute("sceneEditorGridEnabled", sceneEditorGridEnabledState);
+    xml.setAttribute("sceneEditorGridDivision", sceneEditorGridDivisionState);
+    xml.setAttribute("sceneEditorDrawMode", sceneEditorDrawModeEnabledState);
+    xml.setAttribute("sceneEditorLaneOverlays", sceneEditorLaneOverlaysEnabledState);
+    xml.setAttribute("sceneEditorZoomFactor", sceneEditorZoomFactorState);
+    xml.setAttribute("sceneEditorFollowPlayhead", sceneEditorFollowPlayheadState);
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        xml.setAttribute("sceneStripAutomationExpanded" + juce::String(stripIndex),
+                         sceneEditorStripAutomationExpanded[static_cast<size_t>(stripIndex)]);
+        xml.setAttribute("sceneStripHeightExpanded" + juce::String(stripIndex),
+                         sceneEditorStripHeightExpanded[static_cast<size_t>(stripIndex)]);
+    }
     if (soundTouchEnabledParam)
         xml.setAttribute("soundTouchEnabled", getStretchBackend() != TimeStretchBackend::Resample);
     for (int i = 0; i < MacroCount; ++i)
@@ -11862,6 +15883,7 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
         sampleStartSample = visibleSlice.startSample;
     }
 
+    uint32_t autosaveDelayMs = 0;
     if (useQuantize)
     {
         // Schedule for next quantize point - group choke handled in batch execution
@@ -11873,6 +15895,18 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
                                               currentPPQ,
                                               sampleSliceId,
                                               sampleStartSample);
+        const double hostTempoForAutosave = posInfo.getBpm().hasValue()
+            ? *posInfo.getBpm()
+            : audioEngine->getCurrentTempo();
+        if (std::isfinite(hostTempoForAutosave) && hostTempoForAutosave > 0.0)
+        {
+            const double waitBeats = juce::jmax(0.0, nextGridPPQ - currentPPQ);
+            const double waitSeconds = (waitBeats * 60.0) / hostTempoForAutosave;
+            autosaveDelayMs = static_cast<uint32_t>(juce::jlimit<int64_t>(
+                0,
+                8000,
+                static_cast<int64_t>(std::llround(waitSeconds * 1000.0)) + 24));
+        }
     }
     else
     {
@@ -11897,45 +15931,85 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
         }
     }
 
+    if (isSceneModeEnabled())
+        queueActiveSceneAutosave(autosaveDelayMs);
+
     // Record pattern events at the exact trigger timeline position.
     const double eventBeat = useQuantize ? nextGridPPQ : currentPPQ;
-    for (int i = 0; i < 4; ++i)
+    if (isSceneModeEnabled())
     {
-        auto* pattern = audioEngine->getPattern(i);
-        if (pattern && pattern->isRecording() && audioEngine->patternRecorderMatchesStrip(i, stripIndex))
+        int recordedSliceId = sampleSliceId;
+        int64_t recordedSliceStartSample = sampleStartSample;
+        if (isSampleMode)
         {
-            int recordedSliceId = -1;
-            int64_t recordedSliceStartSample = -1;
-            if (isSampleMode)
+            if (auto* sampleEngine = getSampleModeEngine(stripIndex, false))
             {
-                if (auto* sampleEngine = getSampleModeEngine(stripIndex, false))
+                SampleSlice visibleSlice;
+                if (sampleEngine->getVisibleSliceInfo(juce::jlimit(0, SliceModel::VisibleSliceCount - 1, column), visibleSlice))
                 {
-                    SampleSlice visibleSlice;
-                    if (sampleEngine->getVisibleSliceInfo(juce::jlimit(0, SliceModel::VisibleSliceCount - 1, column), visibleSlice))
-                    {
-                        recordedSliceId = visibleSlice.id;
-                        recordedSliceStartSample = visibleSlice.startSample;
-                    }
+                    recordedSliceId = visibleSlice.id;
+                    recordedSliceStartSample = visibleSlice.startSample;
                 }
             }
-            DBG("Recording to pattern " << i << ": strip=" << stripIndex << ", col=" << column << ", beat=" << eventBeat);
-            pattern->recordEvent(stripIndex, column, true, eventBeat, recordedSliceId, recordedSliceStartSample);
+        }
+
+        recordSceneTriggerEvent(stripIndex, column, eventBeat, recordedSliceId, recordedSliceStartSample);
+        if (scenePerformanceRecorder.isRecording() && useQuantize)
+            rememberPendingSceneTriggerRecord(stripIndex, column, eventBeat);
+        else
+            clearPendingSceneTriggerRecord(stripIndex);
+    }
+    else
+    {
+        clearPendingSceneTriggerRecord(stripIndex);
+        for (int i = 0; i < 4; ++i)
+        {
+            auto* pattern = audioEngine->getPattern(i);
+            if (pattern && pattern->isRecording() && audioEngine->patternRecorderMatchesStrip(i, stripIndex))
+            {
+                int recordedSliceId = -1;
+                int64_t recordedSliceStartSample = -1;
+                if (isSampleMode)
+                {
+                    if (auto* sampleEngine = getSampleModeEngine(stripIndex, false))
+                    {
+                        SampleSlice visibleSlice;
+                        if (sampleEngine->getVisibleSliceInfo(juce::jlimit(0, SliceModel::VisibleSliceCount - 1, column), visibleSlice))
+                        {
+                            recordedSliceId = visibleSlice.id;
+                            recordedSliceStartSample = visibleSlice.startSample;
+                        }
+                    }
+                }
+                DBG("Recording to pattern " << i << ": strip=" << stripIndex << ", col=" << column << ", beat=" << eventBeat);
+                pattern->recordEvent(stripIndex, column, true, eventBeat, recordedSliceId, recordedSliceStartSample);
+            }
         }
     }
     
     updateMonomeLEDs();
 }
 
-void MlrVSTAudioProcessor::stopStrip(int stripIndex)
+void MlrVSTAudioProcessor::stopStrip(int stripIndex, bool immediateStop, int sceneReleaseColumnHint)
 {
+    if (audioEngine == nullptr)
+        return;
+
+    captureSceneTriggerRelease(stripIndex, sceneReleaseColumnHint);
+
     if (auto* strip = audioEngine->getStrip(stripIndex))
     {
         audioEngine->clearPendingQuantizedTriggersForStrip(stripIndex);
         if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
-            stopSampleModeStrip(stripIndex, false);
+            stopSampleModeStrip(stripIndex, immediateStop);
         else
-            strip->stop(false);
+            strip->stop(immediateStop);
     }
+
+    clearPendingSceneTriggerRecord(stripIndex);
+
+    if (isSceneModeEnabled())
+        queueActiveSceneAutosave();
 }
 
 void MlrVSTAudioProcessor::setCurrentProgram(int /*index*/)
@@ -11954,7 +16028,15 @@ void MlrVSTAudioProcessor::changeProgramName(int /*index*/, const juce::String& 
 void MlrVSTAudioProcessor::timerCallback()
 {
     syncSceneModeFromParameters();
+    servicePendingScenePreloadRequest();
+    processPendingSceneAutosave();
     processPendingSceneApply();
+    processPendingSceneRecorderApply();
+    applyPendingSceneParameterState();
+    if (isSceneModeEnabled() && audioEngine != nullptr)
+        syncSceneMotionStateFromEngine(activeSceneSlot);
+    processPendingMonomePatternTapActions(juce::Time::getMillisecondCounter());
+    processPendingMonomeSceneRecorderTapActions(juce::Time::getMillisecondCounter());
     refreshUtilityTimerCadence();
 
     applyCompletedPresetSaves();
@@ -12155,26 +16237,67 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
     if (!audioEngine)
         return;
 
+    ScopedSceneAutosaveSuppression suppressSceneAutosave(*this);
+    clearPendingActiveSceneAutosave();
+
     pendingPresetLoadIndex.store(-1, std::memory_order_release);
     pendingSceneApplyMainPreset.store(-1, std::memory_order_release);
     pendingSceneApplySlot.store(-1, std::memory_order_release);
     pendingSceneApplySequenceDriven.store(0, std::memory_order_release);
+    pendingSceneApplySequenceStep.store(-1, std::memory_order_release);
     pendingSceneApplyTargetPpq.store(-1.0, std::memory_order_release);
     pendingSceneApplyTargetTempo.store(120.0, std::memory_order_release);
     pendingSceneApplyTargetSample.store(-1, std::memory_order_release);
+    pendingScenePreloadDirty.store(0, std::memory_order_release);
+    pendingScenePreloadMainPreset.store(-1, std::memory_order_release);
+    pendingScenePreloadSceneSlot.store(-1, std::memory_order_release);
+    pendingScenePreloadSequenceDriven.store(0, std::memory_order_release);
+    pendingScenePreloadSequenceStep.store(-1, std::memory_order_release);
+    pendingScenePreloadTargetPpq.store(-1.0, std::memory_order_release);
+    pendingScenePreloadTargetTempo.store(120.0, std::memory_order_release);
+    pendingScenePreloadTargetSample.store(-1, std::memory_order_release);
+    pendingScenePreloadTransitionType.store(static_cast<int>(SceneChainTransitionType::None), std::memory_order_release);
     pendingSceneRecall = {};
+    preparedSceneRenderContext.reset();
+    activeSceneTransitionContext.reset();
+    sceneTransitionSamplesTotal = 0;
+    sceneTransitionSamplesRendered = 0;
+    sceneTransitionStartSampleOffset = 0;
+    sceneTransitionCommitPending = false;
+    suppressOwnedStripParameterSync.store(0, std::memory_order_release);
+    {
+        const juce::ScopedLock lock(pendingSceneParameterStateLock);
+        pendingSceneParameterState = {};
+    }
+    pendingSceneParameterStateDirty.store(0, std::memory_order_release);
     sceneSequenceActive = false;
-    sceneSequenceSlots.clear();
+    sceneSequenceCurrentStepIndex = -1;
+    sceneChainState = {};
+    activeSceneMainPresetIndex = 0;
+    activeSceneSlot = 0;
+    activeSceneNeedsCaptureBeforeManualRecall = true;
     activeSceneStartPpqValid = false;
     activeSceneStartPpq = 0.0;
     sceneSequenceStartPpqValid = false;
+    sceneSequenceStartPpq = 0.0;
     scenePadHeld.fill(false);
     scenePadHoldDeleteTriggered.fill(false);
+    scenePadLaunchConsumed.fill(false);
     scenePadPressStartMs.fill(0);
     scenePadActionBurstUntilMs.fill(0);
     scenePadLastTapMs.fill(0);
+    monomePatternPadPendingUntilMs.fill(0);
+    monomePatternPadPendingAction.fill(MonomePatternTapAction::None);
+    clearPendingMonomeSceneRecorderTap();
+    clearPendingSceneRecorderAction();
+    pendingSceneTriggerRecords.fill({});
+    scenePerformanceRecorder.clearAll();
+    lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+    lastScenePerformanceProcessSceneSlot = -1;
+    lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
     sceneCopySourceSlot = -1;
     sceneCopyMainPresetIndex = 0;
+    scenePerformanceClipboardData.reset();
 
     {
         const juce::ScopedLock lock(pendingLoopChangeLock);
@@ -12194,11 +16317,15 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults()
     momentaryStutterMacroBaselineCaptured = false;
     momentaryStutterMacroCapturePending = false;
     momentaryStutterMacroStartPpq = 0.0;
+    momentaryStutterRecordedDivisionButton = -1;
     momentaryStutterLastComboMask = 0;
     momentaryStutterTwoButtonStepBaseValid = false;
     momentaryStutterTwoButtonStepBase = 0;
     momentaryStutterStripArmed.fill(false);
     momentaryStutterPlaybackActive.store(0, std::memory_order_release);
+    sceneGlobalStutterBaseAmount.store(0.0f, std::memory_order_release);
+    clearSceneBoundaryTransitionState();
+    clearSceneChainReturnOverride();
     pendingStutterStartActive.store(0, std::memory_order_release);
     pendingStutterStartPpq.store(-1.0, std::memory_order_release);
     pendingStutterStartDivisionBeats.store(1.0, std::memory_order_release);
@@ -12404,7 +16531,7 @@ void MlrVSTAudioProcessor::initRuntimeStateToDefaults()
 
     resetRuntimePresetStateToDefaults();
     sceneRepeatCounts.fill(1);
-    sceneLengthModes.fill(static_cast<int>(SceneLengthMode::LongestStrip));
+    sceneLengthModes.fill(static_cast<int>(SceneLengthMode::ManualBars));
     sceneManualBars.fill(4);
     sceneAnchorStrips.fill(0);
     sceneModeGroupSnapshot.valid = false;
@@ -12491,6 +16618,8 @@ void MlrVSTAudioProcessor::refreshUtilityTimerCadence()
     const bool queuedSceneApplyActive = pendingSceneApplySlot.load(std::memory_order_acquire) >= 0;
     const bool queuedSequenceDriven = pendingSceneApplySequenceDriven.load(std::memory_order_acquire) != 0;
     const bool needsFastScenePolling = pendingSceneRecall.active
+        || pendingSceneRecorderAction.active
+        || pendingSceneRecorderApplyAction.load(std::memory_order_acquire) != static_cast<int>(SceneRecorderAction::None)
         || (queuedSceneApplyActive && (!queuedSequenceDriven || isHostTransportPlaying()));
     const int desiredIntervalMs = needsFastScenePolling
         ? kSceneRecallRefreshMs
@@ -12513,7 +16642,7 @@ void MlrVSTAudioProcessor::performPresetLoad(int presetIndex, double hostPpqSnap
     // This guarantees no strip audio/params leak across preset transitions.
     resetRuntimePresetStateToDefaults();
     sceneRepeatCounts.fill(1);
-    sceneLengthModes.fill(static_cast<int>(SceneLengthMode::LongestStrip));
+    sceneLengthModes.fill(static_cast<int>(SceneLengthMode::ManualBars));
     sceneManualBars.fill(4);
     sceneAnchorStrips.fill(0);
     loadedPresetIndex = -1;
@@ -12534,44 +16663,52 @@ void MlrVSTAudioProcessor::performPresetLoad(int presetIndex, double hostPpqSnap
     for (auto& f : currentStripFiles)
         f = juce::File();
 
-    const bool loadSucceeded = PresetStore::loadPreset(
-        presetIndex,
-        MaxStrips,
-        audioEngine.get(),
-        parameters,
-        [this](int stripIndex, const juce::File& sampleFile)
-        {
-            return loadSampleToStrip(stripIndex, sampleFile);
-        },
-        [this](int stripIndex, const juce::File& sampleFile)
-        {
-            rememberLoadedSamplePathForStrip(stripIndex, sampleFile, false);
-        },
-        [this](int stripIndex,
-               const juce::File& loopDir,
-               const juce::File& stepDir,
-               const juce::File& flipDir)
-        {
-            setRecentSampleDirectory(stripIndex, SamplePathMode::Loop, loopDir, false);
-            setRecentSampleDirectory(stripIndex, SamplePathMode::Step, stepDir, false);
-            setRecentSampleDirectory(stripIndex, SamplePathMode::Flip, flipDir, false);
-        },
-        [this](int stripIndex, const juce::XmlElement* flipStateXml)
-        {
-            applyFlipPresetStateXml(stripIndex, flipStateXml);
-        },
-        [this](int stripIndex, const juce::XmlElement* loopPitchStateXml)
-        {
-            applyLoopPitchPresetStateXml(stripIndex, loopPitchStateXml);
-        },
-        [this](const juce::XmlElement& presetXml)
-        {
-            applySceneChainStateXml(presetXml.getChildByName("SceneChainState"), -1);
-        },
-        hostPpqSnapshot,
-        hostTempoSnapshot,
-        true,
-        -1);
+    bool loadSucceeded = false;
+    {
+        ScopedSceneAutosaveSuppression suppressSceneAutosave(*this);
+        loadSucceeded = PresetStore::loadPreset(
+            presetIndex,
+            MaxStrips,
+            audioEngine.get(),
+            parameters,
+            [this](int stripIndex, const juce::File& sampleFile)
+            {
+                return loadSampleToStrip(stripIndex, sampleFile);
+            },
+            [this](int stripIndex, const juce::File& sampleFile)
+            {
+                rememberLoadedSamplePathForStrip(stripIndex, sampleFile, false);
+            },
+            [this](int stripIndex,
+                   const juce::File& loopDir,
+                   const juce::File& stepDir,
+                   const juce::File& flipDir)
+            {
+                setRecentSampleDirectory(stripIndex, SamplePathMode::Loop, loopDir, false);
+                setRecentSampleDirectory(stripIndex, SamplePathMode::Step, stepDir, false);
+                setRecentSampleDirectory(stripIndex, SamplePathMode::Flip, flipDir, false);
+            },
+            [this](int stripIndex, const juce::XmlElement* flipStateXml)
+            {
+                applyFlipPresetStateXml(stripIndex, flipStateXml);
+            },
+            [this](int stripIndex, const juce::XmlElement* loopPitchStateXml)
+            {
+                applyLoopPitchPresetStateXml(stripIndex, loopPitchStateXml);
+            },
+            [this](const juce::XmlElement& presetXml)
+            {
+                applySceneChainStateXml(presetXml.getChildByName("SceneChainState"), -1);
+            },
+            [this](const juce::MemoryBlock& scenePerformanceData)
+            {
+                applyScenePerformanceStateData(scenePerformanceData, -1);
+            },
+            hostPpqSnapshot,
+            hostTempoSnapshot,
+            true,
+            -1);
+    }
 
     savePersistentDefaultPaths();
 
@@ -12579,8 +16716,12 @@ void MlrVSTAudioProcessor::performPresetLoad(int presetIndex, double hostPpqSnap
     {
         normalizeLoopPitchMasterRoles();
         applyLoopPitchSyncToAllStrips();
+        lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
+        lastScenePerformanceProcessSceneSlot = -1;
+        lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
         if (isSceneModeEnabled())
             clearAllStripGroupsForSceneMode();
+        activeSceneNeedsCaptureBeforeManualRecall = true;
     }
 
     if (loadSucceeded && PresetStore::presetExists(presetIndex))
@@ -12602,6 +16743,10 @@ bool MlrVSTAudioProcessor::runPresetSaveRequest(const PresetSaveRequest& request
             MlrVSTAudioProcessor& processor;
         } scopedSuspend(*this);
 
+        if (isSceneModeEnabled() && audioEngine != nullptr)
+            syncSceneMotionStateFromEngine(activeSceneSlot);
+        syncAllScenePerformanceClipLengthsToResolvedLengths();
+
         return PresetStore::savePreset(request.presetIndex,
                                        MaxStrips,
                                        audioEngine.get(),
@@ -12621,6 +16766,10 @@ bool MlrVSTAudioProcessor::runPresetSaveRequest(const PresetSaveRequest& request
                                        [this]()
                                        {
                                            return createSceneChainStateXml(-1);
+                                       },
+                                       [this]()
+                                       {
+                                           return createScenePerformanceStateData(-1);
                                        });
     }
     catch (const std::exception& e)
@@ -12677,6 +16826,9 @@ void MlrVSTAudioProcessor::savePreset(int presetIndex)
         return;
 
     activeSceneMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, presetIndex);
+
+    if (isSceneModeEnabled())
+        captureSceneSlot(activeSceneSlot);
 
     if (!isTimerRunning())
         startTimer(kGridRefreshMs);

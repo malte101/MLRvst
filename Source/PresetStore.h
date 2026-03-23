@@ -18,7 +18,8 @@ bool savePreset(int presetIndex,
                 const juce::File* recentFlipDirectories,
                 const std::function<std::unique_ptr<juce::XmlElement>(int)>& createFlipStateXml,
                 const std::function<std::unique_ptr<juce::XmlElement>(int)>& createLoopPitchStateXml,
-                const std::function<std::unique_ptr<juce::XmlElement>()>& createAuxStateXml = {});
+                const std::function<std::unique_ptr<juce::XmlElement>()>& createAuxStateXml = {},
+                const std::function<juce::MemoryBlock()>& createScenePerformanceData = {});
 bool loadPreset(int presetIndex,
                 int maxStrips,
                 ModernAudioEngine* audioEngine,
@@ -29,15 +30,18 @@ bool loadPreset(int presetIndex,
                 const std::function<void(int, const juce::XmlElement*)>& applyFlipStateXml,
                 const std::function<void(int, const juce::XmlElement*)>& applyLoopPitchStateXml,
                 const std::function<void(const juce::XmlElement&)>& applyAuxStateXml,
+                const std::function<void(const juce::MemoryBlock&)>& applyScenePerformanceData,
                 double hostPpqSnapshot,
                 double hostTempoSnapshot,
                 bool preserveGlobalParameters = true,
-                int64_t hostGlobalSampleSnapshot = -1);
+                int64_t hostGlobalSampleSnapshot = -1,
+                bool restartPlayingStripsFromSceneStart = false);
 juce::String getPresetName(int presetIndex);
 bool setPresetName(int presetIndex, const juce::String& presetName);
 bool updatePresetAuxState(int presetIndex,
                           const std::function<std::unique_ptr<juce::XmlElement>()>& createAuxStateXml);
 bool presetExists(int presetIndex);
+bool presetHasLaunchableSceneContent(int presetIndex);
 bool copyPreset(int sourcePresetIndex, int destPresetIndex);
 bool deletePreset(int presetIndex);
 } // namespace PresetStore

@@ -81,21 +81,6 @@ PerformanceTarget MacroTargetDispatcher::getDefaultMacroTarget(int macroIndex)
     }
 }
 
-int MacroTargetDispatcher::getDefaultModLaneSlotForMacroTarget(PerformanceTarget target)
-{
-    const auto sanitizedTarget = sanitizeMacroPerformanceTarget(target);
-    if (!performanceTargetAllowsModLane(sanitizedTarget))
-        return -1;
-
-    for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
-    {
-        if (ModernAudioEngine::defaultModTargetForSlot(slot) == sanitizedTarget)
-            return slot;
-    }
-
-    return -1;
-}
-
 float MacroTargetDispatcher::getDefaultMacroNormalizedValue(PerformanceTarget target)
 {
     switch (target)
@@ -228,7 +213,7 @@ float MacroTargetDispatcher::getNormalizedValueForTarget(const MlrVSTAudioProces
         case PerformanceTarget::GrainShape:
             return normalizeMacroLinear(strip.getGrainShape(), -1.0f, 1.0f);
         case PerformanceTarget::Retrigger:
-            return processor.audioEngine != nullptr ? processor.audioEngine->getMacroRetriggerAmount(stripIndex) : 0.0f;
+            return processor.getGlobalSceneStutterAmount();
         case PerformanceTarget::Rearrange:
             return 0.0f;
         case PerformanceTarget::DelayMix:
@@ -350,13 +335,19 @@ void MacroTargetDispatcher::applyTargetValue(MlrVSTAudioProcessor& processor,
             strip.setGrainShape(denormalizeMacroLinear(clamped, -1.0f, 1.0f));
             break;
         case PerformanceTarget::Retrigger:
-            if (processor.audioEngine != nullptr)
-                processor.audioEngine->setMacroRetriggerAmount(stripIndex, clamped);
+            processor.setGlobalSceneStutterAmount(clamped);
             break;
         case PerformanceTarget::Rearrange:
             break;
         case PerformanceTarget::None:
         default:
             break;
+    }
+
+    if (target != PerformanceTarget::None
+        && target != PerformanceTarget::Rearrange
+        && target != PerformanceTarget::Retrigger)
+    {
+        processor.queueActiveSceneAutosave();
     }
 }

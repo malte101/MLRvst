@@ -310,11 +310,13 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
         case grainSizeMode:
         case swingMode:
             applyButtonPressLive(strip, x, mode, static_cast<int>(processor.getGatePageMode()));
+            processor.queueActiveSceneAutosave();
             break;
 
         case gateMode:
         {
             applyButtonPressLive(strip, x, mode, static_cast<int>(processor.getGatePageMode()));
+            processor.queueActiveSceneAutosave();
             if (strip.playMode == EnhancedAudioStrip::PlayMode::Step)
                 break;
 

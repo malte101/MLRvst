@@ -203,6 +203,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
         const int activePage = audioEngine->getModEditPage(targetStrip);
         arcSelectedModStep = juce::jlimit(0, ModernAudioEngine::ModSteps - 1, arcSelectedModStep);
         const int absoluteStep = (activePage * ModernAudioEngine::ModSteps) + arcSelectedModStep;
+        bool scenePersistentChanged = false;
 
         switch (clampedEncoder)
         {
@@ -229,6 +230,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
                         const float updatedEnd = juce::jlimit(0.0f, 1.0f, updatedStart + endDelta);
                         audioEngine->setModStepShapeAbsolute(targetStrip, absoluteStep, subdivisions, updatedEnd);
                     }
+                    scenePersistentChanged = true;
                 }
                 break;
             }
@@ -259,6 +261,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
                         endValue = startValue;
 
                     audioEngine->setModStepShapeAbsolute(targetStrip, absoluteStep, nextSubdivisions, endValue);
+                    scenePersistentChanged = true;
                 }
                 break;
             }
@@ -272,6 +275,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
                     const float smoothStep = fineAdjust ? 0.5f : 2.0f;
                     audioEngine->setModSmoothingMs(targetStrip,
                                                    juce::jlimit(0.0f, 250.0f, smoothMs + (static_cast<float>(delta) * smoothStep)));
+                    scenePersistentChanged = true;
                 }
                 else
                 {
@@ -279,12 +283,16 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
                     const float bendStep = fineAdjust ? 0.010f : 0.045f;
                     audioEngine->setModCurveBend(targetStrip,
                                                  juce::jlimit(-1.0f, 1.0f, bend + (static_cast<float>(delta) * bendStep)));
+                    scenePersistentChanged = true;
                 }
                 break;
             }
             default:
                 break;
         }
+
+        if (scenePersistentChanged)
+            queueActiveSceneAutosave();
     }
     else
     {
@@ -292,6 +300,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
             return;
 
         const bool grainMode = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain);
+        bool scenePersistentChanged = false;
         switch (clampedEncoder)
         {
             case 0:
@@ -300,6 +309,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
                 {
                     const float stepMs = fineAdjust ? 2.0f : 10.0f;
                     strip->setGrainSizeMs(strip->getGrainSizeMs() + (static_cast<float>(delta) * stepMs));
+                    scenePersistentChanged = true;
                 }
                 else
                 {
@@ -317,6 +327,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
                 {
                     const float densityStep = fineAdjust ? 0.003f : 0.012f;
                     strip->setGrainDensity(strip->getGrainDensity() + (static_cast<float>(delta) * densityStep));
+                    scenePersistentChanged = true;
                 }
                 else
                 {
@@ -334,6 +345,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
                 {
                     const float pitchStep = fineAdjust ? 0.10f : 0.35f;
                     strip->setGrainPitch(strip->getGrainPitch() + (static_cast<float>(delta) * pitchStep));
+                    scenePersistentChanged = true;
                 }
                 else
                 {
@@ -342,6 +354,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
                     const float nextNorm = juce::jlimit(0.0f, 1.0f, currentNorm + (static_cast<float>(delta) * filterStep));
                     strip->setFilterEnabled(true);
                     strip->setFilterFrequency(denormalizeFilterHz(nextNorm));
+                    scenePersistentChanged = true;
                 }
                 break;
             }
@@ -352,6 +365,7 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
                 {
                     const float spreadStep = fineAdjust ? 0.003f : 0.012f;
                     strip->setGrainSpread(strip->getGrainSpread() + (static_cast<float>(delta) * spreadStep));
+                    scenePersistentChanged = true;
                 }
                 else
                 {
@@ -359,12 +373,16 @@ void MlrVSTAudioProcessor::handleMonomeArcDelta(int encoder, int delta)
                     audioEngine->setModDepth(targetStrip,
                                              juce::jlimit(0.0f, 1.0f,
                                                           audioEngine->getModDepth(targetStrip) + (static_cast<float>(delta) * depthStep)));
+                    scenePersistentChanged = true;
                 }
                 break;
             }
             default:
                 break;
         }
+
+        if (scenePersistentChanged)
+            queueActiveSceneAutosave();
     }
 
     updateMonomeArcRings();

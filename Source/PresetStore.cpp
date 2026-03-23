@@ -21,6 +21,7 @@ constexpr int kMaxEmbeddedBase64Chars = 64 * 1024 * 1024;
 constexpr size_t kMaxEmbeddedWavBytes = 48 * 1024 * 1024;
 constexpr int64_t kMaxPresetXmlBytes = 128LL * 1024LL * 1024LL;
 constexpr int64_t kMaxPresetNameXmlBytes = 8LL * 1024LL * 1024LL;
+constexpr int64_t kMaxScenePerformanceBytes = 128LL * 1024LL * 1024LL;
 constexpr int kMaxStoredSamplePathChars = 4096;
 
 struct GlobalParameterSnapshot
@@ -77,6 +78,94 @@ bool writePresetAtomically(const juce::XmlElement& preset, const juce::File& tar
     return tempFile.overwriteTargetFileWithTemporary();
 }
 
+juce::File getPresetFileForIndex(int presetIndex)
+{
+    return getPresetDirectory().getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+}
+
+juce::File getScenePerformanceFileForIndex(int presetIndex)
+{
+    return getPresetDirectory().getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrsceneperf");
+}
+
+bool stripXmlHasStoredAudioContent(const juce::XmlElement& stripXml)
+{
+    if (stripXml.getStringAttribute("samplePath").trim().isNotEmpty())
+        return true;
+
+    return stripXml.getStringAttribute(kEmbeddedSampleAttr).isNotEmpty();
+}
+
+bool stripXmlHasLaunchablePlaybackContent(const juce::XmlElement& stripXml)
+{
+    return stripXml.getBoolAttribute("isPlaying", false)
+        && stripXmlHasStoredAudioContent(stripXml);
+}
+
+bool presetXmlMarksCapturedSceneSlot(const juce::XmlElement& presetXml)
+{
+    if (const auto* sceneChainStateXml = presetXml.getChildByName("SceneChainState"))
+        return sceneChainStateXml->getBoolAttribute("storedSceneSnapshot", false);
+
+    return false;
+}
+
+bool writeMemoryBlockAtomically(const juce::MemoryBlock& data, const juce::File& targetFile)
+{
+    juce::TemporaryFile tempFile(targetFile);
+    {
+        juce::FileOutputStream out(tempFile.getFile());
+        if (!out.openedOk())
+            return false;
+
+        if (data.getSize() > 0 && !out.write(data.getData(), data.getSize()))
+            return false;
+
+        out.flush();
+    }
+
+    return tempFile.overwriteTargetFileWithTemporary();
+}
+
+bool loadScenePerformanceDataForPreset(int presetIndex, juce::MemoryBlock& outData)
+{
+    outData.reset();
+    if (presetIndex < 0 || presetIndex >= kMaxPresetSlots)
+        return false;
+
+    const auto dataFile = getScenePerformanceFileForIndex(presetIndex);
+    if (!dataFile.existsAsFile())
+        return false;
+
+    const int64_t size = dataFile.getSize();
+    if (size < 0 || size > kMaxScenePerformanceBytes)
+        return false;
+
+    juce::FileInputStream in(dataFile);
+    if (!in.openedOk())
+        return false;
+
+    return in.readIntoMemoryBlock(outData);
+}
+
+bool saveScenePerformanceDataForPreset(int presetIndex, const juce::MemoryBlock& data)
+{
+    if (presetIndex < 0 || presetIndex >= kMaxPresetSlots)
+        return false;
+
+    const auto dataFile = getScenePerformanceFileForIndex(presetIndex);
+    return writeMemoryBlockAtomically(data, dataFile);
+}
+
+bool deleteScenePerformanceDataForPreset(int presetIndex)
+{
+    if (presetIndex < 0 || presetIndex >= kMaxPresetSlots)
+        return false;
+
+    const auto dataFile = getScenePerformanceFileForIndex(presetIndex);
+    return !dataFile.existsAsFile() || dataFile.deleteFile();
+}
+
 bool isValidStoredSamplePath(const juce::String& rawPath)
 {
     const auto path = rawPath.trim();
@@ -118,8 +207,7 @@ GlobalParameterSnapshot captureGlobalParameters(juce::AudioProcessorValueTreeSta
     GlobalParameterSnapshot snapshot;
     if (auto* p = parameters.getRawParameterValue("masterVolume"))
         snapshot.masterVolume = *p;
-    if (auto* p = parameters.getRawParameterValue("limiterThreshold"))
-        snapshot.limiterThresholdDb = *p;
+    snapshot.limiterThresholdDb = 0.0f;
     if (auto* p = parameters.getRawParameterValue("limiterEnabled"))
         snapshot.limiterEnabled = *p;
     if (auto* p = parameters.getRawParameterValue("quantize"))
@@ -164,7 +252,7 @@ void restoreGlobalParameters(juce::AudioProcessorValueTreeState& parameters, con
     if (auto* param = parameters.getParameter("masterVolume"))
         param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, snapshot.masterVolume));
     if (auto* param = parameters.getParameter("limiterThreshold"))
-        param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, (snapshot.limiterThresholdDb + 24.0f) / 24.0f));
+        param->setValueNotifyingHost(param->convertTo0to1(0.0f));
     if (auto* param = parameters.getParameter("limiterEnabled"))
         param->setValueNotifyingHost(snapshot.limiterEnabled > 0.5f ? 1.0f : 0.0f);
     if (auto* param = parameters.getParameter("quantize"))
@@ -628,7 +716,8 @@ bool savePreset(int presetIndex,
                 const juce::File* recentFlipDirectories,
                 const std::function<std::unique_ptr<juce::XmlElement>(int)>& createFlipStateXml,
                 const std::function<std::unique_ptr<juce::XmlElement>(int)>& createLoopPitchStateXml,
-                const std::function<std::unique_ptr<juce::XmlElement>()>& createAuxStateXml)
+                const std::function<std::unique_ptr<juce::XmlElement>()>& createAuxStateXml,
+                const std::function<juce::MemoryBlock()>& createScenePerformanceData)
 {
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots
         || audioEngine == nullptr
@@ -644,7 +733,7 @@ bool savePreset(int presetIndex,
         if (!presetDir.exists())
             presetDir.createDirectory();
 
-        auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+        auto presetFile = getPresetFileForIndex(presetIndex);
 
         juce::XmlElement preset("mlrVSTPreset");
         preset.setAttribute("version", "1.0");
@@ -731,7 +820,10 @@ bool savePreset(int presetIndex,
             stripXml->setAttribute(kAnalysisRmsAttr, encodeFloatArrayCsv(strip->getCachedRmsMap()));
             stripXml->setAttribute(kAnalysisZeroCrossAttr, encodeIntArrayCsv(strip->getCachedZeroCrossMap()));
         }
-        stripXml->setAttribute("pitchShift", strip->getPitchShift());
+        float savedPitchShift = strip->getPitchShift();
+        if (const auto* pitchParam = parameters.getRawParameterValue("stripPitch" + juce::String(i)))
+            savedPitchShift = juce::jlimit(-24.0f, 24.0f, pitchParam->load(std::memory_order_acquire));
+        stripXml->setAttribute("pitchShift", savedPitchShift);
         stripXml->setAttribute("recordingBars", strip->getRecordingBars());
         stripXml->setAttribute("filterEnabled", strip->isFilterEnabled());
         stripXml->setAttribute("filterFrequency", strip->getFilterFrequency());
@@ -888,14 +980,29 @@ bool savePreset(int presetIndex,
     if (auto* crossfade = parameters.getRawParameterValue("crossfadeLength"))
         globalsXml->setAttribute("crossfadeLength", *crossfade);
 
-    if (writePresetAtomically(preset, presetFile))
+    if (!writePresetAtomically(preset, presetFile))
     {
-        DBG("Preset " << (presetIndex + 1) << " saved: " << presetFile.getFullPathName());
-        return true;
+        DBG("Preset save failed for slot " << (presetIndex + 1) << ": write failed");
+        return false;
     }
 
-    DBG("Preset save failed for slot " << (presetIndex + 1) << ": write failed");
-    return false;
+    if (createScenePerformanceData)
+    {
+        const auto scenePerformanceData = createScenePerformanceData();
+        if (!saveScenePerformanceDataForPreset(presetIndex, scenePerformanceData))
+        {
+            DBG("Preset save failed for slot " << (presetIndex + 1) << ": scene data write failed");
+            return false;
+        }
+    }
+    else if (!deleteScenePerformanceDataForPreset(presetIndex))
+    {
+        DBG("Preset save failed for slot " << (presetIndex + 1) << ": stale scene data delete failed");
+        return false;
+    }
+
+    DBG("Preset " << (presetIndex + 1) << " saved: " << presetFile.getFullPathName());
+    return true;
     }
     catch (const std::exception& e)
     {
@@ -921,18 +1028,19 @@ bool loadPreset(int presetIndex,
                 const std::function<void(int, const juce::XmlElement*)>& applyFlipStateXml,
                 const std::function<void(int, const juce::XmlElement*)>& applyLoopPitchStateXml,
                 const std::function<void(const juce::XmlElement&)>& applyAuxStateXml,
+                const std::function<void(const juce::MemoryBlock&)>& applyScenePerformanceData,
                 double hostPpqSnapshot,
                 double hostTempoSnapshot,
                 bool preserveGlobalParameters,
-                int64_t hostGlobalSampleSnapshot)
+                int64_t hostGlobalSampleSnapshot,
+                bool restartPlayingStripsFromSceneStart)
 {
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots || audioEngine == nullptr)
         return false;
 
     try
     {
-        auto presetDir = getPresetDirectory();
-        auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+        auto presetFile = getPresetFileForIndex(presetIndex);
 
         if (!presetFile.existsAsFile())
         {
@@ -972,6 +1080,27 @@ bool loadPreset(int presetIndex,
         if (preserveGlobalParameters)
             globalSnapshot = captureGlobalParameters(parameters);
 
+        struct PitchRecallBlendSnapshot
+        {
+            float pitch = 0.0f;
+            float pitchControlMode = 0.0f;
+        };
+
+        auto capturePitchRecallBlendSnapshot = [&parameters](int stripIndex) -> PitchRecallBlendSnapshot
+        {
+            PitchRecallBlendSnapshot snapshot;
+            if (auto* pitchParam = parameters.getRawParameterValue("stripPitch" + juce::String(stripIndex)))
+                snapshot.pitch = pitchParam->load(std::memory_order_acquire);
+            if (auto* modeParam = parameters.getRawParameterValue("stripPitchControlMode" + juce::String(stripIndex)))
+                snapshot.pitchControlMode = modeParam->load(std::memory_order_acquire);
+            return snapshot;
+        };
+
+        const int safeMaxStrips = juce::jlimit(0, ModernAudioEngine::MaxStrips, maxStrips);
+        std::vector<PitchRecallBlendSnapshot> previousPitchBlendSnapshots(static_cast<size_t>(safeMaxStrips));
+        for (int i = 0; i < safeMaxStrips; ++i)
+            previousPitchBlendSnapshots[static_cast<size_t>(i)] = capturePitchRecallBlendSnapshot(i);
+
         bool restoredParameterState = false;
         if (auto* paramsXml = preset->getChildByName("ParametersState"))
         {
@@ -986,22 +1115,27 @@ bool loadPreset(int presetIndex,
         if (preserveGlobalParameters)
             restoreGlobalParameters(parameters, globalSnapshot);
 
-        const int safeMaxStrips = juce::jlimit(0, ModernAudioEngine::MaxStrips, maxStrips);
         if (!restoredParameterState)
         {
             for (int i = 0; i < safeMaxStrips; ++i)
                 resetStripParametersToDefaults(parameters, i);
         }
 
-        const bool canRecallPlayingState = std::isfinite(hostPpqSnapshot)
-            && std::isfinite(hostTempoSnapshot)
-            && hostTempoSnapshot > 0.0;
+        std::vector<PitchRecallBlendSnapshot> recalledPitchBlendSnapshots(static_cast<size_t>(safeMaxStrips));
+        for (int i = 0; i < safeMaxStrips; ++i)
+            recalledPitchBlendSnapshots[static_cast<size_t>(i)] = capturePitchRecallBlendSnapshot(i);
+
         const double recallPpq = std::isfinite(hostPpqSnapshot)
             ? hostPpqSnapshot
             : audioEngine->getTimelineBeat();
         const double recallTempo = (std::isfinite(hostTempoSnapshot) && hostTempoSnapshot > 0.0)
             ? hostTempoSnapshot
             : audioEngine->getCurrentTempo();
+        const bool canRecallStripPlayback = std::isfinite(recallTempo)
+            && recallTempo > 0.0;
+        const bool canRecallPatternPlayback = std::isfinite(hostPpqSnapshot)
+            && std::isfinite(hostTempoSnapshot)
+            && hostTempoSnapshot > 0.0;
 
         std::vector<bool> stripSeen(static_cast<size_t>(safeMaxStrips), false);
         for (auto* stripXml : preset->getChildWithTagNameIterator("Strip"))
@@ -1111,33 +1245,42 @@ bool loadPreset(int presetIndex,
         }
 
         const bool restorePlayingRequested = stripXml->getBoolAttribute("isPlaying", false);
-        const bool restorePlaying = canRecallPlayingState && restorePlayingRequested;
+        const bool restorePlaying = canRecallStripPlayback && restorePlayingRequested;
         const int restoreMarkerColumn = clampedInt(stripXml->getIntAttribute("playbackColumn", safeLoopStart),
                                                    0, ModernAudioEngine::MaxColumns - 1, safeLoopStart);
         const bool restorePpqAnchored = stripXml->getBoolAttribute("ppqTimelineAnchored", false);
-        const double restorePpqOffsetBeats = stripXml->getDoubleAttribute("ppqTimelineOffsetBeats", 0.0);
+        const double storedRestorePpqOffsetBeats = stripXml->getDoubleAttribute("ppqTimelineOffsetBeats", 0.0);
+        const int effectiveRestoreMarkerColumn = restartPlayingStripsFromSceneStart
+            ? safeLoopStart
+            : restoreMarkerColumn;
         const int64_t restoreGlobalSample = hostGlobalSampleSnapshot >= 0
             ? hostGlobalSampleSnapshot
             : audioEngine->getGlobalSampleCount();
         const double restoreTimelineBeat = recallPpq;
         const double restoreTempo = recallTempo;
-
-        if (strip->hasAudio())
+        bool effectiveRestorePpqAnchored = restorePpqAnchored;
+        double effectiveRestorePpqOffsetBeats = storedRestorePpqOffsetBeats;
+        if (restartPlayingStripsFromSceneStart)
         {
-            if (restorePlaying)
-                audioEngine->enforceGroupExclusivity(stripIndex, false);
+            const double beatsForLoop = (savedBeatsPerLoop >= 0.0f)
+                ? static_cast<double>(savedBeatsPerLoop)
+                : 4.0;
+            if (beatsForLoop > 0.0 && std::isfinite(restoreTimelineBeat) && restoreTempo > 0.0)
+            {
+                double currentBeatInLoop = std::fmod(restoreTimelineBeat, beatsForLoop);
+                if (currentBeatInLoop < 0.0)
+                    currentBeatInLoop += beatsForLoop;
 
-            strip->restorePresetPpqState(restorePlaying,
-                                         restorePpqAnchored,
-                                         restorePpqOffsetBeats,
-                                         restoreMarkerColumn,
-                                         restoreTempo,
-                                         restoreTimelineBeat,
-                                         restoreGlobalSample);
-        }
-        else
-        {
-            strip->stop(true);
+                effectiveRestorePpqAnchored = true;
+                effectiveRestorePpqOffsetBeats = std::fmod(-currentBeatInLoop, beatsForLoop);
+                if (effectiveRestorePpqOffsetBeats < 0.0)
+                    effectiveRestorePpqOffsetBeats += beatsForLoop;
+            }
+            else
+            {
+                effectiveRestorePpqAnchored = false;
+                effectiveRestorePpqOffsetBeats = 0.0;
+            }
         }
 
         strip->setScratchAmount(clampedFloat(stripXml->getDoubleAttribute("scratchAmount", 0.0), 0.0f, 0.0f, 100.0f));
@@ -1280,7 +1423,7 @@ bool loadPreset(int presetIndex,
                     stripXml->getIntAttribute(slotKey("TransportMode"),
                                               static_cast<int>(ModernAudioEngine::ModTransportMode::Free)),
                     0,
-                    static_cast<int>(ModernAudioEngine::ModTransportMode::Sync),
+                    static_cast<int>(ModernAudioEngine::ModTransportMode::Scene),
                     static_cast<int>(ModernAudioEngine::ModTransportMode::Free))));
             audioEngine->setModOffset(stripIndex, clampedInt(stripXml->getIntAttribute(slotKey("Offset"), 0), -127, 127, 0));
             audioEngine->setModLengthBars(stripIndex, clampedInt(stripXml->getIntAttribute(slotKey("LengthBars"), 1), 1, 8, 1));
@@ -1295,18 +1438,7 @@ bool loadPreset(int presetIndex,
             std::array<float, ModernAudioEngine::ModTotalSteps> modSteps{};
             const auto stepsText = stripXml->getStringAttribute(stepsKey);
             if (stepsText.isEmpty())
-            {
-                if (loadedTarget == ModernAudioEngine::ModTarget::Rearrange)
-                {
-                    for (int step = 0; step < ModernAudioEngine::ModTotalSteps; ++step)
-                        modSteps[static_cast<size_t>(step)] = static_cast<float>(step % ModernAudioEngine::ModSteps)
-                            / static_cast<float>(juce::jmax(1, ModernAudioEngine::ModSteps - 1));
-                }
-                else
-                {
-                    modSteps.fill(ModernAudioEngine::defaultModStepValueForTarget(loadedTarget));
-                }
-            }
+                modSteps.fill(ModernAudioEngine::defaultModStepValueForTarget(loadedTarget));
             else
             {
                 decodeModSteps(stepsText, modSteps);
@@ -1407,7 +1539,33 @@ bool loadPreset(int presetIndex,
             {
                 sliceLengthParam->setValueNotifyingHost(
                     juce::jlimit(0.0f, 1.0f, ranged->convertTo0to1(sliceLengthValue)));
-            }
+                }
+        }
+
+        if (strip->hasAudio())
+        {
+            if (restorePlaying)
+                audioEngine->enforceGroupExclusivity(stripIndex, false);
+
+            const auto& recalledPitchBlendSnapshot = recalledPitchBlendSnapshots[static_cast<size_t>(stripIndex)];
+            const auto& previousPitchBlendSnapshot = previousPitchBlendSnapshots[static_cast<size_t>(stripIndex)];
+            const bool shouldBlendPitchPath = std::abs(previousPitchBlendSnapshot.pitch
+                                                       - recalledPitchBlendSnapshot.pitch) > 1.0e-4f
+                || std::abs(previousPitchBlendSnapshot.pitchControlMode
+                            - recalledPitchBlendSnapshot.pitchControlMode) > 1.0e-4f;
+
+            strip->restorePresetPpqState(restorePlaying,
+                                         effectiveRestorePpqAnchored,
+                                         effectiveRestorePpqOffsetBeats,
+                                         effectiveRestoreMarkerColumn,
+                                         restoreTempo,
+                                         restoreTimelineBeat,
+                                         restoreGlobalSample,
+                                         shouldBlendPitchPath);
+        }
+        else
+        {
+            strip->stop(true);
         }
     }
 
@@ -1483,13 +1641,27 @@ bool loadPreset(int presetIndex,
 
             const int lengthBeats = patternXml->getIntAttribute("lengthBeats", 4);
             pattern->setEventsSnapshot(events, lengthBeats);
-            if (canRecallPlayingState && patternXml->getBoolAttribute("isPlaying", false) && !events.empty())
+            if (canRecallPatternPlayback
+                && std::isfinite(nowBeat)
+                && patternXml->getBoolAttribute("isPlaying", false)
+                && !events.empty())
                 pattern->startPlayback(nowBeat);
         }
     }
 
+    const bool presetDeclaresSceneState = preset->getChildByName("SceneChainState") != nullptr;
+
     if (applyAuxStateXml)
         applyAuxStateXml(*preset);
+
+    if (applyScenePerformanceData)
+    {
+        juce::MemoryBlock scenePerformanceData;
+        if (presetDeclaresSceneState && loadScenePerformanceDataForPreset(presetIndex, scenePerformanceData))
+            applyScenePerformanceData(scenePerformanceData);
+        else
+            applyScenePerformanceData({});
+    }
 
         DBG("Preset " << (presetIndex + 1) << " loaded");
         return true;
@@ -1512,8 +1684,7 @@ juce::String getPresetName(int presetIndex)
 {
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots)
         return {};
-    auto presetDir = getPresetDirectory();
-    auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+    auto presetFile = getPresetFileForIndex(presetIndex);
     if (presetFile.existsAsFile() && isPresetFileSizeValid(presetFile, kMaxPresetNameXmlBytes))
     {
         if (auto preset = parsePresetXmlSafely(presetFile, kMaxPresetNameXmlBytes))
@@ -1533,8 +1704,7 @@ bool setPresetName(int presetIndex, const juce::String& presetName)
 
     try
     {
-        auto presetDir = getPresetDirectory();
-        auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+        auto presetFile = getPresetFileForIndex(presetIndex);
         if (!presetFile.existsAsFile())
         {
             if (!writeDefaultPresetFile(presetFile, presetIndex))
@@ -1567,8 +1737,7 @@ bool updatePresetAuxState(int presetIndex,
 
     try
     {
-        auto presetDir = getPresetDirectory();
-        const auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+        const auto presetFile = getPresetFileForIndex(presetIndex);
         if (!presetFile.existsAsFile())
             return false;
 
@@ -1602,9 +1771,37 @@ bool presetExists(int presetIndex)
     if (presetIndex < 0 || presetIndex >= kMaxPresetSlots)
         return false;
 
-    auto presetDir = getPresetDirectory();
-    auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+    auto presetFile = getPresetFileForIndex(presetIndex);
     return presetFile.existsAsFile();
+}
+
+bool presetHasLaunchableSceneContent(int presetIndex)
+{
+    if (presetIndex < 0 || presetIndex >= kMaxPresetSlots)
+        return false;
+
+    try
+    {
+        const auto presetFile = getPresetFileForIndex(presetIndex);
+        auto presetXml = parsePresetXmlSafely(presetFile, kMaxPresetXmlBytes);
+        if (presetXml == nullptr)
+            return false;
+
+        if (presetXmlMarksCapturedSceneSlot(*presetXml))
+            return true;
+
+        for (auto* stripXml : presetXml->getChildWithTagNameIterator("Strip"))
+        {
+            if (stripXml != nullptr && stripXmlHasLaunchablePlaybackContent(*stripXml))
+                return true;
+        }
+
+        return false;
+    }
+    catch (...)
+    {
+        return false;
+    }
 }
 
 bool copyPreset(int sourcePresetIndex, int destPresetIndex)
@@ -1615,9 +1812,8 @@ bool copyPreset(int sourcePresetIndex, int destPresetIndex)
 
     try
     {
-        auto presetDir = getPresetDirectory();
-        const auto sourceFile = presetDir.getChildFile("Preset_" + juce::String(sourcePresetIndex + 1) + ".mlrpreset");
-        const auto destFile = presetDir.getChildFile("Preset_" + juce::String(destPresetIndex + 1) + ".mlrpreset");
+        const auto sourceFile = getPresetFileForIndex(sourcePresetIndex);
+        const auto destFile = getPresetFileForIndex(destPresetIndex);
         if (!sourceFile.existsAsFile())
             return false;
 
@@ -1626,7 +1822,14 @@ bool copyPreset(int sourcePresetIndex, int destPresetIndex)
             return false;
 
         presetXml->setAttribute("index", destPresetIndex);
-        return writePresetAtomically(*presetXml, destFile);
+        if (!writePresetAtomically(*presetXml, destFile))
+            return false;
+
+        juce::MemoryBlock scenePerformanceData;
+        if (loadScenePerformanceDataForPreset(sourcePresetIndex, scenePerformanceData))
+            return saveScenePerformanceDataForPreset(destPresetIndex, scenePerformanceData);
+
+        return deleteScenePerformanceDataForPreset(destPresetIndex);
     }
     catch (...)
     {
@@ -1641,12 +1844,13 @@ bool deletePreset(int presetIndex)
 
     try
     {
-        auto presetDir = getPresetDirectory();
-        auto presetFile = presetDir.getChildFile("Preset_" + juce::String(presetIndex + 1) + ".mlrpreset");
+        auto presetFile = getPresetFileForIndex(presetIndex);
         if (!presetFile.existsAsFile())
             return false;
 
-        return presetFile.deleteFile();
+        const bool presetDeleted = presetFile.deleteFile();
+        const bool sceneDataDeleted = deleteScenePerformanceDataForPreset(presetIndex);
+        return presetDeleted && sceneDataDeleted;
     }
     catch (...)
     {
