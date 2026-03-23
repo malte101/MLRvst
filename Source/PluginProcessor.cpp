@@ -8987,6 +8987,44 @@ void MlrVSTAudioProcessor::commitSceneTransitionIfReady()
     applySceneRenderContext(std::move(*context));
 }
 
+void MlrVSTAudioProcessor::applyQueuedSceneExitTailFade(juce::AudioBuffer<float>& buffer, int64_t blockStartSample)
+{
+    if (buffer.getNumSamples() <= 0 || blockStartSample < 0)
+        return;
+
+    if (pendingSceneApplySlot.load(std::memory_order_acquire) < 0
+        || pendingSceneApplySequenceDriven.load(std::memory_order_acquire) == 0)
+    {
+        return;
+    }
+
+    const int64_t targetSample = pendingSceneApplyTargetSample.load(std::memory_order_acquire);
+    if (targetSample < blockStartSample
+        || targetSample >= blockStartSample + static_cast<int64_t>(buffer.getNumSamples()))
+    {
+        return;
+    }
+
+    const double effectiveRate = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
+    const float triggerFadeMs = triggerFadeInParam != nullptr
+        ? juce::jlimit(0.01f, 120.0f, triggerFadeInParam->load(std::memory_order_acquire))
+        : 12.0f;
+    const double tailFadeMs = juce::jlimit(0.20, 0.75, juce::jmax(0.20, static_cast<double>(triggerFadeMs) * 0.08));
+    const int fadeSamples = juce::jlimit(8,
+                                         juce::jmax(8, buffer.getNumSamples()),
+                                         static_cast<int>(std::round(effectiveRate * 0.001 * tailFadeMs)));
+    const int fadeStartSample = juce::jmax(0, buffer.getNumSamples() - fadeSamples);
+    const int denom = juce::jmax(1, buffer.getNumSamples() - fadeStartSample - 1);
+
+    for (int sample = fadeStartSample; sample < buffer.getNumSamples(); ++sample)
+    {
+        const float t = static_cast<float>(sample - fadeStartSample) / static_cast<float>(denom);
+        const float gain = std::cos(juce::jlimit(0.0f, 1.0f, t) * juce::MathConstants<float>::halfPi);
+        for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+            buffer.setSample(channel, sample, buffer.getSample(channel, sample) * gain);
+    }
+}
+
 void MlrVSTAudioProcessor::recordMonomeControlPatternEvent(ControlMode mode,
                                                            int targetStripIndex,
                                                            int controlRow,
@@ -9891,6 +9929,7 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     else
         renderActiveSceneAudio(buffer, midiMessages, posInfo, true, true);
     commitSceneTransitionIfReady();
+    applyQueuedSceneExitTailFade(buffer, currentGlobalSample);
 
     if (sceneRecallBlendSamplesRemaining > 0 && sceneRecallBlendTotalSamples > 0)
     {

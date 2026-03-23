@@ -1537,6 +1537,7 @@ private:
                                     const juce::AudioPlayHead::PositionInfo& posInfo);
     void applySceneRenderContext(SceneRenderContext context);
     void commitSceneTransitionIfReady();
+    void applyQueuedSceneExitTailFade(juce::AudioBuffer<float>& buffer, int64_t blockStartSample);
     void queuePendingSceneParameterState(const juce::ValueTree& state);
     void applyPendingSceneParameterState();
     struct PresetSaveRequest
