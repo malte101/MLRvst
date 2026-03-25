@@ -1,13 +1,14 @@
 #include "PresetStore.h"
 #include "AudioEngine.h"
 #include "PlayheadSpeedQuantizer.h"
+#include "ScenePerformanceRecorder.h"
 #include <cmath>
 #include <limits>
 
 namespace PresetStore
 {
 static constexpr int kVisiblePresetSlots = 16 * 7;
-static constexpr int kHiddenScenePresetSlots = kVisiblePresetSlots * 4;
+static constexpr int kHiddenScenePresetSlots = kVisiblePresetSlots * ScenePerformanceRecorder::MaxSceneSlots;
 static constexpr int kMaxPresetSlots = kVisiblePresetSlots + kHiddenScenePresetSlots;
 
 namespace

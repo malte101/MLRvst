@@ -264,36 +264,6 @@ void writeMotionLaneState(juce::MemoryOutputStream& out, const ScenePerformanceM
     }
 }
 
-ScenePerformanceMotionLaneState readMotionLaneState(juce::MemoryInputStream& in)
-{
-    ScenePerformanceMotionLaneState lane;
-    lane.target = performanceTargetFromRaw(in.readInt());
-    lane.bipolar = in.readByte() != 0;
-    lane.curveMode = in.readByte() != 0;
-    lane.depth = in.readFloat();
-    lane.rate = in.readFloat();
-    lane.transportMode = static_cast<ModernAudioEngine::ModTransportMode>(in.readInt());
-    lane.offset = in.readInt();
-    lane.lengthBars = in.readInt();
-    lane.editPage = in.readInt();
-    lane.smoothingMs = in.readFloat();
-    lane.curveBend = in.readFloat();
-    lane.curveShape = static_cast<ModernAudioEngine::ModCurveShape>(in.readInt());
-    lane.pitchScaleQuantize = in.readByte() != 0;
-    lane.pitchScale = static_cast<ModernAudioEngine::PitchScale>(in.readInt());
-
-    for (int stepIndex = 0; stepIndex < ModernAudioEngine::ModTotalSteps; ++stepIndex)
-    {
-        const auto index = static_cast<size_t>(stepIndex);
-        lane.steps[index] = in.readFloat();
-        lane.stepSubdivisions[index] = in.readInt();
-        lane.stepEndValues[index] = in.readFloat();
-        lane.stepCurveShapes[index] = static_cast<ModernAudioEngine::ModCurveShape>(in.readInt());
-    }
-
-    return sanitizeMotionLane(lane);
-}
-
 void writeClip(juce::MemoryOutputStream& out,
                int sceneSlot,
                const ScenePerformanceClip& clip,
@@ -952,46 +922,194 @@ juce::MemoryBlock ScenePerformanceRecorder::createData(int sceneSlotOverride,
 bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int sceneSlotOverride)
 {
     juce::ScopedLock lock(clipLock);
-    recording.store(false, std::memory_order_release);
-    recordingOverdub.store(false, std::memory_order_release);
-    recordingSceneSlot.store(-1, std::memory_order_release);
-    recordingSceneStartBeat.store(-1.0, std::memory_order_release);
-    recordingStartBeat.store(-1.0, std::memory_order_release);
-    recordingEndBeat.store(-1.0, std::memory_order_release);
-    resetRecordingWriteState();
+    auto parsedClips = sceneClips;
+    const int safeSceneSlotOverride = sceneSlotOverride >= 0 ? clampSceneSlot(sceneSlotOverride) : -1;
 
-    if (sceneSlotOverride >= 0)
+    if (safeSceneSlotOverride >= 0)
     {
-        auto& clip = getClipForWrite(sceneSlotOverride);
+        auto& clip = parsedClips[static_cast<size_t>(safeSceneSlotOverride)];
         resetClip(clip);
     }
     else
     {
-        for (auto& clip : sceneClips)
+        for (auto& clip : parsedClips)
             resetClip(clip);
     }
 
     if (data.getSize() == 0)
+    {
+        recording.store(false, std::memory_order_release);
+        recordingOverdub.store(false, std::memory_order_release);
+        recordingSceneSlot.store(-1, std::memory_order_release);
+        recordingSceneStartBeat.store(-1.0, std::memory_order_release);
+        recordingStartBeat.store(-1.0, std::memory_order_release);
+        recordingEndBeat.store(-1.0, std::memory_order_release);
+        resetRecordingWriteState();
+        sceneClips = std::move(parsedClips);
         return true;
+    }
 
     juce::MemoryInputStream in(data, false);
-    if (in.readInt() != kScenePerformanceDataMagic)
+    const auto readByteChecked = [&in](char& value) -> bool
+    {
+        if (in.getNumBytesRemaining() < static_cast<juce::int64>(sizeof(char)))
+            return false;
+        value = static_cast<char>(in.readByte());
+        return true;
+    };
+    const auto readIntChecked = [&in](int& value) -> bool
+    {
+        if (in.getNumBytesRemaining() < static_cast<juce::int64>(sizeof(int)))
+            return false;
+        value = in.readInt();
+        return true;
+    };
+    const auto readInt64Checked = [&in](int64_t& value) -> bool
+    {
+        if (in.getNumBytesRemaining() < static_cast<juce::int64>(sizeof(int64_t)))
+            return false;
+        value = static_cast<int64_t>(in.readInt64());
+        return true;
+    };
+    const auto readFloatChecked = [&in](float& value) -> bool
+    {
+        if (in.getNumBytesRemaining() < static_cast<juce::int64>(sizeof(float)))
+            return false;
+        value = in.readFloat();
+        return true;
+    };
+    const auto readDoubleChecked = [&in](double& value) -> bool
+    {
+        if (in.getNumBytesRemaining() < static_cast<juce::int64>(sizeof(double)))
+            return false;
+        value = in.readDouble();
+        return true;
+    };
+    const auto readMotionLaneStateChecked = [&](ScenePerformanceMotionLaneState& lane) -> bool
+    {
+        int rawInt = 0;
+        char rawByte = 0;
+        float rawFloat = 0.0f;
+
+        if (!readIntChecked(rawInt))
+            return false;
+        lane.target = performanceTargetFromRaw(rawInt);
+
+        if (!readByteChecked(rawByte))
+            return false;
+        lane.bipolar = rawByte != 0;
+
+        if (!readByteChecked(rawByte))
+            return false;
+        lane.curveMode = rawByte != 0;
+
+        if (!readFloatChecked(rawFloat))
+            return false;
+        lane.depth = rawFloat;
+
+        if (!readFloatChecked(rawFloat))
+            return false;
+        lane.rate = rawFloat;
+
+        if (!readIntChecked(rawInt))
+            return false;
+        lane.transportMode = static_cast<ModernAudioEngine::ModTransportMode>(rawInt);
+
+        if (!readIntChecked(rawInt))
+            return false;
+        lane.offset = rawInt;
+
+        if (!readIntChecked(rawInt))
+            return false;
+        lane.lengthBars = rawInt;
+
+        if (!readIntChecked(rawInt))
+            return false;
+        lane.editPage = rawInt;
+
+        if (!readFloatChecked(rawFloat))
+            return false;
+        lane.smoothingMs = rawFloat;
+
+        if (!readFloatChecked(rawFloat))
+            return false;
+        lane.curveBend = rawFloat;
+
+        if (!readIntChecked(rawInt))
+            return false;
+        lane.curveShape = static_cast<ModernAudioEngine::ModCurveShape>(rawInt);
+
+        if (!readByteChecked(rawByte))
+            return false;
+        lane.pitchScaleQuantize = rawByte != 0;
+
+        if (!readIntChecked(rawInt))
+            return false;
+        lane.pitchScale = static_cast<ModernAudioEngine::PitchScale>(rawInt);
+
+        for (int stepIndex = 0; stepIndex < ModernAudioEngine::ModTotalSteps; ++stepIndex)
+        {
+            const auto index = static_cast<size_t>(stepIndex);
+
+            if (!readFloatChecked(rawFloat))
+                return false;
+            lane.steps[index] = rawFloat;
+
+            if (!readIntChecked(rawInt))
+                return false;
+            lane.stepSubdivisions[index] = rawInt;
+
+            if (!readFloatChecked(rawFloat))
+                return false;
+            lane.stepEndValues[index] = rawFloat;
+
+            if (!readIntChecked(rawInt))
+                return false;
+            lane.stepCurveShapes[index] = static_cast<ModernAudioEngine::ModCurveShape>(rawInt);
+        }
+
+        lane = sanitizeMotionLane(lane);
+        return true;
+    };
+
+    int magic = 0;
+    if (!readIntChecked(magic) || magic != kScenePerformanceDataMagic)
         return false;
 
-    const int version = in.readInt();
+    int version = 0;
+    if (!readIntChecked(version))
+        return false;
     if (version != 1 && version != kScenePerformanceDataVersion)
         return false;
 
-    const int clipCount = juce::jlimit(0, MaxSceneSlots, in.readInt());
+    int rawClipCount = 0;
+    if (!readIntChecked(rawClipCount))
+        return false;
+
+    const int clipCount = juce::jlimit(0, MaxSceneSlots, rawClipCount);
     for (int clipIndex = 0; clipIndex < clipCount; ++clipIndex)
     {
-        const int xmlSceneSlot = clampSceneSlot(in.readInt());
-        const double clipLengthBeats = sanitizeLengthBeats(in.readDouble());
-        const uint32_t clipVersion = static_cast<uint32_t>(juce::jmax(1, in.readInt()));
-        const int eventCount = juce::jmax(0, in.readInt());
+        int rawSceneSlot = 0;
+        double rawClipLengthBeats = 0.0;
+        int rawClipVersion = 0;
+        int rawEventCount = 0;
+        if (!readIntChecked(rawSceneSlot)
+            || !readDoubleChecked(rawClipLengthBeats)
+            || !readIntChecked(rawClipVersion)
+            || !readIntChecked(rawEventCount))
+        {
+            return false;
+        }
 
-        const bool shouldApplyClip = sceneSlotOverride < 0 || xmlSceneSlot == clampSceneSlot(sceneSlotOverride);
-        ScenePerformanceClip* clip = shouldApplyClip ? &getClipForWrite(xmlSceneSlot) : nullptr;
+        const int xmlSceneSlot = clampSceneSlot(rawSceneSlot);
+        const double clipLengthBeats = sanitizeLengthBeats(rawClipLengthBeats);
+        const uint32_t clipVersion = static_cast<uint32_t>(juce::jmax(1, rawClipVersion));
+        const int eventCount = juce::jmax(0, rawEventCount);
+
+        const bool shouldApplyClip = safeSceneSlotOverride < 0 || xmlSceneSlot == safeSceneSlotOverride;
+        ScenePerformanceClip* clip = shouldApplyClip
+            ? &parsedClips[static_cast<size_t>(xmlSceneSlot)]
+            : nullptr;
         if (clip != nullptr)
         {
             clip->lengthBeats = clipLengthBeats;
@@ -1005,20 +1123,31 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
         for (int eventIndex = 0; eventIndex < eventCount; ++eventIndex)
         {
             ScenePerformanceEvent event;
-            event.type = static_cast<ScenePerformanceEventType>(juce::jlimit(0, 1, static_cast<int>(in.readByte())));
-            event.stripIndex = in.readInt();
-            event.column = in.readInt();
-            event.sampleSliceId = in.readInt();
-            event.sampleStartSample = static_cast<int64_t>(in.readInt64());
-            event.controlMode = in.readInt();
-            event.controlRow = in.readInt();
+            char rawType = 0;
+            char rawTarget = 0;
+            char rawNoteOn = 0;
+            if (!readByteChecked(rawType)
+                || !readIntChecked(event.stripIndex)
+                || !readIntChecked(event.column)
+                || !readIntChecked(event.sampleSliceId)
+                || !readInt64Checked(event.sampleStartSample)
+                || !readIntChecked(event.controlMode)
+                || !readIntChecked(event.controlRow)
+                || !readByteChecked(rawTarget)
+                || !readFloatChecked(event.value)
+                || !readDoubleChecked(event.timeBeats)
+                || !readByteChecked(rawNoteOn))
+            {
+                return false;
+            }
+
+            event.type = static_cast<ScenePerformanceEventType>(
+                juce::jlimit(0, 1, static_cast<int>(rawType)));
             event.controlTarget = static_cast<ScenePerformanceControlTarget>(
                 juce::jlimit(0,
                              static_cast<int>(ScenePerformanceControlTarget::GrainShape),
-                             static_cast<int>(in.readByte())));
-            event.value = in.readFloat();
-            event.timeBeats = in.readDouble();
-            event.isNoteOn = in.readByte() != 0;
+                             static_cast<int>(rawTarget)));
+            event.isNoteOn = rawNoteOn != 0;
             if (clip != nullptr)
             {
                 if (event.type == ScenePerformanceEventType::ControlPoint
@@ -1036,15 +1165,23 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
 
         if (version >= 2)
         {
-            const bool hasMotionState = in.readByte() != 0;
+            char rawHasMotionState = 0;
+            if (!readByteChecked(rawHasMotionState))
+                return false;
+
+            const bool hasMotionState = rawHasMotionState != 0;
             if (hasMotionState)
             {
                 for (int stripIndex = 0; stripIndex < ModernAudioEngine::MaxStrips; ++stripIndex)
                 {
                     ScenePerformanceMotionStripState stripState;
-                    stripState.activeSlot = in.readInt();
+                    if (!readIntChecked(stripState.activeSlot))
+                        return false;
                     for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
-                        stripState.lanes[static_cast<size_t>(slot)] = readMotionLaneState(in);
+                    {
+                        if (!readMotionLaneStateChecked(stripState.lanes[static_cast<size_t>(slot)]))
+                            return false;
+                    }
 
                     if (clip != nullptr)
                     {
@@ -1056,5 +1193,13 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
         }
     }
 
+    recording.store(false, std::memory_order_release);
+    recordingOverdub.store(false, std::memory_order_release);
+    recordingSceneSlot.store(-1, std::memory_order_release);
+    recordingSceneStartBeat.store(-1.0, std::memory_order_release);
+    recordingStartBeat.store(-1.0, std::memory_order_release);
+    recordingEndBeat.store(-1.0, std::memory_order_release);
+    resetRecordingWriteState();
+    sceneClips = std::move(parsedClips);
     return true;
 }

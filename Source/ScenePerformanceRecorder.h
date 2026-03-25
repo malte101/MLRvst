@@ -118,7 +118,7 @@ struct ScenePerformanceClip
 class ScenePerformanceRecorder
 {
 public:
-    static constexpr int MaxSceneSlots = 4;
+    static constexpr int MaxSceneSlots = 8;
     using MotionStripState = ScenePerformanceMotionStripState;
 
     ScenePerformanceRecorder();

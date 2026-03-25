@@ -772,6 +772,8 @@ private:
     juce::ComboBox arcDeviceSelector;
     juce::TextButton arcConnectButton;
     juce::Label arcStatusLabel;
+    juce::Label topRowModeLabel;
+    juce::Label topRowHintLabel;
     juce::TextButton refreshButton;
     juce::ComboBox rotationSelector;
     juce::Label rotationLabel;
@@ -1422,11 +1424,38 @@ private:
     friend class SceneTimelineCanvas;
     friend class SceneChainCanvas;
 
+    class SceneControlLookAndFeel : public juce::LookAndFeel_V4
+    {
+    public:
+        juce::Font getComboBoxFont(juce::ComboBox&) override;
+        juce::Font getPopupMenuFont() override;
+        juce::Font getTextButtonFont(juce::TextButton&, int buttonHeight) override;
+        void drawButtonBackground(juce::Graphics& g,
+                                  juce::Button& button,
+                                  const juce::Colour& backgroundColour,
+                                  bool shouldDrawButtonAsHighlighted,
+                                  bool shouldDrawButtonAsDown) override;
+        void drawButtonText(juce::Graphics& g,
+                            juce::TextButton& button,
+                            bool shouldDrawButtonAsHighlighted,
+                            bool shouldDrawButtonAsDown) override;
+        void drawComboBox(juce::Graphics& g,
+                          int width,
+                          int height,
+                          bool,
+                          int,
+                          int,
+                          int,
+                          int,
+                          juce::ComboBox& box) override;
+        void positionComboBoxText(juce::ComboBox& box, juce::Label& label) override;
+    };
+
     static constexpr int SceneEditorVisibleStrips = ModernAudioEngine::MaxStrips;
     static constexpr int SceneAutomationLaneCount = 26;
 
     MlrVSTAudioProcessor& processor;
-    juce::LookAndFeel_V4 sceneComboLookAndFeel;
+    SceneControlLookAndFeel sceneLookAndFeel;
 
     struct SceneEditorState
     {
@@ -1450,6 +1479,11 @@ private:
         double drawLastBeat = 0.0;
         float drawLastValue = 0.0f;
         bool drawHasLastPoint = false;
+        bool clickLinePending = false;
+        int clickLineStripIndex = -1;
+        int clickLineLaneIndex = -1;
+        double clickLineBeat = 0.0;
+        float clickLineValue = 0.0f;
         bool eraseActive = false;
         bool eraseTriggerLane = false;
         int eraseStripIndex = -1;
@@ -1474,6 +1508,9 @@ private:
     juce::Label titleLabel;
     juce::Label hintLabel;
     juce::ToggleButton sceneModeToggle;
+    juce::Label sceneSlotsSectionLabel;
+    juce::Label scenePlaybackSectionLabel;
+    juce::Label sceneFillSectionLabel;
     juce::Label sceneChangeModeLabel;
     juce::ComboBox sceneChangeModeBox;
     juce::Label sceneSlotHeaderLabel;

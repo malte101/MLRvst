@@ -656,6 +656,10 @@ uint32_t sceneSlotColourArgb(int sceneSlot) noexcept
         case 1:  return 0xff95dd6a;
         case 2:  return 0xffffc467;
         case 3:  return 0xffff9376;
+        case 4:  return 0xffc79bff;
+        case 5:  return 0xff64dfc8;
+        case 6:  return 0xffff8fbe;
+        case 7:  return 0xffd6d66e;
         default: return 0xff78b7ff;
     }
 }
@@ -5669,143 +5673,6 @@ bool MlrVSTAudioProcessor::consumePendingSceneApplyState(SceneSwitchEvent& event
     }
 }
 
-bool MlrVSTAudioProcessor::hasStoredSceneSlotState(int mainPresetIndex, int sceneSlot) const
-{
-    return getStoredSceneSlotState(mainPresetIndex, sceneSlot) != nullptr;
-}
-
-const MlrVSTAudioProcessor::SceneSlotState* MlrVSTAudioProcessor::getStoredSceneSlotState(int mainPresetIndex,
-                                                                                          int sceneSlot) const
-{
-    const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
-    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
-    if (storedSceneSlotStateMainPresetIndex != safeMainPresetIndex)
-        return nullptr;
-
-    const auto& state = storedSceneSlotStates[static_cast<size_t>(safeSceneSlot)];
-    if (!state.hasStoredContent
-        || state.mainPresetIndex != safeMainPresetIndex
-        || state.preparedSwitchPayloadTemplate == nullptr)
-    {
-        return nullptr;
-    }
-
-    return &state;
-}
-
-void MlrVSTAudioProcessor::clearStoredSceneSlotStates(int mainPresetIndex)
-{
-    storedSceneSlotStateMainPresetIndex = mainPresetIndex >= 0
-        ? juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex)
-        : -1;
-
-    for (int slot = 0; slot < SceneSlots; ++slot)
-    {
-        auto& state = storedSceneSlotStates[static_cast<size_t>(slot)];
-        state = {};
-        state.mainPresetIndex = storedSceneSlotStateMainPresetIndex >= 0
-            ? storedSceneSlotStateMainPresetIndex
-            : 0;
-        state.sceneSlot = slot;
-    }
-}
-
-bool MlrVSTAudioProcessor::restoreStoredSceneSlotStatesFromPresetXml(int mainPresetIndex,
-                                                                     const juce::XmlElement& presetXml)
-{
-    const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
-    clearStoredSceneSlotStates(safeMainPresetIndex);
-
-    const auto* sceneTimingXml = presetXml.getChildByName("SceneChainState");
-    if (sceneTimingXml == nullptr)
-        return false;
-
-    const auto* storedScenesXml = sceneTimingXml->getChildByName("StoredScenes");
-    if (storedScenesXml == nullptr)
-        return false;
-
-    bool restoredAny = false;
-    for (auto* sceneSlotXml : storedScenesXml->getChildIterator())
-    {
-        if (sceneSlotXml == nullptr || sceneSlotXml->getTagName() != "SceneSlot")
-            continue;
-
-        const int safeSceneSlot = juce::jlimit(0,
-                                               SceneSlots - 1,
-                                               sceneSlotXml->getIntAttribute("slot", -1));
-        auto* snapshotXml = sceneSlotXml->getChildByName("mlrVSTPreset");
-        if (snapshotXml == nullptr)
-            continue;
-
-        auto& state = storedSceneSlotStates[static_cast<size_t>(safeSceneSlot)];
-        state.mainPresetIndex = safeMainPresetIndex;
-        state.sceneSlot = safeSceneSlot;
-        state.hasStoredContent = true;
-        state.name = sceneSlotXml->getStringAttribute("name",
-                                                      snapshotXml->getStringAttribute("name").trim()).trim();
-        auto templatePayload = std::make_unique<PreparedSceneSwitchPayload>();
-        if (!parsePreparedSceneSwitchPayloadTemplate(*templatePayload,
-                                                     *snapshotXml,
-                                                     safeMainPresetIndex,
-                                                     safeSceneSlot))
-        {
-            state = {};
-            state.mainPresetIndex = safeMainPresetIndex;
-            state.sceneSlot = safeSceneSlot;
-            continue;
-        }
-        state.preparedSwitchPayloadTemplate = std::move(templatePayload);
-        restoredAny = true;
-    }
-
-    return restoredAny;
-}
-
-bool MlrVSTAudioProcessor::migrateLegacyStoredSceneSlotStates(int mainPresetIndex)
-{
-    const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
-    clearStoredSceneSlotStates(safeMainPresetIndex);
-
-    bool migratedAny = false;
-    for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
-    {
-        const int storageIndex = getSceneStoragePresetIndex(safeMainPresetIndex, sceneSlot);
-        auto legacySceneXml = PresetStore::loadPresetXml(storageIndex);
-        if (legacySceneXml == nullptr)
-            continue;
-
-        juce::MemoryBlock legacyScenePerformanceData;
-        if (PresetStore::loadScenePerformanceData(storageIndex, legacyScenePerformanceData)
-            && legacyScenePerformanceData.getSize() > 0
-            && legacySceneXml->getChildByName("ScenePerformanceData") == nullptr)
-        {
-            auto* perfXml = legacySceneXml->createNewChildElement("ScenePerformanceData");
-            perfXml->addTextElement(legacyScenePerformanceData.toBase64Encoding());
-        }
-
-        auto& state = storedSceneSlotStates[static_cast<size_t>(sceneSlot)];
-        state.mainPresetIndex = safeMainPresetIndex;
-        state.sceneSlot = sceneSlot;
-        state.hasStoredContent = true;
-        state.name = legacySceneXml->getStringAttribute("name").trim();
-        auto templatePayload = std::make_unique<PreparedSceneSwitchPayload>();
-        if (!parsePreparedSceneSwitchPayloadTemplate(*templatePayload,
-                                                     *legacySceneXml,
-                                                     safeMainPresetIndex,
-                                                     sceneSlot))
-        {
-            state = {};
-            state.mainPresetIndex = safeMainPresetIndex;
-            state.sceneSlot = sceneSlot;
-            continue;
-        }
-        state.preparedSwitchPayloadTemplate = std::move(templatePayload);
-        migratedAny = true;
-    }
-
-    return migratedAny;
-}
-
 MlrVSTAudioProcessor::PreparedSceneLoopPitchState
 MlrVSTAudioProcessor::capturePreparedSceneLoopPitchState(int stripIndex) const
 {
@@ -6492,98 +6359,6 @@ std::unique_ptr<juce::XmlElement> MlrVSTAudioProcessor::createSceneSnapshotPrese
     }
 
     return preset;
-}
-
-bool MlrVSTAudioProcessor::captureSceneSlotState(int mainPresetIndex, int sceneSlot)
-{
-    const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
-    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
-
-    juce::String sceneName;
-    if (const auto* existingState = getStoredSceneSlotState(safeMainPresetIndex, safeSceneSlot))
-        sceneName = existingState->name.trim();
-    if (sceneName.isEmpty())
-        sceneName = getSceneInfo(safeSceneSlot, safeMainPresetIndex).name.trim();
-
-    if (storedSceneSlotStateMainPresetIndex != safeMainPresetIndex)
-        clearStoredSceneSlotStates(safeMainPresetIndex);
-
-    auto& state = storedSceneSlotStates[static_cast<size_t>(safeSceneSlot)];
-    state = {};
-    state.mainPresetIndex = safeMainPresetIndex;
-    state.sceneSlot = safeSceneSlot;
-    state.hasStoredContent = true;
-    state.name = sceneName;
-    auto templatePayload = std::make_unique<PreparedSceneSwitchPayload>();
-    if (!capturePreparedSceneSwitchPayloadTemplate(*templatePayload,
-                                                   safeMainPresetIndex,
-                                                   safeSceneSlot))
-    {
-        state = {};
-        state.mainPresetIndex = safeMainPresetIndex;
-        state.sceneSlot = safeSceneSlot;
-        return false;
-    }
-    state.preparedSwitchPayloadTemplate = std::move(templatePayload);
-    return true;
-}
-
-bool MlrVSTAudioProcessor::copyStoredSceneSlotState(int mainPresetIndex, int sourceSceneSlot, int destSceneSlot)
-{
-    const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
-    const int safeSourceSlot = juce::jlimit(0, SceneSlots - 1, sourceSceneSlot);
-    const int safeDestSlot = juce::jlimit(0, SceneSlots - 1, destSceneSlot);
-
-    if (storedSceneSlotStateMainPresetIndex != safeMainPresetIndex)
-        clearStoredSceneSlotStates(safeMainPresetIndex);
-
-    auto& destState = storedSceneSlotStates[static_cast<size_t>(safeDestSlot)];
-    destState = {};
-    destState.mainPresetIndex = safeMainPresetIndex;
-    destState.sceneSlot = safeDestSlot;
-
-    const auto* sourceState = getStoredSceneSlotState(safeMainPresetIndex, safeSourceSlot);
-    if (sourceState == nullptr)
-        return true;
-
-    destState.hasStoredContent = true;
-    destState.name = sourceState->name;
-    destState.preparedSwitchPayloadTemplate =
-        clonePreparedSceneSwitchPayloadTemplate(*sourceState->preparedSwitchPayloadTemplate);
-    if (destState.preparedSwitchPayloadTemplate != nullptr)
-    {
-        destState.preparedSwitchPayloadTemplate->mainPresetIndex = safeMainPresetIndex;
-        destState.preparedSwitchPayloadTemplate->sceneSlot = safeDestSlot;
-        destState.preparedSwitchPayloadTemplate->sequenceDriven = false;
-        destState.preparedSwitchPayloadTemplate->sequenceStepIndex = -1;
-        destState.preparedSwitchPayloadTemplate->switchSerial = 0;
-        destState.preparedSwitchPayloadTemplate->snapshotPresetXml.reset();
-    }
-    return true;
-}
-
-bool MlrVSTAudioProcessor::deleteStoredSceneSlotState(int mainPresetIndex, int sceneSlot)
-{
-    const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
-    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
-
-    if (storedSceneSlotStateMainPresetIndex != safeMainPresetIndex)
-        clearStoredSceneSlotStates(safeMainPresetIndex);
-
-    auto& state = storedSceneSlotStates[static_cast<size_t>(safeSceneSlot)];
-    state = {};
-    state.mainPresetIndex = safeMainPresetIndex;
-    state.sceneSlot = safeSceneSlot;
-    return true;
-}
-
-bool MlrVSTAudioProcessor::persistStoredSceneSlotStatesToMainPreset(int mainPresetIndex)
-{
-    return PresetStore::updatePresetAuxState(juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex),
-                                             [this]()
-                                             {
-                                                 return createSceneChainStateXml(-1);
-                                             });
 }
 
 void MlrVSTAudioProcessor::focusSceneSlot(int sceneSlot)
@@ -7357,6 +7132,179 @@ int MlrVSTAudioProcessor::getMonomeActiveStripCount() const
 {
     const int stripRows = juce::jmax(0, getMonomeControlRow() - 1);
     return juce::jlimit(0, MaxStrips, stripRows);
+}
+
+MlrVSTAudioProcessor::MonomeLayoutState MlrVSTAudioProcessor::getMonomeLayoutState() const
+{
+    MonomeLayoutState layout;
+    layout.gridWidth = getMonomeGridWidth();
+    layout.gridHeight = getMonomeGridHeight();
+    layout.controlRow = getMonomeControlRow();
+    layout.visibleStripCount = juce::jmax(0, getMonomeActiveStripCount());
+    layout.maxStepEditBank = juce::jmax(0, (layout.visibleStripCount - 1) / layout.stepEditBankSize);
+    layout.maxVisibleStripIndex = juce::jmax(0, layout.visibleStripCount - 1);
+    layout.stripRowsDenom = juce::jmax(1, layout.visibleStripCount - 1);
+    layout.modulationRowsDenom = juce::jmax(1, layout.visibleStripCount);
+    layout.lastDisplayedStripRow = layout.firstStripRow + juce::jmax(0, layout.visibleStripCount - 1);
+    layout.lastPresetRow = juce::jmin(layout.controlRow - 1, PresetRows - 1);
+    layout.presetModeActive = (controlModeActive && currentControlMode == ControlMode::Preset);
+    layout.stepEditModeActive = (controlModeActive && currentControlMode == ControlMode::StepEdit);
+    layout.sceneModeActive = isSceneModeEnabled();
+    layout.patternRecorderVisibleOnControlPage =
+        controlModeActive && monomeControlPageShowsPatternRecorder(currentControlMode);
+
+    switch (currentControlMode)
+    {
+        case ControlMode::Normal:
+        case ControlMode::Speed:
+        case ControlMode::Pitch:
+        case ControlMode::Pan:
+        case ControlMode::Volume:
+        case ControlMode::GrainSize:
+        case ControlMode::Delay:
+        case ControlMode::Swing:
+        case ControlMode::FileBrowser:
+        case ControlMode::GroupAssign:
+        case ControlMode::Preset:
+            layout.topRowEditSupported = false;
+            break;
+        case ControlMode::StepEdit:
+        case ControlMode::Gate:
+        case ControlMode::Filter:
+        case ControlMode::Modulation:
+            layout.topRowEditSupported = controlModeActive;
+            break;
+    }
+
+    layout.topRowEditActive = layout.topRowEditSupported && monomeTopRowEditOverlayActive;
+
+    if (layout.presetModeActive)
+    {
+        layout.topRowMode = layout.sceneModeActive
+            ? MonomeLayoutState::TopRowMode::SceneLaunch
+            : MonomeLayoutState::TopRowMode::PresetGrid;
+    }
+    else if (layout.topRowEditActive)
+    {
+        switch (currentControlMode)
+        {
+            case ControlMode::Normal:
+            case ControlMode::Speed:
+            case ControlMode::Pitch:
+            case ControlMode::Pan:
+            case ControlMode::Volume:
+            case ControlMode::GrainSize:
+            case ControlMode::Delay:
+            case ControlMode::Swing:
+            case ControlMode::FileBrowser:
+            case ControlMode::GroupAssign:
+            case ControlMode::Preset:
+                layout.topRowMode = layout.sceneModeActive
+                    ? MonomeLayoutState::TopRowMode::SceneLaunch
+                    : MonomeLayoutState::TopRowMode::Launch;
+                break;
+            case ControlMode::StepEdit:
+                layout.topRowMode = MonomeLayoutState::TopRowMode::StepEdit;
+                break;
+            case ControlMode::Gate:
+                layout.topRowMode = MonomeLayoutState::TopRowMode::Gate;
+                break;
+            case ControlMode::Filter:
+                layout.topRowMode = MonomeLayoutState::TopRowMode::Filter;
+                break;
+            case ControlMode::Modulation:
+                layout.topRowMode = MonomeLayoutState::TopRowMode::Modulation;
+                break;
+        }
+    }
+    else
+    {
+        layout.topRowMode = layout.sceneModeActive
+            ? MonomeLayoutState::TopRowMode::SceneLaunch
+            : MonomeLayoutState::TopRowMode::Launch;
+    }
+
+    layout.topRowSceneMode = layout.topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch;
+    layout.sceneActionStartColumn = layout.topRowSceneMode ? SceneSlots : 4;
+    layout.sceneRecorderVisible = layout.topRowSceneMode
+        && layout.sceneActionStartColumn < layout.gridWidth;
+    return layout;
+}
+
+bool MlrVSTAudioProcessor::isMonomeControlRowUtilityCell(const MonomeLayoutState& layout, int x) const
+{
+    if (x < 0 || x >= layout.gridWidth)
+        return false;
+
+    if (layout.stepEditModeActive)
+        return x == 13 || x == 14;
+
+    if (layout.topRowEditSupported && x == layout.topRowEditToggleColumn)
+        return true;
+
+    if ((!controlModeActive || currentControlMode == ControlMode::Normal) && x >= 13 && x <= 15)
+    {
+        if (x == 15)
+            return true;
+
+        if (audioEngine == nullptr)
+            return false;
+
+        const int selectedStripIndex = layout.clampVisibleStrip(getLastMonomePressedStripRow());
+        if (auto* strip = audioEngine->getStrip(selectedStripIndex))
+            return strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample;
+    }
+
+    return false;
+}
+
+bool MlrVSTAudioProcessor::isMonomeTopRowEditSupported() const
+{
+    return getMonomeLayoutState().topRowEditSupported;
+}
+
+bool MlrVSTAudioProcessor::isMonomeTopRowEditActive() const
+{
+    return getMonomeLayoutState().topRowEditActive;
+}
+
+juce::String MlrVSTAudioProcessor::getMonomeTopRowModeName() const
+{
+    const auto layout = getMonomeLayoutState();
+    switch (layout.topRowMode)
+    {
+        case MonomeLayoutState::TopRowMode::Launch:      return "Launch";
+        case MonomeLayoutState::TopRowMode::SceneLaunch: return "Scene Launch";
+        case MonomeLayoutState::TopRowMode::PresetGrid:  return "Preset Grid";
+        case MonomeLayoutState::TopRowMode::StepEdit:    return "Edit: Step Edit";
+        case MonomeLayoutState::TopRowMode::Gate:        return "Edit: Gate";
+        case MonomeLayoutState::TopRowMode::Filter:      return "Edit: Filter";
+        case MonomeLayoutState::TopRowMode::Modulation:  return "Edit: Modulation";
+    }
+
+    return "Launch";
+}
+
+juce::String MlrVSTAudioProcessor::getMonomeTopRowHintText() const
+{
+    const auto layout = getMonomeLayoutState();
+    const juce::String togglePadText = "bottom-right pad (control-row 15)";
+
+    if (layout.topRowEditSupported)
+    {
+        if (layout.topRowEditActive)
+            return "Press " + togglePadText + " to return the top row to Launch.";
+
+        return "Press " + togglePadText + " to open top-row Edit for this page.";
+    }
+
+    if (layout.topRowMode == MonomeLayoutState::TopRowMode::PresetGrid)
+        return "Preset mode owns the top rows.";
+
+    if (layout.topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch)
+        return "Scene mode keeps row 0 in Launch.";
+
+    return "Edit toggle appears on Step Edit, Gate, Filter, and Mod pages.";
 }
 
 int MlrVSTAudioProcessor::getDefaultMacroMidiCc(int macroIndex)
@@ -10481,6 +10429,7 @@ void MlrVSTAudioProcessor::setControlModeFromGui(ControlMode mode, bool shouldBe
     {
         currentControlMode = ControlMode::Normal;
         controlModeActive = false;
+        monomeTopRowEditOverlayActive = false;
         updateMonomeLEDs();
         return;
     }
@@ -10495,6 +10444,7 @@ void MlrVSTAudioProcessor::setControlModeFromGui(ControlMode mode, bool shouldBe
         currentControlMode = mode;
         controlModeActive = true;
     }
+    monomeTopRowEditOverlayActive = false;
 
     updateMonomeLEDs();
 }
@@ -15783,20 +15733,6 @@ int MlrVSTAudioProcessor::getQuantizeDivision() const
     const int quantizeChoice = quantizeParamLocal ? static_cast<int>(*quantizeParamLocal) : 5;
     const int divisionMap[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32};
     return (quantizeChoice >= 0 && quantizeChoice < 10) ? divisionMap[quantizeChoice] : 8;
-}
-
-int MlrVSTAudioProcessor::getActiveMainPresetIndexForScenes() const
-{
-    if (loadedPresetIndex >= 0 && loadedPresetIndex < MaxPresetSlots)
-        return loadedPresetIndex;
-    return juce::jlimit(0, MaxPresetSlots - 1, activeSceneMainPresetIndex);
-}
-
-int MlrVSTAudioProcessor::getSceneStoragePresetIndex(int mainPresetIndex, int sceneSlot) const
-{
-    const int clampedMain = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
-    const int clampedSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
-    return MaxPresetSlots + (clampedMain * SceneSlots) + clampedSlot;
 }
 
 bool MlrVSTAudioProcessor::sceneSlotExistsForMainPreset(int mainPresetIndex, int sceneSlot) const
@@ -21705,7 +21641,7 @@ void MlrVSTAudioProcessor::performPresetLoad(int presetIndex, double hostPpqSnap
             [this, presetIndex](const juce::XmlElement& presetXml)
             {
                 applySceneChainStateXml(presetXml.getChildByName("SceneChainState"), -1);
-                restoreStoredSceneSlotStatesFromPresetXml(
+                loadStoredSceneSlotStatesForPreset(
                     juce::jlimit(0, MaxPresetSlots - 1, presetIndex), presetXml);
             },
             [this](const juce::MemoryBlock& scenePerformanceData)

@@ -436,26 +436,24 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 {
     if (!audioEngine) return;
 
-    const int gridWidth = getMonomeGridWidth();
-    const int gridHeight = getMonomeGridHeight();
+    const auto layout = getMonomeLayoutState();
+    const int gridWidth = layout.gridWidth;
+    const int gridHeight = layout.gridHeight;
     if (x < 0 || y < 0 || x >= gridWidth || y >= gridHeight)
         return;
 
-    const int GROUP_ROW = 0;
-    const int CONTROL_ROW = getMonomeControlRow();
-    const int FIRST_STRIP_ROW = 1;
-    const int visibleStripCount = juce::jmax(0, getMonomeActiveStripCount());
-    const int stepEditBankSize = 6;
-    const int maxStepEditBank = juce::jmax(0, (visibleStripCount - 1) / stepEditBankSize);
+    const int GROUP_ROW = layout.groupRow;
+    const int CONTROL_ROW = layout.controlRow;
+    const int FIRST_STRIP_ROW = layout.firstStripRow;
+    const int visibleStripCount = layout.visibleStripCount;
+    const int stepEditBankSize = layout.stepEditBankSize;
+    const int maxStepEditBank = layout.maxStepEditBank;
     stepEditStripBank = juce::jlimit(0, maxStepEditBank, stepEditStripBank);
-    const int maxVisibleStripIndex = juce::jmax(0, visibleStripCount - 1);
-    const int stripRowsDenom = juce::jmax(1, visibleStripCount - 1);
-    const int modulationRowsDenom = juce::jmax(1, visibleStripCount);
-    const int lastDisplayedStripRow = FIRST_STRIP_ROW + juce::jmax(0, visibleStripCount - 1);
-    const int lastPresetRow = juce::jmin(CONTROL_ROW - 1, PresetRows - 1);
-    const auto clampVisibleStrip = [maxVisibleStripIndex](int index)
+    const int stripRowsDenom = layout.stripRowsDenom;
+    const int modulationRowsDenom = layout.modulationRowsDenom;
+    const auto clampVisibleStrip = [&layout](int index)
     {
-        return juce::jlimit(0, maxVisibleStripIndex, index);
+        return layout.clampVisibleStrip(index);
     };
     const auto stripRowToUnit = [CONTROL_ROW, stripRowsDenom](int row)
     {
@@ -484,56 +482,47 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             engine.setModEditPage(stripIndex, playbackPage);
         return true;
     };
-    const auto isPresetCell = [](int gridX, int gridY)
+    const auto isPresetCell = [&layout](int gridX, int gridY)
     {
-        return gridX >= 0 && gridX < PresetColumns
-            && gridY >= 0 && gridY < PresetRows;
+        return layout.isPresetCell(gridX, gridY);
     };
-    const auto toPresetIndex = [](int gridX, int gridY)
+    const auto toPresetIndex = [&layout](int gridX, int gridY)
     {
-        return (gridY * PresetColumns) + gridX;
+        return layout.toPresetIndex(gridX, gridY);
     };
-    const auto isSceneTopCell = [](int gridX, int gridY)
+    const auto isSceneTopCell = [&layout](int gridX, int gridY)
     {
-        return gridY == 0 && gridX >= 0 && gridX < SceneSlots;
+        return layout.isSceneTopCell(gridX, gridY);
     };
-    const auto isSceneActionCell = [](int gridX, int gridY)
+    const bool presetModeActive = layout.presetModeActive;
+    const bool stepEditModeActive = layout.stepEditModeActive;
+    const bool sceneModeActive = layout.sceneModeActive;
+    const int sceneActionStartColumn = layout.sceneActionStartColumn;
+    const auto topRowMode = layout.topRowMode;
+    const auto isSceneActionCell = [&layout](int gridX, int gridY)
     {
-        return gridY == 0 && gridX >= SceneSlots && gridX < (SceneSlots + 4);
+        return layout.isSceneActionCell(gridX, gridY);
     };
-    const bool presetModeActive = (controlModeActive && currentControlMode == ControlMode::Preset);
-    const bool stepEditModeActive = (controlModeActive && currentControlMode == ControlMode::StepEdit);
-    const bool sceneModeActive = isSceneModeEnabled();
-    const bool patternRecorderVisibleOnControlPage =
-        controlModeActive && monomeControlPageShowsPatternRecorder(currentControlMode);
-    const bool topRowSceneMode = sceneModeActive
-        && (presetModeActive || (!controlModeActive || currentControlMode == ControlMode::Normal));
-    const bool sceneRecorderVisible = sceneModeActive
-        && (topRowSceneMode || patternRecorderVisibleOnControlPage);
-    const auto isDisplayedDataRow = [presetModeActive, lastDisplayedStripRow, lastPresetRow](int row)
+    const auto isDisplayedDataRow = [&layout](int row)
     {
-        if (row < 1)
-            return false;
-
-        return presetModeActive
-            ? (row <= lastPresetRow)
-            : (row <= lastDisplayedStripRow);
+        return layout.isDisplayedDataRow(row);
     };
     const auto handleSceneActionCellPress = [&](int cellX)
     {
-        if (!sceneModeActive || cellX < 4 || cellX > 7)
+        const int actionIndex = cellX - sceneActionStartColumn;
+        if (!sceneModeActive || actionIndex < 0 || actionIndex > 3)
             return false;
 
         const uint32_t nowMs = juce::Time::getMillisecondCounter();
         const int mainPresetIndex = getActiveMainPresetIndexForScenes();
         const int activeScene = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
 
-        switch (cellX)
+        switch (actionIndex)
         {
-            case 4:
+            case 0:
                 handleMonomeSceneRecorderButtonPress(nowMs);
                 break;
-            case 5:
+            case 1:
                 if (sceneCopySourceSlot == activeScene && sceneCopyMainPresetIndex == mainPresetIndex)
                 {
                     sceneCopySourceSlot = -1;
@@ -550,7 +539,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     sceneCopyMainPresetIndex = 0;
                 }
                 break;
-            case 6:
+            case 2:
                 if (deleteSceneForMainPreset(mainPresetIndex, activeScene))
                 {
                     if (sceneCopySourceSlot == activeScene && sceneCopyMainPresetIndex == mainPresetIndex)
@@ -561,7 +550,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     scenePadActionBurstUntilMs[static_cast<size_t>(activeScene)] = nowMs + sceneActionBurstDurationMs;
                 }
                 break;
-            case 7:
+            case 3:
                 if (captureSceneSlot(activeScene))
                     scenePadActionBurstUntilMs[static_cast<size_t>(activeScene)] = nowMs + sceneActionBurstDurationMs;
                 break;
@@ -581,7 +570,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         // GROUP ROW (y=0): Groups 0-3 + Pattern Recorders 4-7
         if (y == GROUP_ROW)
         {
-            if (topRowSceneMode && isSceneTopCell(x, y))
+            if (topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch && isSceneTopCell(x, y))
             {
                 const int sceneSlot = juce::jlimit(0, SceneSlots - 1, x);
                 const auto slotIdx = static_cast<size_t>(sceneSlot);
@@ -742,13 +731,13 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 return;
             }
 
-            if (topRowSceneMode && isSceneActionCell(x, y))
+            if (topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch && isSceneActionCell(x, y))
             {
                 if (handleSceneActionCellPress(x))
                     return;
             }
 
-            if (presetModeActive && isPresetCell(x, y))
+            if (topRowMode == MonomeLayoutState::TopRowMode::PresetGrid && isPresetCell(x, y))
             {
                 const int presetIndex = toPresetIndex(x, y);
                 auto nowMs = juce::Time::getMillisecondCounter();
@@ -775,7 +764,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 return;
             }
 
-            if (stepEditModeActive)
+            if (topRowMode == MonomeLayoutState::TopRowMode::StepEdit)
             {
                 const int bankStart = stepEditStripBank * stepEditBankSize;
 
@@ -852,7 +841,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 return;
             }
 
-            if (controlModeActive && currentControlMode == ControlMode::Gate)
+            if (topRowMode == MonomeLayoutState::TopRowMode::Gate)
             {
                 switch (x)
                 {
@@ -868,20 +857,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 return;
             }
 
-            // In Monome control-page modes, top row is reserved/disabled except Modulation.
-            // This prevents accidental access to group/pattern/scratch/transient controls.
-            if (controlModeActive
-                && currentControlMode != ControlMode::Normal
-                && !patternRecorderVisibleOnControlPage
-                && currentControlMode != ControlMode::Modulation
-                && currentControlMode != ControlMode::Filter
-                && currentControlMode != ControlMode::Delay)
-            {
-                return;
-            }
-
             // Row 0 col 8: original momentary scratch hold.
-            if (x == 8 && (!controlModeActive || currentControlMode == ControlMode::Normal))
+            if (x == 8 && topRowMode == MonomeLayoutState::TopRowMode::Launch)
             {
                 setMomentaryScratchHold(true);
                 updateMonomeLEDs();
@@ -890,7 +867,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
             // Row 0, cols 9-15: momentary stutter rates (timeline-synced):
             // 9=1/2 ... 15=1/128.
-            if (x >= 9 && x <= 15 && (!controlModeActive || currentControlMode == ControlMode::Normal))
+            if (x >= 9 && x <= 15 && topRowMode == MonomeLayoutState::TopRowMode::Launch)
             {
                 const uint8_t bit = stutterButtonBitForColumn(x);
                 if (bit != 0)
@@ -903,7 +880,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
 
             // FILTER MODE: Buttons 0-3 select filter sub-pages
-            if (controlModeActive && currentControlMode == ControlMode::Filter)
+            if (topRowMode == MonomeLayoutState::TopRowMode::Filter)
             {
                 if (x == 0)
                 {
@@ -923,18 +900,10 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     updateMonomeLEDs();
                     return;
                 }
-
-                if (x < 4 || x > 7)
-                    return;
+                return;
             }
 
-            if (sceneRecorderVisible && x >= 4 && x <= 7)
-            {
-                if (handleSceneActionCellPress(x))
-                    return;
-            }
-
-            if (controlModeActive && currentControlMode == ControlMode::Modulation)
+            if (topRowMode == MonomeLayoutState::TopRowMode::Modulation)
             {
                 const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
                 auto* engine = getAudioEngine();
@@ -974,7 +943,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
             
             // NORMAL MODE: Columns 0-3 = Group mute/unmute
-            if (x < 4)
+            if (topRowMode == MonomeLayoutState::TopRowMode::Launch && x < 4)
             {
                 auto* group = audioEngine->getGroup(x);
                 if (group)
@@ -1030,7 +999,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 }
             }
             // Columns 4-7: Pattern recorders (manual stop with auto-quantized length)
-            else if (x >= 4 && x <= 7)
+            else if (topRowMode == MonomeLayoutState::TopRowMode::Launch && x >= 4 && x <= 7)
             {
                 int patternIndex = x - 4;  // 0-3 for patterns 0-3
                 if (handleMonomePatternButtonPress(patternIndex, juce::Time::getMillisecondCounter()))
@@ -1038,11 +1007,60 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     DBG("Monome pattern button " << patternIndex << " pressed");
                 }
             }
+            else if (topRowMode != MonomeLayoutState::TopRowMode::Launch)
+            {
+                return;
+            }
         }
         // CONTROL ROW - Mode buttons
         else if (y == CONTROL_ROW)
         {
-            if (x >= 0 && x < NumControlRowPages)
+            if (layout.topRowEditSupported && x == layout.topRowEditToggleColumn)
+            {
+                monomeTopRowEditOverlayActive = !monomeTopRowEditOverlayActive;
+                updateMonomeLEDs();
+                return;
+            }
+            else if (stepEditModeActive && (x == 13 || x == 14))
+            {
+                const int selectedStripIndex = clampVisibleStrip(stepEditSelectedStrip);
+                if (auto* strip = audioEngine->getStrip(selectedStripIndex))
+                {
+                    const float currentSemitones = getPitchSemitonesForDisplay(*strip);
+                    const float delta = (x == 13) ? -1.0f : 1.0f;
+                    const float nextSemitones = juce::jlimit(-24.0f, 24.0f, currentSemitones + delta);
+                    applyUserPitchControlToStrip(selectedStripIndex, nextSemitones);
+                }
+
+                updateMonomeLEDs();
+                return;
+            }
+            else if ((!controlModeActive || currentControlMode == ControlMode::Normal)
+                     && isMonomeControlRowUtilityCell(layout, x)
+                     && x >= 13 && x <= 15)
+            {
+                const int selectedStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
+                auto* strip = audioEngine->getStrip(selectedStripIndex);
+                auto* sampleEngine = getSampleModeEngine(selectedStripIndex, false);
+                if (strip != nullptr
+                    && sampleEngine != nullptr
+                    && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
+                {
+                    if (x == 13)
+                        sampleEngine->setTriggerMode(SampleTriggerMode::OneShot);
+                    else if (x == 14)
+                        sampleEngine->setTriggerMode(SampleTriggerMode::Loop);
+                    else
+                        sampleEngine->setLegacyLoopEngineEnabled(!sampleEngine->isLegacyLoopEngineEnabled());
+
+                    updateMonomeLEDs();
+                    return;
+                }
+
+                if (x == 15)
+                    return;  // Don't process as strip trigger!
+            }
+            else if (x >= 0 && x < NumControlRowPages)
             {
                 const bool wasStepEditMode = (controlModeActive && currentControlMode == ControlMode::StepEdit);
                 const auto selectedMode = getControlModeForControlButton(x);
@@ -1071,6 +1089,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                         controlModeActive = true;
                     }
                 }
+                monomeTopRowEditOverlayActive = false;
 
                 if (controlModeActive && currentControlMode == ControlMode::StepEdit)
                 {
@@ -1087,41 +1106,6 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
                 updateMonomeLEDs();  // Force immediate LED update
                 return;  // Don't process as strip trigger!
-            }
-            else if (stepEditModeActive && (x == 13 || x == 14))
-            {
-                const int selectedStripIndex = clampVisibleStrip(stepEditSelectedStrip);
-                if (auto* strip = audioEngine->getStrip(selectedStripIndex))
-                {
-                    const float currentSemitones = getPitchSemitonesForDisplay(*strip);
-                    const float delta = (x == 13) ? -1.0f : 1.0f;
-                    const float nextSemitones = juce::jlimit(-24.0f, 24.0f, currentSemitones + delta);
-                    applyUserPitchControlToStrip(selectedStripIndex, nextSemitones);
-                }
-
-                updateMonomeLEDs();
-                return;
-            }
-            else if ((!controlModeActive || currentControlMode == ControlMode::Normal)
-                     && x >= 13 && x <= 15)
-            {
-                const int selectedStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
-                auto* strip = audioEngine->getStrip(selectedStripIndex);
-                auto* sampleEngine = getSampleModeEngine(selectedStripIndex, false);
-                if (strip != nullptr
-                    && sampleEngine != nullptr
-                    && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
-                {
-                    if (x == 13)
-                        sampleEngine->setTriggerMode(SampleTriggerMode::OneShot);
-                    else if (x == 14)
-                        sampleEngine->setTriggerMode(SampleTriggerMode::Loop);
-                    else
-                        sampleEngine->setLegacyLoopEngineEnabled(!sampleEngine->isLegacyLoopEngineEnabled());
-
-                    updateMonomeLEDs();
-                    return;
-                }
             }
             else if (x == 15)
             {
@@ -1667,7 +1651,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
     }
     else if (state == 0) // Key up
     {
-        if (topRowSceneMode && isSceneTopCell(x, y))
+        if (topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch && isSceneTopCell(x, y))
         {
             const int sceneSlot = juce::jlimit(0, SceneSlots - 1, x);
             const auto slotIdx = static_cast<size_t>(sceneSlot);
@@ -1819,11 +1803,15 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         }
         
         // Release control mode in momentary behavior (control-page buttons)
-        if (isControlPageMomentary() && y == CONTROL_ROW && (x >= 0 && x < NumControlRowPages))
+        if (isControlPageMomentary()
+            && y == CONTROL_ROW
+            && (x >= 0 && x < NumControlRowPages)
+            && !isMonomeControlRowUtilityCell(layout, x))
         {
             const bool wasStepEditMode = (controlModeActive && currentControlMode == ControlMode::StepEdit);
             currentControlMode = ControlMode::Normal;
             controlModeActive = false;
+            monomeTopRowEditOverlayActive = false;
             if (wasStepEditMode)
                 resetStepEditVelocityGestures();
             updateMonomeLEDs();  // Update LEDs when returning to normal
@@ -1866,27 +1854,23 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     if (!monomeConnection.isConnected() || !audioEngine || !monomeConnection.supportsGrid())
         return;
     
-    const int gridWidth = getMonomeGridWidth();
-    const int gridHeight = getMonomeGridHeight();
-    const int GROUP_ROW = 0;
-    const int FIRST_STRIP_ROW = 1;
-    const int CONTROL_ROW = getMonomeControlRow();
-    const int visibleStripCount = juce::jmax(0, getMonomeActiveStripCount());
-    const int stepEditBankSize = 6;
-    const int maxStepEditBank = juce::jmax(0, (visibleStripCount - 1) / stepEditBankSize);
+    const auto layout = getMonomeLayoutState();
+    const int gridWidth = layout.gridWidth;
+    const int gridHeight = layout.gridHeight;
+    const int GROUP_ROW = layout.groupRow;
+    const int FIRST_STRIP_ROW = layout.firstStripRow;
+    const int CONTROL_ROW = layout.controlRow;
+    const int visibleStripCount = layout.visibleStripCount;
+    const int stepEditBankSize = layout.stepEditBankSize;
+    const int maxStepEditBank = layout.maxStepEditBank;
     stepEditStripBank = juce::jlimit(0, maxStepEditBank, stepEditStripBank);
-    const int maxVisibleStripIndex = juce::jmax(0, visibleStripCount - 1);
     const int modulationMaxRow = juce::jmax(1, visibleStripCount);
-    const bool presetModeActive = (controlModeActive && currentControlMode == ControlMode::Preset);
-    const bool sceneModeActive = isSceneModeEnabled();
-    const bool patternRecorderVisibleOnControlPage =
-        controlModeActive && monomeControlPageShowsPatternRecorder(currentControlMode);
-    const bool sceneRecorderVisible = sceneModeActive
-        && ((presetModeActive || (!controlModeActive || currentControlMode == ControlMode::Normal))
-            || patternRecorderVisibleOnControlPage);
-    const auto clampVisibleStrip = [maxVisibleStripIndex](int index)
+    const bool sceneModeActive = layout.sceneModeActive;
+    const int sceneActionStartColumn = layout.sceneActionStartColumn;
+    const auto topRowMode = layout.topRowMode;
+    const auto clampVisibleStrip = [&layout](int index)
     {
-        return juce::jlimit(0, maxVisibleStripIndex, index);
+        return layout.clampVisibleStrip(index);
     };
     const auto stepEditRowNorm = [CONTROL_ROW, visibleStripCount](int row)
     {
@@ -1956,6 +1940,24 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
 
         return hasScenePerformanceClip(sceneSlot) ? 6 : 2;
     };
+    auto renderSceneActionCells = [&](int activeScene)
+    {
+        const bool activeSceneExists = sceneSlotExistsForMainPreset(activeSceneMainPreset, activeScene);
+        const bool copyArmedForMainPreset = sceneCopySourceSlot >= 0
+            && sceneCopyMainPresetIndex == activeSceneMainPreset;
+        const std::array<int, 4> sceneActionLevels{
+            getSceneRecorderLevel(),
+            copyArmedForMainPreset ? (slowBlinkOn ? 15 : 8) : (activeSceneExists ? 6 : 3),
+            activeSceneExists ? 3 : 1,
+            activeSceneExists ? 9 : 2
+        };
+        for (int actionIndex = 0; actionIndex < static_cast<int>(sceneActionLevels.size()); ++actionIndex)
+        {
+            const int column = sceneActionStartColumn + actionIndex;
+            if (column >= 0 && column < gridWidth)
+                newLedState[column][GROUP_ROW] = sceneActionLevels[static_cast<size_t>(actionIndex)];
+        }
+    };
     auto updateSceneSlotLeds = [&]()
     {
         const bool chainPlaying = isSceneChainPlaybackActive();
@@ -2001,15 +2003,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             newLedState[sceneSlot][GROUP_ROW] = level;
         }
 
-        const bool activeSceneExists = sceneSlotExistsForMainPreset(activeSceneMainPreset, activeScene);
-        const bool copyArmedForMainPreset = sceneCopySourceSlot >= 0
-            && sceneCopyMainPresetIndex == activeSceneMainPreset;
-        newLedState[4][GROUP_ROW] = getSceneRecorderLevel();
-        newLedState[5][GROUP_ROW] = copyArmedForMainPreset
-            ? (slowBlinkOn ? 15 : 8)
-            : (activeSceneExists ? 6 : 3);
-        newLedState[6][GROUP_ROW] = activeSceneExists ? 3 : 1;
-        newLedState[7][GROUP_ROW] = activeSceneExists ? 9 : 2;
+        renderSceneActionCells(activeScene);
     };
 
     if (controlModeActive && currentControlMode == ControlMode::FileBrowser)
@@ -2109,9 +2103,8 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         return;
     }
 
-    // ROW 0: Group status (0-3) + Pattern recorders (4-7)
-    // BUT in Filter mode: Buttons 0,1,3 = sub-page selectors
-    if (controlModeActive && currentControlMode == ControlMode::StepEdit)
+    // ROW 0 ownership is explicit: launch surface by default, edit overlay when toggled.
+    if (topRowMode == MonomeLayoutState::TopRowMode::StepEdit)
     {
         for (int i = 0; i < 16; ++i)
             newLedState[i][GROUP_ROW] = 0;
@@ -2165,8 +2158,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         newLedState[14][GROUP_ROW] = bankDownAvailable ? 9 : 2;
         newLedState[15][GROUP_ROW] = bankUpAvailable ? 9 : 2;
     }
-    else if (controlModeActive
-        && currentControlMode == ControlMode::Gate)
+    else if (topRowMode == MonomeLayoutState::TopRowMode::Gate)
     {
         for (int i = 0; i < 16; ++i)
             newLedState[i][GROUP_ROW] = 0;
@@ -2175,51 +2167,15 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         for (int col = 0; col <= 4; ++col)
             newLedState[col][GROUP_ROW] = (col == selectedColumn) ? 15 : 4;
     }
-    else if (controlModeActive
-        && currentControlMode != ControlMode::Normal
-        && !patternRecorderVisibleOnControlPage
-        && currentControlMode != ControlMode::Modulation
-        && currentControlMode != ControlMode::Filter
-        && currentControlMode != ControlMode::Preset)
-    {
-        // In non-modulation control pages, top row is intentionally disabled.
-        for (int i = 0; i < 16; ++i)
-            newLedState[i][GROUP_ROW] = 0;
-    }
-    else if (currentControlMode == ControlMode::Filter && controlModeActive)
+    else if (topRowMode == MonomeLayoutState::TopRowMode::Filter)
     {
         // Filter sub-page indicators
         newLedState[0][GROUP_ROW] = (filterSubPage == FilterSubPage::Frequency) ? 15 : 5;  // Frequency
         newLedState[1][GROUP_ROW] = (filterSubPage == FilterSubPage::Resonance) ? 15 : 5;  // Resonance
         newLedState[2][GROUP_ROW] = 0;  // Unused (skip button 2)
         newLedState[3][GROUP_ROW] = (filterSubPage == FilterSubPage::Type) ? 15 : 5;       // Type
-
-        if (sceneRecorderVisible)
-        {
-            newLedState[4][GROUP_ROW] = getSceneRecorderLevel();
-            newLedState[5][GROUP_ROW] = 0;
-            newLedState[6][GROUP_ROW] = 0;
-            newLedState[7][GROUP_ROW] = 0;
-        }
-        else
-        {
-            for (int i = 0; i < 4; ++i)
-            {
-                const int col = i + 4;
-                auto* pattern = audioEngine->getPattern(i);
-                if (pattern == nullptr)
-                    continue;
-
-                if (pattern->isRecording())
-                    newLedState[col][GROUP_ROW] = fastBlinkOn ? 15 : 0;
-                else if (pattern->isPlaying())
-                    newLedState[col][GROUP_ROW] = slowBlinkOn ? 12 : 0;
-                else
-                    newLedState[col][GROUP_ROW] = 3;
-            }
-        }
     }
-    else if (currentControlMode == ControlMode::Modulation && controlModeActive)
+    else if (topRowMode == MonomeLayoutState::TopRowMode::Modulation)
     {
         const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
         syncMonomeModEditPageToPlayback(targetStrip);
@@ -2356,16 +2312,9 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             }
         }
 
-        if (sceneRecorderVisible)
+        // Row 0, columns 4-7: Pattern recorder status on the launch surface.
+        if (topRowMode == MonomeLayoutState::TopRowMode::Launch)
         {
-            newLedState[4][GROUP_ROW] = getSceneRecorderLevel();
-            newLedState[5][GROUP_ROW] = 0;
-            newLedState[6][GROUP_ROW] = 0;
-            newLedState[7][GROUP_ROW] = 0;
-        }
-        else
-        {
-            // Row 0, columns 4-7: Pattern recorder status (normal mode only)
             for (int i = 0; i < 4; ++i)
             {
                 int col = i + 4;  // Columns 4-7
@@ -2384,12 +2333,12 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     }  // End else (normal mode)
 
     // Row 0 col 8: momentary scratch indicator in normal mode.
-    if (!controlModeActive || currentControlMode == ControlMode::Normal)
+    if (topRowMode == MonomeLayoutState::TopRowMode::Launch)
         newLedState[8][GROUP_ROW] = momentaryScratchHoldActive ? 15 : 4;
 
     // Row 0, cols 9-15: momentary stutter division selectors.
-    // Visible on normal page only.
-    if (!controlModeActive || currentControlMode == ControlMode::Normal)
+    // Visible on the launch layer only.
+    if (topRowMode == MonomeLayoutState::TopRowMode::Launch)
     {
         const uint8_t heldMask = momentaryStutterButtonMask.load(std::memory_order_acquire);
         for (int x = 9; x <= 15; ++x)
@@ -2921,6 +2870,14 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             newLedState[activeButton][CONTROL_ROW] = 15;
     }
 
+    if (layout.topRowEditSupported && layout.topRowEditToggleColumn >= 0 && layout.topRowEditToggleColumn < gridWidth)
+    {
+        const int level = layout.topRowEditActive
+            ? (fastBlinkOn ? 15 : 11)
+            : (slowBlinkOn ? 12 : 4);
+        newLedState[layout.topRowEditToggleColumn][CONTROL_ROW] = level;
+    }
+
     if (controlModeActive && currentControlMode == ControlMode::StepEdit)
     {
         const int selectedStripIndex = clampVisibleStrip(stepEditSelectedStrip);
@@ -2991,7 +2948,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             }
         }
     }
-    else
+    else if (!layout.topRowEditSupported)
     {
         if (metroPulseOn)
             newLedState[15][CONTROL_ROW] = metroDownbeat ? 15 : 7;

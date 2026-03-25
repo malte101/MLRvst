@@ -6299,6 +6299,17 @@ MonomeControlPanel::MonomeControlPanel(MlrVSTAudioProcessor& p)
     arcStatusLabel.setColour(juce::Label::textColourId, kAccent);
     addAndMakeVisible(arcStatusLabel);
 
+    topRowModeLabel.setText("Top Row: Launch", juce::dontSendNotification);
+    topRowModeLabel.setFont(juce::Font(juce::FontOptions(10.8f, juce::Font::bold)));
+    topRowModeLabel.setColour(juce::Label::textColourId, kTextPrimary);
+    addAndMakeVisible(topRowModeLabel);
+
+    topRowHintLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
+    topRowHintLabel.setColour(juce::Label::textColourId, kTextMuted);
+    topRowHintLabel.setJustificationType(juce::Justification::topLeft);
+    topRowHintLabel.setMinimumHorizontalScale(0.82f);
+    addAndMakeVisible(topRowHintLabel);
+
     rotationLabel.setText("Rotation", juce::dontSendNotification);
     rotationLabel.setFont(juce::Font(juce::FontOptions(11.0f)));
     rotationLabel.setColour(juce::Label::textColourId, kTextPrimary);
@@ -6327,6 +6338,7 @@ MonomeControlPanel::MonomeControlPanel(MlrVSTAudioProcessor& p)
     };
 
     updateDeviceList();
+    updateStatus();
     processor.getMonomeConnection().refreshDeviceList();
     startTimer(1000); // Update status every second
 }
@@ -6385,6 +6397,14 @@ void MonomeControlPanel::resized()
     rotationLabel.setBounds(rotationRow.removeFromLeft(70));
     rotationRow.removeFromLeft(4);
     rotationSelector.setBounds(rotationRow.removeFromLeft(110));
+
+    bounds.removeFromTop(6);
+    auto topRowModeRow = bounds.removeFromTop(18);
+    topRowModeLabel.setBounds(topRowModeRow);
+
+    bounds.removeFromTop(2);
+    auto topRowHintBounds = bounds.removeFromTop(32);
+    topRowHintLabel.setBounds(topRowHintBounds);
 }
 
 void MonomeControlPanel::timerCallback()
@@ -6473,6 +6493,18 @@ void MonomeControlPanel::updateStatus()
                               monome.supportsGrid() ? juce::Colour(0xff76be7e) : kAccent);
     arcStatusLabel.setColour(juce::Label::textColourId,
                              monome.supportsArc() ? juce::Colour(0xff76be7e) : kAccent);
+
+    const auto topRowModeText = "Top Row: " + processor.getMonomeTopRowModeName();
+    topRowModeLabel.setText(topRowModeText, juce::dontSendNotification);
+    topRowModeLabel.setColour(juce::Label::textColourId,
+                              processor.isMonomeTopRowEditActive() ? juce::Colour(0xff76be7e)
+                                                                   : (processor.isMonomeTopRowEditSupported()
+                                                                       ? kAccent
+                                                                       : kTextPrimary));
+
+    const auto topRowHintText = processor.getMonomeTopRowHintText();
+    topRowHintLabel.setText(topRowHintText, juce::dontSendNotification);
+    topRowHintLabel.setTooltip(topRowHintText);
 }
 
 

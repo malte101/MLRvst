@@ -225,6 +225,7 @@ target_sources(mlrVST
         Source/SceneScheduler.h
         Source/ScenePerformanceRecorder.cpp
         Source/ScenePerformanceRecorder.h
+        Source/SceneStore.cpp
         Source/StripControlState.cpp
         Source/StripControlState.h
         Source/PresetStore.cpp

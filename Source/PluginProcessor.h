@@ -550,6 +550,10 @@ public:
     int getMonomeGridHeight() const;
     int getMonomeControlRow() const;
     int getMonomeActiveStripCount() const;
+    bool isMonomeTopRowEditSupported() const;
+    bool isMonomeTopRowEditActive() const;
+    juce::String getMonomeTopRowModeName() const;
+    juce::String getMonomeTopRowHintText() const;
     
     // Preset management
     void savePreset(int presetIndex);
@@ -563,7 +567,7 @@ public:
     bool isSceneModeEnabled() const { return sceneModeEnabled.load(std::memory_order_acquire) != 0; }
     void setSceneModeEnabled(bool enabled);
     int getActiveSceneSlot() const { return juce::jlimit(0, SceneSlots - 1, activeSceneSlot); }
-    static constexpr int SceneSlots = 4;
+    static constexpr int SceneSlots = 8;
     static constexpr int MaxSceneChainSteps = 8;
     static constexpr int MaxSceneRepeatCount = 32;
     static constexpr int MaxSceneManualBars = 32;
@@ -1042,6 +1046,95 @@ private:
     friend void sanitizeSceneChainRuntimeState(MlrVSTAudioProcessor& processor);
     friend void markSceneChainDefinitionChanged(MlrVSTAudioProcessor& processor);
 
+    struct MonomeLayoutState
+    {
+        enum class TopRowMode
+        {
+            Launch,
+            SceneLaunch,
+            PresetGrid,
+            StepEdit,
+            Gate,
+            Filter,
+            Modulation
+        };
+
+        int gridWidth = MaxGridWidth;
+        int gridHeight = 8;
+        int groupRow = 0;
+        int firstStripRow = 1;
+        int controlRow = 1;
+        int visibleStripCount = 0;
+        int stepEditBankSize = 6;
+        int maxStepEditBank = 0;
+        int maxVisibleStripIndex = 0;
+        int stripRowsDenom = 1;
+        int modulationRowsDenom = 1;
+        int lastDisplayedStripRow = 1;
+        int lastPresetRow = 0;
+        bool presetModeActive = false;
+        bool stepEditModeActive = false;
+        bool sceneModeActive = false;
+        bool patternRecorderVisibleOnControlPage = false;
+        bool topRowSceneMode = false;
+        bool sceneRecorderVisible = false;
+        bool topRowEditSupported = false;
+        bool topRowEditActive = false;
+        int sceneActionStartColumn = 4;
+        int topRowEditToggleColumn = 15;
+        TopRowMode topRowMode = TopRowMode::Launch;
+
+        int clampVisibleStrip(int index) const noexcept
+        {
+            return juce::jlimit(0, maxVisibleStripIndex, index);
+        }
+
+        bool isPresetCell(int gridX, int gridY) const noexcept
+        {
+            return gridX >= 0 && gridX < PresetColumns
+                && gridY >= 0 && gridY < PresetRows;
+        }
+
+        int toPresetIndex(int gridX, int gridY) const noexcept
+        {
+            return (gridY * PresetColumns) + gridX;
+        }
+
+        bool isSceneTopCell(int gridX, int gridY) const noexcept
+        {
+            return topRowMode == TopRowMode::SceneLaunch
+                && gridY == groupRow
+                && gridX >= 0
+                && gridX < SceneSlots;
+        }
+
+        bool isSceneActionCell(int gridX, int gridY) const noexcept
+        {
+            return topRowMode == TopRowMode::SceneLaunch
+                && gridY == groupRow
+                && gridX >= sceneActionStartColumn
+                && gridX < (sceneActionStartColumn + 4);
+        }
+
+        bool topRowUsesLaunchSurface() const noexcept
+        {
+            return topRowMode == TopRowMode::Launch || topRowMode == TopRowMode::SceneLaunch;
+        }
+
+        bool isDisplayedDataRow(int row) const noexcept
+        {
+            if (row < firstStripRow)
+                return false;
+
+            return presetModeActive
+                ? (row <= lastPresetRow)
+                : (row <= lastDisplayedStripRow);
+        }
+    };
+
+    MonomeLayoutState getMonomeLayoutState() const;
+    bool isMonomeControlRowUtilityCell(const MonomeLayoutState& layout, int x) const;
+
     //==============================================================================
     enum class FilterSubPage
     {
@@ -1201,6 +1294,7 @@ private:
     int lastReportedLatencySamples = 0;
     ControlMode currentControlMode = ControlMode::Normal;
     bool controlModeActive = false;  // True when control button is held
+    bool monomeTopRowEditOverlayActive = false;
     FilterSubPage filterSubPage = FilterSubPage::Frequency;  // Current filter sub-page
     std::atomic<int> lastMonomePressedStripRow{0};
     std::atomic<int> arcSelectedStripRow{0};
@@ -2074,6 +2168,7 @@ private:
     bool hasStoredSceneSlotState(int mainPresetIndex, int sceneSlot) const;
     const SceneSlotState* getStoredSceneSlotState(int mainPresetIndex, int sceneSlot) const;
     void clearStoredSceneSlotStates(int mainPresetIndex = -1);
+    bool loadStoredSceneSlotStatesForPreset(int mainPresetIndex, const juce::XmlElement& presetXml);
     bool restoreStoredSceneSlotStatesFromPresetXml(int mainPresetIndex, const juce::XmlElement& presetXml);
     bool migrateLegacyStoredSceneSlotStates(int mainPresetIndex);
     bool captureSceneSlotState(int mainPresetIndex, int sceneSlot);
