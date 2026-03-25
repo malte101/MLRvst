@@ -480,9 +480,62 @@ void applyGrainPageButtonPressLive(EnhancedAudioStrip& targetStrip, int controlR
     }
 }
 
-void handleGrainPageButtonPress(EnhancedAudioStrip& targetStrip, int controlRow, int x)
+void handleGrainPageButtonPress(MlrVSTAudioProcessor& processor,
+                                EnhancedAudioStrip& targetStrip,
+                                int stripIndex,
+                                int controlRow,
+                                int x)
 {
-    applyGrainPageButtonPressLive(targetStrip, controlRow, x);
+    const int cx = juce::jlimit(0, 15, x);
+    applyGrainPageButtonPressLive(targetStrip, controlRow, cx);
+
+    switch (juce::jlimit(0, 5, controlRow))
+    {
+        case 0:
+            processor.notifyDirectSceneControlChange(stripIndex,
+                                                     ScenePerformanceControlTarget::GrainSize,
+                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                     0,
+                                                     grainSizeFromColumn(cx));
+            break;
+        case 1:
+            processor.notifyDirectSceneControlChange(stripIndex,
+                                                     ScenePerformanceControlTarget::GrainDensity,
+                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                     1,
+                                                     bipolarFromColumn(cx, 0.05f, 0.9f));
+            break;
+        case 2:
+            processor.notifyDirectSceneControlChange(stripIndex,
+                                                     ScenePerformanceControlTarget::GrainPitch,
+                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                     2,
+                                                     bipolarFromColumn(cx, -24.0f, 24.0f));
+            break;
+        case 3:
+            processor.notifyDirectSceneControlChange(stripIndex,
+                                                     ScenePerformanceControlTarget::GrainJitter,
+                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                     3,
+                                                     unitFromColumn(cx));
+            break;
+        case 4:
+            processor.notifyDirectSceneControlChange(stripIndex,
+                                                     ScenePerformanceControlTarget::GrainRandomDepth,
+                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                     4,
+                                                     unitFromColumn(cx));
+            break;
+        case 5:
+            processor.notifyDirectSceneControlChange(stripIndex,
+                                                     ScenePerformanceControlTarget::GrainEnvelope,
+                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                     5,
+                                                     unitFromColumn(cx));
+            break;
+        default:
+            break;
+    }
 }
 
 void renderGrainPageRow(const EnhancedAudioStrip& targetStrip, int controlRow, int y, int newLedState[16][16])

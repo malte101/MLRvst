@@ -9552,8 +9552,10 @@ void MlrVSTAudioProcessorEditor::resized()
 
     if (sceneWorkspaceFullscreen)
     {
-        monomePagesControl->setVisible(false);
-        monomePagesControl->setBounds({});
+        monomePagesControl->setVisible(true);
+        auto monomePagesArea = bounds.removeFromBottom(50);
+        monomePagesControl->setBounds(monomePagesArea);
+        bounds.removeFromBottom(margin);
         topTabs->setBounds(bounds);
         mainTabs->setVisible(false);
         mainTabs->setBounds({});

@@ -117,7 +117,9 @@ public:
                                  int sceneSlot,
                                  double hostPpqSnapshot,
                                  double hostTempoSnapshot,
-                                 int64_t hostGlobalSampleSnapshot);
+                                 int64_t hostGlobalSampleSnapshot,
+                                 bool preserveLoadedStripAudio = false,
+                                 bool* recallContinuityBrokenOut = nullptr);
     static void appendSceneModeStateToState(const MlrVSTAudioProcessor& processor, juce::ValueTree& state);
     static void loadSceneModeStateFromState(MlrVSTAudioProcessor& processor, const juce::ValueTree& state);
 

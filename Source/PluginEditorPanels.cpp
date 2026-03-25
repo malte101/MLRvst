@@ -287,6 +287,7 @@ constexpr float kSceneRulerHeight = 16.0f;
 constexpr float kSceneTriggerHeight = 54.0f;
 constexpr float kSceneAutomationHeaderHeight = 18.0f;
 constexpr float kSceneAutomationLaneHeight = 18.0f;
+constexpr float kSceneGlobalLaneExpandedScale = 3.0f;
 constexpr float kSceneAutomationLaneGap = 2.0f;
 constexpr float kSceneCardPaddingX = 10.0f;
 constexpr float kSceneCardPaddingY = 8.0f;
@@ -395,6 +396,7 @@ struct SceneStripCardLayout
     std::array<juce::Rectangle<float>, kSceneAutomationLaneCount> automationTimelineBounds{};
     int stepTotalSteps = 0;
     int stepRowCount = 0;
+    bool scenePlaybackAvailable = true;
     bool stepTriggerLane = false;
     bool automationExpanded = false;
     bool heightExpanded = false;
@@ -454,12 +456,19 @@ bool sceneStripUsesGrainLanes(const MlrVSTAudioProcessor& processor, int stripIn
     return strip != nullptr && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain;
 }
 
+bool sceneStripSupportsScenePlayback(const MlrVSTAudioProcessor& processor, int stripIndex)
+{
+    return processor.isStripScenePlaybackAvailable(stripIndex);
+}
+
 bool sceneAutomationLaneVisible(const MlrVSTAudioProcessor& processor, int stripIndex, int laneIndex)
 {
     const auto& lane = sceneAutomationLaneDefinition(laneIndex);
     if (sceneAutomationLaneUsesGlobalStrip(laneIndex))
         return stripIndex < 0;
     if (stripIndex < 0)
+        return false;
+    if (!sceneStripSupportsScenePlayback(processor, stripIndex))
         return false;
     return !lane.grainOnly || sceneStripUsesGrainLanes(processor, stripIndex);
 }
@@ -669,16 +678,7 @@ ModernAudioEngine::ModTarget sceneDisplayedModTargetForLane(MlrVSTAudioProcessor
 
 juce::String sceneSlotDisplayName(const MlrVSTAudioProcessor& processor, int sceneSlot)
 {
-    const int safeSceneSlot = juce::jlimit(0, MlrVSTAudioProcessor::SceneSlots - 1, sceneSlot);
-    const int loadedPresetIndex = processor.getLoadedPresetIndex();
-    const int mainPresetIndex = juce::jlimit(0,
-                                             MlrVSTAudioProcessor::MaxPresetSlots - 1,
-                                             loadedPresetIndex >= 0 ? loadedPresetIndex : 0);
-    const int storageIndex = MlrVSTAudioProcessor::MaxPresetSlots
-        + (mainPresetIndex * MlrVSTAudioProcessor::SceneSlots)
-        + safeSceneSlot;
-    const juce::String rawName = processor.getPresetName(storageIndex).trim();
-    return rawName;
+    return processor.getSceneInfo(sceneSlot).name;
 }
 
 juce::String sceneSlotShortDisplayName(const MlrVSTAudioProcessor& processor,
@@ -966,6 +966,9 @@ juce::String sceneTriggerLaneSummaryText(const MlrVSTAudioProcessor& processor,
                                          bool heightExpanded,
                                          const juce::String& sceneLengthLabel)
 {
+    if (!sceneStripSupportsScenePlayback(processor, stripIndex))
+        return "Scene playback unavailable";
+
     if (!sceneStripUsesStepTriggerColumns(processor, stripIndex))
         return (heightExpanded ? "Pattern / Offset  x2  •  " : "Pattern / Offset  •  ") + sceneLengthLabel;
 
@@ -1622,6 +1625,14 @@ bool sceneCurrentEffectiveNormalizedValue(MlrVSTAudioProcessor& processor,
     return std::isfinite(normalizedOut);
 }
 
+bool sceneCurrentBaseNormalizedValue(MlrVSTAudioProcessor& processor,
+                                     int stripIndex,
+                                     ScenePerformanceControlTarget target,
+                                     float& normalizedOut)
+{
+    return processor.getSceneControlBaseNormalizedValue(stripIndex, target, normalizedOut);
+}
+
 bool sceneHeldNormalizedValueForTarget(const std::vector<ScenePerformanceEvent>& events,
                                        int stripIndex,
                                        ScenePerformanceControlTarget target,
@@ -1815,7 +1826,7 @@ void appendSceneStripAutomationWriteEvents(MlrVSTAudioProcessor& processor,
             ? 0.5f
             : sceneDefaultNormalizedValueForLane(lane);
         const auto target = sceneAutomationLaneTarget(lane);
-        if (sceneCurrentEffectiveNormalizedValue(processor, safeStripIndex, target, normalizedValue))
+        if (sceneCurrentBaseNormalizedValue(processor, safeStripIndex, target, normalizedValue))
             normalizedValue = juce::jlimit(0.0f, 1.0f, normalizedValue);
 
         events.push_back(makeDefaultSceneControlEventForLane(safeStripIndex, lane, 0.0, normalizedValue));
@@ -1835,7 +1846,7 @@ void appendSceneGlobalAutomationWriteEvents(MlrVSTAudioProcessor& processor,
     const double endBeat = sceneAutomationWriteEndBeat(lengthBeats);
     float normalizedValue = sceneDefaultNormalizedValueForLane(globalLane);
     const auto target = sceneAutomationLaneTarget(globalLane);
-    if (sceneCurrentEffectiveNormalizedValue(processor, -1, target, normalizedValue))
+    if (sceneCurrentBaseNormalizedValue(processor, -1, target, normalizedValue))
         normalizedValue = juce::jlimit(0.0f, 1.0f, normalizedValue);
 
     events.push_back(makeDefaultSceneControlEventForLane(-1, globalLane, 0.0, normalizedValue));
@@ -1867,10 +1878,15 @@ void ensureSceneDefaultAutomationStartPoints(MlrVSTAudioProcessor& processor,
             if (hasStartPoint)
                 continue;
 
+            float normalizedValue = sceneDefaultNormalizedValueForLane(lane);
+            const auto target = sceneAutomationLaneTarget(lane);
+            if (sceneCurrentBaseNormalizedValue(processor, stripIndex, target, normalizedValue))
+                normalizedValue = juce::jlimit(0.0f, 1.0f, normalizedValue);
+
             events.push_back(makeDefaultSceneControlEventForLane(stripIndex,
                                                                  lane,
                                                                  0.0,
-                                                                 sceneDefaultNormalizedValueForLane(lane)));
+                                                                 normalizedValue));
         }
     }
 
@@ -1887,10 +1903,15 @@ void ensureSceneDefaultAutomationStartPoints(MlrVSTAudioProcessor& processor,
                                                      });
         if (!hasGlobalStartPoint)
         {
+            float normalizedValue = sceneDefaultNormalizedValueForLane(globalLane);
+            const auto target = sceneAutomationLaneTarget(globalLane);
+            if (sceneCurrentBaseNormalizedValue(processor, -1, target, normalizedValue))
+                normalizedValue = juce::jlimit(0.0f, 1.0f, normalizedValue);
+
             events.push_back(makeDefaultSceneControlEventForLane(-1,
                                                                  globalLane,
                                                                  0.0,
-                                                                 sceneDefaultNormalizedValueForLane(globalLane)));
+                                                                 normalizedValue));
         }
     }
 }
@@ -1902,7 +1923,8 @@ float sceneStripVerticalScale(bool heightExpanded)
 
 float sceneGlobalLaneCardHeight(bool expanded)
 {
-    const float laneHeight = expanded ? (kSceneAutomationLaneHeight * 1.7f) : kSceneAutomationLaneHeight;
+    const float laneHeight = expanded ? (kSceneAutomationLaneHeight * kSceneGlobalLaneExpandedScale)
+                                      : kSceneAutomationLaneHeight;
     return (kSceneCardPaddingY * 2.0f)
         + kSceneCardHeaderHeight
         + 4.0f
@@ -1925,7 +1947,8 @@ SceneGlobalLaneLayout makeSceneGlobalLaneLayout(juce::Rectangle<float> cardBound
     layout.summaryBounds = layout.headerBounds;
     inner.removeFromTop(4.0f);
 
-    const float laneHeight = expanded ? (kSceneAutomationLaneHeight * 1.7f) : kSceneAutomationLaneHeight;
+    const float laneHeight = expanded ? (kSceneAutomationLaneHeight * kSceneGlobalLaneExpandedScale)
+                                      : kSceneAutomationLaneHeight;
     auto laneRow = inner.removeFromTop(laneHeight);
     layout.laneLabelBounds = laneRow.removeFromLeft(kSceneTimelineLabelWidth);
     layout.laneBounds = laneRow;
@@ -1937,6 +1960,7 @@ float sceneStripCardHeight(const MlrVSTAudioProcessor& processor,
                            bool automationExpanded,
                            bool heightExpanded)
 {
+    const bool scenePlaybackAvailable = sceneStripSupportsScenePlayback(processor, stripIndex);
     const float verticalScale = sceneStripVerticalScale(heightExpanded);
     const float triggerHeight = sceneTriggerLaneHeight(processor, stripIndex, heightExpanded);
     float height = (kSceneCardPaddingY * 2.0f)
@@ -1948,7 +1972,7 @@ float sceneStripCardHeight(const MlrVSTAudioProcessor& processor,
         + 4.0f
         + kSceneAutomationHeaderHeight;
 
-    if (automationExpanded)
+    if (automationExpanded && scenePlaybackAvailable)
     {
         const int visibleLaneCount = juce::jmax(0, sceneAutomationVisibleLaneCount(processor, stripIndex));
         height += 4.0f;
@@ -1967,7 +1991,8 @@ SceneStripCardLayout makeSceneStripCardLayout(const MlrVSTAudioProcessor& proces
 {
     SceneStripCardLayout layout;
     layout.cardBounds = cardBounds;
-    layout.automationExpanded = automationExpanded;
+    layout.scenePlaybackAvailable = sceneStripSupportsScenePlayback(processor, stripIndex);
+    layout.automationExpanded = automationExpanded && layout.scenePlaybackAvailable;
     layout.heightExpanded = heightExpanded;
     const float verticalScale = sceneStripVerticalScale(heightExpanded);
     layout.stepTriggerLane = sceneStripUsesStepTriggerColumns(processor, stripIndex);
@@ -2012,7 +2037,7 @@ SceneStripCardLayout makeSceneStripCardLayout(const MlrVSTAudioProcessor& proces
     layout.automationHeaderBounds = inner.removeFromTop(kSceneAutomationHeaderHeight);
     layout.automationToggleBounds = layout.automationHeaderBounds.removeFromLeft(120.0f);
 
-    if (automationExpanded)
+    if (layout.automationExpanded)
     {
         inner.removeFromTop(4.0f);
         for (int lane = 0; lane < kSceneAutomationLaneCount; ++lane)
@@ -2205,9 +2230,12 @@ juce::Rectangle<float> sceneControlMarkerBounds(const SceneStripCardLayout& layo
 void drawSceneAutomationPoint(juce::Graphics& g,
                               const ScenePerformanceEvent& event,
                               juce::Rectangle<float> markerBounds,
-                              bool selected)
+                              bool selected,
+                              juce::Colour colourOverride = {})
 {
-    const auto colour = sceneAutomationColour(event).withAlpha(0.95f);
+    const auto colour = colourOverride.isTransparent()
+        ? sceneAutomationColour(event).withAlpha(0.95f)
+        : colourOverride;
     g.setColour(colour);
 
     switch (juce::jlimit(0, 5, event.controlRow))
@@ -2275,16 +2303,9 @@ void drawSceneHeaderActionChip(juce::Graphics& g,
     g.drawText(label, bounds.toNearestInt(), juce::Justification::centred, false);
 }
 
-juce::Colour sceneSlotUiColour(int sceneSlot)
+juce::Colour sceneSlotUiColour(const MlrVSTAudioProcessor& processor, int sceneSlot)
 {
-    switch (juce::jlimit(0, MlrVSTAudioProcessor::SceneSlots - 1, sceneSlot))
-    {
-        case 0:  return juce::Colour(0xff79c8ff);
-        case 1:  return juce::Colour(0xff95dd6a);
-        case 2:  return juce::Colour(0xffffc467);
-        case 3:  return juce::Colour(0xffff9376);
-        default: return kAccent;
-    }
+    return juce::Colour(processor.getSceneInfo(sceneSlot).colourArgb);
 }
 
 juce::String sceneLengthModeSummary(const MlrVSTAudioProcessor& processor, int sceneSlot)
@@ -2481,20 +2502,6 @@ juce::String sceneTransitionTimingModeSummary(bool subtractFromSceneLength)
 juce::String sceneTransitionSubtractButtonLabel(bool enabled)
 {
     return enabled ? "Take From Scene On" : "Take From Scene Off";
-}
-
-juce::String sceneAdvanceSummaryText(const MlrVSTAudioProcessor& processor, int sceneSlot)
-{
-    const double resolvedBeats = processor.getResolvedSceneLengthBeats(sceneSlot);
-    const double totalBeats = processor.getSceneAdvanceLengthBeats(sceneSlot);
-    const int hiddenRepeats = processor.getSceneRepeatCount(sceneSlot);
-
-    juce::String summary = sceneLengthModeSummary(processor, sceneSlot);
-    summary << " -> " << juce::String(resolvedBeats, 2) << "b";
-    if (hiddenRepeats > 1)
-        summary << " x" << juce::String(hiddenRepeats);
-    summary << " • Advance " << juce::String(totalBeats, 2) << "b";
-    return summary;
 }
 
 struct SceneChainLayout
@@ -2903,7 +2910,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     titleLabel.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(titleLabel);
 
-    hintLabel.setText("Monome-style scene row up top, chain rail underneath: top scene buttons launch on the global trigger grid, the chain Advance mode controls chain playback, and chains auto-loop.", juce::dontSendNotification);
+    hintLabel.setText("Monome-style scene row up top, chain rail underneath: top scene buttons manually launch on the global trigger grid, take over from the chain, and the chain Advance mode only controls chain playback.", juce::dontSendNotification);
     hintLabel.setFont(juce::Font(juce::FontOptions(10.5f)));
     hintLabel.setColour(juce::Label::textColourId, kTextMuted);
     hintLabel.setJustificationType(juce::Justification::centredLeft);
@@ -2923,7 +2930,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     sceneChangeModeLabel.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
     sceneChangeModeLabel.setColour(juce::Label::textColourId, kTextMuted);
     sceneChangeModeLabel.setJustificationType(juce::Justification::centredLeft);
-    sceneChangeModeLabel.setTooltip("Choose how the scene chain advances. The scene buttons above the chain still launch on the global trigger quantize grid.");
+    sceneChangeModeLabel.setTooltip("Choose how the scene chain advances. The scene buttons above the chain still manually launch scenes on the global trigger quantize grid and take over from chain playback.");
     addAndMakeVisible(sceneChangeModeLabel);
 
     sceneChangeModeBox.addItem("Grid", static_cast<int>(MlrVSTAudioProcessor::SceneRecallMode::QuantizeGrid) + 1);
@@ -3023,6 +3030,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
         }
 
         selectedSceneActionSlot = getFocusedSceneSlot();
+        processor.focusSceneSlot(selectedSceneActionSlot);
         processor.clearSceneSlot(selectedSceneActionSlot);
         refreshFromProcessor();
     };
@@ -3046,7 +3054,11 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     sceneInsertBeforeButton.onClick = [this]()
     {
         const int targetSlot = getFocusedSceneSlot();
-        processor.insertSceneSlot(targetSlot, false);
+        if (processor.insertSceneSlot(targetSlot, false))
+        {
+            selectedSceneActionSlot = targetSlot;
+            processor.focusSceneSlot(selectedSceneActionSlot);
+        }
         refreshFromProcessor();
     };
     addAndMakeVisible(sceneInsertBeforeButton);
@@ -3058,7 +3070,10 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     {
         const int targetSlot = getFocusedSceneSlot();
         if (processor.insertSceneSlot(targetSlot, true))
+        {
             selectedSceneActionSlot = juce::jmin(MlrVSTAudioProcessor::SceneSlots - 1, targetSlot + 1);
+            processor.focusSceneSlot(selectedSceneActionSlot);
+        }
         refreshFromProcessor();
     };
     addAndMakeVisible(sceneInsertAfterButton);
@@ -3094,12 +3109,11 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(sceneTransitionDelayHeaderLabel);
     addAndMakeVisible(sceneTransitionFilterHeaderLabel);
     addAndMakeVisible(sceneTransitionChopHeaderLabel);
-    configureSummaryLabel(sceneAdvanceSummaryLabel, false);
     configureSummaryLabel(sceneTransitionSummaryLabel, false);
     configureSummaryLabel(sceneTransitionMetaLabel, true);
-    addAndMakeVisible(sceneAdvanceSummaryLabel);
     addAndMakeVisible(sceneTransitionSummaryLabel);
     addAndMakeVisible(sceneTransitionMetaLabel);
+    sceneAdvanceSummaryLabel.setVisible(false);
     sceneTransitionSummaryLabel.setVisible(false);
     sceneTransitionMetaLabel.setVisible(false);
 
@@ -3122,7 +3136,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
             }
 
             selectedSceneActionSlot = sceneSlot;
-            processor.selectSceneSlotFromSurface(sceneSlot);
+            processor.launchSceneSlotFromSurface(sceneSlot);
             refreshFromProcessor();
         };
         addAndMakeVisible(selectorButton);
@@ -3461,6 +3475,21 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(sceneFollowButton);
     styleUiButton(sceneFollowButton, true);
 
+    sceneReenableAutomationButton.setButtonText("Re-enable Automation");
+    sceneReenableAutomationButton.setTooltip("If a scene automation lane is greyed out, a live touch has overridden it. Click to re-enable the written scene automation. Step motion lanes are unaffected.");
+    sceneReenableAutomationButton.onClick = [this]()
+    {
+        processor.reenableActiveSceneAutomation();
+        refreshFromProcessor();
+        const double beat = processor.getAudioEngine() != nullptr
+            ? processor.getAudioEngine()->getTimelineBeat()
+            : 0.0;
+        updateSceneEditorState(beat);
+        sceneTimelineCanvas.repaint();
+    };
+    addAndMakeVisible(sceneReenableAutomationButton);
+    styleUiButton(sceneReenableAutomationButton, true);
+
     sceneLaneOverlayButton.setButtonText("Tint");
     sceneLaneOverlayButton.setClickingTogglesState(true);
     sceneLaneOverlayButton.setToggleState(sceneLaneOverlayEnabled, juce::dontSendNotification);
@@ -3685,9 +3714,7 @@ bool SceneControlPanel::shouldShowSceneMotionTargetSelectors(int stripIndex) con
 
 int SceneControlPanel::getFocusedSceneSlot() const
 {
-    if (selectedSceneActionSlot >= 0 && selectedSceneActionSlot < MlrVSTAudioProcessor::SceneSlots)
-        return selectedSceneActionSlot;
-    return processor.getActiveSceneSlot();
+    return processor.getFocusedSceneSlot();
 }
 
 int SceneControlPanel::getFocusedSceneChainStep() const
@@ -3830,6 +3857,11 @@ std::vector<int> SceneControlPanel::collectSceneEventIndicesInMarquee(juce::Rect
                                                      cardBounds,
                                                      stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+        if (!layout.scenePlaybackAvailable)
+        {
+            y += cardBounds.getHeight() + kSceneCardGap;
+            continue;
+        }
 
         for (int eventIndex = 0; eventIndex < static_cast<int>(sceneEditorState.events.size()); ++eventIndex)
         {
@@ -3918,6 +3950,11 @@ void SceneControlPanel::updateSceneHoverState(const juce::Point<float>& position
                                                      cardBounds,
                                                      stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+        if (!layout.scenePlaybackAvailable)
+        {
+            y += cardBounds.getHeight() + kSceneCardGap;
+            continue;
+        }
 
         const auto triggerInteractionBounds = layout.stepTriggerLane && !layout.stepLaunchBounds.isEmpty()
             ? layout.stepLaunchBounds
@@ -4467,7 +4504,7 @@ bool SceneControlPanel::thinSceneLane(int stripIndex, int laneIndex, bool trigge
 void SceneControlPanel::resized()
 {
     auto bounds = getLocalBounds().reduced(8);
-    const auto comboFont = sceneComboLookAndFeel.getComboBoxFont(sceneChangeModeBox);
+    const auto comboFont = juce::Font(juce::FontOptions(12.0f, juce::Font::bold));
     auto comboWidthForTexts = [&comboFont](std::initializer_list<juce::String> labels, int minWidth, int maxWidth)
     {
         int textWidth = 0;
@@ -4614,16 +4651,11 @@ void SceneControlPanel::resized()
     layoutTransitionParam(sceneTransitionDelayHeaderLabel, sceneTransitionDelaySlider, transitionAmountWidth);
     layoutTransitionParam(sceneTransitionFilterHeaderLabel, sceneTransitionFilterSlider, transitionAmountWidth);
     layoutTransitionParam(sceneTransitionChopHeaderLabel, sceneTransitionChopSlider, transitionAmountWidth);
+    if (transitionParamRow.getWidth() > 4)
+        transitionParamRow.removeFromLeft(4);
+    sceneTransitionSubtractButton.setBounds(transitionParamRow);
 
-    settingsBounds.removeFromTop(3);
-
-    auto summaryRow = settingsBounds.removeFromTop(22);
-    const int transitionToggleWidth = comboWidthForTexts({"Take From Scene Off", "Take From Scene On"},
-                                                         148,
-                                                         juce::jmax(152, summaryRow.getWidth() / 3));
-    sceneTransitionSubtractButton.setBounds(summaryRow.removeFromRight(transitionToggleWidth));
-    summaryRow.removeFromRight(6);
-    sceneAdvanceSummaryLabel.setBounds(summaryRow);
+    sceneAdvanceSummaryLabel.setBounds({});
     sceneTransitionSummaryLabel.setBounds({});
     sceneTransitionMetaLabel.setBounds({});
 
@@ -4639,6 +4671,8 @@ void SceneControlPanel::resized()
     sceneZoomBox.setBounds(recorderRow.removeFromLeft(52));
     recorderRow.removeFromLeft(4);
     sceneFollowButton.setBounds(recorderRow.removeFromLeft(58));
+    recorderRow.removeFromLeft(4);
+    sceneReenableAutomationButton.setBounds(recorderRow.removeFromLeft(176));
     recorderRow.removeFromLeft(8);
     sceneMotionEditButton.setBounds({});
     sceneStatusLabel.setBounds(recorderRow.removeFromRight(108));
@@ -4718,8 +4752,9 @@ void SceneControlPanel::resized()
 void SceneControlPanel::updateSceneEditorState(double beat)
 {
     const int sceneSlot = getFocusedSceneSlot();
-    const int activeSceneSlot = processor.getActiveSceneSlot();
-    const int queuedSceneSlot = processor.getQueuedSceneSlot();
+    const auto sceneWatcher = processor.getSceneWatcherState();
+    const int activeSceneSlot = sceneWatcher.activeSceneSlot;
+    const int queuedSceneSlot = sceneWatcher.queuedSceneSlot;
     const bool focusedIsActive = sceneSlot == activeSceneSlot;
     const bool focusedIsQueued = sceneSlot == queuedSceneSlot;
     const double clipLengthBeats = processor.getScenePerformanceClipLengthBeats(sceneSlot);
@@ -4826,11 +4861,29 @@ void SceneControlPanel::updateSceneEditorState(double beat)
     sceneMotionEditButton.setVisible(false);
     const bool recordingThisScene = processor.isScenePerformanceRecording()
         && processor.getScenePerformanceRecordingSceneSlot() == sceneSlot;
+    const bool hasAutomationOverrides = focusedIsActive && processor.hasAnyActiveSceneAutomationOverrides();
     sceneRecordButton.setToggleState(recordingThisScene, juce::dontSendNotification);
     sceneRecordButton.setButtonText(recordingThisScene
                                         ? (processor.isScenePerformanceOverdubbing() ? "Dub On" : "Rec On")
                                         : "Rec Off");
     sceneRecordButton.setEnabled(focusedIsActive);
+    sceneReenableAutomationButton.setEnabled(hasAutomationOverrides);
+    sceneReenableAutomationButton.setToggleState(hasAutomationOverrides, juce::dontSendNotification);
+    sceneReenableAutomationButton.setTooltip(hasAutomationOverrides
+                                                 ? "Greyed-out scene automation lanes are currently overridden by live touches. Click to re-enable their written values. Step motion lanes are unaffected."
+                                                 : "Touch a recorded scene control live to temporarily grey it out, then click here to re-enable its written automation. Step motion lanes are unaffected.");
+    sceneReenableAutomationButton.setColour(juce::TextButton::buttonColourId,
+                                            hasAutomationOverrides ? kAccent.withAlpha(0.92f)
+                                                                   : juce::Colour(0xff3b4146));
+    sceneReenableAutomationButton.setColour(juce::TextButton::buttonOnColourId,
+                                            hasAutomationOverrides ? kAccent.brighter(0.12f)
+                                                                   : juce::Colour(0xff4a5258));
+    sceneReenableAutomationButton.setColour(juce::TextButton::textColourOffId,
+                                            hasAutomationOverrides ? juce::Colour(0xff141414)
+                                                                   : kTextPrimary);
+    sceneReenableAutomationButton.setColour(juce::TextButton::textColourOnId,
+                                            hasAutomationOverrides ? juce::Colour(0xff101010)
+                                                                   : juce::Colour(0xfff5f5f5));
     const int selectedCount = static_cast<int>(sceneEditorState.selectedEventIndices.size());
     sceneDeleteButton.setEnabled(false);
     sceneClearTriggersButton.setEnabled(false);
@@ -4887,6 +4940,8 @@ void SceneControlPanel::updateSceneEditorState(double beat)
     }
     if (clipboardReady)
         selectionText << " • " << clipboardSummary;
+    if (hasAutomationOverrides)
+        selectionText << " • Manual automation override active; Re-enable restores the written lane values";
     sceneSelectionLabel.setText(selectionText, juce::dontSendNotification);
 
     if (recordingThisScene)
@@ -4907,6 +4962,7 @@ void SceneControlPanel::updateSceneEditorState(double beat)
             ? juce::String("Double-tap keeps layering onto the current scene clip")
             : eventSummary;
         sceneDetailLabel.setText(prefix + " • Ends in " + juce::String(beatsLeft, 2) + " beats"
+                                     + (hasAutomationOverrides ? " • Manual override active" : juce::String())
                                      + (clipboardReady ? (" • " + clipboardSummary) : juce::String()),
                                  juce::dontSendNotification);
     }
@@ -4924,6 +4980,8 @@ void SceneControlPanel::updateSceneEditorState(double beat)
             if (std::abs(clipLengthBeats - resolvedLengthBeats) > 1.0e-6)
                 detail << " • Clip " << juce::String(clipLengthBeats, 2) << " beats";
             detail << " • " << eventSummary;
+            if (hasAutomationOverrides)
+                detail << " • Manual override active";
             if (clipboardReady)
                 detail << " • " << clipboardSummary;
             sceneDetailLabel.setText(detail,
@@ -5085,6 +5143,8 @@ void SceneControlPanel::refreshFromProcessor()
     sceneCaptureButton.setToggleState(sceneDrawModeEnabled, juce::dontSendNotification);
     sceneCaptureButton.setButtonText(sceneDrawModeEnabled ? "Draw On" : "Draw Off");
     sceneFollowButton.setToggleState(sceneFollowPlayheadEnabled, juce::dontSendNotification);
+    sceneReenableAutomationButton.setToggleState(processor.hasAnyActiveSceneAutomationOverrides(),
+                                                 juce::dontSendNotification);
     sceneLaneOverlayButton.setToggleState(sceneLaneOverlayEnabled, juce::dontSendNotification);
     sceneMotionEditButton.setToggleState(sceneLegacyModEditorVisible, juce::dontSendNotification);
     sceneCaptureButton.setTooltip(sceneDrawModeEnabled
@@ -5098,12 +5158,12 @@ void SceneControlPanel::refreshFromProcessor()
     juce::String chainHint = "Monome-style scene row up top, chain rail underneath.";
     if (chainLength > 0)
         chainHint << "  " << processor.getSceneSequenceSummaryText() << ".";
-    chainHint << "  Scene buttons above the chain launch on the global trigger quantize grid and focus that scene for editing. Click a chain step to focus that scene without launching it, right-click a scene bubble to remove it, click empty steps to add the focused scene, drag to reorder, wheel to change repeats, click connector chips to edit fills, and click the loop clamp to edit the loopback fill. Chains keep playing until the manual scene launch takes over. Chains auto-loop.";
+    chainHint << "  Scene buttons above the chain manually launch on the global trigger grid, focus that scene for editing, and take over from chain playback. Click a chain step to focus that scene without launching it, right-click a scene bubble to remove it, click empty steps to add the focused scene, drag to reorder, wheel to change repeats, click connector chips to edit fills, and click the loop clamp to edit the loopback fill. Chains auto-loop.";
     hintLabel.setText(chainHint, juce::dontSendNotification);
     hintLabel.setColour(juce::Label::textColourId,
                         processor.isSceneChainPlaybackActive() ? kAccent : kTextMuted);
     if (selectedSceneActionSlot < 0 || selectedSceneActionSlot >= MlrVSTAudioProcessor::SceneSlots)
-        selectedSceneActionSlot = processor.getActiveSceneSlot();
+        selectedSceneActionSlot = processor.getFocusedSceneSlot();
     const int focusedSceneSlot = getFocusedSceneSlot();
     if (sceneTimingLayoutFocusedSlot != focusedSceneSlot)
         resized();
@@ -5119,7 +5179,7 @@ void SceneControlPanel::refreshFromProcessor()
     const int focusedStep = getFocusedSceneChainStep();
     const bool hasFocusedStep = focusedStep >= 0 && focusedStep < chainLength;
     sceneSlotHeaderLabel.setText("Edit S" + juce::String(focusedSceneSlot + 1), juce::dontSendNotification);
-    sceneSlotHeaderLabel.setColour(juce::Label::textColourId, sceneSlotUiColour(focusedSceneSlot).brighter(0.12f));
+    sceneSlotHeaderLabel.setColour(juce::Label::textColourId, sceneSlotUiColour(processor, focusedSceneSlot).brighter(0.12f));
     sceneSlotHeaderLabel.setTooltip("The scene whose Length and Count settings are shown below.");
     sceneAnchorHeaderLabel.setVisible(focusedLengthMode == MlrVSTAudioProcessor::SceneLengthMode::AnchorStrip);
 
@@ -5148,12 +5208,14 @@ void SceneControlPanel::refreshFromProcessor()
                                          : "Copy a scene first, then paste it into the focused scene slot.");
     sceneChainPlayButton.setTooltip(chainLength >= 2
                                         ? (processor.isSceneChainPlaybackActive()
-                                               ? "Stop chain playback. Top scene buttons still launch on the trigger grid, while clicking a chain step only focuses that scene for editing."
+                                               ? "Stop chain playback. Top scene buttons still launch manually on the trigger grid, take over from the chain, and clicking a chain step only focuses that scene for editing."
                                                : "Start chain playback from the focused scene if it is in the chain, otherwise from step 1. If that start step is already live, playback keeps running and the chain just takes over.")
                                         : "Chain playback becomes available once the chain has at least two steps.");
     sceneChainClearButton.setTooltip("Reset focused scene S"
                                      + juce::String(getFocusedSceneSlot() + 1)
                                      + " to its default empty state. Alt-click clears the chain.");
+
+    const bool queuedSceneBlinkOn = ((juce::Time::getMillisecondCounter() / 500u) & 1u) == 0u;
 
     if (sceneTimingLayoutFocusedStep != focusedStep)
         resized();
@@ -5238,13 +5300,6 @@ void SceneControlPanel::refreshFromProcessor()
                                                hasFocusedStep ? transitionColour.withAlpha(0.88f) : kTextMuted);
     sceneTransitionChopHeaderLabel.setColour(juce::Label::textColourId,
                                              hasFocusedStep ? transitionColour.withAlpha(0.88f) : kTextMuted);
-    sceneAdvanceSummaryLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff1b2125));
-    sceneAdvanceSummaryLabel.setColour(juce::Label::outlineColourId, juce::Colours::white.withAlpha(0.12f));
-    sceneAdvanceSummaryLabel.setColour(juce::Label::textColourId, kTextPrimary);
-    sceneAdvanceSummaryLabel.setText(sceneAdvanceSummaryText(processor, focusedSceneSlot),
-                                     juce::dontSendNotification);
-    sceneAdvanceSummaryLabel.setTooltip("Focused scene advance setup. Source length resolves first, then the scene advances after the shown total beats.");
-
     sceneTransitionSummaryLabel.setColour(juce::Label::backgroundColourId, transitionColour.withAlpha(hasFocusedStep ? 0.18f : 0.10f));
     sceneTransitionSummaryLabel.setColour(juce::Label::outlineColourId, transitionColour.withAlpha(hasFocusedStep ? 0.40f : 0.18f));
     sceneTransitionSummaryLabel.setColour(juce::Label::textColourId, hasFocusedStep ? kTextPrimary : kTextMuted);
@@ -5319,16 +5374,20 @@ void SceneControlPanel::refreshFromProcessor()
     for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
     {
         const auto idx = static_cast<size_t>(sceneSlot);
+        const auto sceneWatcher = processor.getSceneWatcherState();
+        const auto& runtimeSlot = sceneWatcher.slots[idx];
+        const auto& clipSlot = runtimeSlot.clipSlot;
         const auto lengthMode = processor.getSceneLengthMode(sceneSlot);
         const int countValue = processor.getSceneLengthCount(sceneSlot);
         const int anchorStrip = processor.getSceneAnchorStrip(sceneSlot);
         const double resolvedBeats = processor.getResolvedSceneLengthBeats(sceneSlot);
         const double totalBeats = processor.getSceneAdvanceLengthBeats(sceneSlot);
-        const int sequenceStepIndex = processor.getSceneSequenceStepIndex(sceneSlot);
-        const bool chainPlaybackActive = processor.isSceneChainPlaybackActive();
-        const bool isActiveScene = processor.getActiveSceneSlot() == sceneSlot;
-        const bool isQueuedScene = processor.getQueuedSceneSlot() == sceneSlot;
-        const bool isSelectedScene = getFocusedSceneSlot() == sceneSlot;
+        const int sequenceStepIndex = clipSlot.chainStepIndex;
+        const bool chainPlaybackActive = sceneWatcher.chainActive;
+        const bool isActiveScene = runtimeSlot.active;
+        const bool isQueuedScene = runtimeSlot.queued;
+        const bool isQueuedManualScene = isQueuedScene && sceneWatcher.manualPlaybackOwned;
+        const bool isSelectedScene = runtimeSlot.focused;
         juce::ignoreUnused(resolvedBeats);
         juce::String resolvedTooltip = sceneLengthModeSummary(processor, sceneSlot)
             + " | " + juce::String(totalBeats, 2) + " beats";
@@ -5358,12 +5417,19 @@ void SceneControlPanel::refreshFromProcessor()
         auto& selectorButton = sceneSelectorButtons[idx];
         selectorButton.setButtonText(slotText);
         selectorButton.setToggleState(isSelectedScene, juce::dontSendNotification);
-        const auto identityColour = sceneSlotUiColour(sceneSlot);
-        const auto slotColour = isActiveScene ? identityColour.withMultipliedBrightness(1.08f)
-            : (isQueuedScene ? identityColour.interpolatedWith(juce::Colour(0xffd6a345), 0.36f)
-                             : (isSelectedScene ? identityColour.withAlpha(0.58f)
-                                                : (chainPlaybackActive && sequenceStepIndex >= 0 ? identityColour.withAlpha(0.72f)
-                                                                          : identityColour.withAlpha(0.40f))));
+        const auto identityColour = sceneSlotUiColour(processor, sceneSlot);
+        const auto queuedBlinkColour = identityColour.interpolatedWith(juce::Colour(0xffd6a345), 0.36f);
+        juce::Colour slotColour = identityColour.withAlpha(0.40f);
+        if (isActiveScene)
+            slotColour = identityColour.withMultipliedBrightness(1.08f);
+        else if (isQueuedManualScene)
+            slotColour = queuedSceneBlinkOn ? queuedBlinkColour : identityColour.withAlpha(0.28f);
+        else if (isQueuedScene)
+            slotColour = queuedBlinkColour;
+        else if (isSelectedScene)
+            slotColour = identityColour.withAlpha(0.58f);
+        else if (chainPlaybackActive && sequenceStepIndex >= 0)
+            slotColour = identityColour.withAlpha(0.72f);
         selectorButton.setColour(juce::TextButton::buttonColourId, slotColour);
         selectorButton.setColour(juce::TextButton::buttonOnColourId, slotColour.brighter(0.16f));
         selectorButton.setColour(juce::TextButton::textColourOffId,
@@ -5375,7 +5441,7 @@ void SceneControlPanel::refreshFromProcessor()
                                      ? juce::Colour(0xff0f0f0f)
                                      : juce::Colour(0xfffafafa));
         selectorButton.setTooltip(resolvedTooltip
-                                  + " | Click recalls this scene on the global trigger quantize grid."
+                                  + " | Click manually launches this scene on the global trigger grid and takes over from chain playback."
                                   + " | This button also focuses the scene for Copy, Paste, Clear, Length, and Count editing."
                                   + " | Drag this scene into the chain rail below to add it to playback order."
                                   + " | The chain rail below also supports drag-reorder."
@@ -5543,17 +5609,13 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
         const auto loopLeft = layout.stepBounds[static_cast<size_t>(loopStart)].getX() + 4.0f;
         const auto loopRight = layout.stepBounds[static_cast<size_t>(loopEnd)].getRight() - 4.0f;
         const bool chainActive = processor.isSceneChainPlaybackActive();
-        const bool loopSelected = selectedSceneChainStep == loopEnd;
-        const auto loopFillColour = sceneChainTransitionColour(processor.getSceneChainStepTransitionType(loopEnd));
-        const auto loopColour = loopSelected
-            ? loopFillColour.withAlpha(0.96f)
-            : (chainActive ? kAccent.withAlpha(0.92f)
-                           : juce::Colours::white.withAlpha(0.28f));
+        const auto loopColour = chainActive ? kAccent.withAlpha(0.92f)
+                                            : juce::Colours::white.withAlpha(0.28f);
         const auto clampBounds = sceneChainLoopClampBounds(layout, loopStart, loopEnd);
         g.setColour(loopColour.withAlpha(chainActive ? 0.22f : 0.10f));
         g.fillRoundedRectangle(clampBounds, 5.4f);
         g.setColour(loopColour.withAlpha(chainActive ? 0.98f : 0.56f));
-        g.drawRoundedRectangle(clampBounds.reduced(0.4f), 5.4f, loopSelected ? 1.9f : (chainActive ? 1.5f : 1.1f));
+        g.drawRoundedRectangle(clampBounds.reduced(0.4f), 5.4f, chainActive ? 1.5f : 1.1f);
 
         const auto leftClamp = juce::Rectangle<float>(loopLeft - 4.0f,
                                                       clampBounds.getY() - 1.0f,
@@ -5600,44 +5662,37 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
         const int sceneSlot = occupied ? processor.getSceneChainStepSceneSlot(stepIndex) : -1;
         const bool active = stepIndex == activeStep;
         const bool queued = occupied && stepIndex == queuedStep && !active;
-        const bool selected = occupied && stepIndex == selectedSceneChainStep;
         const bool hovered = sceneSlotDragSource < 0 && stepIndex == sceneChainHoverStep;
         const bool dropTarget = sceneChainDragSourceStep >= 0
             && stepIndex == sceneChainDragTargetStep
             && sceneChainDragSourceStep != sceneChainDragTargetStep;
         const bool externalDropTarget = stepIndex == externalDropHighlightStep;
         const auto dropHighlightColour = externalDropTarget
-            ? sceneSlotUiColour(sceneSlotDragSource).withAlpha(0.96f)
+            ? sceneSlotUiColour(processor, sceneSlotDragSource).withAlpha(0.96f)
             : kAccent.withAlpha(0.95f);
-        const auto slotColour = occupied ? sceneSlotUiColour(sceneSlot) : juce::Colour(0xff2a3035);
+        const auto slotColour = occupied ? sceneSlotUiColour(processor, sceneSlot) : juce::Colour(0xff2a3035);
         const auto fill = occupied
             ? (active ? slotColour.withAlpha(0.86f)
                       : (queued ? slotColour.withAlpha(0.58f)
                                 : slotColour.withAlpha(0.28f)))
             : (externalDropTarget
-                   ? sceneSlotUiColour(sceneSlotDragSource).withAlpha(0.18f)
+                   ? sceneSlotUiColour(processor, sceneSlotDragSource).withAlpha(0.18f)
                    : juce::Colour(0xff1f2529));
         const auto outline = active ? juce::Colours::white.withAlpha(0.92f)
-            : (selected ? kAccent.withAlpha(0.96f)
             : (queued ? juce::Colour(0xfff0c567)
                       : ((dropTarget || externalDropTarget)
                              ? dropHighlightColour
                                      : (hovered ? juce::Colours::white.withAlpha(0.3f)
-                                                : juce::Colours::white.withAlpha(0.1f)))));
+                                                : juce::Colours::white.withAlpha(0.1f))));
         g.setColour(fill);
         g.fillRoundedRectangle(drawBounds, 7.0f);
-        if (selected)
-        {
-            g.setColour(kAccent.withAlpha(0.16f));
-            g.fillRoundedRectangle(drawBounds.expanded(1.0f, 1.0f), 8.0f);
-        }
         g.setColour(outline);
-        g.drawRoundedRectangle(drawBounds.reduced(0.5f), 7.0f, active ? 1.4f : (selected ? 1.8f : 1.0f));
+        g.drawRoundedRectangle(drawBounds.reduced(0.5f), 7.0f, active ? 1.4f : 1.0f);
 
         if (dropTarget || externalDropTarget)
         {
             g.setColour((externalDropTarget
-                             ? sceneSlotUiColour(sceneSlotDragSource)
+                             ? sceneSlotUiColour(processor, sceneSlotDragSource)
                              : kAccent)
                             .withAlpha(0.22f));
             g.fillRoundedRectangle(drawBounds.reduced(2.5f, 2.5f), 5.0f);
@@ -5703,7 +5758,7 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
     if (sceneSlotDragSource >= 0 && sceneChainExternalDropStep >= 0)
     {
         const float markerX = sceneChainInsertionMarkerX(layout, sceneChainExternalDropStep);
-        const auto markerColour = sceneSlotUiColour(sceneSlotDragSource).withAlpha(0.96f);
+        const auto markerColour = sceneSlotUiColour(processor, sceneSlotDragSource).withAlpha(0.96f);
         const int ghostStepIndex = juce::jlimit(0,
                                                 MlrVSTAudioProcessor::MaxSceneChainSteps - 1,
                                                 sceneChainExternalDropStep);
@@ -5830,15 +5885,17 @@ void SceneControlPanel::handleSceneChainMouseDown(const juce::MouseEvent& e)
         newStep.repeats = 1;
         chainSteps.insert(chainSteps.begin() + juce::jmin(hitStep, chainLength), newStep);
         applySceneChainSteps(processor, chainSteps, loopEnabled, loopStart, loopEnd);
+        selectedSceneChainStep = juce::jmin(hitStep, chainLength);
         refreshFromProcessor();
         return;
     }
 
-    const int focusedChainSceneSlot = chainSteps[static_cast<size_t>(hitStep)].sceneSlot;
+        const int focusedChainSceneSlot = chainSteps[static_cast<size_t>(hitStep)].sceneSlot;
     if (focusedChainSceneSlot >= 0 && focusedChainSceneSlot < MlrVSTAudioProcessor::SceneSlots)
     {
         selectedSceneChainStep = hitStep;
         selectedSceneActionSlot = focusedChainSceneSlot;
+        processor.focusSceneSlot(focusedChainSceneSlot);
         refreshFromProcessor();
     }
 
@@ -5923,6 +5980,7 @@ void SceneControlPanel::handleSceneChainMouseUp(const juce::MouseEvent&)
             insertIndex = juce::jlimit(0, static_cast<int>(chainSteps.size()), targetStep - 1);
         chainSteps.insert(chainSteps.begin() + insertIndex, movedStep);
         applySceneChainSteps(processor, chainSteps, loopEnabled, loopStart, loopEnd);
+        selectedSceneChainStep = insertIndex;
         refreshFromProcessor();
     }
     else if (sourceStep >= 0 && sourceStep < chainLength && !dragMoved)
@@ -5930,7 +5988,10 @@ void SceneControlPanel::handleSceneChainMouseUp(const juce::MouseEvent&)
         const int sceneSlot = chainSteps[static_cast<size_t>(sourceStep)].sceneSlot;
         selectedSceneChainStep = sourceStep;
         if (sceneSlot >= 0 && sceneSlot < MlrVSTAudioProcessor::SceneSlots)
+        {
             selectedSceneActionSlot = sceneSlot;
+            processor.focusSceneSlot(sceneSlot);
+        }
         refreshFromProcessor();
     }
     else
@@ -6193,10 +6254,13 @@ bool SceneControlPanel::writeCurrentStripAutomation(int stripIndex)
     if (processor.isScenePerformanceRecording())
         return false;
 
+    const int safeStripIndex = juce::jlimit(0, getVisibleSceneStripCount() - 1, stripIndex);
+    if (!processor.isStripScenePlaybackAvailable(safeStripIndex))
+        return false;
+
     const int sceneSlot = getFocusedSceneSlot();
     const double lengthBeats = getSceneTimelineLengthBeats(sceneSlot);
     auto events = sceneEditorState.events;
-    const int safeStripIndex = juce::jlimit(0, getVisibleSceneStripCount() - 1, stripIndex);
     events.erase(std::remove_if(events.begin(),
                                 events.end(),
                                 [safeStripIndex](const ScenePerformanceEvent& event)
@@ -6236,7 +6300,11 @@ bool SceneControlPanel::writeAllStripsAutomation()
     std::vector<ScenePerformanceEvent> writtenEvents;
     writtenEvents.reserve(static_cast<size_t>((visibleStripCount * kSceneAutomationLaneCount * 2) + 2));
     for (int stripIndex = 0; stripIndex < visibleStripCount; ++stripIndex)
+    {
+        if (!processor.isStripScenePlaybackAvailable(stripIndex))
+            continue;
         appendSceneStripAutomationWriteEvents(processor, stripIndex, lengthBeats, writtenEvents);
+    }
     appendSceneGlobalAutomationWriteEvents(processor, lengthBeats, writtenEvents);
 
     if (writtenEvents.empty())
@@ -6252,6 +6320,13 @@ bool SceneControlPanel::copyStripSceneEvents(int sourceStripIndex, int destStrip
     const int safeDestStrip = juce::jlimit(0, getVisibleSceneStripCount() - 1, destStripIndex);
     if (safeSourceStrip == safeDestStrip)
         return false;
+    if (!processor.isStripScenePlaybackAvailable(safeSourceStrip)
+        || !processor.isStripScenePlaybackAvailable(safeDestStrip))
+    {
+        return false;
+    }
+
+    processor.copySceneMotionStripState(getFocusedSceneSlot(), safeSourceStrip, safeDestStrip);
 
     auto events = sceneEditorState.events;
     std::vector<ScenePerformanceEvent> copiedEvents;
@@ -6748,6 +6823,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                                      automationExpanded,
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
         const auto stripColour = getStripColor(visibleStrip);
+        const bool scenePlaybackAvailable = layout.scenePlaybackAvailable;
 
         drawPanel(g, cardBounds.reduced(1.0f), stripColour, 8.0f);
         g.setColour(stripColour.withAlpha(0.9f));
@@ -6773,20 +6849,26 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                    juce::Justification::centredLeft);
 
         const bool stripHasEvents = (triggerCount + controlCount) > 0;
-        drawSceneHeaderActionChip(g, layout.stripWriteBounds, "Write", stripColour, true);
-        drawSceneHeaderActionChip(g, layout.stripWriteAllBounds, "All", stripColour, true);
+        drawSceneHeaderActionChip(g, layout.stripWriteBounds, "Write", stripColour, scenePlaybackAvailable);
+        drawSceneHeaderActionChip(g, layout.stripWriteAllBounds, "All", stripColour, scenePlaybackAvailable);
         drawSceneHeaderActionChip(g, layout.stripClearBounds, "Clr", stripColour, stripHasEvents);
         drawSceneHeaderActionChip(g,
                                   layout.stripDuplicateBounds,
                                   "Dup",
                                   stripColour,
-                                  stripHasEvents && visibleStrip < getVisibleSceneStripCount() - 1);
-        drawSceneHeaderActionChip(g, layout.stripCopyBounds, "Copy", stripColour, stripHasEvents);
+                                  scenePlaybackAvailable && stripHasEvents && visibleStrip < getVisibleSceneStripCount() - 1);
+        drawSceneHeaderActionChip(g,
+                                  layout.stripCopyBounds,
+                                  "Copy",
+                                  stripColour,
+                                  scenePlaybackAvailable && stripHasEvents);
 
         g.setColour(kTextSecondary);
         g.setFont(juce::Font(juce::FontOptions(9.5f)));
-        g.drawText(juce::String(triggerCount) + " trig  •  "
-                       + juce::String(controlCount) + " ctrl  •  " + sceneLengthLabel,
+        g.drawText(scenePlaybackAvailable
+                       ? (juce::String(triggerCount) + " trig  •  "
+                          + juce::String(controlCount) + " ctrl  •  " + sceneLengthLabel)
+                       : "Sample mode not available in scene playback",
                    layout.summaryBounds.toNearestInt(),
                    juce::Justification::centredRight);
 
@@ -6794,7 +6876,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
             ? layout.stepLaunchBounds
             : layout.triggerTimelineBounds;
         auto timelineUnion = layout.rulerTimelineBounds.getUnion(triggerTimeBounds);
-        if (automationExpanded)
+        if (layout.automationExpanded)
         {
             for (const auto& laneBounds : layout.automationTimelineBounds)
             {
@@ -7245,7 +7327,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                        false);
         }
 
-        if (triggerCount == 0)
+        if (scenePlaybackAvailable && triggerCount == 0)
         {
             g.setColour(kTextMuted.withAlpha(0.6f));
             g.setFont(juce::Font(juce::FontOptions(9.0f)));
@@ -7256,12 +7338,38 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                        juce::Justification::centred);
         }
 
+        if (!scenePlaybackAvailable)
+        {
+            g.setColour(kSurfaceDark.brighter(0.05f).withAlpha(0.94f));
+            g.fillRoundedRectangle(layout.triggerTimelineBounds.reduced(0.8f), 4.0f);
+            g.setColour(stripColour.withAlpha(0.28f));
+            g.drawRoundedRectangle(layout.triggerTimelineBounds.reduced(0.8f), 4.0f, 1.0f);
+            g.setColour(kTextPrimary.withAlpha(0.92f));
+            g.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+            g.drawText("Sample mode not available in scene playback",
+                       layout.triggerTimelineBounds.toNearestInt().reduced(12, 10),
+                       juce::Justification::centred,
+                       true);
+        }
+
         g.setColour(kTextMuted);
         g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
-        const auto automationTitle = automationExpanded ? "Automation lanes  [-]" : "Automation lanes  [+]";
+        const auto automationTitle = scenePlaybackAvailable
+            ? (automationExpanded ? "Automation lanes  [-]" : "Automation lanes  [+]")
+            : juce::String("Automation lanes unavailable");
         g.drawText(automationTitle, layout.automationToggleBounds.toNearestInt(), juce::Justification::centredLeft);
 
-        if (!automationExpanded)
+        if (!scenePlaybackAvailable)
+        {
+            g.setColour(kTextMuted.withAlpha(0.8f));
+            g.setFont(juce::Font(juce::FontOptions(9.0f)));
+            g.drawText(stripHasEvents
+                           ? "Existing scene events on this strip are ignored in scene mode"
+                           : "Switch the strip out of sample mode to use scene playback",
+                       layout.automationHeaderBounds.toNearestInt(),
+                       juce::Justification::centredRight);
+        }
+        else if (!automationExpanded)
         {
             if (controlCount == 0)
             {
@@ -7297,6 +7405,18 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                         ++laneEventCount;
                     }
                 }
+                const auto laneTarget = sceneAutomationLaneTarget(lane);
+                const bool laneOverrideActive = focusedSceneIsActive
+                    && processor.isActiveSceneAutomationOverridden(visibleStrip, laneTarget);
+                float liveBaseNormalized = sceneDefaultNormalizedValueForLane(lane);
+                const bool hasLiveBaseValue = focusedSceneIsActive
+                    && sceneCurrentBaseNormalizedValue(processor,
+                                                       visibleStrip,
+                                                       laneTarget,
+                                                       liveBaseNormalized);
+                if (hasLiveBaseValue)
+                    liveBaseNormalized = juce::jlimit(0.0f, 1.0f, liveBaseNormalized);
+                const bool showLiveHoldOverlay = hasLiveBaseValue && (laneEventCount == 0 || laneOverrideActive);
                 auto nameBounds = labelBounds;
                 if (hasTargetDropdown)
                     nameBounds = juce::Rectangle<float>(labelBounds.getX(),
@@ -7306,6 +7426,17 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                 g.setColour(kTextMuted);
                 g.setFont(juce::Font(juce::FontOptions(8.8f, juce::Font::bold)));
                 g.drawText(sceneAutomationLaneName(lane), nameBounds.toNearestInt(), juce::Justification::centredLeft);
+                if (laneOverrideActive)
+                {
+                    drawSceneHeaderActionChip(g,
+                                              juce::Rectangle<float>(laneBounds.getRight() - 50.0f,
+                                                                     laneBounds.getY() + 2.0f,
+                                                                     44.0f,
+                                                                     12.0f),
+                                              "Manual",
+                                              kAccent,
+                                              true);
+                }
 
                 g.setColour(kSurfaceDark.brighter(0.03f));
                 g.fillRoundedRectangle(laneBounds, 3.0f);
@@ -7399,7 +7530,9 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                         static_cast<int>(event.controlTarget)));
                     if (hasPrevious[targetIndex])
                     {
-                        g.setColour(sceneAutomationColour(event).withAlpha(0.4f));
+                        g.setColour(laneOverrideActive
+                                        ? kTextMuted.withAlpha(0.28f)
+                                        : sceneAutomationColour(event).withAlpha(0.4f));
                         g.drawLine(previousPoints[targetIndex].x,
                                    previousPoints[targetIndex].y,
                                    point.x,
@@ -7430,7 +7563,41 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                     drawSceneAutomationPoint(g,
                                              event,
                                              sceneControlMarkerBounds(layout, event, lengthBeats),
-                                             isSelected);
+                                             isSelected,
+                                             laneOverrideActive
+                                                 ? kTextMuted.withAlpha(isSelected ? 0.72f : 0.46f)
+                                                 : juce::Colour());
+                }
+
+                if (showLiveHoldOverlay)
+                {
+                    const auto startEvent = makeDefaultSceneControlEventForLane(visibleStrip,
+                                                                               lane,
+                                                                               0.0,
+                                                                               liveBaseNormalized);
+                    const auto endEvent = makeDefaultSceneControlEventForLane(visibleStrip,
+                                                                             lane,
+                                                                             sceneAutomationWriteEndBeat(lengthBeats),
+                                                                             liveBaseNormalized);
+                    const auto startMarker = sceneControlMarkerBounds(layout, startEvent, lengthBeats);
+                    const auto endMarker = sceneControlMarkerBounds(layout, endEvent, lengthBeats);
+                    const auto liveColour = laneOverrideActive
+                        ? kTextMuted.withAlpha(0.9f)
+                        : laneTint.withAlpha(0.82f);
+
+                    g.setColour(liveColour.withAlpha(laneOverrideActive ? 0.82f : 0.72f));
+                    g.drawLine(startMarker.getCentreX(),
+                               startMarker.getCentreY(),
+                               endMarker.getCentreX(),
+                               endMarker.getCentreY(),
+                               laneOverrideActive ? 1.8f : 1.35f);
+
+                    g.setColour(liveColour);
+                    g.fillEllipse(startMarker.reduced(1.6f));
+                    g.fillEllipse(endMarker.reduced(1.6f));
+                    g.setColour(juce::Colours::white.withAlpha(laneOverrideActive ? 0.72f : 0.48f));
+                    g.drawEllipse(startMarker.reduced(1.0f), 1.0f);
+                    g.drawEllipse(endMarker.reduced(1.0f), 1.0f);
                 }
 
                 if (sceneEditorState.transportProgress >= 0.0f)
@@ -7481,10 +7648,21 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                             probeEvent.controlTarget = target;
                             const auto targetColour = sceneAutomationColour(probeEvent);
                             const auto overlayColour = juce::Colour(0xffd9a04a);
+                            const bool targetOverrideActive = focusedSceneIsActive
+                                && processor.isActiveSceneAutomationOverridden(visibleStrip, target);
+                            const auto heldColour = targetOverrideActive
+                                ? kTextMuted.withAlpha(0.88f)
+                                : targetColour.withAlpha(0.92f);
+                            const auto connectorColour = targetOverrideActive
+                                ? kTextMuted.withAlpha(0.34f)
+                                : overlayColour.withAlpha(0.45f);
+                            const auto labelColour = targetOverrideActive
+                                ? kTextMuted.withAlpha(0.9f)
+                                : overlayColour.withAlpha(0.92f);
 
-                            g.setColour(overlayColour.withAlpha(0.45f));
+                            g.setColour(connectorColour);
                             g.drawLine(overlayX, heldY, overlayX, effectiveY, 1.1f);
-                            g.setColour(targetColour.withAlpha(0.92f));
+                            g.setColour(heldColour);
                             g.drawEllipse(overlayX - 3.2f, heldY - 3.2f, 6.4f, 6.4f, 1.15f);
                             g.setColour(overlayColour.withAlpha(0.96f));
                             g.fillEllipse(overlayX - 2.8f, effectiveY - 2.8f, 5.6f, 5.6f);
@@ -7495,7 +7673,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                                                                        laneBounds.getY() + 2.0f + (overlayIndex * 10.0f),
                                                                                        24.0f,
                                                                                        9.0f);
-                                g.setColour(overlayColour.withAlpha(0.92f));
+                                g.setColour(labelColour);
                                 g.setFont(juce::Font(juce::FontOptions(7.0f, juce::Font::bold)));
                                 g.drawText(sceneControlTargetShortName(target),
                                            overlayLabelBounds.toNearestInt(),
@@ -7506,7 +7684,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                     }
                 }
 
-                if (laneEventCount == 0)
+                if (laneEventCount == 0 && !showLiveHoldOverlay)
                 {
                     g.setColour(kTextMuted.withAlpha(0.42f));
                     g.setFont(juce::Font(juce::FontOptions(8.4f)));
@@ -7588,13 +7766,13 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
                                                      cardBounds,
                                                      stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
-        if (layout.stripWriteBounds.contains(e.position))
+        if (layout.scenePlaybackAvailable && layout.stripWriteBounds.contains(e.position))
         {
             writeCurrentStripAutomation(visibleStrip);
             return;
         }
 
-        if (layout.stripWriteAllBounds.contains(e.position))
+        if (layout.scenePlaybackAvailable && layout.stripWriteAllBounds.contains(e.position))
         {
             writeAllStripsAutomation();
             return;
@@ -7604,6 +7782,12 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
         {
             clearStripSceneEvents(visibleStrip);
             return;
+        }
+
+        if (!layout.scenePlaybackAvailable)
+        {
+            y += cardBounds.getHeight() + kSceneCardGap;
+            continue;
         }
 
         if (layout.stripDuplicateBounds.contains(e.position))
@@ -7618,6 +7802,8 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
             for (int targetStrip = 0; targetStrip < getVisibleSceneStripCount(); ++targetStrip)
             {
                 if (targetStrip == visibleStrip)
+                    continue;
+                if (!processor.isStripScenePlaybackAvailable(targetStrip))
                     continue;
                 menu.addItem(targetStrip + 1, "Copy to Strip " + juce::String(targetStrip + 1));
             }
@@ -7767,6 +7953,11 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
                                                          cardBounds,
                                                          stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                          stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+            if (!layout.scenePlaybackAvailable)
+            {
+                y += cardBounds.getHeight() + kSceneCardGap;
+                continue;
+            }
             if (!layout.automationExpanded)
             {
                 y += cardBounds.getHeight() + kSceneCardGap;
@@ -7836,6 +8027,11 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
                                                          cardBounds,
                                                          stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                          stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+            if (!layout.scenePlaybackAvailable)
+            {
+                y += cardBounds.getHeight() + kSceneCardGap;
+                continue;
+            }
 
             const auto triggerInteractionBounds = layout.stepTriggerLane && !layout.stepLaunchBounds.isEmpty()
                 ? layout.stepLaunchBounds
@@ -7895,6 +8091,11 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
                                                          cardBounds,
                                                          stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                          stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+            if (!layout.scenePlaybackAvailable)
+            {
+                y += cardBounds.getHeight() + kSceneCardGap;
+                continue;
+            }
 
             if (layout.automationExpanded)
             {
@@ -7956,6 +8157,11 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
                                                          cardBounds,
                                                          stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                          stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+            if (!layout.scenePlaybackAvailable)
+            {
+                y += cardBounds.getHeight() + kSceneCardGap;
+                continue;
+            }
             const auto triggerInteractionBounds = layout.stepTriggerLane && !layout.stepLaunchBounds.isEmpty()
                 ? layout.stepLaunchBounds
                 : layout.triggerTimelineBounds;
@@ -8044,6 +8250,11 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
                                                      cardBounds,
                                                      stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+        if (!layout.scenePlaybackAvailable)
+        {
+            y += cardBounds.getHeight() + kSceneCardGap;
+            continue;
+        }
 
         for (int eventIndex = static_cast<int>(sceneEditorState.events.size()) - 1; eventIndex >= 0; --eventIndex)
         {
@@ -8233,6 +8444,12 @@ void SceneControlPanel::handleSceneTimelineMouseDoubleClick(const juce::MouseEve
             return;
         }
 
+        if (!layout.scenePlaybackAvailable)
+        {
+            y += cardBounds.getHeight() + kSceneCardGap;
+            continue;
+        }
+
         for (int eventIndex = static_cast<int>(sceneEditorState.events.size()) - 1; eventIndex >= 0; --eventIndex)
         {
             const auto& event = sceneEditorState.events[static_cast<size_t>(eventIndex)];
@@ -8372,6 +8589,11 @@ void SceneControlPanel::handleSceneTimelineMouseDrag(const juce::MouseEvent& e)
                                                          cardBounds,
                                                          stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                          stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+            if (!layout.scenePlaybackAvailable)
+            {
+                y += cardBounds.getHeight() + kSceneCardGap;
+                continue;
+            }
             if (visibleStrip == paintStripIndex && layout.stepPatternBounds.contains(e.position))
             {
                 const int absoluteStep = sceneStepAbsoluteStepAtPosition(layout, e.position);
@@ -8451,6 +8673,11 @@ void SceneControlPanel::handleSceneTimelineMouseDrag(const juce::MouseEvent& e)
                                                          cardBounds,
                                                          stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                          stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+            if (!layout.scenePlaybackAvailable)
+            {
+                y += cardBounds.getHeight() + kSceneCardGap;
+                continue;
+            }
             const auto triggerInteractionBounds = layout.stepTriggerLane && !layout.stepLaunchBounds.isEmpty()
                 ? layout.stepLaunchBounds
                 : layout.triggerTimelineBounds;
@@ -8544,6 +8771,11 @@ void SceneControlPanel::handleSceneTimelineMouseDrag(const juce::MouseEvent& e)
                                                          cardBounds,
                                                          stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                          stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+            if (!layout.scenePlaybackAvailable)
+            {
+                y += cardBounds.getHeight() + kSceneCardGap;
+                continue;
+            }
             const auto triggerInteractionBounds = layout.stepTriggerLane && !layout.stepLaunchBounds.isEmpty()
                 ? layout.stepLaunchBounds
                 : layout.triggerTimelineBounds;
@@ -8639,6 +8871,11 @@ void SceneControlPanel::handleSceneTimelineMouseDrag(const juce::MouseEvent& e)
                                                      cardBounds,
                                                      stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+        if (!layout.scenePlaybackAvailable)
+        {
+            y += cardBounds.getHeight() + kSceneCardGap;
+            continue;
+        }
         if (visibleStrip == originalStrip)
             hoveredLayout = layout;
 
@@ -8953,6 +9190,7 @@ void SceneControlPanel::mouseUp(const juce::MouseEvent& e)
                 const int loopEnd = processor.getSceneChainLoopEndStep();
                 applySceneChainSteps(processor, chainSteps, loopEnabled, loopStart, loopEnd);
                 selectedSceneActionSlot = sourceSceneSlot;
+                processor.focusSceneSlot(sourceSceneSlot);
                 stateChanged = true;
             }
         }

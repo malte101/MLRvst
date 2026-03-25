@@ -3532,11 +3532,24 @@ bool SampleModeEngine::loadSampleFromBuffer(const juce::AudioBuffer<float>& buff
     if (sample == nullptr)
         return false;
 
+    return installLoadedSample(std::move(sample));
+}
+
+bool SampleModeEngine::installLoadedSample(std::shared_ptr<const LoadedSampleData> sample)
+{
+    if (sample == nullptr
+        || sample->audioBuffer.getNumSamples() <= 0
+        || !std::isfinite(sample->sourceSampleRate)
+        || sample->sourceSampleRate <= 1000.0)
+    {
+        return false;
+    }
+
     {
         const juce::ScopedLock lock(stateLock);
         resetSampleSpecificStateLocked();
         loadedSample = std::move(sample);
-        persistentState.samplePath = sourcePath;
+        persistentState.samplePath = loadedSample->sourcePath;
         invalidateTransientMarkerCachesLocked();
         rebuildSlicesLocked();
         [[maybe_unused]] const auto warmedCanonicalMarkers = buildCanonicalTransientMarkerSamplesLocked();

@@ -531,8 +531,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         switch (cellX)
         {
             case 4:
-                if (captureSceneSlot(activeScene))
-                    scenePadActionBurstUntilMs[static_cast<size_t>(activeScene)] = nowMs + sceneActionBurstDurationMs;
+                handleMonomeSceneRecorderButtonPress(nowMs);
                 break;
             case 5:
                 if (sceneCopySourceSlot == activeScene && sceneCopyMainPresetIndex == mainPresetIndex)
@@ -563,7 +562,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 }
                 break;
             case 7:
-                handleMonomeSceneRecorderButtonPress(nowMs);
+                if (captureSceneSlot(activeScene))
+                    scenePadActionBurstUntilMs[static_cast<size_t>(activeScene)] = nowMs + sceneActionBurstDurationMs;
                 break;
             default:
                 return false;
@@ -716,16 +716,20 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     {
                         const int firstSceneSlot = getSceneChainStepSceneSlot(0);
                         if (firstSceneSlot == previousSceneSlot
-                            && activeSceneStartPpqValid
-                            && std::isfinite(activeSceneStartPpq))
+                            && activeScenePlaybackHandle.active
+                            && std::isfinite(activeScenePlaybackHandle.startPpq))
                         {
                             sceneSequenceActive = true;
                             sceneSequenceCurrentStepIndex = 0;
-                            sceneSequenceStartPpqValid = true;
-                            sceneSequenceStartPpq = activeSceneStartPpq;
+                            setActiveScenePlaybackHandle(mainPresetIndex,
+                                                         previousSceneSlot,
+                                                         true,
+                                                         0,
+                                                         activeScenePlaybackHandle.startPpq,
+                                                         getResolvedSceneLengthBeats(previousSceneSlot));
                             armNextSceneInSequence(mainPresetIndex,
                                                    previousSceneSlot,
-                                                   activeSceneStartPpq);
+                                                   activeScenePlaybackHandle.startPpq);
                         }
                         else
                         {
@@ -1443,25 +1447,86 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                         MonomeMixActions::handleButtonPress(*this, *strip, stripIndex, x, static_cast<int>(currentControlMode));
                         recordMonomeControlPatternEvent(currentControlMode, stripIndex, -1, x);
                     };
+                    auto applySceneAwareMonomeControl = [this, stripIndex, x]
+                        (ScenePerformanceControlTarget target,
+                         ControlMode controlMode,
+                         int controlRow,
+                         float value,
+                         auto&& applyWrite)
+                    {
+                        float liveValue = 0.0f;
+                        const bool shouldSeedTransition = shouldSmoothLiveSceneControlTarget(target)
+                            && getSceneControlCurrentValue(stripIndex, target, liveValue);
+                        const bool shouldSuppressSceneHandling = isSceneModeEnabled();
+                        if (shouldSuppressSceneHandling)
+                            beginSceneManualControlHandlingSuppression();
+                        applyWrite(StripControlWriteMode::NotifyHost);
+                        if (shouldSuppressSceneHandling)
+                            endSceneManualControlHandlingSuppression();
+                        notifyDirectSceneControlChange(stripIndex,
+                                                       target,
+                                                       controlMode,
+                                                       controlRow,
+                                                       value,
+                                                       x);
+                        if (shouldSeedTransition)
+                        {
+                            seedSceneControlTransition(stripIndex,
+                                                       target,
+                                                       liveValue,
+                                                       value,
+                                                       getSceneAutomationTransitionSeconds(target));
+                        }
+                    };
 
                     switch (currentControlMode)
                     {
                         case ControlMode::Speed:
                         case ControlMode::Pitch:
-                        case ControlMode::Pan:
-                        case ControlMode::Volume:
                         case ControlMode::Swing:
                         case ControlMode::Gate:
                             handleSimpleMixControlPress();
                             break;
+
+                        case ControlMode::Pan:
+                        {
+                            float pan = (x - 8) / 8.0f;
+                            pan = juce::jlimit(-1.0f, 1.0f, pan);
+                            applySceneAwareMonomeControl(ScenePerformanceControlTarget::Pan,
+                                                         ControlMode::Pan,
+                                                         0,
+                                                         pan,
+                                                         [this, stripIndex, pan](StripControlWriteMode writeMode)
+                                                         {
+                                                             setStripPanControlValue(stripIndex, pan, writeMode);
+                                                         });
+                            break;
+                        }
+
+                        case ControlMode::Volume:
+                        {
+                            const float volume = juce::jlimit(0.0f, 1.0f, x / 15.0f);
+                            applySceneAwareMonomeControl(ScenePerformanceControlTarget::Volume,
+                                                         ControlMode::Volume,
+                                                         0,
+                                                         volume,
+                                                         [this, stripIndex, volume](StripControlWriteMode writeMode)
+                                                         {
+                                                             setStripVolumeControlValue(stripIndex, volume, writeMode);
+                                                         });
+                            break;
+                        }
 
                         case ControlMode::GrainSize:
                         {
                             const int targetStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
                             if (auto* targetStrip = audioEngine->getStrip(targetStripIndex))
                             {
-                                MonomeMixActions::handleGrainPageButtonPress(*targetStrip, stripIndex, x);
-                                queueActiveSceneAutosave();
+                                MonomeMixActions::handleGrainPageButtonPress(*this,
+                                                                            *targetStrip,
+                                                                            targetStripIndex,
+                                                                            stripIndex,
+                                                                            x);
                                 recordMonomeControlPatternEvent(currentControlMode, targetStripIndex, stripIndex, x);
                             }
                             break;
@@ -1471,20 +1536,46 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                             if (filterSubPage == FilterSubPage::Frequency)
                             {
                                 const float t = juce::jlimit(0.0f, 1.0f, x / 15.0f);
-                                setStripFilterFrequencyControlValue(stripIndex,
-                                                                    20.0f * std::pow(1000.0f, t));
+                                const float frequency = 20.0f * std::pow(1000.0f, t);
+                                applySceneAwareMonomeControl(ScenePerformanceControlTarget::FilterFrequency,
+                                                             ControlMode::Filter,
+                                                             0,
+                                                             frequency,
+                                                             [this, stripIndex, frequency](StripControlWriteMode writeMode)
+                                                             {
+                                                                 setStripFilterFrequencyControlValue(stripIndex,
+                                                                                                frequency,
+                                                                                                writeMode);
+                                                             });
                             }
                             else if (filterSubPage == FilterSubPage::Resonance)
                             {
-                                setStripFilterResonanceControlValue(stripIndex,
-                                                                    0.1f + (x / 15.0f) * 9.9f);
+                                const float resonance = 0.1f + (x / 15.0f) * 9.9f;
+                                applySceneAwareMonomeControl(ScenePerformanceControlTarget::FilterResonance,
+                                                             ControlMode::Filter,
+                                                             1,
+                                                             resonance,
+                                                             [this, stripIndex, resonance](StripControlWriteMode writeMode)
+                                                             {
+                                                                 setStripFilterResonanceControlValue(stripIndex,
+                                                                                                resonance,
+                                                                                                writeMode);
+                                                             });
                             }
                             else if (filterSubPage == FilterSubPage::Type && x <= 2)
                             {
                                 const float morph = (x == 0) ? 0.0f : (x == 1 ? 0.5f : 1.0f);
-                                setStripFilterMorphControlValue(stripIndex, morph);
+                                applySceneAwareMonomeControl(ScenePerformanceControlTarget::FilterMorph,
+                                                             ControlMode::Filter,
+                                                             2,
+                                                             morph,
+                                                             [this, stripIndex, morph](StripControlWriteMode writeMode)
+                                                             {
+                                                                 setStripFilterMorphControlValue(stripIndex,
+                                                                                            morph,
+                                                                                            writeMode);
+                                                             });
                             }
-                            recordMonomeControlPatternEvent(currentControlMode, stripIndex, static_cast<int>(filterSubPage), x);
                             break;
 
                         case ControlMode::Delay:
@@ -1586,7 +1677,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             scenePadLaunchConsumed[slotIdx] = false;
 
             if (shouldLaunchScene)
-                selectSceneSlotFromSurface(sceneSlot);
+                launchSceneSlotFromMonome(sceneSlot);
 
             updateMonomeLEDs();
             return;
@@ -1888,7 +1979,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             const bool copyArmed = sceneCopySourceSlot == sceneSlot
                 && sceneCopyMainPresetIndex == activeSceneMainPreset;
 
-            int level = exists ? 8 : 2;
+            int level = exists ? 5 : 2;
             if (active)
                 level = 11;
             if (inSequence)
@@ -1910,12 +2001,15 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             newLedState[sceneSlot][GROUP_ROW] = level;
         }
 
-        newLedState[4][GROUP_ROW] = sceneSlotExistsForMainPreset(activeSceneMainPreset, activeScene) ? 7 : 3;
-        newLedState[5][GROUP_ROW] = (sceneCopySourceSlot >= 0 && sceneCopyMainPresetIndex == activeSceneMainPreset)
-            ? (slowBlinkOn ? 15 : 6)
-            : 3;
-        newLedState[6][GROUP_ROW] = sceneSlotExistsForMainPreset(activeSceneMainPreset, activeScene) ? 5 : 1;
-        newLedState[7][GROUP_ROW] = getSceneRecorderLevel();
+        const bool activeSceneExists = sceneSlotExistsForMainPreset(activeSceneMainPreset, activeScene);
+        const bool copyArmedForMainPreset = sceneCopySourceSlot >= 0
+            && sceneCopyMainPresetIndex == activeSceneMainPreset;
+        newLedState[4][GROUP_ROW] = getSceneRecorderLevel();
+        newLedState[5][GROUP_ROW] = copyArmedForMainPreset
+            ? (slowBlinkOn ? 15 : 8)
+            : (activeSceneExists ? 6 : 3);
+        newLedState[6][GROUP_ROW] = activeSceneExists ? 3 : 1;
+        newLedState[7][GROUP_ROW] = activeSceneExists ? 9 : 2;
     };
 
     if (controlModeActive && currentControlMode == ControlMode::FileBrowser)

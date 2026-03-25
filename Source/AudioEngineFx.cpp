@@ -13,6 +13,14 @@
 namespace
 {
 
+double sanitizeSceneTransitionRampSecondsFx(double seconds) noexcept
+{
+    if (!std::isfinite(seconds) || seconds <= 0.0)
+        return 0.05;
+
+    return juce::jlimit(0.005, 0.25, seconds);
+}
+
 inline float safetyClip0dB(float sample)
 {
     return juce::jlimit(-1.0f, 1.0f, sample);
@@ -374,11 +382,39 @@ void EnhancedAudioStrip::setFilterFrequency(float freq)
         setFilterEnabled(true);
 }
 
+void EnhancedAudioStrip::seedFilterFrequencyTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(20.0f, 20000.0f, fromValue);
+    const float target = juce::jlimit(20.0f, 20000.0f, toValue);
+    smoothedFilterFrequency.reset(currentSampleRate, sanitizeSceneTransitionRampSecondsFx(rampSeconds));
+    filterFrequency.store(start, std::memory_order_release);
+    displayedFilterFrequency.store(start, std::memory_order_release);
+    smoothedFilterFrequency.setCurrentAndTargetValue(start);
+    filterFrequency.store(target, std::memory_order_release);
+    smoothedFilterFrequency.setTargetValue(target);
+    if (!isFilterEnabled())
+        setFilterEnabled(true);
+}
+
 void EnhancedAudioStrip::setFilterResonance(float res)
 {
     const float clamped = juce::jlimit(0.1f, 10.0f, res);
     filterResonance.store(clamped, std::memory_order_release);
     smoothedFilterResonance.setTargetValue(clamped);
+    if (!isFilterEnabled())
+        setFilterEnabled(true);
+}
+
+void EnhancedAudioStrip::seedFilterResonanceTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(0.1f, 10.0f, fromValue);
+    const float target = juce::jlimit(0.1f, 10.0f, toValue);
+    smoothedFilterResonance.reset(currentSampleRate, sanitizeSceneTransitionRampSecondsFx(rampSeconds));
+    filterResonance.store(start, std::memory_order_release);
+    displayedFilterResonance.store(start, std::memory_order_release);
+    smoothedFilterResonance.setCurrentAndTargetValue(start);
+    filterResonance.store(target, std::memory_order_release);
+    smoothedFilterResonance.setTargetValue(target);
     if (!isFilterEnabled())
         setFilterEnabled(true);
 }
@@ -391,6 +427,24 @@ void EnhancedAudioStrip::setFilterMorph(float morph)
 
     if (clamped < 0.3333f) filterType = FilterType::LowPass;
     else if (clamped < 0.6666f) filterType = FilterType::BandPass;
+    else filterType = FilterType::HighPass;
+
+    if (!isFilterEnabled())
+        setFilterEnabled(true);
+}
+
+void EnhancedAudioStrip::seedFilterMorphTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(0.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 1.0f, toValue);
+    smoothedFilterMorph.reset(currentSampleRate, sanitizeSceneTransitionRampSecondsFx(rampSeconds));
+    filterMorph.store(start, std::memory_order_release);
+    smoothedFilterMorph.setCurrentAndTargetValue(start);
+    filterMorph.store(target, std::memory_order_release);
+    smoothedFilterMorph.setTargetValue(target);
+
+    if (target < 0.3333f) filterType = FilterType::LowPass;
+    else if (target < 0.6666f) filterType = FilterType::BandPass;
     else filterType = FilterType::HighPass;
 
     if (!isFilterEnabled())

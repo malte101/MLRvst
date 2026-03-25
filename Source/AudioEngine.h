@@ -536,7 +536,19 @@ public:
                         const juce::AudioPlayHead::PositionInfo& positionInfo,
                         bool stutterRetrigger = false,
                         double stutterOffsetRatioOverride = -1.0);  // Sample-accurate trigger with PPQ sync
+    static constexpr int kTriggerOutputBlendTailMaxSamples = 64;
+    struct ContinuityBlendState
+    {
+        bool valid = false;
+        float lastSampleL = 0.0f;
+        float lastSampleR = 0.0f;
+        std::array<float, kTriggerOutputBlendTailMaxSamples> tailL{};
+        std::array<float, kTriggerOutputBlendTailMaxSamples> tailR{};
+        int tailLength = 0;
+    };
+
     void stop(bool immediate = false);
+    void stopForSceneRecallWithOutputFade(const ContinuityBlendState* continuityState = nullptr);
     void syncToGlobalPhase(double globalPhase, double tempo);  // NEW: Sync playback to global clock
     void calculatePositionFromGlobalSample(int64_t globalSample, double tempo);  // Calculate from global clock
     void setLoop(int startColumn, int endColumn);
@@ -549,7 +561,11 @@ public:
                                double tempo,
                                double currentTimelineBeat,
                                int64_t currentGlobalSample,
-                               bool shouldBlendPitchPath = true);
+                               bool shouldBlendPitchPath = true,
+                               bool shouldApplyRecallOutputBlend = false,
+                               bool shouldApplyRecallEdgeFade = false,
+                               const ContinuityBlendState* continuityState = nullptr);
+    ContinuityBlendState captureContinuityBlendState() const;
     
     // Step sequencer control
     void startStepSequencer();  // Start step sequencer playback (auto-runs with clock)
@@ -601,10 +617,12 @@ public:
     // Parameters
     void setVolume(float vol);
     float getVolume() const { return volume.load(); }
+    void seedVolumeTransition(float fromValue, float toValue, double rampSeconds);
     void setTrimDb(float trimAmountDb);
     float getTrimDb() const { return trimDb.load(std::memory_order_acquire); }
     void setPan(float panValue); // -1.0 (left) to 1.0 (right)
     float getPan() const { return pan.load(); }
+    void seedPanTransition(float fromValue, float toValue, double rampSeconds);
     void setPlayheadSpeedRatio(float ratio)
     {
         const float clamped = juce::jlimit(0.125f, 8.0f, ratio);
@@ -638,6 +656,7 @@ public:
     }
     void setPlaybackSpeed(float speed);
     void setPlaybackSpeedImmediate(float speed);
+    void seedPlaybackSpeedTransition(float fromValue, float toValue, double rampSeconds);
     void setMomentaryStutterTimingActive(bool active)
     {
         momentaryStutterTimingActive.store(active ? 1 : 0, std::memory_order_release);
@@ -669,6 +688,7 @@ public:
     };
     void setPitchShift(float semitones);
     float getPitchShift() const { return pitchShiftSemitones.load(); }
+    void seedPitchShiftTransition(float fromValue, float toValue, double rampSeconds);
     void setPitchShiftAlgorithm(PitchShiftAlgorithm algorithm);
     void setSignalsmithLiveMode(bool enabled);
     bool isSignalsmithLiveMode() const
@@ -781,20 +801,33 @@ public:
     std::array<float, 8> getGrainPreviewPositions() const;
     std::array<float, 8> getGrainPreviewPitchNorms() const;
     void setGrainSizeMs(float value);
+    void seedGrainSizeTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainSizeModulatedMs(float value);
     void clearGrainSizeModulation();
     void setGrainDensity(float value);
+    void seedGrainDensityTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainPitch(float semitones);
+    void seedGrainPitchTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainPitchJitter(float semitones);
+    void seedGrainPitchJitterTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainSpread(float value);
+    void seedGrainSpreadTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainJitter(float value);
+    void seedGrainJitterTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainPositionJitter(float value);
+    void seedGrainPositionJitterTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainRandomDepth(float value);
+    void seedGrainRandomDepthTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainArpDepth(float value);
+    void seedGrainArpDepthTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainCloudDepth(float value);
+    void seedGrainCloudDepthTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainEmitterDepth(float value);
+    void seedGrainEmitterDepthTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainEnvelope(float value);
+    void seedGrainEnvelopeTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainShape(float value);
+    void seedGrainShapeTransition(float fromValue, float toValue, double rampSeconds);
     void setGrainArpMode(int mode);
     void setGrainTempoSyncEnabled(bool enabled);
     void setGrainResamplerQuality(Resampler::Quality quality) { grainResampler.setQuality(quality); }
@@ -818,11 +851,14 @@ public:
     void setFilterFrequency(float freq);
     float getFilterFrequency() const { return filterFrequency.load(); }
     float getDisplayedFilterFrequency() const { return displayedFilterFrequency.load(std::memory_order_acquire); }
+    void seedFilterFrequencyTransition(float fromValue, float toValue, double rampSeconds);
     void setFilterResonance(float res);
     float getFilterResonance() const { return filterResonance.load(); }
     float getDisplayedFilterResonance() const { return displayedFilterResonance.load(std::memory_order_acquire); }
+    void seedFilterResonanceTransition(float fromValue, float toValue, double rampSeconds);
     void setFilterMorph(float morph);
     float getFilterMorph() const { return filterMorph.load(std::memory_order_acquire); }
+    void seedFilterMorphTransition(float fromValue, float toValue, double rampSeconds);
     void setFilterType(FilterType type);
     FilterType getFilterType() const { return filterType; }
     void setFilterAlgorithm(FilterAlgorithm algorithm);
@@ -849,20 +885,25 @@ public:
     void setDelayMix(float mix) { delayMix.store(juce::jlimit(0.0f, 1.0f, mix), std::memory_order_release); }
     float getDelayMix() const { return delayMix.load(std::memory_order_acquire); }
     float getDisplayedDelayMix() const { return displayedDelayMix.load(std::memory_order_acquire); }
+    void seedDelayMixTransition(float fromValue, float toValue, double rampSeconds);
     void setDelayTimeBeats(float beats) { delayTimeBeats.store(juce::jlimit(0.25f, 4.0f, beats), std::memory_order_release); }
     float getDelayTimeBeats() const { return delayTimeBeats.load(std::memory_order_acquire); }
     float getDisplayedDelayTimeBeats() const { return displayedDelayTimeBeats.load(std::memory_order_acquire); }
+    void seedDelayTimeTransition(float fromValue, float toValue, double rampSeconds);
     void setDelaySyncEnabled(bool enabled) { delaySyncEnabled.store(enabled ? 1 : 0, std::memory_order_release); }
     bool isDelaySyncEnabled() const { return delaySyncEnabled.load(std::memory_order_acquire) != 0; }
     void setDelayFeedback(float feedback) { delayFeedback.store(juce::jlimit(0.0f, 0.97f, feedback), std::memory_order_release); }
     float getDelayFeedback() const { return delayFeedback.load(std::memory_order_acquire); }
     float getDisplayedDelayFeedback() const { return displayedDelayFeedback.load(std::memory_order_acquire); }
+    void seedDelayFeedbackTransition(float fromValue, float toValue, double rampSeconds);
     void setDelayLowCutHz(float hz) { delayLowCutHz.store(juce::jlimit(20.0f, 12000.0f, hz), std::memory_order_release); }
     float getDelayLowCutHz() const { return delayLowCutHz.load(std::memory_order_acquire); }
     float getDisplayedDelayLowCutHz() const { return displayedDelayLowCutHz.load(std::memory_order_acquire); }
+    void seedDelayLowCutTransition(float fromValue, float toValue, double rampSeconds);
     void setDelayHighCutHz(float hz) { delayHighCutHz.store(juce::jlimit(200.0f, 20000.0f, hz), std::memory_order_release); }
     float getDelayHighCutHz() const { return delayHighCutHz.load(std::memory_order_acquire); }
     float getDisplayedDelayHighCutHz() const { return displayedDelayHighCutHz.load(std::memory_order_acquire); }
+    void seedDelayHighCutTransition(float fromValue, float toValue, double rampSeconds);
     void setDelayMode(DelayMode mode)
     {
         delayMode.store(juce::jlimit(0, 2, static_cast<int>(mode)), std::memory_order_release);
@@ -960,11 +1001,9 @@ public:
 
             // Short output blend from previous sample to prevent mode-switch crackle.
             const float modeFadeMs = juce::jlimit(0.2f, 8.0f, triggerFadeInMs.load(std::memory_order_acquire));
-            triggerOutputBlendTotalSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * modeFadeMs));
-            triggerOutputBlendSamplesRemaining = triggerOutputBlendTotalSamples;
-            triggerOutputBlendStartL = lastOutputSampleL;
-            triggerOutputBlendStartR = lastOutputSampleR;
-            triggerOutputBlendActive = true;
+            armTriggerOutputBlendLocked(
+                juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * modeFadeMs)),
+                false);
             playing = true;
         }
         else if (mode == PlayMode::Sample)
@@ -1233,6 +1272,15 @@ private:
     juce::SmoothedValue<float> grainDensitySmoother{0.05f};
     juce::SmoothedValue<float> grainPitchSmoother{0.0f};
     juce::SmoothedValue<float> grainPitchJitterSmoother{0.0f};
+    juce::SmoothedValue<float> grainSpreadSmoother{0.0f};
+    juce::SmoothedValue<float> grainJitterSmoother{0.0f};
+    juce::SmoothedValue<float> grainPositionJitterSmoother{0.0f};
+    juce::SmoothedValue<float> grainRandomDepthSmoother{0.0f};
+    juce::SmoothedValue<float> grainArpDepthSmoother{0.0f};
+    juce::SmoothedValue<float> grainCloudDepthSmoother{0.0f};
+    juce::SmoothedValue<float> grainEmitterDepthSmoother{0.0f};
+    juce::SmoothedValue<float> grainEnvelopeSmoother{0.0f};
+    juce::SmoothedValue<float> grainShapeSmoother{0.0f};
     juce::SmoothedValue<float> grainFreezeBlendSmoother{0.0f};
     juce::SmoothedValue<float> grainScratchSceneMix{0.0f};
     double grainBloomPhase = 0.0;
@@ -1357,11 +1405,90 @@ private:
     int retriggerBlendSamplesRemaining = 0;
     int retriggerBlendTotalSamples = 0;
     double retriggerBlendOldPosition = 0.0;
-    bool triggerOutputBlendActive = false;
-    int triggerOutputBlendSamplesRemaining = 0;
-    int triggerOutputBlendTotalSamples = 0;
-    float triggerOutputBlendStartL = 0.0f;
-    float triggerOutputBlendStartR = 0.0f;
+    struct SampleFader
+    {
+        enum class FadeType
+        {
+            FadeOut,
+            Crossfade
+        };
+
+        bool isActive() const noexcept
+        {
+            return remainingSamples > 0 && totalSamples > 0;
+        }
+
+        void reset()
+        {
+            startL = 0.0f;
+            startR = 0.0f;
+            tailLength = 0;
+            totalSamples = 0;
+            remainingSamples = 0;
+            tailL.fill(0.0f);
+            tailR.fill(0.0f);
+        }
+
+        void trigger(int numSamplesToFade)
+        {
+            totalSamples = juce::jmax(0, numSamplesToFade);
+            remainingSamples = totalSamples;
+        }
+
+        bool apply(float& leftSample, float& rightSample, FadeType fadeType)
+        {
+            if (!isActive())
+                return false;
+
+            const int completedSamples = juce::jmax(0, totalSamples - remainingSamples);
+            const float progress = totalSamples > 1
+                ? static_cast<float>(completedSamples) / static_cast<float>(totalSamples - 1)
+                : 1.0f;
+            const float t = juce::jlimit(0.0f, 1.0f, progress);
+            float fromL = startL;
+            float fromR = startR;
+
+            if (tailLength > 0)
+            {
+                const int sourceIndex = tailLength > 1 && totalSamples > 1
+                    ? juce::jlimit(0,
+                                   tailLength - 1,
+                                   static_cast<int>(std::llround(
+                                       (static_cast<double>(completedSamples)
+                                        * static_cast<double>(tailLength - 1))
+                                       / static_cast<double>(totalSamples - 1))))
+                    : juce::jmax(0, tailLength - 1);
+                fromL = tailL[static_cast<size_t>(sourceIndex)];
+                fromR = tailR[static_cast<size_t>(sourceIndex)];
+            }
+
+            if (fadeType == FadeType::FadeOut)
+            {
+                leftSample += fromL * (1.0f - t);
+                rightSample += fromR * (1.0f - t);
+            }
+            else
+            {
+                leftSample = (fromL * (1.0f - t)) + (leftSample * t);
+                rightSample = (fromR * (1.0f - t)) + (rightSample * t);
+            }
+
+            --remainingSamples;
+            if (remainingSamples <= 0)
+                reset();
+            return true;
+        }
+
+        float startL = 0.0f;
+        float startR = 0.0f;
+        std::array<float, kTriggerOutputBlendTailMaxSamples> tailL{};
+        std::array<float, kTriggerOutputBlendTailMaxSamples> tailR{};
+        int tailLength = 0;
+        int totalSamples = 0;
+        int remainingSamples = 0;
+    };
+    SampleFader triggerOutputSampleFader;
+    SampleFader stoppedOutputSampleFader;
     bool pitchCacheOutputBlendActive = false;
     int pitchCacheOutputBlendSamplesRemaining = 0;
     int pitchCacheOutputBlendTotalSamples = 0;
@@ -1369,6 +1496,10 @@ private:
     float pitchCacheOutputBlendStartR = 0.0f;
     float lastOutputSampleL = 0.0f;
     float lastOutputSampleR = 0.0f;
+    std::array<float, kTriggerOutputBlendTailMaxSamples> recentOutputTailL{};
+    std::array<float, kTriggerOutputBlendTailMaxSamples> recentOutputTailR{};
+    int recentOutputTailLength = 0;
+    int recentOutputTailWritePos = 0;
     int64_t playheadSample = 0;      // Samples since trigger (playhead position)
     
     // Key-press smoothing / scratching (clock-locked approach)
@@ -1537,6 +1668,7 @@ public:
     }
     
     DirectionMode getDirectionMode() const { return directionMode; }
+    bool isReverse() const { return reverse; }
     
     Crossfader crossfader;
     StepSampler stepSampler;  // Monophonic sampler for step sequencer
@@ -1597,6 +1729,21 @@ public:
     void reverseScratchToTimeline(int64_t currentGlobalSample);
     void resetPitchShifter();
     void invalidatePitchShiftCaches();
+    void clearRecentOutputTailLocked();
+    void rememberRenderedOutputSampleLocked(float left, float right);
+    void captureRenderedOutputTailFromBufferLocked(const juce::AudioBuffer<float>& buffer,
+                                                   int startSample,
+                                                   int numSamples);
+    void armSampleFaderFromRecentTailLocked(SampleFader& fader,
+                                            int fadeSamples,
+                                            bool useRecentTail,
+                                            const ContinuityBlendState* continuityState = nullptr);
+    void armTriggerOutputBlendLocked(int fadeSamples,
+                                     bool useRecentTail,
+                                     const ContinuityBlendState* continuityState = nullptr);
+    void armTriggerOutputBlendFromSilenceLocked(int fadeSamples);
+    void applyTriggerOutputBlendToSampleLocked(float& leftSample, float& rightSample);
+    bool renderStoppedOutputFadeSampleLocked(float& leftSample, float& rightSample);
     void startPitchCacheOutputBlendLocked();
     bool getPitchCacheSourceLocked(const juce::AudioBuffer<float>*& outSourceBuffer,
                                    double& outSourceSampleRate,

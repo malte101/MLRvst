@@ -1425,22 +1425,8 @@ private:
     static constexpr int SceneEditorVisibleStrips = ModernAudioEngine::MaxStrips;
     static constexpr int SceneAutomationLaneCount = 26;
 
-    class SceneComboLookAndFeel : public juce::LookAndFeel_V4
-    {
-    public:
-        juce::Font getComboBoxFont(juce::ComboBox&) override
-        {
-            return juce::Font(juce::FontOptions(12.0f, juce::Font::bold));
-        }
-
-        juce::Font getPopupMenuFont() override
-        {
-            return juce::Font(juce::FontOptions(14.5f, juce::Font::bold));
-        }
-    };
-
     MlrVSTAudioProcessor& processor;
-    SceneComboLookAndFeel sceneComboLookAndFeel;
+    juce::LookAndFeel_V4 sceneComboLookAndFeel;
 
     struct SceneEditorState
     {
@@ -1536,6 +1522,7 @@ private:
     juce::ComboBox sceneGridDivisionBox;
     juce::ComboBox sceneZoomBox;
     juce::TextButton sceneFollowButton;
+    juce::TextButton sceneReenableAutomationButton;
     juce::TextButton sceneLaneOverlayButton;
     juce::TextButton sceneMotionEditButton;
     juce::TextButton sceneDuplicateButton;

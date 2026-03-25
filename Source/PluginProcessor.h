@@ -232,6 +232,7 @@ public:
     bool loadSampleToSampleModeStrip(int stripIndex, const juce::File& file);
     SampleModeEngine* getSampleModeEngine(int stripIndex, bool createIfMissing = true);
     bool hasSampleModeAudio(int stripIndex) const;
+    bool isStripScenePlaybackAvailable(int stripIndex) const;
     void loadAdjacentFile(int stripIndex, int direction);  // Browse files
     void captureRecentAudioToStrip(int stripIndex);
     void clearRecentAudioBuffer();
@@ -569,7 +570,7 @@ public:
     static constexpr float MinSceneTransitionLengthBeats = 0.25f;
     static constexpr float MaxSceneTransitionLengthBeats = 8.0f;
     static constexpr float DefaultSceneTransitionLengthBeats = 1.0f;
-    static constexpr float DefaultSceneTransitionIntensity = 0.72f;
+    static constexpr float DefaultSceneTransitionIntensity = 1.0f;
     static constexpr float DefaultSceneTransitionDelayAmount = 0.48f;
     static constexpr float DefaultSceneTransitionFilterAmount = 0.42f;
     static constexpr float DefaultSceneTransitionChopAmount = 0.18f;
@@ -636,6 +637,238 @@ public:
         int loopEnd = 0;
     };
 
+    struct ScenePlaybackHandle
+    {
+        bool active = false;
+        bool sequenceDriven = false;
+        int mainPresetIndex = 0;
+        int sceneSlot = 0;
+        int sequenceStepIndex = -1;
+        double startPpq = 0.0;
+        double resolvedLengthBeats = 4.0;
+    };
+
+    enum class SceneStripLaunchTransitionKind
+    {
+        Idle = 0,
+        Continue,
+        Restart,
+        NewStart,
+        Stop
+    };
+
+    struct SceneStripPlaybackHandle
+    {
+        void reset() noexcept
+        {
+            *this = {};
+            stripIndex = -1;
+            playbackColumn = 0;
+            loopEnd = ModernAudioEngine::MaxColumns;
+            recordingBars = 2;
+            playheadSpeedRatio = 1.0f;
+        }
+
+        bool valid = false;
+        bool present = false;
+        bool playing = false;
+        bool sequenceDriven = false;
+        int mainPresetIndex = 0;
+        int sceneSlot = 0;
+        int stripIndex = -1;
+        int sequenceStepIndex = -1;
+        EnhancedAudioStrip::PlayMode playMode = EnhancedAudioStrip::PlayMode::Loop;
+        int loopStart = 0;
+        int loopEnd = ModernAudioEngine::MaxColumns;
+        int recordingBars = 2;
+        float beatsPerLoop = -1.0f;
+        float playheadSpeedRatio = 1.0f;
+        EnhancedAudioStrip::DirectionMode directionMode = EnhancedAudioStrip::DirectionMode::Normal;
+        bool reverse = false;
+        bool ppqTimelineAnchored = false;
+        double ppqTimelineOffsetBeats = 0.0;
+        int playbackColumn = 0;
+        juce::File sampleFile;
+        uint64_t audioSourceSignature = 0;
+        EnhancedAudioStrip::ContinuityBlendState continuityBlendState;
+        uint64_t revision = 0;
+    };
+
+    struct SceneStripLaunchHandle
+    {
+        void reset() noexcept
+        {
+            active = false;
+            current.reset();
+            lastTransition = SceneStripLaunchTransitionKind::Idle;
+            lastTransitionContinuityPreserved = false;
+            lastTransitionContinuityBroken = false;
+            lastTransitionBlendPitchPath = false;
+            lastTransitionApplyOutputBlend = false;
+            lastTransitionApplyEdgeFade = false;
+        }
+
+        bool active = false;
+        SceneStripPlaybackHandle current;
+        SceneStripLaunchTransitionKind lastTransition = SceneStripLaunchTransitionKind::Idle;
+        bool lastTransitionContinuityPreserved = false;
+        bool lastTransitionContinuityBroken = false;
+        bool lastTransitionBlendPitchPath = false;
+        bool lastTransitionApplyOutputBlend = false;
+        bool lastTransitionApplyEdgeFade = false;
+    };
+
+    enum class ScenePlaybackOwner
+    {
+        Manual = 0,
+        Chain
+    };
+    using SceneLaunchOwner = ScenePlaybackOwner;
+
+    struct SceneLaunchQuantisation
+    {
+        ScenePlaybackOwner owner = ScenePlaybackOwner::Manual;
+        ScenePlaybackOwner outgoingOwner = ScenePlaybackOwner::Manual;
+        SceneRecallMode recallMode = SceneRecallMode::QuantizeGrid;
+        bool sequenceDriven = false;
+        bool surfaceQuantizedLaunch = false;
+        bool useSceneDurationTiming = false;
+        bool targetResolved = false;
+        bool targetWithinCurrentBlock = false;
+        bool exactBlockBoundary = false;
+        bool splitSwitchInBlock = false;
+        bool legatoOwnerSwitch = false;
+        int mainPresetIndex = 0;
+        int sceneSlot = 0;
+        int sequenceStepIndex = -1;
+        double currentPpq = std::numeric_limits<double>::quiet_NaN();
+        double currentTempo = std::numeric_limits<double>::quiet_NaN();
+        double blockEndPpq = std::numeric_limits<double>::quiet_NaN();
+        double intervalBeats = 4.0;
+        double targetPpq = std::numeric_limits<double>::quiet_NaN();
+        int64_t blockStartSample = -1;
+        int64_t targetGlobalSample = -1;
+        int blockNumSamples = 0;
+        int targetSampleOffsetInBlock = -1;
+        int boundaryCaptureSampleOffsetInBlock = -1;
+    };
+
+    struct SceneSwitchRange
+    {
+        bool playing = false;
+        int startOffsetInBlock = 0;
+        int numSamples = 0;
+        double playStartPpq = std::numeric_limits<double>::quiet_NaN();
+    };
+
+    struct SceneSwitchSplitStatus
+    {
+        bool isSplit = false;
+        SceneSwitchRange range1;
+        SceneSwitchRange range2;
+    };
+
+    struct SceneSwitchEvent
+    {
+        bool active = false;
+        ScenePlaybackOwner owner = ScenePlaybackOwner::Manual;
+        ScenePlaybackOwner outgoingOwner = ScenePlaybackOwner::Manual;
+        bool sequenceDriven = false;
+        bool ownerOnlySwitch = false;
+        bool exactBlockBoundary = false;
+        bool splitSwitchInBlock = false;
+        bool legatoOwnerSwitch = false;
+        int mainPresetIndex = 0;
+        int sceneSlot = 0;
+        int sequenceStepIndex = -1;
+        double targetPpq = std::numeric_limits<double>::quiet_NaN();
+        double targetTempo = std::numeric_limits<double>::quiet_NaN();
+        int64_t targetGlobalSample = -1;
+        int64_t blockStartSample = -1;
+        int blockNumSamples = 0;
+        int targetSampleOffsetInBlock = -1;
+        int boundaryCaptureSampleOffsetInBlock = -1;
+        uint64_t serial = 0;
+        SceneSwitchSplitStatus splitStatus;
+    };
+
+    struct SceneInfo
+    {
+        int mainPresetIndex = 0;
+        int sceneSlot = 0;
+        juce::String name;
+        uint32_t colourArgb = 0xff5d7488;
+    };
+
+    struct SceneClipSlotState
+    {
+        int mainPresetIndex = 0;
+        int sceneSlot = 0;
+        bool hasStoredContent = false;
+        bool hasMotionState = false;
+        bool hasPerformanceClip = false;
+        bool hasLiveStripControlState = false;
+        bool liveStripControlDirty = false;
+        int repeatCount = 1;
+        SceneLengthMode lengthMode = SceneLengthMode::ManualBars;
+        int lengthCount = 4;
+        int anchorStrip = 0;
+        bool inChain = false;
+        int chainStepIndex = -1;
+    };
+
+    struct PreparedSceneSwitchPayload;
+
+    struct SceneSlotState
+    {
+        int mainPresetIndex = 0;
+        int sceneSlot = 0;
+        bool hasStoredContent = false;
+        juce::String name;
+        std::unique_ptr<PreparedSceneSwitchPayload> preparedSwitchPayloadTemplate;
+    };
+
+    struct SceneRuntimeSlotState
+    {
+        SceneInfo scene;
+        SceneClipSlotState clipSlot;
+        bool focused = false;
+        bool active = false;
+        bool queued = false;
+        bool chainCurrent = false;
+    };
+
+    struct SceneSlotDefinition
+    {
+        int mainPresetIndex = 0;
+        int sceneSlot = 0;
+        juce::String name;
+        uint32_t colourArgb = 0xff5d7488;
+        bool hasStoredContent = false;
+        int repeatCount = 1;
+        SceneLengthMode lengthMode = SceneLengthMode::ManualBars;
+        int lengthCount = 4;
+        int anchorStrip = 0;
+        bool inChain = false;
+        int chainStepIndex = -1;
+    };
+
+    struct SceneWatcherState
+    {
+        std::array<SceneRuntimeSlotState, SceneSlots> slots{};
+        int focusedSceneSlot = 0;
+        int activeMainPresetIndex = 0;
+        int activeSceneSlot = 0;
+        int queuedMainPresetIndex = -1;
+        int queuedSceneSlot = -1;
+        bool hasQueuedScene = false;
+        bool chainActive = false;
+        int chainStepIndex = -1;
+        ScenePlaybackOwner playbackOwner = ScenePlaybackOwner::Manual;
+        bool manualPlaybackOwned = true;
+        bool chainPlaybackOwned = false;
+    };
+
     int getSceneRepeatCount(int sceneSlot) const;
     void setSceneRepeatCount(int sceneSlot, int repeats);
     SceneLengthMode getSceneLengthMode(int sceneSlot) const;
@@ -651,6 +884,14 @@ public:
     double getResolvedSceneLengthBeats(int sceneSlot) const;
     double getSceneAdvanceLengthBeats(int sceneSlot) const;
     bool persistSceneTimingForSlot(int sceneSlot);
+    void focusSceneSlot(int sceneSlot);
+    int getFocusedSceneSlot() const;
+    SceneInfo getSceneInfo(int sceneSlot, int mainPresetIndex = -1) const;
+    SceneClipSlotState getSceneClipSlotState(int sceneSlot, int mainPresetIndex = -1) const;
+    SceneSlotDefinition getSceneSlotDefinition(int sceneSlot, int mainPresetIndex = -1) const;
+    SceneWatcherState getSceneWatcherState() const;
+    void launchSceneSlotFromSurface(int sceneSlot);
+    void launchSceneSlotFromMonome(int sceneSlot);
     void selectSceneSlotFromSurface(int sceneSlot);
     int getSceneSequenceStepIndex(int sceneSlot) const;
     int getQueuedSceneSlot() const;
@@ -705,6 +946,21 @@ public:
     double getScenePerformanceRecordingProgress(double currentBeat) const;
     std::vector<ScenePerformanceEvent> getScenePerformanceEventsSnapshot(int sceneSlot) const;
     bool replaceScenePerformanceClipEvents(int sceneSlot, const std::vector<ScenePerformanceEvent>& events);
+    bool getSceneControlBaseNormalizedValue(int stripIndex,
+                                            ScenePerformanceControlTarget target,
+                                            float& normalizedOut) const;
+    bool getSceneControlCurrentValue(int stripIndex,
+                                     ScenePerformanceControlTarget target,
+                                     float& valueOut) const;
+    bool isActiveSceneAutomationOverridden(int stripIndex, ScenePerformanceControlTarget target) const;
+    bool hasAnyActiveSceneAutomationOverrides() const;
+    void reenableActiveSceneAutomation();
+    void notifyDirectSceneControlChange(int stripIndex,
+                                        ScenePerformanceControlTarget target,
+                                        ControlMode controlMode,
+                                        int controlRow,
+                                        float value,
+                                        int columnHint = -1);
     bool copySceneSlotToClipboard(int sceneSlot);
     bool pasteSceneSlotFromClipboard(int sceneSlot);
     bool hasSceneSlotClipboard() const;
@@ -737,6 +993,7 @@ public:
     ModernAudioEngine::ModTarget getSceneMotionTargetForSlot(int stripIndex, int laneSlot) const;
     void setSceneMotionTargetForSlot(int stripIndex, int laneSlot, ModernAudioEngine::ModTarget target);
     void clearSceneMotionStripState(int sceneSlot, int stripIndex);
+    void copySceneMotionStripState(int sceneSlot, int sourceStripIndex, int destStripIndex);
     void cycleSceneModLaneTarget(int stripIndex);
     bool captureSceneSlot(int sceneSlot);
     bool insertSceneSlot(int sceneSlot, bool insertAfter);
@@ -1028,10 +1285,15 @@ private:
     ArcControlMode arcControlMode = ArcControlMode::SelectedStrip;
     int arcSelectedModStep = 0;
     juce::int64 lastGridLedUpdateTimeMs = 0;
+    uint32_t lastSceneMotionSyncTimeMs = 0;
+    uint32_t lastPitchCacheRefreshTimeMs = 0;
     std::atomic<int> lastHostTransportPlaying{0};
     static constexpr int kGridRefreshMs = 33;
     static constexpr int kArcRefreshMs = 33;
-    static constexpr int kSceneRecallRefreshMs = 1;
+    static constexpr int kSceneRecallFastRefreshMs = 1;
+    static constexpr int kSceneRecallArmedRefreshMs = 8;
+    static constexpr uint32_t kSceneMotionSyncRefreshMs = 33;
+    static constexpr uint32_t kPitchCacheRefreshMs = 50;
     static constexpr uint32_t browserFavoriteHoldSaveMs = 3000;
     static constexpr uint32_t browserFavoriteSaveBurstDurationMs = 320;
     static constexpr uint32_t browserFavoriteMissingBurstDurationMs = 260;
@@ -1138,6 +1400,7 @@ private:
     };
     struct FlipLegacyLoopSyncInfoCacheEntry
     {
+        const SampleModeEngine* engineToken = nullptr;
         uint64_t version = 0;
         std::shared_ptr<const SampleModeEngine::LegacyLoopSyncInfo> syncInfo;
     };
@@ -1367,7 +1630,9 @@ private:
                           int sceneSlot,
                           double hostPpqSnapshot,
                           double hostTempoSnapshot,
-                          int64_t hostGlobalSampleSnapshot);
+                          int64_t hostGlobalSampleSnapshot,
+                          bool preserveLoadedStripAudio = false,
+                          bool* recallContinuityBrokenOut = nullptr);
     double computeNextScenePatternEndPpq(int sceneSlot,
                                          double currentPpq,
                                          double cycleBeats,
@@ -1395,7 +1660,7 @@ private:
     void appendSceneModeStateToState(juce::ValueTree& state) const;
     void loadSceneModeStateFromState(const juce::ValueTree& state);
     void processScenePerformancePlayback(const juce::AudioPlayHead::PositionInfo& posInfo, int numSamples);
-    void clearSceneBoundaryTransitionState(bool clearBlendSuppression = true);
+    void clearSceneBoundaryTransitionState();
     void armSceneBoundaryTransition(SceneChainTransitionType type,
                                     SceneChainTransitionOption option,
                                     float lengthBeats,
@@ -1441,7 +1706,40 @@ private:
     void recordMacroSceneEvent(int stripIndex, MacroTarget target, float normalizedValue);
     void recordSceneGlobalStutterEvent(float normalizedValue, int columnHint, double eventBeat);
     void recordMomentaryStutterSceneDivision(double divisionBeats, int columnHint, double eventBeat);
+    void applyScenePerformanceEvent(const ScenePerformanceEvent& event,
+                                    StripControlWriteMode writeMode);
     void playbackScenePerformanceEvent(const ScenePerformanceEvent& event);
+    enum class ManualSceneControlHandling
+    {
+        Ignored = 0,
+        PassedThrough,
+        Recorded,
+        OverrodeAutomation
+    };
+    ManualSceneControlHandling processManualSceneControlChange(int stripIndex,
+                                                               ScenePerformanceControlTarget target,
+                                                               ControlMode controlMode,
+                                                               int controlRow,
+                                                               float value,
+                                                               int columnHint = -1);
+    void refreshSceneAutomationTargetMask(int sceneSlot);
+    void refreshAllSceneAutomationTargetMasks();
+    bool sceneClipHasAutomationTarget(int sceneSlot,
+                                      int stripIndex,
+                                      ScenePerformanceControlTarget target) const;
+    double getSceneAutomationTransitionSeconds() const;
+    double getSceneAutomationTransitionSeconds(ScenePerformanceControlTarget target) const;
+    bool shouldSmoothLiveSceneControlTarget(ScenePerformanceControlTarget target) const;
+    void seedSceneControlTransition(int stripIndex,
+                                    ScenePerformanceControlTarget target,
+                                    float fromValue,
+                                    float toValue,
+                                    double rampSeconds);
+    void beginSceneManualControlHandlingSuppression();
+    void endSceneManualControlHandlingSuppression();
+    bool isSceneManualControlHandlingSuppressed() const;
+    void clearActiveSceneAutomationOverrides(bool restoreWrittenValues);
+    void pruneActiveSceneAutomationOverrides();
     void copyScenePerformanceClip(int sourceSceneSlot, int destSceneSlot);
     void handleIncomingMacroCc(const juce::MidiBuffer& midiMessages);
     int getMacroTargetStripIndex() const;
@@ -1468,47 +1766,242 @@ private:
                                  StripControlWriteMode writeMode);
     void applyOwnedStripControlsFromParameters(int stripIndex, EnhancedAudioStrip& strip);
     void performPresetLoad(int presetIndex, double hostPpqSnapshot, double hostTempoSnapshot);
-    struct SceneRenderContext
+    struct SceneFileAudioCacheEntry
     {
-        std::unique_ptr<ModernAudioEngine> engine;
-        std::array<std::unique_ptr<SampleModeEngine>, MaxStrips> sampleModeEngines;
-        std::array<juce::AudioBuffer<float>, MaxStrips> sampleModeScratchBuffers;
-        std::array<bool, MaxStrips> sampleModeRenderedLastBlock{};
-        std::array<juce::File, MaxStrips> currentStripFiles;
-        std::array<juce::File, MaxStrips> recentLoopDirectories;
-        std::array<juce::File, MaxStrips> recentStepDirectories;
-        std::array<juce::File, MaxStrips> recentFlipDirectories;
-        std::array<std::unique_ptr<juce::XmlElement>, MaxStrips> loopPitchStateXml;
-        std::unique_ptr<juce::XmlElement> sceneTimingStateXml;
-        juce::MemoryBlock scenePerformanceStateData;
-        juce::ValueTree parameterState;
-        SceneChainTransitionType transitionType = SceneChainTransitionType::None;
+        juce::String filePath;
+        int64_t fileSize = -1;
+        int64_t fileModificationTimeMs = 0;
+        juce::AudioBuffer<float> audioBuffer;
+        double sourceSampleRate = 0.0;
+        std::array<int, 16> transientSlices{};
+        std::array<float, 128> rmsMap{};
+        std::array<int, 128> zeroCrossMap{};
+        int analysisSampleCount = 0;
+        uint64_t useCounter = 0;
+    };
+    struct PreparedSceneStripAudioPayload
+    {
+        juce::AudioBuffer<float> audioBuffer;
+        double sourceSampleRate = 0.0;
+        std::array<int, 16> transientSlices{};
+        std::array<float, 128> rmsMap{};
+        std::array<int, 128> zeroCrossMap{};
+        int analysisSampleCount = 0;
+        bool valid = false;
+    };
+    struct PreparedSceneStripParameterState
+    {
+        bool valid = false;
+        ResolvedOwnedStripControlState ownedControls;
+        float pitchSemitones = 0.0f;
+        float sliceLength = 1.0f;
+        int pitchControlMode = 0;
+        int tempoMatchMode = 0;
+        bool duckEnabled = false;
+        int duckSource = 0;
+        float duckThresholdDb = -24.0f;
+        float duckRatio = 4.0f;
+        float duckAttackMs = 10.0f;
+        float duckReleaseMs = 180.0f;
+        float duckGainCompDb = 0.0f;
+        bool duckFollowMaster = false;
+    };
+    struct PreparedSceneModLaneState
+    {
+        ModernAudioEngine::ModTarget target = ModernAudioEngine::defaultModTargetForSlot(0);
+        bool bipolar = false;
+        bool curveMode = false;
+        float depth = 1.0f;
+        float rate = 1.0f;
+        ModernAudioEngine::ModTransportMode transportMode = ModernAudioEngine::ModTransportMode::Free;
+        int offset = 0;
+        int lengthBars = 1;
+        int editPage = 0;
+        float smoothingMs = 0.0f;
+        float curveBend = 0.0f;
+        ModernAudioEngine::ModCurveShape curveShape = ModernAudioEngine::ModCurveShape::Linear;
+        bool pitchScaleQuantize = false;
+        ModernAudioEngine::PitchScale pitchScale = ModernAudioEngine::PitchScale::Chromatic;
+        std::array<float, ModernAudioEngine::ModTotalSteps> steps{};
+        std::array<int, ModernAudioEngine::ModTotalSteps> stepSubdivisions{};
+        std::array<float, ModernAudioEngine::ModTotalSteps> stepEndValues{};
+        std::array<ModernAudioEngine::ModCurveShape, ModernAudioEngine::ModTotalSteps> stepCurveShapes{};
+    };
+    struct PreparedSceneLoopPitchState
+    {
+        bool valid = false;
+        LoopPitchRole role = LoopPitchRole::None;
+        LoopPitchSyncTiming syncTiming = LoopPitchSyncTiming::Immediate;
+        int assignedMidi = -1;
+        bool assignedManual = false;
+        int detectedMidi = -1;
+        float detectedHz = 0.0f;
+        float detectedPitchConfidence = 0.0f;
+        int detectedScaleIndex = -1;
+        float detectedScaleConfidence = 0.0f;
+        bool essentiaUsed = false;
+    };
+    struct PreparedSceneTimingState
+    {
+        bool valid = false;
+        int repeatCount = 1;
+        int lengthModeIndex = static_cast<int>(SceneLengthMode::ManualBars);
+        int manualBars = 4;
+        int anchorStrip = 0;
+    };
+public:
+    struct PreparedSceneStripState
+    {
+        bool present = false;
+        bool restorePlaying = false;
+        bool hasStoredSamplePath = false;
+        juce::File storedSampleFile;
+        juce::String embeddedSampleWavBase64;
+        juce::File recentLoopDirectory;
+        juce::File recentStepDirectory;
+        juce::File recentFlipDirectory;
+        int analysisSampleCount = 0;
+        std::array<int, 16> analysisTransientSlices{};
+        std::array<float, 128> analysisRmsMap{};
+        std::array<int, 128> analysisZeroCrossMap{};
+        EnhancedAudioStrip::PlayMode playMode = EnhancedAudioStrip::PlayMode::Loop;
+        int loopStart = 0;
+        int loopEnd = ModernAudioEngine::MaxColumns;
+        int playbackColumn = 0;
+        bool ppqTimelineAnchored = false;
+        double ppqTimelineOffsetBeats = 0.0;
+        EnhancedAudioStrip::DirectionMode directionMode = EnhancedAudioStrip::DirectionMode::Normal;
+        bool reverse = false;
+        int groupId = -1;
+        float beatsPerLoop = -1.0f;
+        float scratchAmount = 0.0f;
+        bool transientSliceMode = false;
+        float pitchShift = 0.0f;
+        int recordingBars = 2;
+        bool filterEnabled = false;
+        float filterFrequency = 20000.0f;
+        float filterResonance = 0.707f;
+        float filterMorph = 0.0f;
+        EnhancedAudioStrip::FilterAlgorithm filterAlgorithm = EnhancedAudioStrip::FilterAlgorithm::Tpt12;
+        float swingAmount = 0.0f;
+        float gateAmount = 0.0f;
+        float gateSpeed = 4.0f;
+        float gateEnvelope = 0.5f;
+        float gateShape = 0.5f;
+        int stepPatternSteps = 16;
+        int stepViewPage = 0;
+        int stepCurrent = 0;
+        std::array<bool, 64> stepPattern{};
+        std::array<int, 64> stepSubdivisions{};
+        std::array<float, 64> stepSubdivisionStartVelocity{};
+        std::array<float, 64> stepSubdivisionRepeatVelocity{};
+        std::array<float, 64> stepProbability{};
+        float stepAttackMs = 0.0f;
+        float stepDecayMs = 4000.0f;
+        float stepReleaseMs = 110.0f;
+        float grainSizeMs = 1240.0f;
+        float grainDensity = 0.05f;
+        float grainPitch = 0.0f;
+        float grainPitchJitter = 0.0f;
+        float grainSpread = 0.0f;
+        float grainJitter = 0.0f;
+        float grainPositionJitter = 0.0f;
+        float grainRandomDepth = 0.0f;
+        float grainArpDepth = 0.0f;
+        float grainCloudDepth = 0.0f;
+        float grainEmitterDepth = 0.0f;
+        float grainEnvelope = 0.0f;
+        float grainShape = 0.0f;
+        int grainArpMode = 0;
+        bool grainTempoSync = true;
+        int activeModSlot = 0;
+        std::array<PreparedSceneModLaneState, ModernAudioEngine::NumModSequencers> modLanes{};
+        PreparedSceneStripParameterState parameterState;
+        bool hasFlipState = false;
+        SampleModePersistentState flipState;
+        juce::String embeddedFlipSampleBase64;
+        PreparedSceneLoopPitchState loopPitchState;
+    };
+    struct PreparedSceneGroupState
+    {
+        float volume = 1.0f;
+        bool muted = false;
+    };
+    struct PreparedScenePatternState
+    {
+        bool present = false;
+        bool playing = false;
+        int lengthBeats = 4;
+        std::vector<PatternRecorder::Event> events;
+    };
+    struct PreparedSceneSwitchPayload
+    {
         int mainPresetIndex = 0;
         int sceneSlot = 0;
-        int sequenceStepIndex = -1;
         bool sequenceDriven = false;
-        bool sceneStartPpqValid = false;
-        double sceneStartPpq = 0.0;
-        double sceneTempo = 120.0;
-        int64_t sceneStartSample = -1;
-        double lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
-        int lastScenePerformanceProcessSceneSlot = -1;
-        double lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
+        int sequenceStepIndex = -1;
+        uint64_t switchSerial = 0;
+        std::array<PreparedSceneStripAudioPayload, MaxStrips> stripAudioPayloads;
+        std::array<PreparedSceneStripState, MaxStrips> stripStates;
+        std::array<PreparedSceneGroupState, ModernAudioEngine::MaxGroups> groupStates{};
+        std::array<PreparedScenePatternState, ModernAudioEngine::MaxPatterns> patternStates;
+        PreparedSceneTimingState sceneTimingState;
+        juce::MemoryBlock scenePerformanceStateData;
+        juce::ValueTree parameterState;
+        std::unique_ptr<juce::XmlElement> snapshotPresetXml;
     };
+private:
     void configureAudioEngineCallbacks(ModernAudioEngine& engine);
     bool loadSampleFileIntoSampleModeEngine(SampleModeEngine& engine, const juce::File& file) const;
-    bool applyFlipPresetStateXmlToSceneContext(SceneRenderContext& context,
-                                               int stripIndex,
-                                               const juce::XmlElement* flipStateXml);
-    bool buildSceneRenderContext(SceneRenderContext& context,
-                                 int mainPresetIndex,
-                                 int sceneSlot,
-                                 double hostPpqSnapshot,
-                                 double hostTempoSnapshot,
-                                 int64_t hostGlobalSampleSnapshot,
-                                 SceneChainTransitionType transitionType,
-                                 bool sequenceDriven,
-                                 int sequenceStepIndex);
+    bool readAudioFileToStereoBuffer(const juce::File& file,
+                                     juce::AudioBuffer<float>& buffer,
+                                     double& sourceRate) const;
+    bool decodeEmbeddedSceneAudioToStereoBuffer(const juce::String& base64Audio,
+                                                juce::AudioBuffer<float>& buffer,
+                                                double& sourceRate) const;
+    bool buildPreparedSceneStripAnalysisPayload(int stripIndex,
+                                                PreparedSceneStripAudioPayload& payload) const;
+    bool tryCloneLiveStripAudioPayload(int stripIndex,
+                                       const juce::File& file,
+                                       PreparedSceneStripAudioPayload& payload) const;
+    bool tryLoadPreparedSceneStripAudioPayloadFromCache(const juce::File& file,
+                                                        PreparedSceneStripAudioPayload& payload);
+    bool tryBuildPreparedSceneStripAudioPayload(int stripIndex,
+                                                const juce::XmlElement& stripXml,
+                                                PreparedSceneStripAudioPayload& payload);
+    bool tryBuildPreparedSceneStripAudioPayload(int stripIndex,
+                                                const PreparedSceneStripState& stripState,
+                                                PreparedSceneStripAudioPayload& payload);
+    PreparedSceneLoopPitchState capturePreparedSceneLoopPitchState(int stripIndex) const;
+    void applyPreparedSceneLoopPitchState(int stripIndex, const PreparedSceneLoopPitchState& state);
+    PreparedSceneTimingState capturePreparedSceneTimingState(int sceneSlot) const;
+    void applyPreparedSceneTimingState(int sceneSlot, const PreparedSceneTimingState& state);
+    bool capturePreparedSceneSwitchPayloadTemplate(PreparedSceneSwitchPayload& payload,
+                                                   int mainPresetIndex,
+                                                   int sceneSlot);
+    bool parsePreparedSceneSwitchPayloadTemplate(PreparedSceneSwitchPayload& payload,
+                                                 const juce::XmlElement& presetXml,
+                                                 int mainPresetIndex,
+                                                 int sceneSlot) const;
+    std::unique_ptr<PreparedSceneSwitchPayload> clonePreparedSceneSwitchPayloadTemplate(
+        const PreparedSceneSwitchPayload& source) const;
+    std::unique_ptr<juce::XmlElement> createSceneSnapshotPresetXml(
+        const PreparedSceneSwitchPayload& payload,
+        const juce::String& sceneName) const;
+    bool buildPreparedSceneSwitchPayload(PreparedSceneSwitchPayload& payload,
+                                         int mainPresetIndex,
+                                         int sceneSlot,
+                                         bool sequenceDriven,
+                                         int sequenceStepIndex);
+    void cacheSceneAudioFilePayload(const juce::File& file,
+                                    const juce::AudioBuffer<float>& sourceBuffer,
+                                    double sourceRate,
+                                    const EnhancedAudioStrip* analysisSourceStrip);
+    void cachePreparedSceneAudioFilePayload(const juce::File& file,
+                                            const PreparedSceneStripAudioPayload& payload);
+    static void applySceneMotionStateToTargetEngine(const ScenePerformanceRecorder& recorder,
+                                                    int sceneSlot,
+                                                    ModernAudioEngine& engine);
     void requestScenePreload(int mainPresetIndex,
                              int sceneSlot,
                              bool sequenceDriven,
@@ -1516,30 +2009,95 @@ private:
                              double targetPpq,
                              double targetTempo,
                              int64_t targetSample,
-                             SceneChainTransitionType transitionType);
+                             SceneChainTransitionType transitionType,
+                             uint64_t switchSerial = 0);
     void servicePendingScenePreloadRequest();
-    bool tryStartPreloadedSceneTransition(int mainPresetIndex,
-                                          int sceneSlot,
-                                          bool sequenceDriven,
-                                          int sequenceStepIndex,
-                                          double targetPpq,
-                                          double targetTempo,
-                                          int64_t targetSample,
-                                          int sampleOffset,
-                                          SceneChainTransitionType transitionType);
+    bool preparedSceneSwitchPayloadMatchesTarget(const PreparedSceneSwitchPayload& payload,
+                                                 int mainPresetIndex,
+                                                 int sceneSlot,
+                                                 bool sequenceDriven,
+                                                 int sequenceStepIndex) const noexcept;
+    bool preparedSceneSwitchPayloadMatchesSwitchEvent(const PreparedSceneSwitchPayload& payload,
+                                                      const SceneSwitchEvent& event) const noexcept;
+    bool hasPreparedSceneSwitchPayloadForEvent(const SceneSwitchEvent& event) const;
+    PreparedSceneSwitchPayload* takePreparedSceneSwitchPayloadForEvent(const SceneSwitchEvent& event);
+    void retirePreparedSceneSwitchPayload(PreparedSceneSwitchPayload* payload) noexcept;
+    void reclaimRetiredPreparedSceneSwitchPayloads();
+    bool loadPreparedSceneStripAudioToActiveEngine(const PreparedSceneSwitchPayload& payload,
+                                                   int stripIndex);
+    bool applyPreparedSceneSwitchPayload(const PreparedSceneSwitchPayload& payload,
+                                         const SceneSwitchEvent& event,
+                                         bool& recallContinuityBroken);
     void renderActiveSceneAudio(juce::AudioBuffer<float>& buffer,
                                 juce::MidiBuffer& midiMessages,
                                 const juce::AudioPlayHead::PositionInfo& posInfo,
                                 bool allowSeparateStripRouting,
                                 bool applySceneTransitionOverlay);
-    void renderSceneTransitionBlock(juce::AudioBuffer<float>& buffer,
-                                    juce::MidiBuffer& midiMessages,
-                                    const juce::AudioPlayHead::PositionInfo& posInfo);
-    void applySceneRenderContext(SceneRenderContext context);
-    void commitSceneTransitionIfReady();
-    void applyQueuedSceneExitTailFade(juce::AudioBuffer<float>& buffer, int64_t blockStartSample);
+    void renderActiveSceneAudioRange(juce::AudioBuffer<float>& destination,
+                                     juce::MidiBuffer& midiMessages,
+                                     const juce::AudioPlayHead::PositionInfo& posInfo,
+                                     int startOffset);
+    void requestAbortActiveSceneTransition();
+    bool renderPendingPreparedSceneSwitch(juce::AudioBuffer<float>& buffer,
+                                          juce::MidiBuffer& midiMessages,
+                                          const juce::AudioPlayHead::PositionInfo& posInfo,
+                                          int64_t blockStartSample);
+    ScenePlaybackOwner getRenderedScenePlaybackOwner() const noexcept;
+    bool hasAnyLiveScenePlayback() const noexcept;
+    bool sceneSwitchHasIncomingPlayback(const SceneSwitchEvent& event) const noexcept;
     void queuePendingSceneParameterState(const juce::ValueTree& state);
     void applyPendingSceneParameterState();
+    void clearSceneStripLaunchHandles() noexcept;
+    SceneStripPlaybackHandle captureSceneStripPlaybackHandle(int stripIndex);
+    void refreshSceneStripLaunchHandlesFromEngine();
+    void clearActiveScenePlaybackHandle();
+    void setActiveScenePlaybackHandle(int mainPresetIndex,
+                                      int sceneSlot,
+                                      bool sequenceDriven,
+                                      int sequenceStepIndex,
+                                      double startPpq,
+                                      double resolvedLengthBeats);
+    void switchScenePlaybackOwner(ScenePlaybackOwner owner,
+                                  bool chainActive,
+                                  int chainStepIndex = -1);
+    void setSceneChainAttachStartPpq(double startPpq);
+    void setScenePlaybackOwner(ScenePlaybackOwner owner);
+    SceneSwitchSplitStatus buildSceneSwitchSplitStatus(const SceneSwitchEvent& event) const noexcept;
+    int resolveSceneSwitchTargetOffsetForCurrentBlock(const SceneSwitchEvent& event,
+                                                      int64_t blockStartSample,
+                                                      int blockNumSamples) const noexcept;
+    void clearPendingSceneApplyState();
+    uint64_t queuePendingSceneApplyState(const SceneSwitchEvent& event);
+    bool peekPendingSceneApplyState(SceneSwitchEvent& event) const;
+    bool consumePendingSceneApplyState(SceneSwitchEvent& event);
+    void startManualScenePlayback(int sceneSlot, bool useTriggerQuantization, bool focusSceneSlotFirst);
+    bool hasStoredSceneSlotState(int mainPresetIndex, int sceneSlot) const;
+    const SceneSlotState* getStoredSceneSlotState(int mainPresetIndex, int sceneSlot) const;
+    void clearStoredSceneSlotStates(int mainPresetIndex = -1);
+    bool restoreStoredSceneSlotStatesFromPresetXml(int mainPresetIndex, const juce::XmlElement& presetXml);
+    bool migrateLegacyStoredSceneSlotStates(int mainPresetIndex);
+    bool captureSceneSlotState(int mainPresetIndex, int sceneSlot);
+    bool copyStoredSceneSlotState(int mainPresetIndex, int sourceSceneSlot, int destSceneSlot);
+    bool deleteStoredSceneSlotState(int mainPresetIndex, int sceneSlot);
+    bool persistStoredSceneSlotStatesToMainPreset(int mainPresetIndex);
+    struct SceneStripControlRuntimeState
+    {
+        float volume = 1.0f;
+        float pan = 0.0f;
+        float speed = 1.0f;
+    };
+    struct SceneClipSlotRuntimeState
+    {
+        int mainPresetIndex = 0;
+        bool hasLiveStripControls = false;
+        bool liveStripControlsDirty = false;
+        std::array<SceneStripControlRuntimeState, MaxStrips> stripControls{};
+    };
+    void syncActiveSceneClipSlotRuntimeStateFromEngine(bool markDirty);
+    void applySceneClipSlotRuntimeState(int mainPresetIndex, int sceneSlot);
+    void clearSceneClipSlotRuntimeState(int mainPresetIndex, int sceneSlot);
+    void clearAllSceneClipSlotRuntimeStates();
+    void copySceneClipSlotRuntimeState(int mainPresetIndex, int sourceSceneSlot, int destSceneSlot);
     struct PresetSaveRequest
     {
         int presetIndex = -1;
@@ -1559,7 +2117,7 @@ private:
     bool runPresetSaveRequest(const PresetSaveRequest& request);
     void pushPresetSaveResult(const PresetSaveResult& result);
     void applyCompletedPresetSaves();
-    void resetRuntimePresetStateToDefaults();
+    void resetRuntimePresetStateToDefaults(bool preserveLoadedStripAudio = false);
 public:
     void processPendingSceneAutosave();
     bool flushPendingActiveSceneAutosaveIfCurrent();
@@ -1730,6 +2288,18 @@ private:
     juce::MemoryBlock scenePerformanceClipboardData;
     bool sceneSequenceActive = false;
     int sceneSequenceCurrentStepIndex = -1;
+    ScenePlaybackHandle activeScenePlaybackHandle;
+    std::array<SceneStripLaunchHandle, MaxStrips> sceneStripLaunchHandles{};
+    std::atomic<uint64_t> sceneStripLaunchRevisionCounter{1};
+    int focusedSceneSlot = 0;
+    ScenePlaybackOwner scenePlaybackOwner = ScenePlaybackOwner::Manual;
+    std::array<SceneClipSlotRuntimeState, SceneSlots> sceneClipSlotRuntimeStates{};
+    std::array<SceneSlotState, SceneSlots> storedSceneSlotStates{};
+    int storedSceneSlotStateMainPresetIndex = -1;
+    std::array<std::array<std::atomic<uint64_t>, MaxStrips + 1>, SceneSlots> sceneClipAutomationTargetMasks{};
+    std::array<std::atomic<uint64_t>, MaxStrips + 1> activeSceneAutomationOverrideMasks{};
+    bool sceneChainAttachStartPpqValid = false;
+    double sceneChainAttachStartPpq = 0.0;
     bool activeSceneStartPpqValid = false;
     double activeSceneStartPpq = 0.0;
     bool sceneSequenceStartPpqValid = false;
@@ -1741,6 +2311,15 @@ private:
     std::atomic<double> pendingSceneApplyTargetPpq{-1.0};
     std::atomic<double> pendingSceneApplyTargetTempo{120.0};
     std::atomic<int64_t> pendingSceneApplyTargetSample{-1};
+    std::atomic<int64_t> pendingSceneApplyBlockStartSample{-1};
+    std::atomic<int> pendingSceneApplyBlockNumSamples{0};
+    std::atomic<int> pendingSceneApplyTargetSampleOffset{-1};
+    std::atomic<int> pendingSceneApplyOutgoingOwner{static_cast<int>(ScenePlaybackOwner::Manual)};
+    std::atomic<int> pendingSceneApplyOwnerOnlySwitch{0};
+    std::atomic<int> pendingSceneApplyLegatoOwnerSwitch{0};
+    std::atomic<uint64_t> pendingSceneApplyPublishedSerial{0};
+    std::atomic<uint64_t> pendingSceneApplyConsumedSerial{0};
+    std::atomic<uint64_t> pendingSceneApplyNextSerial{1};
     std::atomic<int> pendingSceneRecorderApplyAction{static_cast<int>(SceneRecorderAction::None)};
     std::atomic<int> pendingSceneRecorderApplySceneSlot{-1};
     std::atomic<double> pendingSceneRecorderApplyTargetPpq{-1.0};
@@ -1754,28 +2333,26 @@ private:
     std::atomic<double> pendingScenePreloadTargetTempo{120.0};
     std::atomic<int64_t> pendingScenePreloadTargetSample{-1};
     std::atomic<int> pendingScenePreloadTransitionType{static_cast<int>(SceneChainTransitionType::None)};
-    std::unique_ptr<SceneRenderContext> preparedSceneRenderContext;
-    std::unique_ptr<SceneRenderContext> activeSceneTransitionContext;
-    int sceneTransitionSamplesTotal = 0;
-    int sceneTransitionSamplesRendered = 0;
-    int sceneTransitionStartSampleOffset = 0;
-    bool sceneTransitionCommitPending = false;
+    std::atomic<uint64_t> pendingScenePreloadSwitchSerial{0};
+    std::atomic<PreparedSceneSwitchPayload*> preparedSceneSwitchPayloadPublished{nullptr};
+    std::atomic<int> preparedSceneSwitchPayloadMainPreset{-1};
+    std::atomic<int> preparedSceneSwitchPayloadSceneSlot{-1};
+    std::atomic<int> preparedSceneSwitchPayloadSequenceDriven{0};
+    std::atomic<int> preparedSceneSwitchPayloadSequenceStep{-1};
+    std::atomic<uint64_t> preparedSceneSwitchPayloadSwitchSerial{0};
+    static constexpr size_t MaxRetiredPreparedSceneSwitchPayloads = 8;
+    std::array<std::atomic<PreparedSceneSwitchPayload*>, MaxRetiredPreparedSceneSwitchPayloads>
+        retiredPreparedSceneSwitchPayloads{};
+    juce::CriticalSection sceneFileAudioCacheLock;
+    std::vector<SceneFileAudioCacheEntry> sceneFileAudioCache;
+    uint64_t sceneFileAudioCacheUseCounter = 0;
     std::atomic<int> suppressOwnedStripParameterSync{0};
-    juce::CriticalSection pendingSceneParameterStateLock;
-    juce::ValueTree pendingSceneParameterState;
-    std::atomic<int> pendingSceneParameterStateDirty{0};
-    juce::AudioBuffer<float> sceneTransitionOutgoingScratch;
-    juce::AudioBuffer<float> sceneTransitionIncomingScratch;
+    std::atomic<juce::ValueTree*> pendingSceneParameterStatePtr{nullptr};
+    static constexpr size_t MaxRetiredPendingSceneParameterStates = 4;
+    std::array<std::atomic<juce::ValueTree*>, MaxRetiredPendingSceneParameterStates>
+        retiredPendingSceneParameterStates{};
+    std::atomic<int> suppressSceneManualControlHandlingDepth{0};
     static constexpr int kSceneRecallBlendMaxChannels = 32;
-    static constexpr int kSceneRecallBlendMaxSamples = 16384;
-    std::array<float, kSceneRecallBlendMaxChannels> sceneRecallBlendStartSamples{};
-    std::array<std::array<float, kSceneRecallBlendMaxSamples>, kSceneRecallBlendMaxChannels> sceneRecallBlendStartTail{};
-    int sceneRecallBlendStartTailLength = 0;
-    std::array<float, kSceneRecallBlendMaxChannels> lastRenderedOutputSamples{};
-    std::array<std::array<float, kSceneRecallBlendMaxSamples>, kSceneRecallBlendMaxChannels> lastRenderedOutputTail{};
-    int lastRenderedOutputTailLength = 0;
-    int sceneRecallBlendSamplesRemaining = 0;
-    int sceneRecallBlendTotalSamples = 0;
     std::atomic<float> sceneGlobalStutterBaseAmount{0.0f};
     std::atomic<float> sceneTransitionStutterOverlayAmount{0.0f};
     std::atomic<int> sceneBoundaryTransitionType{static_cast<int>(SceneChainTransitionType::None)};
@@ -1792,7 +2369,8 @@ private:
     std::atomic<float> sceneBoundaryTransitionDelayAmount{DefaultSceneTransitionDelayAmount};
     std::atomic<float> sceneBoundaryTransitionFilterAmount{DefaultSceneTransitionFilterAmount};
     std::atomic<float> sceneBoundaryTransitionChopAmount{DefaultSceneTransitionChopAmount};
-    std::atomic<int> suppressSceneRecallBlendOnNextLoad{0};
+    juce::AudioBuffer<float> preparedSceneSwitchOutgoingBuffer;
+    juce::AudioBuffer<float> preparedSceneSwitchIncomingBuffer;
     std::atomic<int> sceneChainReturnOverrideActive{0};
     std::atomic<int> sceneChainReturnOverrideSourceStep{-1};
     std::atomic<int> sceneChainReturnOverrideTriggerStep{-1};

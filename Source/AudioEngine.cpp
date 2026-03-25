@@ -60,6 +60,14 @@ float pitchSmoothingSecondsForAlgorithm(EnhancedAudioStrip::PitchShiftAlgorithm 
     }
 }
 
+double sanitizeSceneTransitionRampSeconds(double seconds) noexcept
+{
+    if (!std::isfinite(seconds) || seconds <= 0.0)
+        return 0.05;
+
+    return juce::jlimit(0.005, 0.25, seconds);
+}
+
 void ensureStereoScratchBuffer(juce::AudioBuffer<float>& buffer, int requiredSamples)
 {
     if (requiredSamples <= 0)
@@ -1514,11 +1522,8 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
 {
     currentSampleRate = sampleRate;
     crossfader.reset(static_cast<int>(sampleRate));
-    triggerOutputBlendActive = false;
-    triggerOutputBlendSamplesRemaining = 0;
-    triggerOutputBlendTotalSamples = 0;
-    triggerOutputBlendStartL = 0.0f;
-    triggerOutputBlendStartR = 0.0f;
+    triggerOutputSampleFader.reset();
+    stoppedOutputSampleFader.reset();
     pitchCacheOutputBlendActive = false;
     pitchCacheOutputBlendSamplesRemaining = 0;
     pitchCacheOutputBlendTotalSamples = 0;
@@ -1526,6 +1531,7 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     pitchCacheOutputBlendStartR = 0.0f;
     lastOutputSampleL = 0.0f;
     lastOutputSampleR = 0.0f;
+    clearRecentOutputTailLocked();
     resetDelayState();
     
     // Initialize step sampler
@@ -1556,6 +1562,15 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     grainDensitySmoother.reset(sampleRate, 0.015);
     grainPitchSmoother.reset(sampleRate, 0.012);
     grainPitchJitterSmoother.reset(sampleRate, 0.012);
+    grainSpreadSmoother.reset(sampleRate, 0.02);
+    grainJitterSmoother.reset(sampleRate, 0.02);
+    grainPositionJitterSmoother.reset(sampleRate, 0.02);
+    grainRandomDepthSmoother.reset(sampleRate, 0.02);
+    grainArpDepthSmoother.reset(sampleRate, 0.025);
+    grainCloudDepthSmoother.reset(sampleRate, 0.025);
+    grainEmitterDepthSmoother.reset(sampleRate, 0.025);
+    grainEnvelopeSmoother.reset(sampleRate, 0.02);
+    grainShapeSmoother.reset(sampleRate, 0.02);
     grainFreezeBlendSmoother.reset(sampleRate, 0.08);
     
     smoothedVolume.setCurrentAndTargetValue(volume.load());
@@ -1587,6 +1602,15 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
     grainDensitySmoother.setCurrentAndTargetValue(grainParams.density);
     grainPitchSmoother.setCurrentAndTargetValue(grainParams.pitchSemitones);
     grainPitchJitterSmoother.setCurrentAndTargetValue(grainParams.pitchJitterSemitones);
+    grainSpreadSmoother.setCurrentAndTargetValue(grainParams.spread);
+    grainJitterSmoother.setCurrentAndTargetValue(grainParams.jitter);
+    grainPositionJitterSmoother.setCurrentAndTargetValue(grainParams.positionJitter);
+    grainRandomDepthSmoother.setCurrentAndTargetValue(grainParams.randomDepth);
+    grainArpDepthSmoother.setCurrentAndTargetValue(grainParams.arpDepth);
+    grainCloudDepthSmoother.setCurrentAndTargetValue(grainParams.cloudDepth);
+    grainEmitterDepthSmoother.setCurrentAndTargetValue(grainParams.emitterDepth);
+    grainEnvelopeSmoother.setCurrentAndTargetValue(grainParams.envelope);
+    grainShapeSmoother.setCurrentAndTargetValue(grainParams.shape);
     grainFreezeBlendSmoother.setCurrentAndTargetValue(0.0f);
     resetSignalsmithRealtimeAlignmentState();
     // Precompute a fixed Blackman-Harris table once; per-voice envelope uses normalized lookup.
@@ -1697,11 +1721,7 @@ void EnhancedAudioStrip::prepareToPlay(double sampleRate, int maxBlockSize)
 void EnhancedAudioStrip::loadSample(const juce::AudioBuffer<float>& buffer, double sourceRate)
 {
     juce::ScopedLock lock(bufferLock);
-    triggerOutputBlendActive = false;
-    triggerOutputBlendSamplesRemaining = 0;
-    triggerOutputBlendTotalSamples = 0;
-    triggerOutputBlendStartL = 0.0f;
-    triggerOutputBlendStartR = 0.0f;
+    triggerOutputSampleFader.reset();
     pitchCacheOutputBlendActive = false;
     pitchCacheOutputBlendSamplesRemaining = 0;
     pitchCacheOutputBlendTotalSamples = 0;
@@ -1709,6 +1729,7 @@ void EnhancedAudioStrip::loadSample(const juce::AudioBuffer<float>& buffer, doub
     pitchCacheOutputBlendStartR = 0.0f;
     lastOutputSampleL = 0.0f;
     lastOutputSampleR = 0.0f;
+    clearRecentOutputTailLocked();
     resetDelayState();
     
     // Safety check
@@ -1773,11 +1794,7 @@ void EnhancedAudioStrip::loadSampleWithAnalysisCache(const juce::AudioBuffer<flo
                                                      int sourceSampleCount)
 {
     juce::ScopedLock lock(bufferLock);
-    triggerOutputBlendActive = false;
-    triggerOutputBlendSamplesRemaining = 0;
-    triggerOutputBlendTotalSamples = 0;
-    triggerOutputBlendStartL = 0.0f;
-    triggerOutputBlendStartR = 0.0f;
+    triggerOutputSampleFader.reset();
     pitchCacheOutputBlendActive = false;
     pitchCacheOutputBlendSamplesRemaining = 0;
     pitchCacheOutputBlendTotalSamples = 0;
@@ -1785,6 +1802,7 @@ void EnhancedAudioStrip::loadSampleWithAnalysisCache(const juce::AudioBuffer<flo
     pitchCacheOutputBlendStartR = 0.0f;
     lastOutputSampleL = 0.0f;
     lastOutputSampleR = 0.0f;
+    clearRecentOutputTailLocked();
     resetDelayState();
 
     if (buffer.getNumSamples() == 0)
@@ -1843,11 +1861,7 @@ void EnhancedAudioStrip::adoptPreparedSample(juce::AudioBuffer<float>& preparedS
                                              TimeStretchBackend preparedLoopTempoMatchBackend)
 {
     juce::ScopedLock lock(bufferLock);
-    triggerOutputBlendActive = false;
-    triggerOutputBlendSamplesRemaining = 0;
-    triggerOutputBlendTotalSamples = 0;
-    triggerOutputBlendStartL = 0.0f;
-    triggerOutputBlendStartR = 0.0f;
+    triggerOutputSampleFader.reset();
     pitchCacheOutputBlendActive = false;
     pitchCacheOutputBlendSamplesRemaining = 0;
     pitchCacheOutputBlendTotalSamples = 0;
@@ -1855,6 +1869,7 @@ void EnhancedAudioStrip::adoptPreparedSample(juce::AudioBuffer<float>& preparedS
     pitchCacheOutputBlendStartR = 0.0f;
     lastOutputSampleL = 0.0f;
     lastOutputSampleR = 0.0f;
+    clearRecentOutputTailLocked();
 
     if (preparedSampleBuffer.getNumSamples() <= 0 || preparedSampleBuffer.getNumChannels() <= 0)
     {
@@ -2268,6 +2283,15 @@ void EnhancedAudioStrip::resetGrainState()
     grainDensitySmoother.setCurrentAndTargetValue(grainParams.density);
     grainPitchSmoother.setCurrentAndTargetValue(grainParams.pitchSemitones);
     grainPitchJitterSmoother.setCurrentAndTargetValue(grainParams.pitchJitterSemitones);
+    grainSpreadSmoother.setCurrentAndTargetValue(grainParams.spread);
+    grainJitterSmoother.setCurrentAndTargetValue(grainParams.jitter);
+    grainPositionJitterSmoother.setCurrentAndTargetValue(grainParams.positionJitter);
+    grainRandomDepthSmoother.setCurrentAndTargetValue(grainParams.randomDepth);
+    grainArpDepthSmoother.setCurrentAndTargetValue(grainParams.arpDepth);
+    grainCloudDepthSmoother.setCurrentAndTargetValue(grainParams.cloudDepth);
+    grainEmitterDepthSmoother.setCurrentAndTargetValue(grainParams.emitterDepth);
+    grainEnvelopeSmoother.setCurrentAndTargetValue(grainParams.envelope);
+    grainShapeSmoother.setCurrentAndTargetValue(grainParams.shape);
     grainFreezeBlendSmoother.setCurrentAndTargetValue(0.0f);
     grainScratchSceneMix.setCurrentAndTargetValue(0.0f);
     grainBloomPhase = 0.0;
@@ -2393,6 +2417,10 @@ void EnhancedAudioStrip::updateGrainSizeFromGrip()
         grainParams.reverse = true;
     grainSizeSmoother.setTargetValue(grainParams.sizeMs);
     grainDensitySmoother.setTargetValue(grainParams.density);
+    grainSpreadSmoother.setTargetValue(grainParams.spread);
+    grainJitterSmoother.setTargetValue(grainParams.jitter);
+    grainRandomDepthSmoother.setTargetValue(grainParams.randomDepth);
+    grainEnvelopeSmoother.setTargetValue(grainParams.envelope);
     grainSizeMsAtomic.store(grainParams.sizeMs, std::memory_order_release);
     grainDensityAtomic.store(grainParams.density, std::memory_order_release);
     grainSpreadAtomic.store(grainParams.spread, std::memory_order_release);
@@ -2416,6 +2444,10 @@ void EnhancedAudioStrip::updateGrainGripModulation()
     grainParams.randomDepth = juce::jlimit(0.0f, 1.0f, 0.06f + (0.2f * (1.0f - spanNorm)));
     grainParams.emitterDepth = juce::jlimit(0.0f, 1.0f, 0.2f + (0.5f * spanNorm));
     grainDensitySmoother.setTargetValue(grainParams.density);
+    grainSpreadSmoother.setTargetValue(grainParams.spread);
+    grainJitterSmoother.setTargetValue(grainParams.jitter);
+    grainRandomDepthSmoother.setTargetValue(grainParams.randomDepth);
+    grainEmitterDepthSmoother.setTargetValue(grainParams.emitterDepth);
     grainDensityAtomic.store(grainParams.density, std::memory_order_release);
     grainSpreadAtomic.store(grainParams.spread, std::memory_order_release);
     grainJitterAtomic.store(grainParams.jitter, std::memory_order_release);
@@ -2599,6 +2631,15 @@ void EnhancedAudioStrip::updateGrainGestureOnRelease(int column, int64_t globalS
         grainParams = grainParamsBeforeGesture;
         grainSizeSmoother.setTargetValue(grainParams.sizeMs);
         grainDensitySmoother.setTargetValue(grainParams.density);
+        grainSpreadSmoother.setTargetValue(grainParams.spread);
+        grainJitterSmoother.setTargetValue(grainParams.jitter);
+        grainPositionJitterSmoother.setTargetValue(grainParams.positionJitter);
+        grainRandomDepthSmoother.setTargetValue(grainParams.randomDepth);
+        grainArpDepthSmoother.setTargetValue(grainParams.arpDepth);
+        grainCloudDepthSmoother.setTargetValue(grainParams.cloudDepth);
+        grainEmitterDepthSmoother.setTargetValue(grainParams.emitterDepth);
+        grainEnvelopeSmoother.setTargetValue(grainParams.envelope);
+        grainShapeSmoother.setTargetValue(grainParams.shape);
         grainSizeMsAtomic.store(grainParams.sizeMs, std::memory_order_release);
         grainDensityAtomic.store(grainParams.density, std::memory_order_release);
         grainPitchAtomic.store(grainParams.pitchSemitones, std::memory_order_release);
@@ -3038,17 +3079,33 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     grainBloomAmount += (targetBloom - grainBloomAmount) * 0.0025f;
     const float pitchNow = grainPitchSmoother.getNextValue();
     const float pitchJitterNow = grainPitchJitterSmoother.getNextValue();
+    const float spreadNow = grainSpreadSmoother.getNextValue();
+    const float jitterNow = grainJitterSmoother.getNextValue();
+    const float positionJitterNow = grainPositionJitterSmoother.getNextValue();
+    const float randomDepthNow = grainRandomDepthSmoother.getNextValue();
+    const float arpDepthNow = grainArpDepthSmoother.getNextValue();
+    const float cloudDepthNow = grainCloudDepthSmoother.getNextValue();
+    const float emitterDepthNow = grainEmitterDepthSmoother.getNextValue();
+    const float envelopeNow = grainEnvelopeSmoother.getNextValue();
+    const float shapeNow = grainShapeSmoother.getNextValue();
     grainPitchAtomic.store(pitchNow, std::memory_order_release);
     grainPitchJitterAtomic.store(pitchJitterNow, std::memory_order_release);
-    const float arpDepth = grainArpDepthAtomic.load(std::memory_order_acquire);
-    float jitterAmount = grainJitterAtomic.load(std::memory_order_acquire);
-    const float positionJitterAmount = grainPositionJitterAtomic.load(std::memory_order_acquire);
-    float randomDepth = grainRandomDepthAtomic.load(std::memory_order_acquire);
-    const float spreadBaseNow = grainSpreadAtomic.load(std::memory_order_acquire);
-    const float cloudDepth = grainCloudDepthAtomic.load(std::memory_order_acquire);
-    const float emitterDepth = grainEmitterDepthAtomic.load(std::memory_order_acquire);
-    const float envelopeNow = grainEnvelopeAtomic.load(std::memory_order_acquire);
-    const float shapeNow = grainShapeAtomic.load(std::memory_order_acquire);
+    grainSpreadAtomic.store(spreadNow, std::memory_order_release);
+    grainJitterAtomic.store(jitterNow, std::memory_order_release);
+    grainPositionJitterAtomic.store(positionJitterNow, std::memory_order_release);
+    grainRandomDepthAtomic.store(randomDepthNow, std::memory_order_release);
+    grainArpDepthAtomic.store(arpDepthNow, std::memory_order_release);
+    grainCloudDepthAtomic.store(cloudDepthNow, std::memory_order_release);
+    grainEmitterDepthAtomic.store(emitterDepthNow, std::memory_order_release);
+    grainEnvelopeAtomic.store(envelopeNow, std::memory_order_release);
+    grainShapeAtomic.store(shapeNow, std::memory_order_release);
+    const float arpDepth = arpDepthNow;
+    float jitterAmount = jitterNow;
+    const float positionJitterAmount = positionJitterNow;
+    float randomDepth = randomDepthNow;
+    const float spreadBaseNow = spreadNow;
+    const float cloudDepth = cloudDepthNow;
+    const float emitterDepth = emitterDepthNow;
     const double bloomHz = 1.2 + (2.3 * static_cast<double>(juce::jmax(0, heldCount)));
     grainBloomPhase += (juce::MathConstants<double>::twoPi * bloomHz) / juce::jmax(1.0, currentSampleRate);
     if (grainBloomPhase > juce::MathConstants<double>::twoPi)
@@ -4563,8 +4620,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         signalsmithRealtimeAlignmentTailSamplesRemaining = juce::jmax(
             0,
             signalsmithRealtimeAlignmentTailSamplesRemaining - numSamples);
-        lastOutputSampleL = signalsmithRealtimeRenderBuffer.getSample(0, numSamples - 1);
-        lastOutputSampleR = signalsmithRealtimeRenderBuffer.getSample(1, numSamples - 1);
+        captureRenderedOutputTailFromBufferLocked(signalsmithRealtimeRenderBuffer, 0, numSamples);
         return;
     }
     
@@ -4962,11 +5018,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     playheadTraversalSliceCountAtLastCalc = -1;
                     quantizedTraversalHandoffThisSample = true;
                     const int fadeSamples = juce::jmax(12, static_cast<int>(currentSampleRate * 0.0015));
-                    triggerOutputBlendTotalSamples = fadeSamples;
-                    triggerOutputBlendSamplesRemaining = fadeSamples;
-                    triggerOutputBlendStartL = lastOutputSampleL;
-                    triggerOutputBlendStartR = lastOutputSampleR;
-                    triggerOutputBlendActive = true;
+                    armTriggerOutputBlendLocked(fadeSamples, false);
                 }
             }
         }
@@ -4978,11 +5030,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             pendingPlayheadSpeedChange.store(0, std::memory_order_release);
             pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
             const int fadeSamples = juce::jmax(12, static_cast<int>(currentSampleRate * 0.0015));
-            triggerOutputBlendTotalSamples = fadeSamples;
-            triggerOutputBlendSamplesRemaining = fadeSamples;
-            triggerOutputBlendStartL = lastOutputSampleL;
-            triggerOutputBlendStartR = lastOutputSampleR;
-            triggerOutputBlendActive = true;
+            armTriggerOutputBlendLocked(fadeSamples, false);
         }
 
         const double slicePos = wrapped / sliceLength;
@@ -5076,11 +5124,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                         8.0f,
                         triggerFadeInMs.load(std::memory_order_acquire));
                     const int fadeSamples = juce::jmax(12, static_cast<int>(currentSampleRate * 0.001 * rearrangeFadeMs));
-                    triggerOutputBlendTotalSamples = fadeSamples;
-                    triggerOutputBlendSamplesRemaining = fadeSamples;
-                    triggerOutputBlendStartL = lastOutputSampleL;
-                    triggerOutputBlendStartR = lastOutputSampleR;
-                    triggerOutputBlendActive = true;
+                    armTriggerOutputBlendLocked(fadeSamples, false);
                 };
 
                 if (transientSliceMode.load(std::memory_order_acquire) && sampleLength > 1.0 && musicalSlices > 1)
@@ -5770,8 +5814,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             processSignalsmithRealtimeAlignmentDelayBufferInPlace(signalsmithRealtimeRenderBuffer, 0, numSamples);
             output.addFrom(0, startSample, signalsmithRealtimeRenderBuffer, 0, 0, numSamples);
             output.addFrom(1, startSample, signalsmithRealtimeRenderBuffer, 1, 0, numSamples);
-            lastOutputSampleL = signalsmithRealtimeRenderBuffer.getSample(0, numSamples - 1);
-            lastOutputSampleR = signalsmithRealtimeRenderBuffer.getSample(1, numSamples - 1);
+            captureRenderedOutputTailFromBufferLocked(signalsmithRealtimeRenderBuffer, 0, numSamples);
         }
         
         // Done - return early, don't process normal audio
@@ -6021,7 +6064,19 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     for (int i = 0; i < numSamples; ++i)
     {
         if (!playing)
-            break;
+        {
+            float stoppedFadeL = 0.0f;
+            float stoppedFadeR = 0.0f;
+            if (!renderStoppedOutputFadeSampleLocked(stoppedFadeL, stoppedFadeR))
+                break;
+
+            renderOutputBuffer->addSample(0, renderOutputStartSample + i, stoppedFadeL);
+            renderOutputBuffer->addSample(1, renderOutputStartSample + i, stoppedFadeR);
+            renderedSamples = i + 1;
+            if (!useRealtimeAlignmentDelay)
+                rememberRenderedOutputSampleLocked(stoppedFadeL, stoppedFadeR);
+            continue;
+        }
         
         // Get smoothed values for this sample
         float currentPan = smoothedPan.getNextValue();
@@ -6863,24 +6918,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         float outL = leftSample * finalGainLeft;
         float outR = rightSample * finalGainRight;
 
-        if (triggerOutputBlendActive
-            && triggerOutputBlendSamplesRemaining > 0
-            && triggerOutputBlendTotalSamples > 0)
-        {
-            const float progress = 1.0f - (static_cast<float>(triggerOutputBlendSamplesRemaining)
-                                           / static_cast<float>(triggerOutputBlendTotalSamples));
-            const float t = juce::jlimit(0.0f, 1.0f, progress);
-            outL = (triggerOutputBlendStartL * (1.0f - t)) + (outL * t);
-            outR = (triggerOutputBlendStartR * (1.0f - t)) + (outR * t);
-
-            --triggerOutputBlendSamplesRemaining;
-            if (triggerOutputBlendSamplesRemaining <= 0)
-            {
-                triggerOutputBlendActive = false;
-                triggerOutputBlendSamplesRemaining = 0;
-                triggerOutputBlendTotalSamples = 0;
-            }
-        }
+        applyTriggerOutputBlendToSampleLocked(outL, outR);
 
         if (pitchCacheOutputBlendActive
             && pitchCacheOutputBlendSamplesRemaining > 0
@@ -6911,8 +6949,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         renderedSamples = i + 1;
         if (!useRealtimeAlignmentDelay)
         {
-            lastOutputSampleL = outL;
-            lastOutputSampleR = outR;
+            rememberRenderedOutputSampleLocked(outL, outR);
         }
     }
 
@@ -6967,8 +7004,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 signalsmithLoopDebugFinalRmsValue = signalsmithLoopDebugWetRmsValue;
                 output.addFrom(0, startSample, signalsmithRealtimeWetBuffer, 0, 0, renderedSamples);
                 output.addFrom(1, startSample, signalsmithRealtimeWetBuffer, 1, 0, renderedSamples);
-                lastOutputSampleL = signalsmithRealtimeWetBuffer.getSample(0, renderedSamples - 1);
-                lastOutputSampleR = signalsmithRealtimeWetBuffer.getSample(1, renderedSamples - 1);
+                captureRenderedOutputTailFromBufferLocked(signalsmithRealtimeWetBuffer, 0, renderedSamples);
             }
             else
             {
@@ -6978,8 +7014,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 signalsmithLoopDebugFinalRmsValue = computeStereoBufferRms(signalsmithRealtimeRenderBuffer, 0, renderedSamples);
                 output.addFrom(0, startSample, signalsmithRealtimeRenderBuffer, 0, 0, renderedSamples);
                 output.addFrom(1, startSample, signalsmithRealtimeRenderBuffer, 1, 0, renderedSamples);
-                lastOutputSampleL = signalsmithRealtimeRenderBuffer.getSample(0, renderedSamples - 1);
-                lastOutputSampleR = signalsmithRealtimeRenderBuffer.getSample(1, renderedSamples - 1);
+                captureRenderedOutputTailFromBufferLocked(signalsmithRealtimeRenderBuffer, 0, renderedSamples);
             }
         }
         else
@@ -6990,8 +7025,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             signalsmithLoopDebugFinalRmsValue = computeStereoBufferRms(signalsmithRealtimeRenderBuffer, 0, renderedSamples);
             output.addFrom(0, startSample, signalsmithRealtimeRenderBuffer, 0, 0, renderedSamples);
             output.addFrom(1, startSample, signalsmithRealtimeRenderBuffer, 1, 0, renderedSamples);
-            lastOutputSampleL = signalsmithRealtimeRenderBuffer.getSample(0, renderedSamples - 1);
-            lastOutputSampleR = signalsmithRealtimeRenderBuffer.getSample(1, renderedSamples - 1);
+            captureRenderedOutputTailFromBufferLocked(signalsmithRealtimeRenderBuffer, 0, renderedSamples);
         }
     }
     else
@@ -7100,8 +7134,7 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
         smoothedPitchShift.skip(numSamples);
         processSignalsmithRealtimePitchBufferInPlace(output, startSample, numSamples, startSemitones, endSemitones);
         applySignalsmithRealtimePostPitchBufferInPlace(output, startSample, numSamples, positionInfo, tempo);
-        lastOutputSampleL = output.getSample(0, startSample + numSamples - 1);
-        lastOutputSampleR = output.getSample(1, startSample + numSamples - 1);
+        captureRenderedOutputTailFromBufferLocked(output, startSample, numSamples);
         signalsmithRealtimeStreamProcessedLastBlock = true;
     }
     else
@@ -7161,8 +7194,7 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
 
         output.setSample(0, startSample + i, leftSample);
         output.setSample(1, startSample + i, rightSample);
-        lastOutputSampleL = leftSample;
-        lastOutputSampleR = rightSample;
+        rememberRenderedOutputSampleLocked(leftSample, rightSample);
     }
 
         signalsmithRealtimeStreamProcessedLastBlock = false;
@@ -7245,20 +7277,15 @@ void EnhancedAudioStrip::trigger(int column, double tempo, bool quantized)
         retriggerBlendTotalSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
         retriggerBlendSamplesRemaining = retriggerBlendTotalSamples;
         retriggerBlendActive = true;
-        triggerOutputBlendTotalSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
-        triggerOutputBlendSamplesRemaining = triggerOutputBlendTotalSamples;
-        triggerOutputBlendStartL = lastOutputSampleL;
-        triggerOutputBlendStartR = lastOutputSampleR;
-        triggerOutputBlendActive = true;
+        armTriggerOutputBlendLocked(juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs)),
+                                    false);
     }
     else
     {
         retriggerBlendActive = false;
         retriggerBlendSamplesRemaining = 0;
         retriggerBlendTotalSamples = 0;
-        triggerOutputBlendActive = false;
-        triggerOutputBlendSamplesRemaining = 0;
-        triggerOutputBlendTotalSamples = 0;
+        triggerOutputSampleFader.reset();
     }
     playbackPosition = newTargetPosition;
     triggerOffsetRatio = juce::jlimit(0.0, 0.999999, (newTargetPosition - loopStartSamples) / juce::jmax(1.0, loopLengthSamples));
@@ -7437,20 +7464,15 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         retriggerBlendTotalSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
         retriggerBlendSamplesRemaining = retriggerBlendTotalSamples;
         retriggerBlendActive = true;
-        triggerOutputBlendTotalSamples = juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs));
-        triggerOutputBlendSamplesRemaining = triggerOutputBlendTotalSamples;
-        triggerOutputBlendStartL = lastOutputSampleL;
-        triggerOutputBlendStartR = lastOutputSampleR;
-        triggerOutputBlendActive = true;
+        armTriggerOutputBlendLocked(juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * triggerFadeMs)),
+                                    false);
     }
     else
     {
         retriggerBlendActive = false;
         retriggerBlendSamplesRemaining = 0;
         retriggerBlendTotalSamples = 0;
-        triggerOutputBlendActive = false;
-        triggerOutputBlendSamplesRemaining = 0;
-        triggerOutputBlendTotalSamples = 0;
+        triggerOutputSampleFader.reset();
     }
     triggerOffsetRatio = juce::jlimit(0.0, 0.999999, (newTargetPosition - loopStartSamples) / juce::jmax(1.0, loopLengthSamples));
 
@@ -8443,9 +8465,8 @@ void EnhancedAudioStrip::stop(bool immediate)
     retriggerBlendActive = false;
     retriggerBlendSamplesRemaining = 0;
     retriggerBlendTotalSamples = 0;
-    triggerOutputBlendActive = false;
-    triggerOutputBlendSamplesRemaining = 0;
-    triggerOutputBlendTotalSamples = 0;
+    triggerOutputSampleFader.reset();
+    stoppedOutputSampleFader.reset();
     pitchCacheOutputBlendActive = false;
     pitchCacheOutputBlendSamplesRemaining = 0;
     pitchCacheOutputBlendTotalSamples = 0;
@@ -8467,6 +8488,7 @@ void EnhancedAudioStrip::stop(bool immediate)
         pitchCacheOutputBlendStartR = 0.0f;
         lastOutputSampleL = 0.0f;
         lastOutputSampleR = 0.0f;
+        clearRecentOutputTailLocked();
         resetGrainState();
         resetSignalsmithRealtimeAlignmentState();
     }
@@ -8477,6 +8499,64 @@ void EnhancedAudioStrip::stop(bool immediate)
         stopAfterFade = true;
         crossfader.startFade(false, fadeSamples);
     }
+}
+
+EnhancedAudioStrip::ContinuityBlendState EnhancedAudioStrip::captureContinuityBlendState() const
+{
+    juce::ScopedLock lock(bufferLock);
+
+    ContinuityBlendState state;
+    state.valid = recentOutputTailLength > 0 || std::abs(lastOutputSampleL) > 1.0e-8f || std::abs(lastOutputSampleR) > 1.0e-8f;
+    state.lastSampleL = lastOutputSampleL;
+    state.lastSampleR = lastOutputSampleR;
+
+    const int copyCount = juce::jmin(recentOutputTailLength, kTriggerOutputBlendTailMaxSamples);
+    const int startIndex = (recentOutputTailWritePos - copyCount + kTriggerOutputBlendTailMaxSamples)
+        % kTriggerOutputBlendTailMaxSamples;
+    for (int i = 0; i < copyCount; ++i)
+    {
+        const int sourceIndex = (startIndex + i) % kTriggerOutputBlendTailMaxSamples;
+        state.tailL[static_cast<size_t>(i)] = recentOutputTailL[static_cast<size_t>(sourceIndex)];
+        state.tailR[static_cast<size_t>(i)] = recentOutputTailR[static_cast<size_t>(sourceIndex)];
+    }
+    state.tailLength = copyCount;
+    return state;
+}
+
+void EnhancedAudioStrip::stopForSceneRecallWithOutputFade(const ContinuityBlendState* continuityState)
+{
+    juce::ScopedLock lock(bufferLock);
+
+    const int fadeSamples = juce::jmax(1,
+        static_cast<int>(std::llround((10.0 * currentSampleRate) / 44100.0)));
+    armSampleFaderFromRecentTailLocked(stoppedOutputSampleFader, fadeSamples, true, continuityState);
+
+    retriggerBlendActive = false;
+    retriggerBlendSamplesRemaining = 0;
+    retriggerBlendTotalSamples = 0;
+    triggerOutputSampleFader.reset();
+    pitchCacheOutputBlendActive = false;
+    pitchCacheOutputBlendSamplesRemaining = 0;
+    pitchCacheOutputBlendTotalSamples = 0;
+    scrubActive = false;
+    tapeStopActive = false;
+    scratchGestureActive = false;
+    isReverseScratch = false;
+    reverseScratchPpqRetarget = false;
+    reverseScratchUseRateBlend = false;
+    scratchTravelDistance = 0.0;
+    resetScratchComboState();
+
+    stopAfterFade = false;
+    playing = false;
+    playbackPosition = 0.0;
+    pitchCacheOutputBlendStartL = 0.0f;
+    pitchCacheOutputBlendStartR = 0.0f;
+    lastOutputSampleL = 0.0f;
+    lastOutputSampleR = 0.0f;
+    clearRecentOutputTailLocked();
+    resetGrainState();
+    resetSignalsmithRealtimeAlignmentState();
 }
 
 void EnhancedAudioStrip::startStepSequencer()
@@ -8664,7 +8744,10 @@ void EnhancedAudioStrip::restorePresetPpqState(bool shouldPlay,
                                                double tempo,
                                                double currentTimelineBeat,
                                                int64_t currentGlobalSample,
-                                               bool shouldBlendPitchPath)
+                                               bool shouldBlendPitchPath,
+                                               bool shouldApplyRecallOutputBlend,
+                                               bool shouldApplyRecallEdgeFade,
+                                               const ContinuityBlendState* continuityState)
 {
     if (sampleLength <= 0.0)
         return;
@@ -8736,26 +8819,36 @@ void EnhancedAudioStrip::restorePresetPpqState(bool shouldPlay,
         const float triggerFadeMs = juce::jlimit(0.01f, 120.0f, triggerFadeInMs.load(std::memory_order_acquire));
         const int fadeSamples = juce::jmax(8, static_cast<int>(std::round(currentSampleRate * 0.001 * triggerFadeMs)));
         crossfader.startFade(true, fadeSamples, true);
-        triggerOutputBlendTotalSamples = fadeSamples;
-        triggerOutputBlendSamplesRemaining = fadeSamples;
-        triggerOutputBlendStartL = lastOutputSampleL;
-        triggerOutputBlendStartR = lastOutputSampleR;
-        triggerOutputBlendActive = true;
+        armTriggerOutputBlendLocked(fadeSamples, true, continuityState);
         startPitchCacheOutputBlendLocked();
     }
     else
     {
         crossfader.reset(static_cast<int>(currentSampleRate));
-        triggerOutputBlendActive = false;
-        triggerOutputBlendSamplesRemaining = 0;
-        triggerOutputBlendTotalSamples = 0;
-        triggerOutputBlendStartL = 0.0f;
-        triggerOutputBlendStartR = 0.0f;
         pitchCacheOutputBlendActive = false;
         pitchCacheOutputBlendSamplesRemaining = 0;
         pitchCacheOutputBlendTotalSamples = 0;
         pitchCacheOutputBlendStartL = 0.0f;
         pitchCacheOutputBlendStartR = 0.0f;
+
+        if (shouldApplyRecallOutputBlend && currentSampleRate > 0.0)
+        {
+            const int fadeSamples = juce::jlimit(16,
+                                                 32,
+                                                 static_cast<int>(std::round(currentSampleRate * 0.0004)));
+            armTriggerOutputBlendLocked(fadeSamples, true, continuityState);
+        }
+        else if (shouldApplyRecallEdgeFade && currentSampleRate > 0.0)
+        {
+            const int fadeSamples = juce::jlimit(8,
+                                                 24,
+                                                 static_cast<int>(std::round(currentSampleRate * 0.00025)));
+            armTriggerOutputBlendFromSilenceLocked(fadeSamples);
+        }
+        else
+        {
+            triggerOutputSampleFader.reset();
+        }
     }
 }
 
@@ -8767,6 +8860,17 @@ void EnhancedAudioStrip::setVolume(float vol)
         return;
     volume = vol;
     smoothedVolume.setTargetValue(vol);
+}
+
+void EnhancedAudioStrip::seedVolumeTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(0.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 1.0f, toValue);
+    smoothedVolume.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    volume.store(start, std::memory_order_release);
+    smoothedVolume.setCurrentAndTargetValue(start);
+    volume.store(target, std::memory_order_release);
+    smoothedVolume.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setTrimDb(float trimAmountDb)
@@ -8790,6 +8894,17 @@ void EnhancedAudioStrip::setPan(float panValue)
         return;
     pan = panValue;
     smoothedPan.setTargetValue(panValue);
+}
+
+void EnhancedAudioStrip::seedPanTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(-1.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(-1.0f, 1.0f, toValue);
+    smoothedPan.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    pan.store(start, std::memory_order_release);
+    smoothedPan.setCurrentAndTargetValue(start);
+    pan.store(target, std::memory_order_release);
+    smoothedPan.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setPlaybackSpeed(float speed)
@@ -8860,6 +8975,19 @@ void EnhancedAudioStrip::setPlaybackSpeedImmediate(float speed)
     smoothedSpeed.setCurrentAndTargetValue(speed);
 }
 
+void EnhancedAudioStrip::seedPlaybackSpeedTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(0.0f, 8.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 8.0f, toValue);
+    smoothedSpeed.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    playbackSpeed.store(static_cast<double>(start), std::memory_order_release);
+    displaySpeedAtomic.store(start, std::memory_order_release);
+    smoothedSpeed.setCurrentAndTargetValue(start);
+    playbackSpeed.store(static_cast<double>(target), std::memory_order_release);
+    displaySpeedAtomic.store(target, std::memory_order_release);
+    smoothedSpeed.setTargetValue(target);
+}
+
 void EnhancedAudioStrip::setPitchShift(float semitones)
 {
     const float clamped = juce::jlimit(-24.0f, 24.0f, semitones);
@@ -8868,6 +8996,77 @@ void EnhancedAudioStrip::setPitchShift(float semitones)
         return;
     pitchShiftSemitones.store(clamped, std::memory_order_release);
     smoothedPitchShift.setTargetValue(clamped);
+}
+
+void EnhancedAudioStrip::seedPitchShiftTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(-24.0f, 24.0f, fromValue);
+    const float target = juce::jlimit(-24.0f, 24.0f, toValue);
+    smoothedPitchShift.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    pitchShiftSemitones.store(start, std::memory_order_release);
+    smoothedPitchShift.setCurrentAndTargetValue(start);
+    pitchShiftSemitones.store(target, std::memory_order_release);
+    smoothedPitchShift.setTargetValue(target);
+}
+
+void EnhancedAudioStrip::seedDelayMixTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(0.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 1.0f, toValue);
+    smoothedDelayMix.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    delayMix.store(start, std::memory_order_release);
+    displayedDelayMix.store(start, std::memory_order_release);
+    smoothedDelayMix.setCurrentAndTargetValue(start);
+    delayMix.store(target, std::memory_order_release);
+    smoothedDelayMix.setTargetValue(target);
+}
+
+void EnhancedAudioStrip::seedDelayTimeTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(0.25f, 4.0f, fromValue);
+    const float target = juce::jlimit(0.25f, 4.0f, toValue);
+    smoothedDelayTimeBeats.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    delayTimeBeats.store(start, std::memory_order_release);
+    displayedDelayTimeBeats.store(start, std::memory_order_release);
+    smoothedDelayTimeBeats.setCurrentAndTargetValue(start);
+    delayTimeBeats.store(target, std::memory_order_release);
+    smoothedDelayTimeBeats.setTargetValue(target);
+}
+
+void EnhancedAudioStrip::seedDelayFeedbackTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(0.0f, 0.97f, fromValue);
+    const float target = juce::jlimit(0.0f, 0.97f, toValue);
+    smoothedDelayFeedback.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    delayFeedback.store(start, std::memory_order_release);
+    displayedDelayFeedback.store(start, std::memory_order_release);
+    smoothedDelayFeedback.setCurrentAndTargetValue(start);
+    delayFeedback.store(target, std::memory_order_release);
+    smoothedDelayFeedback.setTargetValue(target);
+}
+
+void EnhancedAudioStrip::seedDelayLowCutTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(20.0f, 12000.0f, fromValue);
+    const float target = juce::jlimit(20.0f, 12000.0f, toValue);
+    smoothedDelayLowCutHz.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    delayLowCutHz.store(start, std::memory_order_release);
+    displayedDelayLowCutHz.store(start, std::memory_order_release);
+    smoothedDelayLowCutHz.setCurrentAndTargetValue(start);
+    delayLowCutHz.store(target, std::memory_order_release);
+    smoothedDelayLowCutHz.setTargetValue(target);
+}
+
+void EnhancedAudioStrip::seedDelayHighCutTransition(float fromValue, float toValue, double rampSeconds)
+{
+    const float start = juce::jlimit(200.0f, 20000.0f, fromValue);
+    const float target = juce::jlimit(200.0f, 20000.0f, toValue);
+    smoothedDelayHighCutHz.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    delayHighCutHz.store(start, std::memory_order_release);
+    displayedDelayHighCutHz.store(start, std::memory_order_release);
+    smoothedDelayHighCutHz.setCurrentAndTargetValue(start);
+    delayHighCutHz.store(target, std::memory_order_release);
+    smoothedDelayHighCutHz.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setPitchShiftAlgorithm(PitchShiftAlgorithm algorithm)
@@ -9310,6 +9509,131 @@ void EnhancedAudioStrip::invalidatePitchShiftCaches()
     signalsmithPitchCacheActiveBaseSemitones = 0.0f;
 }
 
+void EnhancedAudioStrip::clearRecentOutputTailLocked()
+{
+    recentOutputTailLength = 0;
+    recentOutputTailWritePos = 0;
+    recentOutputTailL.fill(0.0f);
+    recentOutputTailR.fill(0.0f);
+}
+
+void EnhancedAudioStrip::rememberRenderedOutputSampleLocked(float left, float right)
+{
+    lastOutputSampleL = left;
+    lastOutputSampleR = right;
+
+    recentOutputTailL[static_cast<size_t>(recentOutputTailWritePos)] = left;
+    recentOutputTailR[static_cast<size_t>(recentOutputTailWritePos)] = right;
+    recentOutputTailWritePos = (recentOutputTailWritePos + 1) % kTriggerOutputBlendTailMaxSamples;
+    recentOutputTailLength = juce::jmin(recentOutputTailLength + 1, kTriggerOutputBlendTailMaxSamples);
+}
+
+void EnhancedAudioStrip::captureRenderedOutputTailFromBufferLocked(const juce::AudioBuffer<float>& buffer,
+                                                                   int startSample,
+                                                                   int numSamples)
+{
+    if (numSamples <= 0 || buffer.getNumChannels() <= 0)
+    {
+        lastOutputSampleL = 0.0f;
+        lastOutputSampleR = 0.0f;
+        clearRecentOutputTailLocked();
+        return;
+    }
+
+    const int safeStart = juce::jlimit(0, juce::jmax(0, buffer.getNumSamples() - 1), startSample);
+    const int safeLength = juce::jlimit(1, buffer.getNumSamples() - safeStart, numSamples);
+    const int tailLength = juce::jmin(safeLength, kTriggerOutputBlendTailMaxSamples);
+    const int tailStart = safeStart + safeLength - tailLength;
+    const int rightChannel = juce::jmin(1, buffer.getNumChannels() - 1);
+
+    lastOutputSampleL = buffer.getSample(0, safeStart + safeLength - 1);
+    lastOutputSampleR = buffer.getSample(rightChannel, safeStart + safeLength - 1);
+
+    std::copy_n(buffer.getReadPointer(0, tailStart),
+                tailLength,
+                recentOutputTailL.begin());
+    if (rightChannel == 0)
+    {
+        std::copy_n(recentOutputTailL.begin(),
+                    tailLength,
+                    recentOutputTailR.begin());
+    }
+    else
+    {
+        std::copy_n(buffer.getReadPointer(rightChannel, tailStart),
+                    tailLength,
+                    recentOutputTailR.begin());
+    }
+    recentOutputTailLength = tailLength;
+    recentOutputTailWritePos = tailLength % kTriggerOutputBlendTailMaxSamples;
+}
+
+void EnhancedAudioStrip::armSampleFaderFromRecentTailLocked(SampleFader& fader,
+                                                            int fadeSamples,
+                                                            bool useRecentTail,
+                                                            const ContinuityBlendState* continuityState)
+{
+    fader.reset();
+    const bool useContinuityState = continuityState != nullptr && continuityState->valid;
+    fader.startL = useContinuityState ? continuityState->lastSampleL : lastOutputSampleL;
+    fader.startR = useContinuityState ? continuityState->lastSampleR : lastOutputSampleR;
+    fader.trigger(juce::jmax(1, fadeSamples));
+
+    if (useContinuityState)
+    {
+        const int copyCount = juce::jmin(continuityState->tailLength, kTriggerOutputBlendTailMaxSamples);
+        for (int i = 0; i < copyCount; ++i)
+        {
+            fader.tailL[static_cast<size_t>(i)] = continuityState->tailL[static_cast<size_t>(i)];
+            fader.tailR[static_cast<size_t>(i)] = continuityState->tailR[static_cast<size_t>(i)];
+        }
+        fader.tailLength = copyCount;
+        return;
+    }
+
+    if (!useRecentTail || recentOutputTailLength <= 0)
+        return;
+
+    const int copyCount = juce::jmin(recentOutputTailLength, kTriggerOutputBlendTailMaxSamples);
+    const int startIndex = (recentOutputTailWritePos - copyCount + kTriggerOutputBlendTailMaxSamples)
+        % kTriggerOutputBlendTailMaxSamples;
+    for (int i = 0; i < copyCount; ++i)
+    {
+        const int sourceIndex = (startIndex + i) % kTriggerOutputBlendTailMaxSamples;
+        fader.tailL[static_cast<size_t>(i)] = recentOutputTailL[static_cast<size_t>(sourceIndex)];
+        fader.tailR[static_cast<size_t>(i)] = recentOutputTailR[static_cast<size_t>(sourceIndex)];
+    }
+    fader.tailLength = copyCount;
+}
+
+void EnhancedAudioStrip::armTriggerOutputBlendLocked(int fadeSamples,
+                                                     bool useRecentTail,
+                                                     const ContinuityBlendState* continuityState)
+{
+    armSampleFaderFromRecentTailLocked(triggerOutputSampleFader,
+                                       fadeSamples,
+                                       useRecentTail,
+                                       continuityState);
+}
+
+void EnhancedAudioStrip::armTriggerOutputBlendFromSilenceLocked(int fadeSamples)
+{
+    triggerOutputSampleFader.reset();
+    triggerOutputSampleFader.trigger(juce::jmax(1, fadeSamples));
+}
+
+void EnhancedAudioStrip::applyTriggerOutputBlendToSampleLocked(float& leftSample, float& rightSample)
+{
+    triggerOutputSampleFader.apply(leftSample, rightSample, SampleFader::FadeType::Crossfade);
+}
+
+bool EnhancedAudioStrip::renderStoppedOutputFadeSampleLocked(float& leftSample, float& rightSample)
+{
+    leftSample = 0.0f;
+    rightSample = 0.0f;
+    return stoppedOutputSampleFader.apply(leftSample, rightSample, SampleFader::FadeType::FadeOut);
+}
+
 void EnhancedAudioStrip::startPitchCacheOutputBlendLocked()
 {
     if (!playing.load(std::memory_order_acquire) || currentSampleRate <= 0.0)
@@ -9704,24 +10028,7 @@ void EnhancedAudioStrip::applySignalsmithRealtimePostPitchBufferInPlace(
         leftSample *= currentVol;
         rightSample *= currentVol;
 
-        if (triggerOutputBlendActive
-            && triggerOutputBlendSamplesRemaining > 0
-            && triggerOutputBlendTotalSamples > 0)
-        {
-            const float progress = 1.0f - (static_cast<float>(triggerOutputBlendSamplesRemaining)
-                                           / static_cast<float>(triggerOutputBlendTotalSamples));
-            const float t = juce::jlimit(0.0f, 1.0f, progress);
-            leftSample = (triggerOutputBlendStartL * (1.0f - t)) + (leftSample * t);
-            rightSample = (triggerOutputBlendStartR * (1.0f - t)) + (rightSample * t);
-
-            --triggerOutputBlendSamplesRemaining;
-            if (triggerOutputBlendSamplesRemaining <= 0)
-            {
-                triggerOutputBlendActive = false;
-                triggerOutputBlendSamplesRemaining = 0;
-                triggerOutputBlendTotalSamples = 0;
-            }
-        }
+        applyTriggerOutputBlendToSampleLocked(leftSample, rightSample);
 
         if (pitchCacheOutputBlendActive
             && pitchCacheOutputBlendSamplesRemaining > 0
@@ -10674,6 +10981,20 @@ void EnhancedAudioStrip::setGrainSizeMs(float value)
     grainSizeMsAtomic.store(grainParams.sizeMs, std::memory_order_release);
 }
 
+void EnhancedAudioStrip::seedGrainSizeTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(kGrainMinSizeMs, kGrainMaxSizeMs, fromValue);
+    const float target = juce::jlimit(kGrainMinSizeMs, kGrainMaxSizeMs, toValue);
+    grainSizeSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.sizeMs = start;
+    grainSizeMsAtomic.store(start, std::memory_order_release);
+    grainSizeSmoother.setCurrentAndTargetValue(start);
+    grainParams.sizeMs = target;
+    grainSizeMsAtomic.store(target, std::memory_order_release);
+    grainSizeSmoother.setTargetValue(target);
+}
+
 void EnhancedAudioStrip::setGrainSizeModulatedMs(float value)
 {
     grainSizeModulatedMsAtomic.store(juce::jlimit(kGrainMinSizeMs, kGrainMaxSizeMs, value), std::memory_order_release);
@@ -10690,6 +11011,20 @@ void EnhancedAudioStrip::setGrainDensity(float value)
     grainParams.density = juce::jlimit(kGrainMinDensity, kGrainMaxDensity, value);
     grainDensitySmoother.setTargetValue(grainParams.density);
     grainDensityAtomic.store(grainParams.density, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::seedGrainDensityTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(kGrainMinDensity, kGrainMaxDensity, fromValue);
+    const float target = juce::jlimit(kGrainMinDensity, kGrainMaxDensity, toValue);
+    grainDensitySmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.density = start;
+    grainDensityAtomic.store(start, std::memory_order_release);
+    grainDensitySmoother.setCurrentAndTargetValue(start);
+    grainParams.density = target;
+    grainDensityAtomic.store(target, std::memory_order_release);
+    grainDensitySmoother.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setGrainPitch(float semitones)
@@ -10710,6 +11045,22 @@ void EnhancedAudioStrip::setGrainPitch(float semitones)
         grainPitchBeforeArp = grainParams.pitchSemitones;
 }
 
+void EnhancedAudioStrip::seedGrainPitchTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(-48.0f, 48.0f, fromValue);
+    const float target = juce::jlimit(-48.0f, 48.0f, toValue);
+    grainPitchSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.pitchSemitones = start;
+    grainPitchAtomic.store(start, std::memory_order_release);
+    grainPitchSmoother.setCurrentAndTargetValue(start);
+    grainParams.pitchSemitones = target;
+    grainPitchAtomic.store(target, std::memory_order_release);
+    grainPitchSmoother.setTargetValue(target);
+    if (!grainArpWasActive)
+        grainPitchBeforeArp = target;
+}
+
 void EnhancedAudioStrip::setGrainPitchJitter(float semitones)
 {
     juce::ScopedLock lock(bufferLock);
@@ -10718,32 +11069,106 @@ void EnhancedAudioStrip::setGrainPitchJitter(float semitones)
     grainPitchJitterSmoother.setTargetValue(grainParams.pitchJitterSemitones);
 }
 
+void EnhancedAudioStrip::seedGrainPitchJitterTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(0.0f, 48.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 48.0f, toValue);
+    grainPitchJitterSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.pitchJitterSemitones = start;
+    grainPitchJitterAtomic.store(start, std::memory_order_release);
+    grainPitchJitterSmoother.setCurrentAndTargetValue(start);
+    grainParams.pitchJitterSemitones = target;
+    grainPitchJitterAtomic.store(target, std::memory_order_release);
+    grainPitchJitterSmoother.setTargetValue(target);
+}
+
 void EnhancedAudioStrip::setGrainSpread(float value)
 {
     juce::ScopedLock lock(bufferLock);
     grainParams.spread = juce::jlimit(0.0f, 1.0f, value);
+    grainSpreadSmoother.setTargetValue(grainParams.spread);
     grainSpreadAtomic.store(grainParams.spread, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::seedGrainSpreadTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(0.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 1.0f, toValue);
+    grainSpreadSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.spread = start;
+    grainSpreadAtomic.store(start, std::memory_order_release);
+    grainSpreadSmoother.setCurrentAndTargetValue(start);
+    grainParams.spread = target;
+    grainSpreadAtomic.store(target, std::memory_order_release);
+    grainSpreadSmoother.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setGrainJitter(float value)
 {
     juce::ScopedLock lock(bufferLock);
     grainParams.jitter = juce::jlimit(0.0f, 1.0f, value);
+    grainJitterSmoother.setTargetValue(grainParams.jitter);
     grainJitterAtomic.store(grainParams.jitter, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::seedGrainJitterTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(0.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 1.0f, toValue);
+    grainJitterSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.jitter = start;
+    grainJitterAtomic.store(start, std::memory_order_release);
+    grainJitterSmoother.setCurrentAndTargetValue(start);
+    grainParams.jitter = target;
+    grainJitterAtomic.store(target, std::memory_order_release);
+    grainJitterSmoother.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setGrainPositionJitter(float value)
 {
     juce::ScopedLock lock(bufferLock);
     grainParams.positionJitter = juce::jlimit(0.0f, 1.0f, value);
+    grainPositionJitterSmoother.setTargetValue(grainParams.positionJitter);
     grainPositionJitterAtomic.store(grainParams.positionJitter, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::seedGrainPositionJitterTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(0.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 1.0f, toValue);
+    grainPositionJitterSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.positionJitter = start;
+    grainPositionJitterAtomic.store(start, std::memory_order_release);
+    grainPositionJitterSmoother.setCurrentAndTargetValue(start);
+    grainParams.positionJitter = target;
+    grainPositionJitterAtomic.store(target, std::memory_order_release);
+    grainPositionJitterSmoother.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setGrainRandomDepth(float value)
 {
     juce::ScopedLock lock(bufferLock);
     grainParams.randomDepth = juce::jlimit(0.0f, 1.0f, value);
+    grainRandomDepthSmoother.setTargetValue(grainParams.randomDepth);
     grainRandomDepthAtomic.store(grainParams.randomDepth, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::seedGrainRandomDepthTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(0.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 1.0f, toValue);
+    grainRandomDepthSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.randomDepth = start;
+    grainRandomDepthAtomic.store(start, std::memory_order_release);
+    grainRandomDepthSmoother.setCurrentAndTargetValue(start);
+    grainParams.randomDepth = target;
+    grainRandomDepthAtomic.store(target, std::memory_order_release);
+    grainRandomDepthSmoother.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setGrainArpDepth(float value)
@@ -10755,7 +11180,35 @@ void EnhancedAudioStrip::setGrainArpDepth(float value)
     if (!wasActive && nowActive)
         grainPitchBeforeArp = grainParams.pitchSemitones;
     grainParams.arpDepth = clamped;
+    grainArpDepthSmoother.setTargetValue(grainParams.arpDepth);
     grainArpDepthAtomic.store(grainParams.arpDepth, std::memory_order_release);
+    grainArpWasActive = nowActive;
+
+    if (wasActive && !nowActive)
+    {
+        grainParams.pitchSemitones = juce::jlimit(-48.0f, 48.0f, grainPitchBeforeArp);
+        grainPitchAtomic.store(grainParams.pitchSemitones, std::memory_order_release);
+        grainPitchSmoother.setTargetValue(grainParams.pitchSemitones);
+    }
+}
+
+void EnhancedAudioStrip::seedGrainArpDepthTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(0.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 1.0f, toValue);
+    const bool wasActive = start > 0.001f;
+    const bool nowActive = target > 0.001f;
+    if (!wasActive && nowActive)
+        grainPitchBeforeArp = grainParams.pitchSemitones;
+
+    grainArpDepthSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.arpDepth = start;
+    grainArpDepthAtomic.store(start, std::memory_order_release);
+    grainArpDepthSmoother.setCurrentAndTargetValue(start);
+    grainParams.arpDepth = target;
+    grainArpDepthAtomic.store(target, std::memory_order_release);
+    grainArpDepthSmoother.setTargetValue(target);
     grainArpWasActive = nowActive;
 
     if (wasActive && !nowActive)
@@ -10770,28 +11223,88 @@ void EnhancedAudioStrip::setGrainCloudDepth(float value)
 {
     juce::ScopedLock lock(bufferLock);
     grainParams.cloudDepth = juce::jlimit(0.0f, 1.0f, value);
+    grainCloudDepthSmoother.setTargetValue(grainParams.cloudDepth);
     grainCloudDepthAtomic.store(grainParams.cloudDepth, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::seedGrainCloudDepthTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(0.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 1.0f, toValue);
+    grainCloudDepthSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.cloudDepth = start;
+    grainCloudDepthAtomic.store(start, std::memory_order_release);
+    grainCloudDepthSmoother.setCurrentAndTargetValue(start);
+    grainParams.cloudDepth = target;
+    grainCloudDepthAtomic.store(target, std::memory_order_release);
+    grainCloudDepthSmoother.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setGrainEmitterDepth(float value)
 {
     juce::ScopedLock lock(bufferLock);
     grainParams.emitterDepth = juce::jlimit(0.0f, 1.0f, value);
+    grainEmitterDepthSmoother.setTargetValue(grainParams.emitterDepth);
     grainEmitterDepthAtomic.store(grainParams.emitterDepth, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::seedGrainEmitterDepthTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(0.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 1.0f, toValue);
+    grainEmitterDepthSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.emitterDepth = start;
+    grainEmitterDepthAtomic.store(start, std::memory_order_release);
+    grainEmitterDepthSmoother.setCurrentAndTargetValue(start);
+    grainParams.emitterDepth = target;
+    grainEmitterDepthAtomic.store(target, std::memory_order_release);
+    grainEmitterDepthSmoother.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setGrainEnvelope(float value)
 {
     juce::ScopedLock lock(bufferLock);
     grainParams.envelope = juce::jlimit(0.0f, 1.0f, value);
+    grainEnvelopeSmoother.setTargetValue(grainParams.envelope);
     grainEnvelopeAtomic.store(grainParams.envelope, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::seedGrainEnvelopeTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(0.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(0.0f, 1.0f, toValue);
+    grainEnvelopeSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.envelope = start;
+    grainEnvelopeAtomic.store(start, std::memory_order_release);
+    grainEnvelopeSmoother.setCurrentAndTargetValue(start);
+    grainParams.envelope = target;
+    grainEnvelopeAtomic.store(target, std::memory_order_release);
+    grainEnvelopeSmoother.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setGrainShape(float value)
 {
     juce::ScopedLock lock(bufferLock);
     grainParams.shape = juce::jlimit(-1.0f, 1.0f, value);
+    grainShapeSmoother.setTargetValue(grainParams.shape);
     grainShapeAtomic.store(grainParams.shape, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::seedGrainShapeTransition(float fromValue, float toValue, double rampSeconds)
+{
+    juce::ScopedLock lock(bufferLock);
+    const float start = juce::jlimit(-1.0f, 1.0f, fromValue);
+    const float target = juce::jlimit(-1.0f, 1.0f, toValue);
+    grainShapeSmoother.reset(currentSampleRate, sanitizeSceneTransitionRampSeconds(rampSeconds));
+    grainParams.shape = start;
+    grainShapeAtomic.store(start, std::memory_order_release);
+    grainShapeSmoother.setCurrentAndTargetValue(start);
+    grainParams.shape = target;
+    grainShapeAtomic.store(target, std::memory_order_release);
+    grainShapeSmoother.setTargetValue(target);
 }
 
 void EnhancedAudioStrip::setGrainArpMode(int mode)

@@ -22,7 +22,9 @@ void renderRow(const EnhancedAudioStrip& strip,
                int newLedState[16][16],
                int mode);
 
-void handleGrainPageButtonPress(EnhancedAudioStrip& targetStrip,
+void handleGrainPageButtonPress(MlrVSTAudioProcessor& processor,
+                                EnhancedAudioStrip& targetStrip,
+                                int stripIndex,
                                 int controlRow,
                                 int x);
 void applyGrainPageButtonPressLive(EnhancedAudioStrip& targetStrip,

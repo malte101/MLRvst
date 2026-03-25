@@ -332,6 +332,7 @@ public:
                               double sourceSampleRate,
                               const juce::String& sourcePath = {},
                               const juce::String& displayName = {});
+    bool installLoadedSample(std::shared_ptr<const LoadedSampleData> sample);
     void clear();
     void stop(bool immediate = true);
 
