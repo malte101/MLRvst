@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <utility>
 
 namespace
@@ -757,42 +758,50 @@ void ScenePerformanceRecorder::recordControlEvent(int sceneSlot,
     const double lastRecordedBeat = lastRecordedControlEventBeats[stateStripIndex][targetIndex];
     const float lastRecordedValue = lastRecordedControlEventValues[stateStripIndex][targetIndex];
 
-    if (!recordingOverdub.load(std::memory_order_acquire))
+    if (!recordingOverdub.load(std::memory_order_acquire) && !std::isfinite(lastRecordedBeat))
     {
         eraseEventsIf(clip,
-                      [safeStripIndex, safeTarget, wrappedBeat](const ScenePerformanceEvent& existing)
+                      [safeStripIndex, safeTarget](const ScenePerformanceEvent& existing)
                       {
                           return existing.type == ScenePerformanceEventType::ControlPoint
                               && existing.stripIndex == safeStripIndex
-                              && existing.controlTarget == safeTarget
-                              && std::abs(existing.timeBeats - wrappedBeat) <= kSceneEventReplaceEpsilonBeats;
+                              && existing.controlTarget == safeTarget;
                       });
+    }
 
-        if (std::isfinite(lastRecordedBeat) && std::abs(lastRecordedBeat - wrappedBeat) > kSceneEventReplaceEpsilonBeats)
-        {
-            const bool wrappedForward = wrappedBeat < lastRecordedBeat;
-            const double rangeStart = juce::jmin(lastRecordedBeat, wrappedBeat);
-            const double rangeEnd = juce::jmax(lastRecordedBeat, wrappedBeat);
-            eraseEventsIf(clip,
-                          [safeStripIndex, safeTarget, rangeStart, rangeEnd, wrappedForward](const ScenePerformanceEvent& existing)
+    eraseEventsIf(clip,
+                  [safeStripIndex, safeTarget, wrappedBeat](const ScenePerformanceEvent& existing)
+                  {
+                      return existing.type == ScenePerformanceEventType::ControlPoint
+                          && existing.stripIndex == safeStripIndex
+                          && existing.controlTarget == safeTarget
+                          && std::abs(existing.timeBeats - wrappedBeat) <= kSceneEventReplaceEpsilonBeats;
+                  });
+
+    if (std::isfinite(lastRecordedBeat) && std::abs(lastRecordedBeat - wrappedBeat) > kSceneEventReplaceEpsilonBeats)
+    {
+        const bool wrappedForward = wrappedBeat < lastRecordedBeat;
+        const double rangeStart = juce::jmin(lastRecordedBeat, wrappedBeat);
+        const double rangeEnd = juce::jmax(lastRecordedBeat, wrappedBeat);
+        eraseEventsIf(clip,
+                      [safeStripIndex, safeTarget, rangeStart, rangeEnd, wrappedForward](const ScenePerformanceEvent& existing)
+                      {
+                          if (existing.type != ScenePerformanceEventType::ControlPoint
+                              || existing.stripIndex != safeStripIndex
+                              || existing.controlTarget != safeTarget)
                           {
-                              if (existing.type != ScenePerformanceEventType::ControlPoint
-                                  || existing.stripIndex != safeStripIndex
-                                  || existing.controlTarget != safeTarget)
-                              {
-                                  return false;
-                              }
+                              return false;
+                          }
 
-                              if (!wrappedForward)
-                              {
-                                  return existing.timeBeats > (rangeStart + kSceneEventReplaceEpsilonBeats)
-                                      && existing.timeBeats <= (rangeEnd + kSceneEventReplaceEpsilonBeats);
-                              }
+                          if (!wrappedForward)
+                          {
+                              return existing.timeBeats > (rangeStart + kSceneEventReplaceEpsilonBeats)
+                                  && existing.timeBeats <= (rangeEnd + kSceneEventReplaceEpsilonBeats);
+                          }
 
-                                  return existing.timeBeats > (rangeEnd + kSceneEventReplaceEpsilonBeats)
-                                      || existing.timeBeats <= (rangeStart + kSceneEventReplaceEpsilonBeats);
-                          });
-        }
+                          return existing.timeBeats > (rangeEnd + kSceneEventReplaceEpsilonBeats)
+                              || existing.timeBeats <= (rangeStart + kSceneEventReplaceEpsilonBeats);
+                      });
     }
 
     const bool hasRecentRecordedPoint = std::isfinite(lastRecordedBeat)
@@ -922,17 +931,17 @@ juce::MemoryBlock ScenePerformanceRecorder::createData(int sceneSlotOverride,
 bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int sceneSlotOverride)
 {
     juce::ScopedLock lock(clipLock);
-    auto parsedClips = sceneClips;
+    auto parsedClips = std::make_unique<std::array<ScenePerformanceClip, MaxSceneSlots>>(sceneClips);
     const int safeSceneSlotOverride = sceneSlotOverride >= 0 ? clampSceneSlot(sceneSlotOverride) : -1;
 
     if (safeSceneSlotOverride >= 0)
     {
-        auto& clip = parsedClips[static_cast<size_t>(safeSceneSlotOverride)];
+        auto& clip = (*parsedClips)[static_cast<size_t>(safeSceneSlotOverride)];
         resetClip(clip);
     }
     else
     {
-        for (auto& clip : parsedClips)
+        for (auto& clip : *parsedClips)
             resetClip(clip);
     }
 
@@ -945,7 +954,7 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
         recordingStartBeat.store(-1.0, std::memory_order_release);
         recordingEndBeat.store(-1.0, std::memory_order_release);
         resetRecordingWriteState();
-        sceneClips = std::move(parsedClips);
+        sceneClips = std::move(*parsedClips);
         return true;
     }
 
@@ -1108,7 +1117,7 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
 
         const bool shouldApplyClip = safeSceneSlotOverride < 0 || xmlSceneSlot == safeSceneSlotOverride;
         ScenePerformanceClip* clip = shouldApplyClip
-            ? &parsedClips[static_cast<size_t>(xmlSceneSlot)]
+            ? &(*parsedClips)[static_cast<size_t>(xmlSceneSlot)]
             : nullptr;
         if (clip != nullptr)
         {
@@ -1200,6 +1209,6 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
     recordingStartBeat.store(-1.0, std::memory_order_release);
     recordingEndBeat.store(-1.0, std::memory_order_release);
     resetRecordingWriteState();
-    sceneClips = std::move(parsedClips);
+    sceneClips = std::move(*parsedClips);
     return true;
 }

@@ -1618,6 +1618,7 @@ private:
                                     double endBeat,
                                     float endValue);
     bool eraseSceneLaneEventAt(int stripIndex, int laneIndex, bool triggerLane, double timeBeats);
+    bool defaultSceneLane(int stripIndex, int laneIndex);
     bool clearSceneLane(int stripIndex, int laneIndex, bool triggerLane);
     bool thinSceneLane(int stripIndex, int laneIndex, bool triggerLane);
     bool deleteSelectedSceneEvent();

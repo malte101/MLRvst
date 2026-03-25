@@ -283,10 +283,12 @@ constexpr std::array<SceneAutomationLaneDefinition, 26> kSceneAutomationLanes =
 constexpr int kSceneAutomationLaneCount = static_cast<int>(kSceneAutomationLanes.size());
 constexpr float kSceneCardGap = 8.0f;
 constexpr float kSceneCardHeaderHeight = 22.0f;
+constexpr float kSceneOverviewLaneHeight = 18.0f;
 constexpr float kSceneRulerHeight = 16.0f;
 constexpr float kSceneTriggerHeight = 54.0f;
 constexpr float kSceneAutomationHeaderHeight = 18.0f;
 constexpr float kSceneAutomationLaneHeight = 18.0f;
+constexpr float kSceneAutomationMarkerSize = 5.0f;
 constexpr float kSceneGlobalLaneExpandedScale = 3.0f;
 constexpr float kSceneAutomationLaneGap = 2.0f;
 constexpr float kSceneCardPaddingX = 10.0f;
@@ -400,6 +402,7 @@ struct SceneStripCardLayout
     bool stepTriggerLane = false;
     bool automationExpanded = false;
     bool heightExpanded = false;
+    bool compactOverview = false;
 };
 
 struct SceneGlobalLaneLayout
@@ -434,6 +437,68 @@ bool sceneIsGlobalAutomationEvent(const ScenePerformanceEvent& event)
 {
     return event.type == ScenePerformanceEventType::ControlPoint
         && event.controlTarget == ScenePerformanceControlTarget::Retrigger;
+}
+
+bool sceneAutomationTargetUsesSteppedSegments(ScenePerformanceControlTarget target)
+{
+    switch (target)
+    {
+        case ScenePerformanceControlTarget::FilterEnabled:
+        case ScenePerformanceControlTarget::DelayMode:
+        case ScenePerformanceControlTarget::DelaySyncEnabled:
+            return true;
+        case ScenePerformanceControlTarget::None:
+        case ScenePerformanceControlTarget::Speed:
+        case ScenePerformanceControlTarget::Pitch:
+        case ScenePerformanceControlTarget::Pan:
+        case ScenePerformanceControlTarget::Volume:
+        case ScenePerformanceControlTarget::Swing:
+        case ScenePerformanceControlTarget::GrainSize:
+        case ScenePerformanceControlTarget::GrainDensity:
+        case ScenePerformanceControlTarget::GrainPitch:
+        case ScenePerformanceControlTarget::GrainJitter:
+        case ScenePerformanceControlTarget::GrainRandomDepth:
+        case ScenePerformanceControlTarget::GrainEnvelope:
+        case ScenePerformanceControlTarget::FilterFrequency:
+        case ScenePerformanceControlTarget::FilterResonance:
+        case ScenePerformanceControlTarget::FilterMorph:
+        case ScenePerformanceControlTarget::SliceLength:
+        case ScenePerformanceControlTarget::Scratch:
+        case ScenePerformanceControlTarget::DelayMix:
+        case ScenePerformanceControlTarget::DelayTime:
+        case ScenePerformanceControlTarget::DelayFeedback:
+        case ScenePerformanceControlTarget::DelayLowCut:
+        case ScenePerformanceControlTarget::DelayHighCut:
+        case ScenePerformanceControlTarget::Retrigger:
+        case ScenePerformanceControlTarget::Rearrange:
+        case ScenePerformanceControlTarget::GrainPitchJitter:
+        case ScenePerformanceControlTarget::GrainSpread:
+        case ScenePerformanceControlTarget::GrainPositionJitter:
+        case ScenePerformanceControlTarget::GrainArp:
+        case ScenePerformanceControlTarget::GrainCloud:
+        case ScenePerformanceControlTarget::GrainEmitter:
+        case ScenePerformanceControlTarget::GrainShape:
+        default:
+            return false;
+    }
+}
+
+void drawSceneAutomationConnection(juce::Graphics& g,
+                                   juce::Point<float> start,
+                                   juce::Point<float> end,
+                                   juce::Colour colour,
+                                   bool stepped,
+                                   float thickness)
+{
+    g.setColour(colour);
+    if (stepped)
+    {
+        g.drawLine(start.x, start.y, end.x, start.y, thickness);
+        g.drawLine(end.x, start.y, end.x, end.y, thickness);
+        return;
+    }
+
+    g.drawLine(start.x, start.y, end.x, end.y, thickness);
 }
 
 void drawSceneHeaderActionChip(juce::Graphics& g,
@@ -1961,6 +2026,14 @@ float sceneStripCardHeight(const MlrVSTAudioProcessor& processor,
                            bool heightExpanded)
 {
     const bool scenePlaybackAvailable = sceneStripSupportsScenePlayback(processor, stripIndex);
+    if (!heightExpanded || !scenePlaybackAvailable)
+    {
+        return (kSceneCardPaddingY * 2.0f)
+            + kSceneCardHeaderHeight
+            + 4.0f
+            + kSceneOverviewLaneHeight;
+    }
+
     const float verticalScale = sceneStripVerticalScale(heightExpanded);
     const float triggerHeight = sceneTriggerLaneHeight(processor, stripIndex, heightExpanded);
     float height = (kSceneCardPaddingY * 2.0f)
@@ -1992,8 +2065,9 @@ SceneStripCardLayout makeSceneStripCardLayout(const MlrVSTAudioProcessor& proces
     SceneStripCardLayout layout;
     layout.cardBounds = cardBounds;
     layout.scenePlaybackAvailable = sceneStripSupportsScenePlayback(processor, stripIndex);
-    layout.automationExpanded = automationExpanded && layout.scenePlaybackAvailable;
     layout.heightExpanded = heightExpanded;
+    layout.compactOverview = !layout.scenePlaybackAvailable || !layout.heightExpanded;
+    layout.automationExpanded = !layout.compactOverview && automationExpanded && layout.scenePlaybackAvailable;
     const float verticalScale = sceneStripVerticalScale(heightExpanded);
     layout.stepTriggerLane = sceneStripUsesStepTriggerColumns(processor, stripIndex);
     layout.stepTotalSteps = layout.stepTriggerLane ? sceneStepTotalSteps(processor, stripIndex) : 0;
@@ -2016,6 +2090,14 @@ SceneStripCardLayout makeSceneStripCardLayout(const MlrVSTAudioProcessor& proces
 
     layout.summaryBounds = layout.headerBounds;
     inner.removeFromTop(4.0f);
+
+    if (layout.compactOverview)
+    {
+        auto overviewRow = inner.removeFromTop(kSceneOverviewLaneHeight);
+        layout.triggerLabelBounds = overviewRow.removeFromLeft(kSceneTimelineLabelWidth);
+        layout.triggerTimelineBounds = overviewRow;
+        return layout;
+    }
 
     auto rulerRow = inner.removeFromTop(kSceneRulerHeight);
     layout.rulerLabelBounds = rulerRow.removeFromLeft(kSceneTimelineLabelWidth);
@@ -2205,13 +2287,17 @@ juce::Rectangle<float> sceneControlMarkerBounds(juce::Rectangle<float> laneBound
     if (laneBounds.isEmpty())
         return {};
 
+    const float markerRadius = kSceneAutomationMarkerSize * 0.5f;
     const float x = laneBounds.getX()
         + (laneBounds.getWidth() * static_cast<float>(event.timeBeats / juce::jmax(1.0, lengthBeats)));
     const float normalizedValue = normalizeSceneAutomationValue(event);
     const float valueY = laneBounds.getBottom()
-        - (normalizedValue * juce::jmax(4.0f, laneBounds.getHeight() - 4.0f))
-        - 2.0f;
-    return juce::Rectangle<float>(x - 5.0f, valueY - 5.0f, 10.0f, 10.0f);
+        - (normalizedValue * juce::jmax(kSceneAutomationMarkerSize, laneBounds.getHeight() - kSceneAutomationMarkerSize))
+        - markerRadius;
+    return juce::Rectangle<float>(x - markerRadius,
+                                  valueY - markerRadius,
+                                  kSceneAutomationMarkerSize,
+                                  kSceneAutomationMarkerSize);
 }
 
 juce::Rectangle<float> sceneControlMarkerBounds(const SceneStripCardLayout& layout,
@@ -2236,52 +2322,55 @@ void drawSceneAutomationPoint(juce::Graphics& g,
     const auto colour = colourOverride.isTransparent()
         ? sceneAutomationColour(event).withAlpha(0.95f)
         : colourOverride;
+    const float shapeInset = juce::jmax(0.45f, markerBounds.getWidth() * 0.16f);
+    const float edgeInset = juce::jmax(0.6f, markerBounds.getWidth() * 0.18f);
     g.setColour(colour);
 
     switch (juce::jlimit(0, 5, event.controlRow))
     {
         case 1:
-            g.fillRoundedRectangle(markerBounds.reduced(1.6f), 1.6f);
+            g.fillRoundedRectangle(markerBounds.reduced(shapeInset), juce::jmax(0.7f, markerBounds.getWidth() * 0.18f));
             break;
         case 2:
         {
             juce::Path diamond;
-            diamond.addTriangle(markerBounds.getCentreX(), markerBounds.getY() + 1.0f,
-                                markerBounds.getRight() - 1.0f, markerBounds.getCentreY(),
-                                markerBounds.getCentreX(), markerBounds.getBottom() - 1.0f);
-            diamond.addTriangle(markerBounds.getCentreX(), markerBounds.getY() + 1.0f,
-                                markerBounds.getX() + 1.0f, markerBounds.getCentreY(),
-                                markerBounds.getCentreX(), markerBounds.getBottom() - 1.0f);
+            diamond.addTriangle(markerBounds.getCentreX(), markerBounds.getY() + edgeInset,
+                                markerBounds.getRight() - edgeInset, markerBounds.getCentreY(),
+                                markerBounds.getCentreX(), markerBounds.getBottom() - edgeInset);
+            diamond.addTriangle(markerBounds.getCentreX(), markerBounds.getY() + edgeInset,
+                                markerBounds.getX() + edgeInset, markerBounds.getCentreY(),
+                                markerBounds.getCentreX(), markerBounds.getBottom() - edgeInset);
             g.fillPath(diamond);
             break;
         }
         case 3:
         {
             juce::Path triangle;
-            triangle.addTriangle(markerBounds.getCentreX(), markerBounds.getY() + 1.0f,
-                                 markerBounds.getRight() - 1.0f, markerBounds.getBottom() - 1.0f,
-                                 markerBounds.getX() + 1.0f, markerBounds.getBottom() - 1.0f);
+            triangle.addTriangle(markerBounds.getCentreX(), markerBounds.getY() + edgeInset,
+                                 markerBounds.getRight() - edgeInset, markerBounds.getBottom() - edgeInset,
+                                 markerBounds.getX() + edgeInset, markerBounds.getBottom() - edgeInset);
             g.fillPath(triangle);
             break;
         }
         case 4:
         {
             juce::Path triangle;
-            triangle.addTriangle(markerBounds.getX() + 1.0f, markerBounds.getY() + 1.0f,
-                                 markerBounds.getRight() - 1.0f, markerBounds.getY() + 1.0f,
-                                 markerBounds.getCentreX(), markerBounds.getBottom() - 1.0f);
+            triangle.addTriangle(markerBounds.getX() + edgeInset, markerBounds.getY() + edgeInset,
+                                 markerBounds.getRight() - edgeInset, markerBounds.getY() + edgeInset,
+                                 markerBounds.getCentreX(), markerBounds.getBottom() - edgeInset);
             g.fillPath(triangle);
             break;
         }
         default:
-            g.fillEllipse(markerBounds.reduced(1.8f));
+            g.fillEllipse(markerBounds.reduced(shapeInset));
             break;
     }
 
     if (selected)
     {
         g.setColour(juce::Colours::white.withAlpha(0.92f));
-        g.drawEllipse(markerBounds.reduced(1.1f), 1.2f);
+        g.drawEllipse(markerBounds.reduced(juce::jmax(0.3f, markerBounds.getWidth() * 0.08f)),
+                      juce::jmax(0.85f, markerBounds.getWidth() * 0.18f));
     }
 }
 
@@ -3143,6 +3232,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
 
     configureSectionLabel(sceneSlotsSectionLabel, "SCENES");
     addAndMakeVisible(sceneSlotsSectionLabel);
+    sceneSlotsSectionLabel.setVisible(false);
 
     configureSectionLabel(scenePlaybackSectionLabel, "PLAYBACK");
     addAndMakeVisible(scenePlaybackSectionLabel);
@@ -3267,7 +3357,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
 
     sceneCaptureButton.setButtonText("Draw");
     sceneCaptureButton.setClickingTogglesState(true);
-    sceneCaptureButton.setTooltip("With Draw off, click automation points to place anchors and connect line segments between clicks. Enable Draw to paint triggers and automation directly into the clip grid. Option-click resets automation points to the lane default, and Option-drag snaps bipolar lanes to center.");
+    sceneCaptureButton.setTooltip("With Draw off, click automation points to place anchors and connect line segments between clicks. Enable Draw to paint triggers and automation directly into the clip grid. Option-click resets automation points to the lane default, Ctrl/Cmd-click defaults a whole automation lane, and Option-drag snaps bipolar lanes to center.");
     sceneCaptureButton.onClick = [this]()
     {
         sceneDrawModeEnabled = sceneCaptureButton.getToggleState();
@@ -3981,7 +4071,6 @@ void SceneControlPanel::paint(juce::Graphics& g)
     juce::Rectangle<int> playbackBounds;
     unionVisibleBounds(playbackBounds, scenePlaybackSectionLabel);
     unionVisibleBounds(playbackBounds, sceneChainPlayButton);
-    unionVisibleBounds(playbackBounds, sceneRecordButton);
     unionVisibleBounds(playbackBounds, sceneChangeModeLabel);
     unionVisibleBounds(playbackBounds, sceneChangeModeBox);
     unionVisibleBounds(playbackBounds, sceneLengthHeaderLabel);
@@ -4031,6 +4120,7 @@ void SceneControlPanel::paint(juce::Graphics& g)
     unionVisibleBounds(timelineBounds, sceneZoomBox);
     unionVisibleBounds(timelineBounds, sceneFollowButton);
     unionVisibleBounds(timelineBounds, sceneReenableAutomationButton);
+    unionVisibleBounds(timelineBounds, sceneRecordButton);
     unionVisibleBounds(timelineBounds, sceneCaptureButton);
     unionVisibleBounds(timelineBounds, sceneStatusLabel);
     unionVisibleBounds(timelineBounds, sceneDetailLabel);
@@ -4083,7 +4173,14 @@ int SceneControlPanel::getFocusedSceneChainStep() const
 
 int SceneControlPanel::getVisibleSceneStripCount() const
 {
-    return juce::jmin(SceneEditorVisibleStrips, MlrVSTAudioProcessor::MaxStrips);
+    const int maxVisibleStrips = juce::jmin(SceneEditorVisibleStrips, MlrVSTAudioProcessor::MaxStrips);
+    const int monomeWidth = processor.getMonomeGridWidth();
+    const int monomeHeight = processor.getMonomeGridHeight();
+
+    if (monomeWidth == 16 && monomeHeight == 8)
+        return juce::jlimit(0, maxVisibleStrips, processor.getMonomeActiveStripCount());
+
+    return maxVisibleStrips;
 }
 
 int SceneControlPanel::getSceneTimelineContentHeight() const
@@ -4210,6 +4307,11 @@ std::vector<int> SceneControlPanel::collectSceneEventIndicesInMarquee(juce::Rect
             y += cardBounds.getHeight() + kSceneCardGap;
             continue;
         }
+        if (layout.compactOverview)
+        {
+            y += cardBounds.getHeight() + kSceneCardGap;
+            continue;
+        }
 
         for (int eventIndex = 0; eventIndex < static_cast<int>(sceneEditorState.events.size()); ++eventIndex)
         {
@@ -4299,6 +4401,11 @@ void SceneControlPanel::updateSceneHoverState(const juce::Point<float>& position
                                                      stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
         if (!layout.scenePlaybackAvailable)
+        {
+            y += cardBounds.getHeight() + kSceneCardGap;
+            continue;
+        }
+        if (layout.compactOverview)
         {
             y += cardBounds.getHeight() + kSceneCardGap;
             continue;
@@ -4612,23 +4719,25 @@ bool SceneControlPanel::applySceneDrawPoint(int stripIndex, int laneIndex, doubl
     const double gridStepBeats = sceneGridEnabled ? (4.0 / static_cast<double>(safeDivision)) : 0.0;
     const double matchEpsilon = sceneGridEnabled ? juce::jmax(1.0e-4, gridStepBeats * 0.45) : 1.0e-3;
 
-    for (auto& event : events)
-    {
-        if (event.type != ScenePerformanceEventType::ControlPoint
-            || sceneAutomationLaneIndex(event) != laneIndex)
-        {
-            continue;
-        }
+    events.erase(std::remove_if(events.begin(),
+                                events.end(),
+                                [safeLaneIndex, safeStripIndex, &drawnEvent, matchEpsilon](const ScenePerformanceEvent& event)
+                                {
+                                    if (event.type != ScenePerformanceEventType::ControlPoint
+                                        || sceneAutomationLaneIndex(event) != safeLaneIndex)
+                                    {
+                                        return false;
+                                    }
 
-        if (!sceneAutomationLaneUsesGlobalStrip(safeLaneIndex) && event.stripIndex != drawnEvent.stripIndex)
-            continue;
+                                    if (!sceneAutomationLaneUsesGlobalStrip(safeLaneIndex)
+                                        && event.stripIndex != safeStripIndex)
+                                    {
+                                        return false;
+                                    }
 
-        if (std::abs(event.timeBeats - drawnEvent.timeBeats) <= matchEpsilon)
-        {
-            event = drawnEvent;
-            return applyEditedSceneEvents(std::move(events), -1, &drawnEvent);
-        }
-    }
+                                    return std::abs(event.timeBeats - drawnEvent.timeBeats) <= matchEpsilon;
+                                }),
+                 events.end());
 
     events.push_back(drawnEvent);
     return applyEditedSceneEvents(std::move(events), -1, &drawnEvent);
@@ -4641,9 +4750,6 @@ bool SceneControlPanel::applySceneDrawCurveSegment(int stripIndex,
                                                    double endBeat,
                                                    float endValue)
 {
-    if (!sceneGridEnabled)
-        return applySceneDrawPoint(stripIndex, laneIndex, endBeat, endValue);
-
     if (processor.isScenePerformanceRecording())
         return false;
 
@@ -4651,6 +4757,56 @@ bool SceneControlPanel::applySceneDrawCurveSegment(int stripIndex,
     const double lengthBeats = getSceneTimelineLengthBeats(sceneSlot);
     const int safeLaneIndex = juce::jlimit(0, kSceneAutomationLaneCount - 1, laneIndex);
     const int safeStripIndex = sceneResolveAutomationStripIndex(stripIndex, safeLaneIndex);
+
+    if (!sceneGridEnabled)
+    {
+        const double clampedStart = juce::jlimit(0.0, lengthBeats, startBeat);
+        const double clampedEnd = juce::jlimit(0.0, lengthBeats, endBeat);
+        const double segmentStart = juce::jmin(clampedStart, clampedEnd);
+        const double segmentEnd = juce::jmax(clampedStart, clampedEnd);
+        constexpr double matchEpsilon = 1.0e-4;
+
+        auto events = sceneEditorState.events;
+        std::vector<ScenePerformanceEvent> drawnEvents;
+        events.erase(std::remove_if(events.begin(),
+                                    events.end(),
+                                    [safeStripIndex, safeLaneIndex, segmentStart, segmentEnd](const ScenePerformanceEvent& event)
+                                    {
+                                        return event.type == ScenePerformanceEventType::ControlPoint
+                                            && sceneAutomationLaneIndex(event) == safeLaneIndex
+                                            && (!sceneAutomationLaneUsesGlobalStrip(safeLaneIndex)
+                                                    ? (event.stripIndex == safeStripIndex)
+                                                    : true)
+                                            && event.timeBeats >= (segmentStart - matchEpsilon)
+                                            && event.timeBeats <= (segmentEnd + matchEpsilon);
+                                    }),
+                     events.end());
+
+        auto startEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
+                                                              safeLaneIndex,
+                                                              clampedStart,
+                                                              juce::jlimit(0.0f, 1.0f, startValue));
+        auto endEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
+                                                            safeLaneIndex,
+                                                            clampedEnd,
+                                                            juce::jlimit(0.0f, 1.0f, endValue));
+
+        if (std::abs(clampedEnd - clampedStart) <= matchEpsilon)
+        {
+            events.push_back(endEvent);
+            drawnEvents.push_back(endEvent);
+        }
+        else
+        {
+            events.push_back(startEvent);
+            events.push_back(endEvent);
+            drawnEvents.push_back(startEvent);
+            drawnEvents.push_back(endEvent);
+        }
+
+        return applyEditedSceneEvents(std::move(events), -1, &drawnEvents.back(), &drawnEvents);
+    }
+
     const int safeDivision = juce::jlimit(1, 64, sceneGridDivision);
     const double gridStepBeats = 4.0 / static_cast<double>(safeDivision);
     if (!(gridStepBeats > 0.0) || !std::isfinite(gridStepBeats))
@@ -4769,6 +4925,64 @@ bool SceneControlPanel::clearSceneLane(int stripIndex, int laneIndex, bool trigg
     return applyEditedSceneEvents(std::move(events));
 }
 
+bool SceneControlPanel::defaultSceneLane(int stripIndex, int laneIndex)
+{
+    if (processor.isScenePerformanceRecording())
+        return false;
+
+    auto events = sceneEditorState.events;
+    const int safeLaneIndex = juce::jlimit(0, kSceneAutomationLaneCount - 1, laneIndex);
+    const int safeStripIndex = sceneResolveAutomationStripIndex(stripIndex, safeLaneIndex);
+    const auto oldSize = events.size();
+
+    events.erase(std::remove_if(events.begin(),
+                                events.end(),
+                                [safeStripIndex, safeLaneIndex](const ScenePerformanceEvent& event)
+                                {
+                                    return event.type == ScenePerformanceEventType::ControlPoint
+                                        && sceneAutomationLaneIndex(event) == safeLaneIndex
+                                        && (sceneAutomationLaneUsesGlobalStrip(safeLaneIndex)
+                                               ? sceneIsGlobalAutomationEvent(event)
+                                               : (event.stripIndex == safeStripIndex));
+                                }),
+                 events.end());
+
+    const int sceneSlot = getFocusedSceneSlot();
+    const double lengthBeats = getSceneTimelineLengthBeats(sceneSlot);
+    const double endBeat = sceneAutomationWriteEndBeat(lengthBeats);
+    float normalizedValue = sceneAutomationLaneIsBipolar(safeLaneIndex)
+        ? 0.5f
+        : sceneDefaultNormalizedValueForLane(safeLaneIndex);
+    const auto target = sceneAutomationLaneTarget(safeLaneIndex);
+    if (sceneCurrentBaseNormalizedValue(processor,
+                                        sceneAutomationLaneUsesGlobalStrip(safeLaneIndex) ? -1 : safeStripIndex,
+                                        target,
+                                        normalizedValue))
+    {
+        normalizedValue = juce::jlimit(0.0f, 1.0f, normalizedValue);
+    }
+
+    std::vector<ScenePerformanceEvent> insertedEvents;
+    insertedEvents.push_back(makeDefaultSceneControlEventForLane(safeStripIndex,
+                                                                 safeLaneIndex,
+                                                                 0.0,
+                                                                 normalizedValue));
+    if (endBeat > 0.0)
+    {
+        insertedEvents.push_back(makeDefaultSceneControlEventForLane(safeStripIndex,
+                                                                     safeLaneIndex,
+                                                                     endBeat,
+                                                                     normalizedValue));
+    }
+
+    events.insert(events.end(), insertedEvents.begin(), insertedEvents.end());
+
+    if (events.size() == oldSize && insertedEvents.empty())
+        return false;
+
+    return applyEditedSceneEvents(std::move(events), -1, &insertedEvents.front(), &insertedEvents);
+}
+
 bool SceneControlPanel::thinSceneLane(int stripIndex, int laneIndex, bool triggerLane)
 {
     auto events = sceneEditorState.events;
@@ -4880,8 +5094,6 @@ void SceneControlPanel::resized()
     const int sceneButtonGap = 10;
     const int controlHeight = 22;
 
-    auto sceneSectionRow = settingsBounds.removeFromTop(10);
-    const int sceneSectionY = sceneSectionRow.getY();
     sceneSlotsSectionLabel.setBounds({});
     settingsBounds.removeFromTop(2);
 
@@ -4897,7 +5109,6 @@ void SceneControlPanel::resized()
     }
     const auto sceneContentX = sceneSelectorButtons.front().getX();
     const auto sceneContentWidth = sceneSelectorButtons.back().getRight() - sceneContentX;
-    sceneSlotsSectionLabel.setBounds(sceneContentX, sceneSectionY, 72, sceneSectionRow.getHeight());
     sceneChainPlayButton.setBounds({});
     sceneRecordButton.setBounds({});
     sceneSceneCaptureButton.setBounds({});
@@ -4954,8 +5165,6 @@ void SceneControlPanel::resized()
                                                42,
                                                juce::jmax(44, timingRow.getWidth() / 10));
     sceneChainPlayButton.setBounds(timingRow.removeFromLeft(transportWidth));
-    timingRow.removeFromLeft(actionGap);
-    sceneRecordButton.setBounds(timingRow.removeFromLeft(transportWidth));
     timingRow.removeFromLeft(labelGap + 3);
     sceneChangeModeLabel.setBounds(timingRow.removeFromLeft(advanceLabelWidth));
     timingRow.removeFromLeft(labelGap);
@@ -5042,9 +5251,12 @@ void SceneControlPanel::resized()
     auto recorderRow = bounds.removeFromTop(22);
     const int clipGap = 4;
     const int reenableWidth = compactButtonWidthForText("Re-enable", 86, 100);
+    const int recWidth = compactButtonWidthForText("Rec", 44, 50);
     sceneRecorderTitleLabel.setBounds({});
     sceneReenableAutomationButton.setBounds(recorderRow.removeFromRight(reenableWidth));
     recorderRow.removeFromRight(10);
+    sceneRecordButton.setBounds(recorderRow.removeFromLeft(recWidth));
+    recorderRow.removeFromLeft(clipGap);
     sceneCaptureButton.setBounds(recorderRow.removeFromLeft(54));
     recorderRow.removeFromLeft(clipGap);
     sceneGridToggleButton.setBounds(recorderRow.removeFromLeft(50));
@@ -5258,11 +5470,23 @@ void SceneControlPanel::updateSceneEditorState(double beat)
     const bool recordingThisScene = processor.isScenePerformanceRecording()
         && processor.getScenePerformanceRecordingSceneSlot() == sceneSlot;
     const bool hasAutomationOverrides = focusedIsActive && processor.hasAnyActiveSceneAutomationOverrides();
+    const bool blinkOn = hasEngine && processor.getAudioEngine()->shouldBlinkRecordLED();
+    const bool overdubbingThisScene = recordingThisScene && processor.isScenePerformanceOverdubbing();
     sceneRecordButton.setToggleState(recordingThisScene, juce::dontSendNotification);
     sceneRecordButton.setButtonText(recordingThisScene
-                                        ? (processor.isScenePerformanceOverdubbing() ? "Dub" : "Rec")
+                                        ? (overdubbingThisScene ? "Dub" : "Rec")
                                         : "Rec");
     sceneRecordButton.setEnabled(focusedIsActive);
+    sceneRecordButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff374048));
+    sceneRecordButton.setColour(juce::TextButton::buttonOnColourId,
+                                recordingThisScene
+                                    ? (overdubbingThisScene
+                                           ? (blinkOn ? juce::Colour(0xffdf9152) : juce::Colour(0xff7a4a31))
+                                           : (blinkOn ? juce::Colour(0xffd45b5b) : juce::Colour(0xff6d3434)))
+                                    : juce::Colour(0xff374048));
+    sceneRecordButton.setColour(juce::TextButton::textColourOffId, juce::Colour(0xfff2f4f6));
+    sceneRecordButton.setColour(juce::TextButton::textColourOnId,
+                                recordingThisScene ? juce::Colour(0xfffcfcfd) : juce::Colour(0xfff2f4f6));
     sceneReenableAutomationButton.setEnabled(hasAutomationOverrides);
     sceneReenableAutomationButton.setToggleState(hasAutomationOverrides, juce::dontSendNotification);
     sceneReenableAutomationButton.setTooltip(hasAutomationOverrides
@@ -5550,8 +5774,8 @@ void SceneControlPanel::refreshFromProcessor()
     sceneLaneOverlayButton.setToggleState(sceneLaneOverlayEnabled, juce::dontSendNotification);
     sceneMotionEditButton.setToggleState(sceneLegacyModEditorVisible, juce::dontSendNotification);
     sceneCaptureButton.setTooltip(sceneDrawModeEnabled
-                                      ? "Draw mode is on. Drag in trigger lanes to paint hits and automation lanes to paint quantized curves. Option-click resets automation points to the lane default, and Option-drag snaps bipolar lanes to center."
-                                      : "Draw mode is off. Click automation points to place anchors and connect line segments between clicks. Enable Draw to paint triggers and automation directly into the clip grid. Option-click resets automation points to the lane default, and Option-drag snaps bipolar lanes to center.");
+                                      ? "Draw mode is on. Drag in trigger lanes to paint hits and automation lanes to paint quantized curves. Option-click resets automation points to the lane default, Ctrl/Cmd-click defaults a whole automation lane, and Option-drag snaps bipolar lanes to center."
+                                      : "Draw mode is off. Click automation points to place anchors and connect line segments between clicks. Enable Draw to paint triggers and automation directly into the clip grid. Option-click resets automation points to the lane default, Ctrl/Cmd-click defaults a whole automation lane, and Option-drag snaps bipolar lanes to center.");
     const int chainLength = processor.getSceneChainLength();
     if (selectedSceneChainStep >= chainLength)
         selectedSceneChainStep = -1;
@@ -7200,9 +7424,12 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
             const auto point = marker.getCentre();
             if (hasPreviousPoint)
             {
-                g.setColour(globalColour.withAlpha(0.4f));
-                g.drawLine(previousPoint.x, previousPoint.y, point.x, previousPoint.y, 1.2f);
-                g.drawLine(point.x, previousPoint.y, point.x, point.y, 1.2f);
+                drawSceneAutomationConnection(g,
+                                              previousPoint,
+                                              point,
+                                              globalColour.withAlpha(0.4f),
+                                              sceneAutomationTargetUsesSteppedSegments(event.controlTarget),
+                                              1.2f);
             }
             previousPoint = point;
             hasPreviousPoint = true;
@@ -7306,7 +7533,8 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
         g.setFont(juce::Font(juce::FontOptions(9.5f)));
         g.drawText(scenePlaybackAvailable
                        ? (juce::String(triggerCount) + " trig  •  "
-                          + juce::String(controlCount) + " ctrl  •  " + sceneLengthLabel)
+                          + juce::String(controlCount) + " ctrl  •  " + sceneLengthLabel
+                          + (layout.compactOverview ? "  •  dbl-click edit" : ""))
                        : "Sample mode not available in scene playback",
                    layout.summaryBounds.toNearestInt(),
                    juce::Justification::centredRight);
@@ -7433,6 +7661,199 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
         auto* strip = engine != nullptr
             ? engine->getStrip(juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, visibleStrip))
             : nullptr;
+
+        if (layout.compactOverview)
+        {
+            auto* overviewStrip = strip;
+            if (overviewStrip == nullptr)
+            {
+                if (auto* overviewEngine = processor.getAudioEngine())
+                    overviewStrip = overviewEngine->getStrip(juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, visibleStrip));
+            }
+
+            g.setColour(kSurfaceDark.brighter(0.04f));
+            g.fillRoundedRectangle(layout.triggerTimelineBounds, 4.0f);
+            g.setColour(juce::Colours::white.withAlpha(0.06f));
+            g.drawRoundedRectangle(layout.triggerTimelineBounds.reduced(0.5f), 4.0f, 1.0f);
+
+            g.setColour(kTextMuted.withAlpha(0.92f));
+            g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+            g.drawText(stepTriggerLane ? "Steps" : "Wave",
+                       layout.triggerLabelBounds.toNearestInt(),
+                       juce::Justification::centredLeft,
+                       false);
+
+            auto overviewBounds = layout.triggerTimelineBounds.reduced(3.0f, 2.0f);
+            drawBarBlocks(overviewBounds);
+
+            if (stepTriggerLane)
+            {
+                const int totalSteps = juce::jmax(1, layout.stepTotalSteps);
+                const int displayColumns = juce::jlimit(8, 16, totalSteps);
+                const float cellGap = 1.0f;
+                const float cellWidth = juce::jmax(2.0f,
+                                                   (overviewBounds.getWidth() - (cellGap * static_cast<float>(displayColumns - 1)))
+                                                       / static_cast<float>(displayColumns));
+                const bool highlightPlayStep = overviewStrip != nullptr && overviewStrip->isPlaying();
+                const int playStep = (overviewStrip != nullptr)
+                    ? juce::jlimit(0, totalSteps - 1, overviewStrip->currentStep)
+                    : -1;
+                for (int column = 0; column < displayColumns; ++column)
+                {
+                    const int stepStart = (column * totalSteps) / displayColumns;
+                    const int stepEnd = juce::jmax(stepStart + 1, ((column + 1) * totalSteps) / displayColumns);
+                    bool enabled = false;
+                    float probabilityPeak = 0.0f;
+                    bool playStepInside = false;
+                    if (overviewStrip != nullptr)
+                    {
+                        for (int step = stepStart; step < juce::jmin(totalSteps, stepEnd); ++step)
+                        {
+                            enabled = enabled || overviewStrip->stepPattern[static_cast<size_t>(step)];
+                            probabilityPeak = juce::jmax(probabilityPeak,
+                                                         juce::jlimit(0.0f,
+                                                                      1.0f,
+                                                                      overviewStrip->stepProbability[static_cast<size_t>(step)]));
+                            playStepInside = playStepInside || (highlightPlayStep && step == playStep);
+                        }
+                    }
+
+                    auto cellBounds = juce::Rectangle<float>(overviewBounds.getX() + (column * (cellWidth + cellGap)),
+                                                             overviewBounds.getY(),
+                                                             cellWidth,
+                                                             overviewBounds.getHeight());
+                    g.setColour(enabled
+                                    ? stripColour.withAlpha(0.28f + (probabilityPeak * 0.32f))
+                                    : juce::Colour(0xff171b1f).withAlpha(0.82f));
+                    g.fillRoundedRectangle(cellBounds, 1.8f);
+                    g.setColour(playStepInside
+                                    ? kAccent.withAlpha(0.96f)
+                                    : juce::Colours::white.withAlpha(enabled ? 0.11f : 0.06f));
+                    g.drawRoundedRectangle(cellBounds.reduced(0.3f), 1.8f, playStepInside ? 1.0f : 0.7f);
+                }
+            }
+            else
+            {
+                const float centerY = overviewBounds.getCentreY();
+                g.setColour(juce::Colours::white.withAlpha(0.08f));
+                g.drawHorizontalLine(static_cast<int>(std::round(centerY)),
+                                     overviewBounds.getX() + 1.0f,
+                                     overviewBounds.getRight() - 1.0f);
+
+                if (overviewStrip != nullptr && overviewStrip->hasAudio())
+                {
+                    if (const auto* buffer = overviewStrip->getAudioBuffer();
+                        buffer != nullptr && buffer->getNumSamples() > 0)
+                    {
+                        const int totalSamples = buffer->getNumSamples();
+                        int sampleStart = 0;
+                        int sampleEnd = totalSamples;
+                        const int loopStart = juce::jlimit(0, juce::jmax(0, totalSamples - 1), overviewStrip->getLoopStart());
+                        const int loopEnd = juce::jlimit(loopStart + 1, totalSamples, overviewStrip->getLoopEnd());
+                        if (loopEnd > loopStart + 32)
+                        {
+                            sampleStart = loopStart;
+                            sampleEnd = loopEnd;
+                        }
+
+                        const int pixelColumns = juce::jmax(18, static_cast<int>(std::round(overviewBounds.getWidth())));
+                        const float halfHeight = overviewBounds.getHeight() * 0.42f;
+                        for (int pixel = 0; pixel < pixelColumns; ++pixel)
+                        {
+                            const int regionStart = sampleStart
+                                + ((pixel * (sampleEnd - sampleStart)) / pixelColumns);
+                            const int regionEnd = sampleStart
+                                + (((pixel + 1) * (sampleEnd - sampleStart)) / pixelColumns);
+                            const int sampleStride = juce::jmax(1, (regionEnd - regionStart) / 8);
+                            float peak = 0.0f;
+                            for (int sample = regionStart; sample < juce::jmax(regionStart + 1, regionEnd); sample += sampleStride)
+                            {
+                                for (int channel = 0; channel < buffer->getNumChannels(); ++channel)
+                                    peak = juce::jmax(peak, std::abs(buffer->getSample(channel, sample)));
+                            }
+
+                            const float x = overviewBounds.getX()
+                                + (overviewBounds.getWidth() * ((static_cast<float>(pixel) + 0.5f) / static_cast<float>(pixelColumns)));
+                            const float yExtent = juce::jlimit(0.0f, halfHeight, peak * halfHeight);
+                            g.setColour(stripColour.withAlpha(0.28f + (peak * 0.34f)));
+                            g.drawLine(x,
+                                       centerY - yExtent,
+                                       x,
+                                       centerY + yExtent,
+                                       1.0f);
+                        }
+                    }
+                }
+            }
+
+            for (const auto& event : sceneEditorState.events)
+            {
+                if (event.stripIndex != visibleStrip)
+                    continue;
+
+                const float x = overviewBounds.getX()
+                    + (overviewBounds.getWidth()
+                       * static_cast<float>(event.timeBeats / juce::jmax(1.0, lengthBeats)));
+                if (event.type == ScenePerformanceEventType::Trigger)
+                {
+                    g.setColour(stripColour.withAlpha(event.isNoteOn ? 0.92f : 0.62f));
+                    g.drawLine(x,
+                               overviewBounds.getY() + 1.0f,
+                               x,
+                               overviewBounds.getBottom() - 1.0f,
+                               1.15f);
+                }
+                else
+                {
+                    const float normalizedValue = normalizeSceneAutomationValue(event);
+                    const float yPos = overviewBounds.getBottom() - 2.0f
+                        - (juce::jlimit(0.0f, 1.0f, normalizedValue)
+                           * juce::jmax(3.0f, overviewBounds.getHeight() - 4.0f));
+                    g.setColour(stripColour.brighter(0.35f).withAlpha(0.72f));
+                    g.fillEllipse(x - 1.1f, yPos - 1.1f, 2.2f, 2.2f);
+                }
+            }
+
+            if (focusedSceneIsActive && overviewStrip != nullptr && overviewStrip->isPlaying())
+            {
+                const auto phaseBounds = overviewBounds.reduced(0.5f, 0.0f);
+                const float phase = static_cast<float>(juce::jlimit(0.0, 1.0, overviewStrip->getLoopPhaseNormalized()));
+                const float phaseX = phaseBounds.getX() + (phaseBounds.getWidth() * phase);
+                g.setColour(stripColour.withAlpha(0.95f));
+                g.drawLine(phaseX,
+                           phaseBounds.getY(),
+                           phaseX,
+                           phaseBounds.getBottom(),
+                           1.2f);
+            }
+
+            if (!scenePlaybackAvailable)
+            {
+                g.setColour(kTextPrimary.withAlpha(0.82f));
+                g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+                g.drawText("Scene playback unavailable",
+                           layout.triggerTimelineBounds.toNearestInt().reduced(8, 1),
+                           juce::Justification::centred,
+                           false);
+            }
+            else if (!stripHasEvents)
+            {
+                g.setColour(kTextMuted.withAlpha(0.52f));
+                g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+                const auto openHintBounds = juce::Rectangle<float>(layout.triggerTimelineBounds.getRight() - 38.0f,
+                                                                   layout.triggerTimelineBounds.getY(),
+                                                                   34.0f,
+                                                                   layout.triggerTimelineBounds.getHeight())
+                    .toNearestInt();
+                g.drawText("Open",
+                           openHintBounds,
+                           juce::Justification::centredRight,
+                           false);
+            }
+
+            y += cardHeight + kSceneCardGap;
+            continue;
+        }
 
         if (stepTriggerLane)
         {
@@ -7969,19 +8390,14 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                         static_cast<int>(event.controlTarget)));
                     if (hasPrevious[targetIndex])
                     {
-                        g.setColour(laneOverrideActive
-                                        ? kTextMuted.withAlpha(0.28f)
-                                        : sceneAutomationColour(event).withAlpha(0.4f));
-                        g.drawLine(previousPoints[targetIndex].x,
-                                   previousPoints[targetIndex].y,
-                                   point.x,
-                                   previousPoints[targetIndex].y,
-                                   1.2f);
-                        g.drawLine(point.x,
-                                   previousPoints[targetIndex].y,
-                                   point.x,
-                                   point.y,
-                                   1.2f);
+                        drawSceneAutomationConnection(g,
+                                                      previousPoints[targetIndex],
+                                                      point,
+                                                      laneOverrideActive
+                                                          ? kTextMuted.withAlpha(0.28f)
+                                                          : sceneAutomationColour(event).withAlpha(0.4f),
+                                                      sceneAutomationTargetUsesSteppedSegments(event.controlTarget),
+                                                      1.2f);
                     }
                     previousPoints[targetIndex] = point;
                     hasPrevious[targetIndex] = true;
@@ -8031,14 +8447,17 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                endMarker.getCentreY(),
                                laneOverrideActive ? 1.8f : 1.35f);
 
-                    const auto startAnchorBounds = startMarker.reduced(2.5f);
-                    const auto endAnchorBounds = endMarker.reduced(2.5f);
+                    const float anchorSize = juce::jmax(2.4f, startMarker.getWidth() * 0.58f);
+                    const auto startAnchorBounds = juce::Rectangle<float>(anchorSize, anchorSize)
+                        .withCentre(startMarker.getCentre());
+                    const auto endAnchorBounds = juce::Rectangle<float>(anchorSize, anchorSize)
+                        .withCentre(endMarker.getCentre());
                     g.setColour(liveColour);
                     g.fillEllipse(startAnchorBounds);
                     g.fillEllipse(endAnchorBounds);
                     g.setColour(juce::Colours::white.withAlpha(laneOverrideActive ? 0.72f : 0.48f));
-                    g.drawEllipse(startAnchorBounds.reduced(-0.5f), 0.95f);
-                    g.drawEllipse(endAnchorBounds.reduced(-0.5f), 0.95f);
+                    g.drawEllipse(startAnchorBounds.reduced(-0.35f), 0.85f);
+                    g.drawEllipse(endAnchorBounds.reduced(-0.35f), 0.85f);
                 }
 
                 if (sceneEditorState.transportProgress >= 0.0f)
@@ -8171,6 +8590,10 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
     const bool wantsThin = laneActionModifier && e.mods.isShiftDown();
     const bool wantsErase = e.mods.isPopupMenu()
         || e.mods.isRightButtonDown();
+    const bool wantsDefaultLane = (e.mods.isCommandDown() || e.mods.isCtrlDown())
+        && !e.mods.isShiftDown()
+        && !e.mods.isAltDown()
+        && !wantsErase;
     const bool wantsRetargetLaunch = (e.mods.isCommandDown() || e.mods.isCtrlDown()) && !e.mods.isShiftDown();
     const bool wantsToggleSelection = e.mods.isShiftDown()
         || e.mods.isCommandDown()
@@ -8192,6 +8615,14 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
     sceneEditorState.clickLineLaneIndex = -1;
     sceneEditorState.clickLineBeat = 0.0;
     sceneEditorState.clickLineValue = 0.0f;
+
+    if (wantsDefaultLane
+        && globalLane >= 0
+        && globalLayout.laneBounds.contains(e.position))
+    {
+        defaultSceneLane(-1, globalLane);
+        return;
+    }
 
     if (laneActionModifier
         && globalLane >= 0
@@ -8279,6 +8710,25 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
             updateSceneTimelineContentSize();
             sceneTimelineCanvas.repaint();
             return;
+        }
+
+        if (layout.compactOverview)
+        {
+            y += cardBounds.getHeight() + kSceneCardGap;
+            continue;
+        }
+
+        if (wantsDefaultLane && layout.automationExpanded)
+        {
+            for (int lane = 0; lane < kSceneAutomationLaneCount; ++lane)
+            {
+                const auto laneBounds = layout.automationTimelineBounds[static_cast<size_t>(lane)];
+                if (!laneBounds.contains(e.position))
+                    continue;
+
+                defaultSceneLane(visibleStrip, lane);
+                return;
+            }
         }
 
         if (laneActionModifier && layout.triggerLabelBounds.expanded(4.0f, 2.0f).contains(e.position))
@@ -8483,6 +8933,11 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
                 y += cardBounds.getHeight() + kSceneCardGap;
                 continue;
             }
+            if (layout.compactOverview)
+            {
+                y += cardBounds.getHeight() + kSceneCardGap;
+                continue;
+            }
 
             const auto triggerInteractionBounds = layout.stepTriggerLane && !layout.stepLaunchBounds.isEmpty()
                 ? layout.stepLaunchBounds
@@ -8613,6 +9068,12 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
                 y += cardBounds.getHeight() + kSceneCardGap;
                 continue;
             }
+            if (layout.compactOverview)
+            {
+                y += cardBounds.getHeight() + kSceneCardGap;
+                continue;
+            }
+
             const auto triggerInteractionBounds = layout.stepTriggerLane && !layout.stepLaunchBounds.isEmpty()
                 ? layout.stepLaunchBounds
                 : layout.triggerTimelineBounds;
@@ -8702,6 +9163,11 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
                                                      stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
         if (!layout.scenePlaybackAvailable)
+        {
+            y += cardBounds.getHeight() + kSceneCardGap;
+            continue;
+        }
+        if (layout.compactOverview)
         {
             y += cardBounds.getHeight() + kSceneCardGap;
             continue;
@@ -8971,6 +9437,26 @@ void SceneControlPanel::handleSceneTimelineMouseDoubleClick(const juce::MouseEve
                                                      stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
 
+        const bool compactCardHit = layout.compactOverview
+            && layout.scenePlaybackAvailable
+            && cardBounds.expanded(0.0f, 2.0f).contains(e.position)
+            && !layout.stripWriteBounds.contains(e.position)
+            && !layout.stripWriteAllBounds.contains(e.position)
+            && !layout.stripClearBounds.contains(e.position)
+            && !layout.stripDuplicateBounds.contains(e.position)
+            && !layout.stripCopyBounds.contains(e.position);
+
+        if (compactCardHit)
+        {
+            stripHeightExpanded[static_cast<size_t>(visibleStrip)] = true;
+            stripAutomationExpanded[static_cast<size_t>(visibleStrip)] = true;
+            processor.setSceneEditorStripHeightExpanded(visibleStrip, true);
+            processor.setSceneEditorStripAutomationExpanded(visibleStrip, true);
+            updateSceneTimelineContentSize();
+            sceneTimelineCanvas.repaint();
+            return;
+        }
+
         if (layout.titleBounds.expanded(8.0f, 3.0f).contains(e.position))
         {
             stripHeightExpanded[static_cast<size_t>(visibleStrip)]
@@ -8984,6 +9470,11 @@ void SceneControlPanel::handleSceneTimelineMouseDoubleClick(const juce::MouseEve
         }
 
         if (!layout.scenePlaybackAvailable)
+        {
+            y += cardBounds.getHeight() + kSceneCardGap;
+            continue;
+        }
+        if (layout.compactOverview)
         {
             y += cardBounds.getHeight() + kSceneCardGap;
             continue;
@@ -9268,15 +9759,12 @@ void SceneControlPanel::handleSceneTimelineMouseDrag(const juce::MouseEvent& e)
         const int globalLane = sceneGlobalAutomationLaneIndex();
         if (sceneEditorState.drawStripIndex < 0
             && globalLane >= 0
-            && globalLayout.laneBounds.expanded(0.0f, 3.0f).contains(e.position))
+            && sceneEditorState.drawLaneIndex == globalLane)
         {
             const float normalizedY = 1.0f - juce::jlimit(0.0f,
                                                           1.0f,
                                                           (e.position.y - globalLayout.laneBounds.getY())
                                                               / juce::jmax(1.0f, globalLayout.laneBounds.getHeight()));
-            sceneEditorState.drawTriggerLane = false;
-            sceneEditorState.drawStripIndex = -1;
-            sceneEditorState.drawLaneIndex = globalLane;
             const double currentBeat = sceneTimeBeatsForX(globalLayout.laneBounds, e.position.x, lengthBeats);
             const double startBeat = sceneEditorState.drawHasLastPoint ? sceneEditorState.drawLastBeat : currentBeat;
             const float startValue = sceneEditorState.drawHasLastPoint ? sceneEditorState.drawLastValue : normalizedY;
@@ -9294,7 +9782,12 @@ void SceneControlPanel::handleSceneTimelineMouseDrag(const juce::MouseEvent& e)
         if (sceneEditorState.drawStripIndex < 0)
             return;
 
+        const int lockedStripIndex = juce::jlimit(0,
+                                                  getVisibleSceneStripCount() - 1,
+                                                  sceneEditorState.drawStripIndex);
         float y = sceneGlobalLaneSectionHeight(sceneGlobalLaneExpanded);
+        SceneStripCardLayout lockedLayout;
+        bool foundLockedLayout = false;
         for (int visibleStrip = 0; visibleStrip < getVisibleSceneStripCount(); ++visibleStrip)
         {
             const auto cardBounds = juce::Rectangle<float>(
@@ -9310,62 +9803,59 @@ void SceneControlPanel::handleSceneTimelineMouseDrag(const juce::MouseEvent& e)
                                                          cardBounds,
                                                          stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                          stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
-            if (!layout.scenePlaybackAvailable)
+            if (visibleStrip == lockedStripIndex)
             {
-                y += cardBounds.getHeight() + kSceneCardGap;
-                continue;
-            }
-            const auto triggerInteractionBounds = layout.stepTriggerLane && !layout.stepLaunchBounds.isEmpty()
-                ? layout.stepLaunchBounds
-                : layout.triggerTimelineBounds;
-            if (triggerInteractionBounds.expanded(0.0f, 3.0f).contains(e.position))
-            {
-                sceneEditorState.drawTriggerLane = true;
-                sceneEditorState.drawStripIndex = visibleStrip;
-                sceneEditorState.drawLaneIndex = -1;
-                sceneEditorState.drawHasLastPoint = false;
-                applySceneDrawTrigger(visibleStrip,
-                                      sceneTimeBeatsForX(triggerInteractionBounds, e.position.x, lengthBeats),
-                                      layout.stepTriggerLane
-                                          ? defaultStepTriggerColumnForStrip(visibleStrip)
-                                          : sceneTriggerColumnForY(layout.triggerTimelineBounds, e.position.y));
-                return;
-            }
-
-            if (layout.automationExpanded)
-            {
-                for (int lane = 0; lane < kSceneAutomationLaneCount; ++lane)
-                {
-                    const auto laneBounds = layout.automationTimelineBounds[static_cast<size_t>(lane)];
-                    if (!laneBounds.expanded(0.0f, 3.0f).contains(e.position))
-                        continue;
-
-                    const float normalizedY = (e.mods.isAltDown() && sceneAutomationLaneIsBipolar(lane))
-                        ? 0.5f
-                        : (1.0f - juce::jlimit(0.0f,
-                                               1.0f,
-                                               (e.position.y - laneBounds.getY()) / juce::jmax(1.0f, laneBounds.getHeight())));
-                    sceneEditorState.drawTriggerLane = false;
-                    sceneEditorState.drawStripIndex = visibleStrip;
-                    sceneEditorState.drawLaneIndex = lane;
-                    const double currentBeat = sceneTimeBeatsForX(laneBounds, e.position.x, lengthBeats);
-                    const double startBeat = sceneEditorState.drawHasLastPoint ? sceneEditorState.drawLastBeat : currentBeat;
-                    const float startValue = sceneEditorState.drawHasLastPoint ? sceneEditorState.drawLastValue : normalizedY;
-                    applySceneDrawCurveSegment(visibleStrip,
-                                               lane,
-                                               startBeat,
-                                               startValue,
-                                               currentBeat,
-                                               normalizedY);
-                    sceneEditorState.drawLastBeat = currentBeat;
-                    sceneEditorState.drawLastValue = normalizedY;
-                    sceneEditorState.drawHasLastPoint = true;
-                    return;
-                }
+                lockedLayout = layout;
+                foundLockedLayout = true;
+                break;
             }
 
             y += cardBounds.getHeight() + kSceneCardGap;
         }
+
+        if (!foundLockedLayout || !lockedLayout.scenePlaybackAvailable)
+            return;
+
+        if (sceneEditorState.drawTriggerLane)
+        {
+            const auto triggerInteractionBounds = lockedLayout.stepTriggerLane && !lockedLayout.stepLaunchBounds.isEmpty()
+                ? lockedLayout.stepLaunchBounds
+                : lockedLayout.triggerTimelineBounds;
+            sceneEditorState.drawHasLastPoint = false;
+            applySceneDrawTrigger(lockedStripIndex,
+                                  sceneTimeBeatsForX(triggerInteractionBounds, e.position.x, lengthBeats),
+                                  lockedLayout.stepTriggerLane
+                                      ? defaultStepTriggerColumnForStrip(lockedStripIndex)
+                                      : sceneTriggerColumnForY(lockedLayout.triggerTimelineBounds, e.position.y));
+            return;
+        }
+
+        const int lockedLaneIndex = sceneEditorState.drawLaneIndex;
+        if (!juce::isPositiveAndBelow(lockedLaneIndex, kSceneAutomationLaneCount)
+            || !lockedLayout.automationExpanded)
+        {
+            return;
+        }
+
+        const auto laneBounds = lockedLayout.automationTimelineBounds[static_cast<size_t>(lockedLaneIndex)];
+        const float normalizedY = (e.mods.isAltDown() && sceneAutomationLaneIsBipolar(lockedLaneIndex))
+            ? 0.5f
+            : (1.0f - juce::jlimit(0.0f,
+                                   1.0f,
+                                   (e.position.y - laneBounds.getY()) / juce::jmax(1.0f, laneBounds.getHeight())));
+        const double currentBeat = sceneTimeBeatsForX(laneBounds, e.position.x, lengthBeats);
+        const double startBeat = sceneEditorState.drawHasLastPoint ? sceneEditorState.drawLastBeat : currentBeat;
+        const float startValue = sceneEditorState.drawHasLastPoint ? sceneEditorState.drawLastValue : normalizedY;
+        applySceneDrawCurveSegment(lockedStripIndex,
+                                   lockedLaneIndex,
+                                   startBeat,
+                                   startValue,
+                                   currentBeat,
+                                   normalizedY);
+        sceneEditorState.drawLastBeat = currentBeat;
+        sceneEditorState.drawLastValue = normalizedY;
+        sceneEditorState.drawHasLastPoint = true;
+        return;
     }
 
     if (!sceneEditorState.dragActive
@@ -9420,12 +9910,12 @@ void SceneControlPanel::handleSceneTimelineMouseDrag(const juce::MouseEvent& e)
 
         if (cardBounds.expanded(0.0f, 4.0f).contains(e.position))
         {
-            if (editedEvent.type == ScenePerformanceEventType::Trigger || layout.automationExpanded)
+            if (layout.automationExpanded)
             {
                 hoveredStrip = visibleStrip;
                 hoveredLayout = layout;
+                foundHoveredLayout = true;
             }
-            foundHoveredLayout = true;
             break;
         }
 
@@ -9445,6 +9935,8 @@ void SceneControlPanel::handleSceneTimelineMouseDrag(const juce::MouseEvent& e)
             moveTriggerTime = sceneEditorState.dragTriggerMoveTime;
             moveTriggerOffset = sceneEditorState.dragTriggerMoveOffset;
         }
+        if (!foundHoveredLayout || !hoveredLayout.automationExpanded)
+            return;
         editedEvent.stripIndex = hoveredStrip;
         const auto timelineBounds = hoveredLayout.stepTriggerLane && !hoveredLayout.stepLaunchBounds.isEmpty()
             ? hoveredLayout.stepLaunchBounds
