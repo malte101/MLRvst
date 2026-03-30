@@ -20,6 +20,42 @@ bool MlrVSTAudioProcessor::hasStoredSceneSlotState(int mainPresetIndex, int scen
     return getStoredSceneSlotState(mainPresetIndex, sceneSlot) != nullptr;
 }
 
+bool MlrVSTAudioProcessor::hasAnyStoredSceneSlotState(int mainPresetIndex) const
+{
+    const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
+    if (storedSceneSlotStateMainPresetIndex != safeMainPresetIndex)
+        return false;
+
+    for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
+    {
+        if (getStoredSceneSlotState(safeMainPresetIndex, sceneSlot) != nullptr)
+            return true;
+    }
+
+    return false;
+}
+
+bool MlrVSTAudioProcessor::hasPersistableStoredSceneSlotState(int mainPresetIndex, int sceneSlot) const
+{
+    const auto* state = getStoredSceneSlotState(mainPresetIndex, sceneSlot);
+    return state != nullptr && !state->implicitMainPresetFallback;
+}
+
+bool MlrVSTAudioProcessor::hasAnyPersistableStoredSceneSlotState(int mainPresetIndex) const
+{
+    const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
+    if (storedSceneSlotStateMainPresetIndex != safeMainPresetIndex)
+        return false;
+
+    for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
+    {
+        if (hasPersistableStoredSceneSlotState(safeMainPresetIndex, sceneSlot))
+            return true;
+    }
+
+    return false;
+}
+
 const MlrVSTAudioProcessor::SceneSlotState* MlrVSTAudioProcessor::getStoredSceneSlotState(int mainPresetIndex,
                                                                                           int sceneSlot) const
 {
@@ -60,13 +96,7 @@ bool MlrVSTAudioProcessor::loadStoredSceneSlotStatesForPreset(int mainPresetInde
                                                               const juce::XmlElement& presetXml)
 {
     const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
-    if (restoreStoredSceneSlotStatesFromPresetXml(safeMainPresetIndex, presetXml))
-        return true;
-
-    const bool migrated = migrateLegacyStoredSceneSlotStates(safeMainPresetIndex);
-    if (migrated)
-        juce::ignoreUnused(persistStoredSceneSlotStatesToMainPreset(safeMainPresetIndex));
-    return migrated;
+    return restoreStoredSceneSlotStatesFromPresetXml(safeMainPresetIndex, presetXml);
 }
 
 bool MlrVSTAudioProcessor::restoreStoredSceneSlotStatesFromPresetXml(int mainPresetIndex,
@@ -100,6 +130,7 @@ bool MlrVSTAudioProcessor::restoreStoredSceneSlotStatesFromPresetXml(int mainPre
         state.mainPresetIndex = safeMainPresetIndex;
         state.sceneSlot = safeSceneSlot;
         state.hasStoredContent = true;
+        state.implicitMainPresetFallback = false;
         state.name = sceneSlotXml->getStringAttribute("name",
                                                       snapshotXml->getStringAttribute("name").trim()).trim();
         auto templatePayload = std::make_unique<PreparedSceneSwitchPayload>();
@@ -117,55 +148,22 @@ bool MlrVSTAudioProcessor::restoreStoredSceneSlotStatesFromPresetXml(int mainPre
         restoredAny = true;
     }
 
-    return restoredAny;
+    juce::ignoreUnused(restoredAny);
+    return true;
 }
 
 bool MlrVSTAudioProcessor::migrateLegacyStoredSceneSlotStates(int mainPresetIndex)
 {
-    const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
-    clearStoredSceneSlotStates(safeMainPresetIndex);
-
-    bool migratedAny = false;
-    for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
-    {
-        const int storageIndex = getSceneStoragePresetIndex(safeMainPresetIndex, sceneSlot);
-        auto legacySceneXml = PresetStore::loadPresetXml(storageIndex);
-        if (legacySceneXml == nullptr)
-            continue;
-
-        juce::MemoryBlock legacyScenePerformanceData;
-        if (PresetStore::loadScenePerformanceData(storageIndex, legacyScenePerformanceData)
-            && legacyScenePerformanceData.getSize() > 0
-            && legacySceneXml->getChildByName("ScenePerformanceData") == nullptr)
-        {
-            auto* perfXml = legacySceneXml->createNewChildElement("ScenePerformanceData");
-            perfXml->addTextElement(legacyScenePerformanceData.toBase64Encoding());
-        }
-
-        auto& state = storedSceneSlotStates[static_cast<size_t>(sceneSlot)];
-        state.mainPresetIndex = safeMainPresetIndex;
-        state.sceneSlot = sceneSlot;
-        state.hasStoredContent = true;
-        state.name = legacySceneXml->getStringAttribute("name").trim();
-        auto templatePayload = std::make_unique<PreparedSceneSwitchPayload>();
-        if (!parsePreparedSceneSwitchPayloadTemplate(*templatePayload,
-                                                     *legacySceneXml,
-                                                     safeMainPresetIndex,
-                                                     sceneSlot))
-        {
-            state = {};
-            state.mainPresetIndex = safeMainPresetIndex;
-            state.sceneSlot = sceneSlot;
-            continue;
-        }
-        state.preparedSwitchPayloadTemplate = std::move(templatePayload);
-        migratedAny = true;
-    }
-
-    return migratedAny;
+    // Legacy per-scene preset-slot migration is intentionally disabled.
+    // Presets without explicit embedded StoredScenes should load as plain presets
+    // and only synthesize S1 from the loaded preset state at runtime.
+    clearStoredSceneSlotStates(juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex));
+    return false;
 }
 
-bool MlrVSTAudioProcessor::captureSceneSlotState(int mainPresetIndex, int sceneSlot)
+bool MlrVSTAudioProcessor::captureSceneSlotState(int mainPresetIndex,
+                                                 int sceneSlot,
+                                                 bool implicitMainPresetFallback)
 {
     const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
     const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
@@ -184,6 +182,7 @@ bool MlrVSTAudioProcessor::captureSceneSlotState(int mainPresetIndex, int sceneS
     state.mainPresetIndex = safeMainPresetIndex;
     state.sceneSlot = safeSceneSlot;
     state.hasStoredContent = true;
+    state.implicitMainPresetFallback = implicitMainPresetFallback;
     state.name = sceneName;
     auto templatePayload = std::make_unique<PreparedSceneSwitchPayload>();
     if (!capturePreparedSceneSwitchPayloadTemplate(*templatePayload,
@@ -196,6 +195,30 @@ bool MlrVSTAudioProcessor::captureSceneSlotState(int mainPresetIndex, int sceneS
         return false;
     }
     state.preparedSwitchPayloadTemplate = std::move(templatePayload);
+    return true;
+}
+
+bool MlrVSTAudioProcessor::ensureSceneSlotFallbackState(int mainPresetIndex, int sceneSlot)
+{
+    const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+
+    if (hasStoredSceneSlotState(safeMainPresetIndex, safeSceneSlot))
+        return true;
+    if (audioEngine == nullptr)
+        return false;
+
+    if (storedSceneSlotStateMainPresetIndex != safeMainPresetIndex)
+        clearStoredSceneSlotStates(safeMainPresetIndex);
+
+    syncSceneMotionStateFromEngine(safeSceneSlot);
+    syncScenePerformanceClipLengthToResolvedLength(safeSceneSlot);
+
+    const bool captured = captureSceneSlotState(safeMainPresetIndex, safeSceneSlot, true);
+    if (!captured)
+        return false;
+
+    clearSceneClipSlotRuntimeState(safeMainPresetIndex, safeSceneSlot);
     return true;
 }
 
@@ -218,6 +241,7 @@ bool MlrVSTAudioProcessor::copyStoredSceneSlotState(int mainPresetIndex, int sou
         return true;
 
     destState.hasStoredContent = true;
+    destState.implicitMainPresetFallback = false;
     destState.name = sourceState->name;
     destState.preparedSwitchPayloadTemplate =
         clonePreparedSceneSwitchPayloadTemplate(*sourceState->preparedSwitchPayloadTemplate);

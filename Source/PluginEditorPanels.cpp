@@ -663,7 +663,7 @@ juce::String sceneControlTargetName(ScenePerformanceControlTarget target)
     }
 }
 
-juce::String describeSceneEditorEvent(const ScenePerformanceEvent& event)
+[[maybe_unused]] juce::String describeSceneEditorEvent(const ScenePerformanceEvent& event)
 {
     if (event.type == ScenePerformanceEventType::Trigger)
         return "Pattern S" + juce::String(event.stripIndex + 1)
@@ -1900,6 +1900,32 @@ void appendSceneStripAutomationWriteEvents(MlrVSTAudioProcessor& processor,
     }
 }
 
+void appendSceneStripStoredDefaultAutomationStartPoints(MlrVSTAudioProcessor& processor,
+                                                        int sceneSlot,
+                                                        int stripIndex,
+                                                        std::vector<ScenePerformanceEvent>& events)
+{
+    const int safeStripIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
+
+    for (int lane = 0; lane < kSceneAutomationLaneCount; ++lane)
+    {
+        if (!sceneAutomationLaneVisible(processor, safeStripIndex, lane))
+            continue;
+
+        float normalizedValue = sceneAutomationLaneIsBipolar(lane)
+            ? 0.5f
+            : sceneDefaultNormalizedValueForLane(lane);
+        const auto target = sceneAutomationLaneTarget(lane);
+        if (processor.getStoredSceneControlNormalizedValue(sceneSlot, safeStripIndex, target, normalizedValue))
+            normalizedValue = juce::jlimit(0.0f, 1.0f, normalizedValue);
+
+        events.push_back(makeDefaultSceneControlEventForLane(safeStripIndex,
+                                                             lane,
+                                                             0.0,
+                                                             normalizedValue));
+    }
+}
+
 void appendSceneGlobalAutomationWriteEvents(MlrVSTAudioProcessor& processor,
                                             double lengthBeats,
                                             std::vector<ScenePerformanceEvent>& events)
@@ -2490,20 +2516,93 @@ juce::String sceneChainTransitionOptionSummary(MlrVSTAudioProcessor::SceneChainT
     }
 }
 
-int sceneChainTransitionOptionVisualLevel(MlrVSTAudioProcessor::SceneChainTransitionOption option)
+juce::String sceneChainTransitionScopeLabel(MlrVSTAudioProcessor::SceneChainTransitionScope scope)
 {
-    using TransitionOption = MlrVSTAudioProcessor::SceneChainTransitionOption;
-    switch (option)
+    using Scope = MlrVSTAudioProcessor::SceneChainTransitionScope;
+    switch (scope)
     {
-        case TransitionOption::Snap:    return 1;
-        case TransitionOption::Tight:   return 2;
-        case TransitionOption::Default: return 3;
-        case TransitionOption::Wide:    return 4;
-        case TransitionOption::Wash:    return 5;
-        case TransitionOption::Echo:    return 4;
-        case TransitionOption::Sweep:   return 4;
-        case TransitionOption::Gate:    return 3;
-        default:                        return 3;
+        case Scope::Loops:  return "Loops";
+        case Scope::Steps:  return "Steps";
+        case Scope::Grains: return "Grains";
+        case Scope::Flip:   return "Flip";
+        case Scope::All:
+        default:
+            return "All";
+    }
+}
+
+juce::String sceneChainTransitionScopeSummary(MlrVSTAudioProcessor::SceneChainTransitionScope scope)
+{
+    using Scope = MlrVSTAudioProcessor::SceneChainTransitionScope;
+    switch (scope)
+    {
+        case Scope::Loops:  return "loop, gate, and one-shot strips";
+        case Scope::Steps:  return "step sequencer strips";
+        case Scope::Grains: return "granular strips";
+        case Scope::Flip:   return "flip/sample strips";
+        case Scope::All:
+        default:
+            return "all playable strips";
+    }
+}
+
+juce::String sceneChainTransitionContourLabel(MlrVSTAudioProcessor::SceneChainTransitionContour contour)
+{
+    using Contour = MlrVSTAudioProcessor::SceneChainTransitionContour;
+    switch (contour)
+    {
+        case Contour::Ramp:         return "Ramp";
+        case Contour::BurstEnd:     return "Burst";
+        case Contour::DuckThenLift: return "Duck/Lift";
+        case Contour::LateHit:      return "Late Hit";
+        case Contour::Smooth:
+        default:
+            return "Smooth";
+    }
+}
+
+juce::String sceneChainTransitionContourSummary(MlrVSTAudioProcessor::SceneChainTransitionContour contour)
+{
+    using Contour = MlrVSTAudioProcessor::SceneChainTransitionContour;
+    switch (contour)
+    {
+        case Contour::Ramp:         return "steady rise toward the handoff";
+        case Contour::BurstEnd:     return "back-loaded burst into the scene change";
+        case Contour::DuckThenLift: return "early duck with a later lift";
+        case Contour::LateHit:      return "late punch in the final moment";
+        case Contour::Smooth:
+        default:
+            return "even S-curve movement across the whole fill";
+    }
+}
+
+juce::String sceneChainTransitionConditionLabel(MlrVSTAudioProcessor::SceneChainTransitionCondition condition)
+{
+    using Condition = MlrVSTAudioProcessor::SceneChainTransitionCondition;
+    switch (condition)
+    {
+        case Condition::Chance50:   return "50%";
+        case Condition::Chance25:   return "25%";
+        case Condition::LoopOnly:   return "Loop";
+        case Condition::ForwardOnly:return "Forward";
+        case Condition::Always:
+        default:
+            return "Always";
+    }
+}
+
+juce::String sceneChainTransitionConditionSummary(MlrVSTAudioProcessor::SceneChainTransitionCondition condition)
+{
+    using Condition = MlrVSTAudioProcessor::SceneChainTransitionCondition;
+    switch (condition)
+    {
+        case Condition::Chance50:    return "fires on about half of eligible handoffs";
+        case Condition::Chance25:    return "fires on about a quarter of eligible handoffs";
+        case Condition::LoopOnly:    return "fires only when the chain wraps back through its loop";
+        case Condition::ForwardOnly: return "fires only on forward, non-loop handoffs";
+        case Condition::Always:
+        default:
+            return "fires on every eligible handoff";
     }
 }
 
@@ -2554,6 +2653,49 @@ int sceneTransitionComboIdForValue(float value,
     return bestId;
 }
 
+template <size_t N>
+int sceneTransitionOptionIndexForComboId(int comboId,
+                                         const std::array<SceneTransitionComboOption, N>& options)
+{
+    for (int index = 0; index < static_cast<int>(N); ++index)
+    {
+        if (options[static_cast<size_t>(index)].comboId == comboId)
+            return index;
+    }
+    return -1;
+}
+
+float steppedSceneTransitionLengthBeats(float value, bool increase)
+{
+    const int currentComboId = sceneTransitionComboIdForValue(value,
+                                                              kSceneTransitionLengthOptions,
+                                                              MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats);
+    const int currentIndex = sceneTransitionOptionIndexForComboId(currentComboId, kSceneTransitionLengthOptions);
+    if (currentIndex < 0)
+        return MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats;
+
+    const int nextIndex = juce::jlimit(0,
+                                       static_cast<int>(kSceneTransitionLengthOptions.size()) - 1,
+                                       currentIndex + (increase ? 1 : -1));
+    return kSceneTransitionLengthOptions[static_cast<size_t>(nextIndex)].value;
+}
+
+float sceneTransitionLengthBeatsForDrag(float startValue, float deltaX)
+{
+    const int currentComboId = sceneTransitionComboIdForValue(startValue,
+                                                              kSceneTransitionLengthOptions,
+                                                              MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats);
+    const int currentIndex = sceneTransitionOptionIndexForComboId(currentComboId, kSceneTransitionLengthOptions);
+    if (currentIndex < 0)
+        return MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats;
+
+    const int indexOffset = juce::roundToInt(deltaX / 18.0f);
+    const int nextIndex = juce::jlimit(0,
+                                       static_cast<int>(kSceneTransitionLengthOptions.size()) - 1,
+                                       currentIndex + indexOffset);
+    return kSceneTransitionLengthOptions[static_cast<size_t>(nextIndex)].value;
+}
+
 juce::String formatSceneTransitionLengthBeats(float beats)
 {
     const float safeBeats = sceneTransitionValueForComboId(
@@ -2569,12 +2711,18 @@ juce::String formatSceneTransitionLengthBeats(float beats)
 }
 
 juce::String sceneTransitionParameterSummary(float lengthBeats,
+                                             MlrVSTAudioProcessor::SceneChainTransitionScope scope,
+                                             MlrVSTAudioProcessor::SceneChainTransitionContour contour,
+                                             MlrVSTAudioProcessor::SceneChainTransitionCondition condition,
                                              float intensity,
                                              float delayAmount,
                                              float filterAmount,
                                              float chopAmount)
 {
     return formatSceneTransitionLengthBeats(lengthBeats)
+        + " • " + sceneChainTransitionScopeLabel(scope)
+        + " • " + sceneChainTransitionContourLabel(contour)
+        + " • " + sceneChainTransitionConditionLabel(condition)
         + " • Mix " + juce::String(juce::roundToInt(intensity * 100.0f)) + "%"
         + " • Dly " + juce::String(juce::roundToInt(delayAmount * 100.0f)) + "%"
         + " • Flt " + juce::String(juce::roundToInt(filterAmount * 100.0f)) + "%"
@@ -2591,6 +2739,177 @@ juce::String sceneTransitionTimingModeSummary(bool subtractFromSceneLength)
 juce::String sceneTransitionSubtractButtonLabel(bool enabled)
 {
     return enabled ? "Shorten Scene" : "Ride Over End";
+}
+
+struct SceneTransitionTuningProfile
+{
+    float defaultLengthBeats = MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats;
+    float defaultIntensity = MlrVSTAudioProcessor::DefaultSceneTransitionIntensity;
+    float delayWeight = 1.0f;
+    float filterWeight = 1.0f;
+    float chopWeight = 1.0f;
+    bool subtractFromSceneLength = false;
+};
+
+SceneTransitionTuningProfile sceneTransitionTypeTuningProfile(MlrVSTAudioProcessor::SceneChainTransitionType type)
+{
+    using TransitionType = MlrVSTAudioProcessor::SceneChainTransitionType;
+
+    switch (type)
+    {
+        case TransitionType::Fill:       return { 1.0f, 0.78f, 0.62f, 0.48f, 0.34f, false };
+        case TransitionType::Stutter:    return { 0.5f, 0.84f, 0.18f, 0.24f, 1.00f, true };
+        case TransitionType::FilterRise: return { 2.0f, 0.80f, 0.18f, 1.00f, 0.12f, false };
+        case TransitionType::Drop:       return { 1.0f, 0.86f, 0.34f, 0.76f, 0.58f, true };
+        case TransitionType::MuteTail:   return { 0.5f, 0.72f, 0.10f, 0.14f, 0.82f, true };
+        case TransitionType::Break:      return { 1.0f, 0.88f, 0.44f, 0.34f, 0.76f, true };
+        case TransitionType::Return:     return { 1.0f, 0.64f, 0.20f, 0.26f, 0.16f, false };
+        case TransitionType::None:
+        default:
+            return { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false };
+    }
+}
+
+SceneTransitionTuningProfile sceneTransitionOptionTuningProfile(MlrVSTAudioProcessor::SceneChainTransitionOption option)
+{
+    using TransitionOption = MlrVSTAudioProcessor::SceneChainTransitionOption;
+
+    switch (option)
+    {
+        case TransitionOption::Snap:    return { 0.5f, 0.92f, 0.48f, 0.72f, 1.14f, true };
+        case TransitionOption::Tight:   return { 0.75f, 0.96f, 0.70f, 0.82f, 1.08f, false };
+        case TransitionOption::Wide:    return { 1.5f, 1.04f, 1.08f, 1.08f, 0.90f, false };
+        case TransitionOption::Wash:    return { 2.0f, 0.94f, 1.34f, 1.20f, 0.66f, false };
+        case TransitionOption::Echo:    return { 1.25f, 0.98f, 1.56f, 0.82f, 0.72f, false };
+        case TransitionOption::Sweep:   return { 1.25f, 0.98f, 0.84f, 1.58f, 0.76f, false };
+        case TransitionOption::Gate:    return { 0.85f, 1.02f, 0.68f, 0.78f, 1.44f, true };
+        case TransitionOption::Default:
+        default:
+            return { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, false };
+    }
+}
+
+struct SceneTransitionSuggestedSettings
+{
+    float lengthBeats = MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats;
+    float intensity = MlrVSTAudioProcessor::DefaultSceneTransitionIntensity;
+    float delayAmount = MlrVSTAudioProcessor::DefaultSceneTransitionDelayAmount;
+    float filterAmount = MlrVSTAudioProcessor::DefaultSceneTransitionFilterAmount;
+    float chopAmount = MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount;
+    bool subtractFromSceneLength = false;
+};
+
+float normalizedSceneTransitionLead(float lengthBeats)
+{
+    const float safeLength = juce::jlimit(MlrVSTAudioProcessor::MinSceneTransitionLengthBeats,
+                                          MlrVSTAudioProcessor::MaxSceneTransitionLengthBeats,
+                                          std::isfinite(lengthBeats)
+                                              ? lengthBeats
+                                              : MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats);
+    return juce::jlimit(0.0f,
+                        1.0f,
+                        (safeLength - MlrVSTAudioProcessor::MinSceneTransitionLengthBeats)
+                            / (MlrVSTAudioProcessor::MaxSceneTransitionLengthBeats
+                               - MlrVSTAudioProcessor::MinSceneTransitionLengthBeats));
+}
+
+SceneTransitionSuggestedSettings sceneTransitionSuggestedSettings(MlrVSTAudioProcessor::SceneChainTransitionType type,
+                                                                 MlrVSTAudioProcessor::SceneChainTransitionOption option,
+                                                                 float intensity,
+                                                                 float lengthBeats,
+                                                                 bool subtractFromSceneLength)
+{
+    SceneTransitionSuggestedSettings settings;
+    const auto typeProfile = sceneTransitionTypeTuningProfile(type);
+    const auto optionProfile = sceneTransitionOptionTuningProfile(option);
+
+    if (type == MlrVSTAudioProcessor::SceneChainTransitionType::None)
+    {
+        settings.intensity = 0.0f;
+        settings.delayAmount = 0.0f;
+        settings.filterAmount = 0.0f;
+        settings.chopAmount = 0.0f;
+        settings.subtractFromSceneLength = false;
+        return settings;
+    }
+
+    settings.lengthBeats = juce::jlimit(MlrVSTAudioProcessor::MinSceneTransitionLengthBeats,
+                                        MlrVSTAudioProcessor::MaxSceneTransitionLengthBeats,
+                                        std::isfinite(lengthBeats)
+                                            ? lengthBeats
+                                            : (typeProfile.defaultLengthBeats * optionProfile.defaultLengthBeats));
+    settings.intensity = juce::jlimit(0.0f,
+                                      1.0f,
+                                      std::isfinite(intensity)
+                                          ? intensity
+                                          : (typeProfile.defaultIntensity * optionProfile.defaultIntensity));
+
+    const float leadNormal = normalizedSceneTransitionLead(settings.lengthBeats);
+    const float shortLeadFocus = 1.0f - leadNormal;
+    const float longLeadFocus = leadNormal;
+
+    const float delayWeight = juce::jmax(0.0f,
+                                         typeProfile.delayWeight
+                                             * optionProfile.delayWeight
+                                             * (0.78f + (0.52f * longLeadFocus)));
+    const float filterWeight = juce::jmax(0.0f,
+                                          typeProfile.filterWeight
+                                              * optionProfile.filterWeight
+                                              * (0.80f + (0.54f * longLeadFocus)));
+    const float chopWeight = juce::jmax(0.0f,
+                                        typeProfile.chopWeight
+                                            * optionProfile.chopWeight
+                                            * (0.78f + (0.56f * shortLeadFocus)));
+    const float maxWeight = juce::jmax(0.0001f, juce::jmax(delayWeight, juce::jmax(filterWeight, chopWeight)));
+
+    auto weightedAmount = [&](float rawWeight, float baseFloor, float range)
+    {
+        const float normalizedWeight = juce::jlimit(0.0f, 1.0f, rawWeight / maxWeight);
+        return juce::jlimit(0.0f, 1.0f, baseFloor + (settings.intensity * range * normalizedWeight));
+    };
+
+    settings.delayAmount = weightedAmount(delayWeight, 0.04f + (0.06f * longLeadFocus), 0.78f);
+    settings.filterAmount = weightedAmount(filterWeight, 0.05f + (0.05f * longLeadFocus), 0.80f);
+    settings.chopAmount = weightedAmount(chopWeight, 0.04f + (0.06f * shortLeadFocus), 0.76f);
+    settings.subtractFromSceneLength = subtractFromSceneLength
+        || typeProfile.subtractFromSceneLength
+        || optionProfile.subtractFromSceneLength;
+    return settings;
+}
+
+juce::String sceneTransitionFocusSummary(float delayAmount, float filterAmount, float chopAmount)
+{
+    const float delay = juce::jlimit(0.0f, 1.0f, delayAmount);
+    const float filter = juce::jlimit(0.0f, 1.0f, filterAmount);
+    const float chop = juce::jlimit(0.0f, 1.0f, chopAmount);
+
+    if (juce::jmax(delay, juce::jmax(filter, chop)) < 0.18f)
+        return "subtle";
+    if (delay >= filter + 0.10f && delay >= chop + 0.10f)
+        return "echo-led";
+    if (filter >= delay + 0.10f && filter >= chop + 0.10f)
+        return "sweep-led";
+    if (chop >= delay + 0.10f && chop >= filter + 0.10f)
+        return "gate-led";
+    if (delay > 0.46f && filter > 0.46f)
+        return "wide lift";
+    if (filter > 0.42f && chop > 0.42f)
+        return "cutting break";
+    return "balanced";
+}
+
+juce::String sceneTransitionEnergySummary(float intensity)
+{
+    const float clamped = juce::jlimit(0.0f, 1.0f, intensity);
+    if (clamped < 0.22f)
+        return "very light";
+    if (clamped < 0.46f)
+        return "light";
+    if (clamped < 0.74f)
+        return "driving";
+    if (clamped < 0.92f)
+        return "high energy";
+    return "full send";
 }
 
 struct SceneChainLayout
@@ -2686,16 +3005,34 @@ juce::Colour sceneChainTransitionColour(MlrVSTAudioProcessor::SceneChainTransiti
     using TransitionType = MlrVSTAudioProcessor::SceneChainTransitionType;
     switch (type)
     {
-        case TransitionType::Fill:       return juce::Colour(0xffd9a04a);
-        case TransitionType::Stutter:    return juce::Colour(0xffdf6f42);
-        case TransitionType::FilterRise: return juce::Colour(0xff79b88f);
-        case TransitionType::Drop:       return juce::Colour(0xffd35d5d);
-        case TransitionType::MuteTail:   return juce::Colour(0xff7f8d98);
-        case TransitionType::Break:      return juce::Colour(0xff5b95b8);
-        case TransitionType::Return:     return juce::Colour(0xffb98e54);
+        case TransitionType::Fill:       return juce::Colour(0xffe0b248);
+        case TransitionType::Stutter:    return juce::Colour(0xfff06f45);
+        case TransitionType::FilterRise: return juce::Colour(0xff58c96d);
+        case TransitionType::Drop:       return juce::Colour(0xffe35576);
+        case TransitionType::MuteTail:   return juce::Colour(0xff8ca1b8);
+        case TransitionType::Break:      return juce::Colour(0xff41b7e8);
+        case TransitionType::Return:     return juce::Colour(0xffc48d44);
         case TransitionType::None:
         default:
             return juce::Colour(0xff465158);
+    }
+}
+
+juce::Colour sceneChainTransitionSecondaryColour(MlrVSTAudioProcessor::SceneChainTransitionType type)
+{
+    using TransitionType = MlrVSTAudioProcessor::SceneChainTransitionType;
+    switch (type)
+    {
+        case TransitionType::Fill:       return juce::Colour(0xff6e4f1d);
+        case TransitionType::Stutter:    return juce::Colour(0xff6d2c1f);
+        case TransitionType::FilterRise: return juce::Colour(0xff1f5730);
+        case TransitionType::Drop:       return juce::Colour(0xff5b1f34);
+        case TransitionType::MuteTail:   return juce::Colour(0xff334252);
+        case TransitionType::Break:      return juce::Colour(0xff173d52);
+        case TransitionType::Return:     return juce::Colour(0xff664018);
+        case TransitionType::None:
+        default:
+            return juce::Colour(0xff20262b);
     }
 }
 
@@ -2731,6 +3068,54 @@ MlrVSTAudioProcessor::SceneChainTransitionOption previousSceneChainTransitionOpt
     return static_cast<TransitionOption>((current <= 0) ? maxValue : (current - 1));
 }
 
+MlrVSTAudioProcessor::SceneChainTransitionScope nextSceneChainTransitionScope(MlrVSTAudioProcessor::SceneChainTransitionScope scope)
+{
+    using Scope = MlrVSTAudioProcessor::SceneChainTransitionScope;
+    const int current = static_cast<int>(scope);
+    const int maxValue = static_cast<int>(Scope::Flip);
+    return static_cast<Scope>((current >= maxValue) ? 0 : (current + 1));
+}
+
+MlrVSTAudioProcessor::SceneChainTransitionScope previousSceneChainTransitionScope(MlrVSTAudioProcessor::SceneChainTransitionScope scope)
+{
+    using Scope = MlrVSTAudioProcessor::SceneChainTransitionScope;
+    const int current = static_cast<int>(scope);
+    const int maxValue = static_cast<int>(Scope::Flip);
+    return static_cast<Scope>((current <= 0) ? maxValue : (current - 1));
+}
+
+MlrVSTAudioProcessor::SceneChainTransitionContour nextSceneChainTransitionContour(MlrVSTAudioProcessor::SceneChainTransitionContour contour)
+{
+    using Contour = MlrVSTAudioProcessor::SceneChainTransitionContour;
+    const int current = static_cast<int>(contour);
+    const int maxValue = static_cast<int>(Contour::LateHit);
+    return static_cast<Contour>((current >= maxValue) ? 0 : (current + 1));
+}
+
+MlrVSTAudioProcessor::SceneChainTransitionContour previousSceneChainTransitionContour(MlrVSTAudioProcessor::SceneChainTransitionContour contour)
+{
+    using Contour = MlrVSTAudioProcessor::SceneChainTransitionContour;
+    const int current = static_cast<int>(contour);
+    const int maxValue = static_cast<int>(Contour::LateHit);
+    return static_cast<Contour>((current <= 0) ? maxValue : (current - 1));
+}
+
+MlrVSTAudioProcessor::SceneChainTransitionCondition nextSceneChainTransitionCondition(MlrVSTAudioProcessor::SceneChainTransitionCondition condition)
+{
+    using Condition = MlrVSTAudioProcessor::SceneChainTransitionCondition;
+    const int current = static_cast<int>(condition);
+    const int maxValue = static_cast<int>(Condition::ForwardOnly);
+    return static_cast<Condition>((current >= maxValue) ? 0 : (current + 1));
+}
+
+MlrVSTAudioProcessor::SceneChainTransitionCondition previousSceneChainTransitionCondition(MlrVSTAudioProcessor::SceneChainTransitionCondition condition)
+{
+    using Condition = MlrVSTAudioProcessor::SceneChainTransitionCondition;
+    const int current = static_cast<int>(condition);
+    const int maxValue = static_cast<int>(Condition::ForwardOnly);
+    return static_cast<Condition>((current <= 0) ? maxValue : (current - 1));
+}
+
 std::vector<MlrVSTAudioProcessor::SceneChainStep> snapshotSceneChainSteps(const MlrVSTAudioProcessor& processor)
 {
     std::vector<MlrVSTAudioProcessor::SceneChainStep> steps;
@@ -2743,11 +3128,18 @@ std::vector<MlrVSTAudioProcessor::SceneChainStep> snapshotSceneChainSteps(const 
         step.repeats = processor.getSceneChainStepRepeatCount(stepIndex);
         step.transitionToNext = processor.getSceneChainStepTransitionType(stepIndex);
         step.transitionOption = processor.getSceneChainStepTransitionOption(stepIndex);
+        step.transitionScope = processor.getSceneChainStepTransitionScope(stepIndex);
+        step.transitionContour = processor.getSceneChainStepTransitionContour(stepIndex);
+        step.transitionCondition = processor.getSceneChainStepTransitionCondition(stepIndex);
         step.transitionLengthBeats = processor.getSceneChainStepTransitionLengthBeats(stepIndex);
+        step.transitionSubtractsFromSceneLength =
+            processor.getSceneChainStepTransitionSubtractsFromSceneLength(stepIndex);
         step.transitionIntensity = processor.getSceneChainStepTransitionIntensity(stepIndex);
         step.transitionDelayAmount = processor.getSceneChainStepTransitionDelayAmount(stepIndex);
         step.transitionFilterAmount = processor.getSceneChainStepTransitionFilterAmount(stepIndex);
         step.transitionChopAmount = processor.getSceneChainStepTransitionChopAmount(stepIndex);
+        step.transitionEndSampleFile = processor.getSceneChainStepTransitionEndSampleFile(stepIndex);
+        step.transitionEndSampleSettings = processor.getSceneChainStepTransitionEndSampleSettings(stepIndex);
         if (step.sceneSlot >= 0)
             steps.push_back(step);
     }
@@ -2768,11 +3160,18 @@ void applySceneChainSteps(MlrVSTAudioProcessor& processor,
         processor.setSceneChainStep(stepIndex, step.sceneSlot, step.repeats);
         processor.setSceneChainStepTransitionType(stepIndex, step.transitionToNext);
         processor.setSceneChainStepTransitionOption(stepIndex, step.transitionOption);
+        processor.setSceneChainStepTransitionScope(stepIndex, step.transitionScope);
+        processor.setSceneChainStepTransitionContour(stepIndex, step.transitionContour);
+        processor.setSceneChainStepTransitionCondition(stepIndex, step.transitionCondition);
         processor.setSceneChainStepTransitionLengthBeats(stepIndex, step.transitionLengthBeats);
+        processor.setSceneChainStepTransitionSubtractsFromSceneLength(stepIndex,
+                                                                      step.transitionSubtractsFromSceneLength);
         processor.setSceneChainStepTransitionIntensity(stepIndex, step.transitionIntensity);
         processor.setSceneChainStepTransitionDelayAmount(stepIndex, step.transitionDelayAmount);
         processor.setSceneChainStepTransitionFilterAmount(stepIndex, step.transitionFilterAmount);
         processor.setSceneChainStepTransitionChopAmount(stepIndex, step.transitionChopAmount);
+        processor.setSceneChainStepTransitionEndSampleFile(stepIndex, step.transitionEndSampleFile);
+        processor.setSceneChainStepTransitionEndSampleSettings(stepIndex, step.transitionEndSampleSettings);
     }
 
     if (loopEnabled && safeCount >= 2)
@@ -2954,6 +3353,8 @@ juce::Font SceneControlPanel::SceneControlLookAndFeel::getTextButtonFont(juce::T
         size = 9.2f;
     else if (role == "tool")
         size = 9.6f;
+    else if (role == "transport")
+        size = juce::jmax(11.2f, buttonHeight * 0.46f);
     else if (role == "slot")
         size = juce::jmax(10.4f, buttonHeight * 0.41f);
 
@@ -2973,7 +3374,10 @@ void SceneControlPanel::SceneControlLookAndFeel::drawButtonBackground(juce::Grap
     const auto role = button.getProperties()["sceneRole"].toString();
     const bool isSlot = role == "slot";
     const bool isChip = role == "chip";
-    const float cornerSize = isSlot ? 8.4f : (isChip ? 6.0f : 7.0f);
+    const bool isTransport = role == "transport";
+    const bool slotHasStoredData = !isSlot
+        || static_cast<bool>(button.getProperties().getWithDefault("sceneHasStoredData", true));
+    const float cornerSize = isSlot ? 8.4f : (isTransport ? 8.6f : (isChip ? 6.0f : 7.0f));
 
     auto baseColour = button.getToggleState()
         ? button.findColour(juce::TextButton::buttonOnColourId)
@@ -2984,27 +3388,39 @@ void SceneControlPanel::SceneControlLookAndFeel::drawButtonBackground(juce::Grap
     else if (shouldDrawButtonAsHighlighted)
         baseColour = baseColour.brighter(isSlot ? 0.07f : 0.05f);
 
+    if (isSlot && !slotHasStoredData)
+        baseColour = baseColour.interpolatedWith(juce::Colour(0xff3b4249), 0.56f);
+
     if (!button.isEnabled())
         baseColour = baseColour.withMultipliedAlpha(0.42f);
 
-    g.setColour(juce::Colours::black.withAlpha(0.20f));
-    g.fillRoundedRectangle(bounds.translated(0.0f, 1.0f), cornerSize);
+    g.setColour(juce::Colours::black.withAlpha(isTransport ? 0.28f : 0.20f));
+    g.fillRoundedRectangle(bounds.translated(0.0f, isTransport ? 1.4f : 1.0f), cornerSize);
 
-    juce::ColourGradient fill(baseColour.brighter(isSlot ? 0.10f : 0.05f),
+    juce::ColourGradient fill(baseColour.brighter(isTransport ? 0.16f : (isSlot ? 0.10f : 0.05f)),
                               bounds.getX(),
                               bounds.getY(),
-                              baseColour.darker(isChip ? 0.08f : 0.15f),
+                              baseColour.darker(isTransport ? 0.22f : (isChip ? 0.08f : 0.15f)),
                               bounds.getX(),
                               bounds.getBottom(),
                               false);
     g.setGradientFill(fill);
     g.fillRoundedRectangle(bounds, cornerSize);
 
-    g.setColour(juce::Colours::white.withAlpha(shouldDrawButtonAsHighlighted ? 0.11f : 0.06f));
+    g.setColour(juce::Colours::white.withAlpha(shouldDrawButtonAsHighlighted
+                                                   ? (isTransport ? 0.16f : 0.11f)
+                                                   : (isTransport ? 0.10f : 0.06f)));
     g.drawRoundedRectangle(bounds.reduced(0.45f), cornerSize, 1.0f);
 
-    g.setColour(baseColour.contrasting(0.16f).withAlpha(isSlot ? 0.28f : 0.18f));
+    g.setColour(baseColour.contrasting(isTransport ? 0.22f : 0.16f)
+                    .withAlpha(isSlot ? 0.28f : (isTransport ? 0.24f : 0.18f)));
     g.drawRoundedRectangle(bounds.reduced(1.35f), juce::jmax(2.0f, cornerSize - 1.4f), 1.0f);
+
+    if (isTransport)
+    {
+        g.setColour(baseColour.brighter(0.55f).withAlpha(button.getToggleState() ? 0.38f : 0.22f));
+        g.drawRoundedRectangle(bounds.reduced(2.2f), juce::jmax(3.0f, cornerSize - 2.2f), 1.2f);
+    }
 }
 
 void SceneControlPanel::SceneControlLookAndFeel::drawButtonText(juce::Graphics& g,
@@ -3012,17 +3428,59 @@ void SceneControlPanel::SceneControlLookAndFeel::drawButtonText(juce::Graphics& 
                                                                 bool,
                                                                 bool)
 {
-    g.setFont(getTextButtonFont(button, button.getHeight()));
-
+    const auto role = button.getProperties()["sceneRole"].toString();
+    const bool isSlot = role == "slot";
+    const bool slotHasStoredData = !isSlot
+        || static_cast<bool>(button.getProperties().getWithDefault("sceneHasStoredData", true));
     auto colour = button.findColour(button.getToggleState()
                                         ? juce::TextButton::textColourOnId
                                         : juce::TextButton::textColourOffId);
     if (!button.isEnabled())
         colour = colour.withMultipliedAlpha(0.48f);
 
+    auto textBounds = button.getLocalBounds().reduced(8, 0);
+    if (isSlot && !slotHasStoredData)
+    {
+        auto mainTextBounds = textBounds;
+        auto badgeBounds = mainTextBounds.removeFromBottom(9);
+        mainTextBounds.removeFromBottom(1);
+
+        g.setFont(getTextButtonFont(button, button.getHeight()));
+        g.setColour(colour);
+        g.drawFittedText(button.getButtonText(),
+                         mainTextBounds,
+                         juce::Justification::centred,
+                         1);
+
+        const auto badgeText = button.getProperties().getWithDefault("sceneDataBadgeText", "EMPTY").toString();
+        if (badgeText.isNotEmpty())
+        {
+            const auto badgeFont = juce::Font(juce::FontOptions(6.0f, juce::Font::bold));
+            const int badgeWidth = juce::jlimit(22,
+                                                juce::jmax(22, badgeBounds.getWidth()),
+                                                juce::GlyphArrangement::getStringWidthInt(badgeFont, badgeText) + 10);
+            auto badgeArea = juce::Rectangle<int>(badgeWidth, 7).withCentre(badgeBounds.getCentre());
+            badgeArea.setY(badgeBounds.getY() + 1);
+
+            g.setColour(juce::Colour(0xff0f1317).withAlpha(0.70f));
+            g.fillRoundedRectangle(badgeArea.toFloat(), 3.0f);
+            g.setColour(juce::Colours::white.withAlpha(0.11f));
+            g.drawRoundedRectangle(badgeArea.toFloat().reduced(0.5f), 3.0f, 0.8f);
+            g.setFont(badgeFont);
+            g.setColour(colour.withMultipliedAlpha(0.74f));
+            g.drawFittedText(badgeText,
+                             badgeArea,
+                             juce::Justification::centred,
+                             1);
+        }
+
+        return;
+    }
+
+    g.setFont(getTextButtonFont(button, button.getHeight()));
     g.setColour(colour);
     g.drawFittedText(button.getButtonText(),
-                     button.getLocalBounds().reduced(8, 0),
+                     textBounds,
                      juce::Justification::centred,
                      1);
 }
@@ -3084,6 +3542,771 @@ void SceneControlPanel::SceneControlLookAndFeel::positionComboBoxText(juce::Comb
     label.setBounds(10, 1, box.getWidth() - 26, box.getHeight() - 2);
     label.setFont(getComboBoxFont(box));
     label.setJustificationType(juce::Justification::centredLeft);
+}
+
+namespace
+{
+bool isSceneTransitionEndSampleAudioFile(const juce::File& file)
+{
+    return file.existsAsFile()
+        && file.hasFileExtension(".wav;.aif;.aiff;.mp3;.ogg;.flac");
+}
+
+std::vector<juce::File> collectSceneTransitionEndSampleChoices(const juce::File& directory)
+{
+    std::vector<juce::File> files;
+    if (directory == juce::File() || !directory.exists() || !directory.isDirectory())
+        return files;
+
+    juce::Array<juce::File> audioFiles;
+    for (auto& file : directory.findChildFiles(juce::File::findFiles, false))
+    {
+        if (isSceneTransitionEndSampleAudioFile(file))
+            audioFiles.add(file);
+    }
+
+    if (audioFiles.isEmpty())
+    {
+        for (auto& file : directory.findChildFiles(juce::File::findFiles, true))
+        {
+            if (isSceneTransitionEndSampleAudioFile(file))
+                audioFiles.add(file);
+        }
+    }
+
+    audioFiles.sort();
+    files.reserve(static_cast<size_t>(audioFiles.size()));
+    for (const auto& file : audioFiles)
+        files.push_back(file);
+    return files;
+}
+
+juce::File effectiveSceneTransitionEndSampleDirectory(MlrVSTAudioProcessor& processor, int stepIndex)
+{
+    auto directory = processor.getSceneTransitionEndSampleDirectory();
+    if (directory.exists() && directory.isDirectory())
+        return directory;
+
+    if (stepIndex >= 0)
+    {
+        const auto pickedFile = processor.getSceneChainStepTransitionEndSampleFile(stepIndex);
+        const auto pickedDirectory = pickedFile.getParentDirectory();
+        if (pickedDirectory.exists() && pickedDirectory.isDirectory())
+            return pickedDirectory;
+    }
+
+    const int chainLength = processor.getSceneChainLength();
+    for (int index = 0; index < chainLength; ++index)
+    {
+        const auto pickedDirectory = processor.getSceneChainStepTransitionEndSampleFile(index).getParentDirectory();
+        if (pickedDirectory.exists() && pickedDirectory.isDirectory())
+            return pickedDirectory;
+    }
+
+    return {};
+}
+
+bool sceneTransitionEndSampleDirectoryAvailable(const juce::File& directory)
+{
+    return directory.exists() && directory.isDirectory();
+}
+
+juce::String sceneTransitionEndSampleChoiceLabel(const juce::File& file, const juce::File& directory)
+{
+    if (file == juce::File())
+        return {};
+
+    juce::String label = directory.exists() && directory.isDirectory()
+        ? file.getRelativePathFrom(directory)
+        : file.getFileName();
+    if (label.isEmpty())
+        label = file.getFileName();
+    return label;
+}
+
+juce::String sceneTransitionEndSamplePickedLabel(const juce::File& file)
+{
+    if (file == juce::File() || file.getFullPathName().trim().isEmpty())
+        return "Picked: None";
+
+    if (!file.existsAsFile())
+        return "Picked: (Missing) " + file.getFileName();
+
+    return "Picked: " + file.getFileName();
+}
+
+bool sceneTransitionEndSampleFilesMatch(const juce::File& lhs, const juce::File& rhs)
+{
+    return lhs.getFullPathName().trim() == rhs.getFullPathName().trim();
+}
+
+juce::String sceneTransitionEndSampleEditorContext(MlrVSTAudioProcessor& processor, int stepIndex)
+{
+    const int chainLength = processor.getSceneChainLength();
+    if (stepIndex < 0 || stepIndex >= chainLength)
+        return {};
+
+    const bool loopbackStep = processor.isSceneChainLoopEnabled() && stepIndex == (chainLength - 1);
+    const int fromSceneSlot = processor.getSceneChainStepSceneSlot(stepIndex);
+    const int nextStep = (stepIndex + 1 < chainLength)
+        ? (stepIndex + 1)
+        : (processor.isSceneChainLoopEnabled() ? processor.getSceneChainLoopStartStep() : -1);
+
+    juce::String label = loopbackStep ? "Loopback clamp" : "Fill bubble";
+    label << "  Step " << juce::String(stepIndex + 1);
+    if (fromSceneSlot >= 0)
+        label << "  S" << juce::String(fromSceneSlot + 1);
+
+    if (nextStep >= 0 && nextStep < chainLength)
+    {
+        const int toSceneSlot = processor.getSceneChainStepSceneSlot(nextStep);
+        if (toSceneSlot >= 0)
+            label << " -> S" << juce::String(toSceneSlot + 1);
+    }
+    else
+    {
+        label << " -> Stop";
+    }
+
+    return label;
+}
+
+juce::String sceneTransitionEndSampleFrequencyLabel(double value, bool lowpass)
+{
+    if ((lowpass && value >= 19950.0) || (!lowpass && value <= 20.5))
+        return "Off";
+
+    if (value >= 1000.0)
+        return juce::String(value / 1000.0, value >= 10000.0 ? 0 : 1) + " kHz";
+
+    return juce::String(juce::roundToInt(value)) + " Hz";
+}
+
+juce::String sceneTransitionEndSampleDuckSourceSummary(int sourceSelection)
+{
+    if (sourceSelection <= 0)
+        return "Off";
+    if (sourceSelection == 1)
+        return "Master";
+
+    return "Strip " + juce::String(sourceSelection - 1);
+}
+} // namespace
+
+SceneTransitionEndSampleEditorPanel::SceneTransitionEndSampleEditorPanel(MlrVSTAudioProcessor& p)
+    : processor(p)
+{
+    titleLabel.setText("Fill-End Sample", juce::dontSendNotification);
+    titleLabel.setColour(juce::Label::textColourId, kTextPrimary);
+    titleLabel.setFont(juce::Font(juce::FontOptions(13.0f, juce::Font::bold)));
+    titleLabel.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(titleLabel);
+
+    contextLabel.setColour(juce::Label::textColourId, kTextMuted);
+    contextLabel.setFont(juce::Font(juce::FontOptions(9.8f, juce::Font::bold)));
+    contextLabel.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(contextLabel);
+
+    closeButton.setButtonText("Close");
+    closeButton.setTooltip("Close the fill-end sample editor.");
+    closeButton.onClick = [this]()
+    {
+        if (onCloseRequested != nullptr)
+            onCloseRequested();
+    };
+    styleUiButton(closeButton);
+    addAndMakeVisible(closeButton);
+
+    currentSampleLabel.setColour(juce::Label::textColourId, kTextPrimary);
+    currentSampleLabel.setFont(juce::Font(juce::FontOptions(11.4f, juce::Font::bold)));
+    currentSampleLabel.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(currentSampleLabel);
+
+    folderLabel.setColour(juce::Label::textColourId, kTextSecondary);
+    folderLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
+    folderLabel.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(folderLabel);
+
+    folderButton.setButtonText("Folder");
+    folderButton.setTooltip("Choose the folder used for fill-end sample browsing.");
+    folderButton.onClick = [this]()
+    {
+        auto startDir = listedDirectory;
+        if (!sceneTransitionEndSampleDirectoryAvailable(startDir))
+            startDir = processor.getSceneTransitionEndSampleDirectory();
+        if (!sceneTransitionEndSampleDirectoryAvailable(startDir))
+            startDir = effectiveSceneTransitionEndSampleDirectory(processor, pinnedStepIndex);
+        if (!sceneTransitionEndSampleDirectoryAvailable(startDir))
+            startDir = juce::File::getSpecialLocation(juce::File::userHomeDirectory);
+
+        juce::FileChooser chooser("Select fill-end sample folder", startDir, "*");
+        if (!chooser.browseForDirectory())
+            return;
+
+        listedDirectory = chooser.getResult();
+        processor.setSceneTransitionEndSampleDirectory(listedDirectory);
+        rebuildSampleChoices();
+        refreshFromProcessor();
+        if (onChanged != nullptr)
+            onChanged();
+    };
+    styleUiButton(folderButton);
+    addAndMakeVisible(folderButton);
+
+    clearButton.setButtonText("Clear Pick");
+    clearButton.setTooltip("Remove the picked fill-end sample from this bubble.");
+    clearButton.onClick = [this]()
+    {
+        if (pinnedStepIndex < 0)
+            return;
+
+        processor.setSceneChainStepTransitionEndSampleFile(pinnedStepIndex, {});
+        refreshFromProcessor();
+        if (onChanged != nullptr)
+            onChanged();
+    };
+    styleUiButton(clearButton);
+    addAndMakeVisible(clearButton);
+
+    sampleListLabel.setColour(juce::Label::textColourId, kTextMuted);
+    sampleListLabel.setFont(juce::Font(juce::FontOptions(9.6f, juce::Font::bold)));
+    sampleListLabel.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(sampleListLabel);
+
+    sampleListBox.setModel(this);
+    sampleListBox.setRowHeight(24);
+    sampleListBox.setColour(juce::ListBox::backgroundColourId, juce::Colour(0xff171a1d));
+    sampleListBox.setColour(juce::ListBox::outlineColourId, juce::Colour(0xff596068));
+    sampleListBox.setColour(juce::ListBox::textColourId, kTextPrimary);
+    sampleListBox.setOutlineThickness(1);
+    addAndMakeVisible(sampleListBox);
+
+    shapeLabel.setText("Playback Shape", juce::dontSendNotification);
+    shapeLabel.setColour(juce::Label::textColourId, kTextSecondary);
+    shapeLabel.setFont(juce::Font(juce::FontOptions(9.6f, juce::Font::bold)));
+    shapeLabel.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(shapeLabel);
+
+    auto styleLabel = [](juce::Label& label, const juce::String& text)
+    {
+        label.setText(text, juce::dontSendNotification);
+        label.setColour(juce::Label::textColourId, kTextMuted);
+        label.setFont(juce::Font(juce::FontOptions(10.0f)));
+        label.setJustificationType(juce::Justification::centredLeft);
+    };
+
+    auto styleSlider = [](juce::Slider& slider)
+    {
+        slider.setSliderStyle(juce::Slider::LinearHorizontal);
+        slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 16);
+        slider.setColour(juce::Slider::backgroundColourId, juce::Colour(0xff23282d));
+        slider.setColour(juce::Slider::trackColourId, kAccent.withAlpha(0.82f));
+        slider.setColour(juce::Slider::thumbColourId, juce::Colours::white.withAlpha(0.94f));
+        slider.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour(0xff1b1f22));
+        slider.setColour(juce::Slider::textBoxOutlineColourId, juce::Colour(0xff596068));
+        slider.setColour(juce::Slider::textBoxTextColourId, kTextPrimary);
+    };
+
+    auto connectSlider = [this, &styleLabel, &styleSlider](juce::Label& label,
+                                                           juce::Slider& slider,
+                                                           const juce::String& text,
+                                                           double minValue,
+                                                           double maxValue,
+                                                           double interval,
+                                                           const juce::String& tooltip)
+    {
+        styleLabel(label, text);
+        addAndMakeVisible(label);
+        slider.setRange(minValue, maxValue, interval);
+        slider.setTooltip(tooltip);
+        slider.onValueChange = [this]()
+        {
+            if (!suppressControlCallbacks)
+                applyCurrentSettings();
+        };
+        styleSlider(slider);
+        addAndMakeVisible(slider);
+    };
+
+    connectSlider(gainLabel,
+                  gainSlider,
+                  "Gain",
+                  -24.0,
+                  12.0,
+                  0.1,
+                  "Trim the picked end sample louder or quieter.");
+    gainSlider.textFromValueFunction = [](double value)
+    {
+        return (value > 0.0 ? "+" : "") + juce::String(value, 1) + " dB";
+    };
+
+    connectSlider(pitchLabel,
+                  pitchSlider,
+                  "Pitch",
+                  -24.0,
+                  24.0,
+                  0.1,
+                  "Transpose the picked end sample in semitones.");
+    pitchSlider.textFromValueFunction = [](double value)
+    {
+        return (value > 0.0 ? "+" : "") + juce::String(value, 1) + " st";
+    };
+
+    connectSlider(fadeInLabel,
+                  fadeInSlider,
+                  "Fade In",
+                  0.0,
+                  500.0,
+                  1.0,
+                  "Fade the start of the picked end sample.");
+    fadeInSlider.textFromValueFunction = [](double value)
+    {
+        return juce::String(juce::roundToInt(value)) + " ms";
+    };
+
+    connectSlider(fadeOutLabel,
+                  fadeOutSlider,
+                  "Fade Out",
+                  0.0,
+                  500.0,
+                  1.0,
+                  "Fade the end of the picked end sample.");
+    fadeOutSlider.textFromValueFunction = [](double value)
+    {
+        return juce::String(juce::roundToInt(value)) + " ms";
+    };
+
+    connectSlider(lowpassLabel,
+                  lowpassSlider,
+                  "LPF",
+                  20.0,
+                  20000.0,
+                  1.0,
+                  "Low-pass filter for the picked end sample. Turn fully up for Off.");
+    lowpassSlider.setSkewFactorFromMidPoint(2200.0);
+    lowpassSlider.textFromValueFunction = [](double value)
+    {
+        return sceneTransitionEndSampleFrequencyLabel(value, true);
+    };
+
+    connectSlider(highpassLabel,
+                  highpassSlider,
+                  "HPF",
+                  20.0,
+                  20000.0,
+                  1.0,
+                  "High-pass filter for the picked end sample. Turn fully down for Off.");
+    highpassSlider.setSkewFactorFromMidPoint(180.0);
+    highpassSlider.textFromValueFunction = [](double value)
+    {
+        return sceneTransitionEndSampleFrequencyLabel(value, false);
+    };
+
+    styleLabel(duckLabel, "Duck");
+    addAndMakeVisible(duckLabel);
+
+    duckSourceBox.addItem("Off", 1);
+    duckSourceBox.addItem("Master", 2);
+    for (int stripIndex = 0; stripIndex < MlrVSTAudioProcessor::MaxStrips; ++stripIndex)
+        duckSourceBox.addItem("S" + juce::String(stripIndex + 1), stripIndex + 3);
+    duckSourceBox.setTooltip("Auto-duck the end sample from the chosen strip or the master mix.");
+    duckSourceBox.onChange = [this]()
+    {
+        if (!suppressControlCallbacks)
+            applyCurrentSettings();
+    };
+    styleUiCombo(duckSourceBox);
+    addAndMakeVisible(duckSourceBox);
+
+    duckActivityIndicator.setText({}, juce::dontSendNotification);
+    duckActivityIndicator.setOpaque(true);
+    duckActivityIndicator.setBorderSize({1, 1, 1, 1});
+    duckActivityIndicator.setInterceptsMouseClicks(false, false);
+    duckActivityIndicator.setTooltip("Duck sidechain activity.");
+    duckActivityIndicator.setColour(juce::Label::backgroundColourId, juce::Colours::black.withAlpha(0.10f));
+    duckActivityIndicator.setColour(juce::Label::outlineColourId, juce::Colours::white.withAlpha(0.08f));
+    addAndMakeVisible(duckActivityIndicator);
+
+    connectSlider(duckAmountLabel,
+                  duckAmountSlider,
+                  "Amt",
+                  0.0,
+                  1.0,
+                  0.01,
+                  "How strongly the chosen sidechain source ducks the end sample.");
+    duckAmountSlider.textFromValueFunction = [](double value)
+    {
+        return juce::String(juce::roundToInt(value * 100.0)) + "%";
+    };
+
+    chokeToggle.setButtonText("Choke previous");
+    chokeToggle.setTooltip("Stop any previous end sample voice when this one fires.");
+    chokeToggle.onClick = [this]()
+    {
+        if (!suppressControlCallbacks)
+            applyCurrentSettings();
+    };
+    chokeToggle.setColour(juce::ToggleButton::textColourId, kTextPrimary);
+    chokeToggle.setColour(juce::ToggleButton::tickColourId, kAccent);
+    addAndMakeVisible(chokeToggle);
+
+    reverseToggle.setButtonText("Reverse");
+    reverseToggle.setTooltip("Play the picked end sample backwards.");
+    reverseToggle.onClick = [this]()
+    {
+        if (!suppressControlCallbacks)
+            applyCurrentSettings();
+    };
+    reverseToggle.setColour(juce::ToggleButton::textColourId, kTextPrimary);
+    reverseToggle.setColour(juce::ToggleButton::tickColourId, kAccent);
+    addAndMakeVisible(reverseToggle);
+
+    hintLabel.setColour(juce::Label::textColourId, kTextMuted);
+    hintLabel.setFont(juce::Font(juce::FontOptions(9.6f)));
+    hintLabel.setJustificationType(juce::Justification::centredLeft);
+    hintLabel.setText("Click a sample to audition and assign it. Duck can follow master or any strip.",
+                      juce::dontSendNotification);
+    addAndMakeVisible(hintLabel);
+
+    startTimer(180);
+    refreshFromProcessor();
+}
+
+void SceneTransitionEndSampleEditorPanel::setPinnedStep(int stepIndex, const juce::String& contextText)
+{
+    pinnedStepIndex = stepIndex;
+    pinnedContextText = contextText;
+    refreshFromProcessor();
+}
+
+void SceneTransitionEndSampleEditorPanel::clearPinnedStep()
+{
+    pinnedStepIndex = -1;
+    pinnedContextText.clear();
+    sampleChoices.clear();
+    sampleListBox.updateContent();
+    sampleListBox.deselectAllRows();
+    refreshFromProcessor();
+}
+
+void SceneTransitionEndSampleEditorPanel::paint(juce::Graphics& g)
+{
+    drawPanel(g, getLocalBounds().toFloat(), kAccent, 8.0f);
+}
+
+void SceneTransitionEndSampleEditorPanel::resized()
+{
+    auto bounds = getLocalBounds().reduced(10);
+
+    auto titleRow = bounds.removeFromTop(22);
+    closeButton.setBounds(titleRow.removeFromRight(60));
+    titleLabel.setBounds(titleRow);
+
+    bounds.removeFromTop(2);
+    contextLabel.setBounds(bounds.removeFromTop(16));
+    currentSampleLabel.setBounds(bounds.removeFromTop(20));
+    bounds.removeFromTop(4);
+
+    auto folderRow = bounds.removeFromTop(22);
+    clearButton.setBounds(folderRow.removeFromRight(84));
+    folderRow.removeFromRight(4);
+    folderButton.setBounds(folderRow.removeFromRight(64));
+    folderRow.removeFromRight(8);
+    folderLabel.setBounds(folderRow);
+
+    bounds.removeFromTop(6);
+    sampleListLabel.setBounds(bounds.removeFromTop(16));
+    sampleListBox.setBounds(bounds.removeFromTop(98));
+
+    bounds.removeFromTop(8);
+    shapeLabel.setBounds(bounds.removeFromTop(16));
+
+    auto toggleRow = bounds.removeFromTop(22);
+    chokeToggle.setBounds(toggleRow.removeFromLeft(toggleRow.getWidth() / 2));
+    reverseToggle.setBounds(toggleRow);
+
+    bounds.removeFromTop(4);
+    auto duckRow = bounds.removeFromTop(22);
+    duckLabel.setBounds(duckRow.removeFromLeft(54));
+    duckSourceBox.setBounds(duckRow.removeFromLeft(90));
+    duckRow.removeFromLeft(6);
+    duckActivityIndicator.setBounds(duckRow.removeFromLeft(14).reduced(0, 4));
+    duckRow.removeFromLeft(6);
+    duckAmountLabel.setBounds(duckRow.removeFromLeft(36));
+    duckAmountSlider.setBounds(duckRow);
+
+    bounds.removeFromTop(4);
+    auto layoutSliderRow = [&](juce::Label& label, juce::Slider& slider)
+    {
+        auto row = bounds.removeFromTop(22);
+        label.setBounds(row.removeFromLeft(54));
+        slider.setBounds(row);
+        bounds.removeFromTop(2);
+    };
+
+    layoutSliderRow(gainLabel, gainSlider);
+    layoutSliderRow(pitchLabel, pitchSlider);
+    layoutSliderRow(fadeInLabel, fadeInSlider);
+    layoutSliderRow(fadeOutLabel, fadeOutSlider);
+    layoutSliderRow(lowpassLabel, lowpassSlider);
+    layoutSliderRow(highpassLabel, highpassSlider);
+
+    hintLabel.setBounds(bounds);
+}
+
+int SceneTransitionEndSampleEditorPanel::getNumRows()
+{
+    return static_cast<int>(sampleChoices.size());
+}
+
+void SceneTransitionEndSampleEditorPanel::paintListBoxItem(int rowNumber,
+                                                           juce::Graphics& g,
+                                                           int width,
+                                                           int height,
+                                                           bool rowIsSelected)
+{
+    auto bounds = juce::Rectangle<int>(0, 0, width, height).reduced(4, 2);
+    if (rowNumber < 0 || rowNumber >= static_cast<int>(sampleChoices.size()) || bounds.isEmpty())
+        return;
+
+    const auto& file = sampleChoices[static_cast<size_t>(rowNumber)];
+    const bool isPicked = pinnedStepIndex >= 0
+        && sceneTransitionEndSampleFilesMatch(processor.getSceneChainStepTransitionEndSampleFile(pinnedStepIndex),
+                                              file);
+    const auto fillColour = rowIsSelected
+        ? kAccent.withAlpha(0.26f)
+        : (isPicked ? kAccent.withAlpha(0.16f) : juce::Colours::black.withAlpha(0.14f));
+    const auto outlineColour = rowIsSelected || isPicked
+        ? kAccent.withAlpha(rowIsSelected ? 0.88f : 0.48f)
+        : juce::Colours::white.withAlpha(0.08f);
+
+    g.setColour(fillColour);
+    g.fillRoundedRectangle(bounds.toFloat(), 5.0f);
+    g.setColour(outlineColour);
+    g.drawRoundedRectangle(bounds.toFloat(), 5.0f, 1.0f);
+
+    auto textBounds = bounds.reduced(8, 0);
+    if (isPicked)
+    {
+        auto badgeBounds = textBounds.removeFromRight(58).reduced(0, 3);
+        g.setColour(kAccent.withAlpha(0.92f));
+        g.fillRoundedRectangle(badgeBounds.toFloat(), 4.0f);
+        g.setColour(juce::Colour(0xff111111));
+        g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+        g.drawFittedText("PICKED", badgeBounds, juce::Justification::centred, 1);
+        textBounds.removeFromRight(4);
+    }
+
+    g.setColour(kTextPrimary.withAlpha(rowIsSelected ? 0.98f : 0.92f));
+    g.setFont(juce::Font(juce::FontOptions(10.6f)));
+    g.drawFittedText(sampleChoiceLabel(file), textBounds, juce::Justification::centredLeft, 1);
+}
+
+void SceneTransitionEndSampleEditorPanel::listBoxItemClicked(int row, const juce::MouseEvent&)
+{
+    if (!suppressListCallbacks)
+        auditionAndPickRow(row);
+}
+
+void SceneTransitionEndSampleEditorPanel::selectedRowsChanged(int lastRowSelected)
+{
+    if (suppressListCallbacks || lastRowSelected < 0 || !sampleListBox.hasKeyboardFocus(true))
+        return;
+
+    auditionAndPickRow(lastRowSelected);
+}
+
+void SceneTransitionEndSampleEditorPanel::timerCallback()
+{
+    if (!isShowing())
+        return;
+
+    const bool draggingSlider = gainSlider.isMouseButtonDown()
+        || pitchSlider.isMouseButtonDown()
+        || fadeInSlider.isMouseButtonDown()
+        || fadeOutSlider.isMouseButtonDown()
+        || lowpassSlider.isMouseButtonDown()
+        || highpassSlider.isMouseButtonDown()
+        || duckAmountSlider.isMouseButtonDown();
+    if (!draggingSlider)
+        refreshFromProcessor();
+    else
+        refreshDuckActivityIndicator();
+}
+
+void SceneTransitionEndSampleEditorPanel::refreshFromProcessor()
+{
+    if (pinnedStepIndex < 0 || pinnedStepIndex >= processor.getSceneChainLength())
+    {
+        contextLabel.setText("Pick a fill bubble to edit its end sample.", juce::dontSendNotification);
+        currentSampleLabel.setText("Picked: None", juce::dontSendNotification);
+        currentSampleLabel.setTooltip({});
+        folderLabel.setText("Folder: not set", juce::dontSendNotification);
+        folderLabel.setTooltip({});
+        sampleListLabel.setText("Choose a folder to browse end samples.", juce::dontSendNotification);
+        clearButton.setEnabled(false);
+        folderButton.setEnabled(false);
+        sampleChoices.clear();
+        sampleListBox.updateContent();
+        sampleListBox.deselectAllRows();
+        refreshDuckActivityIndicator();
+        return;
+    }
+
+    folderButton.setEnabled(true);
+    contextLabel.setText(pinnedContextText, juce::dontSendNotification);
+
+    const auto pickedFile = processor.getSceneChainStepTransitionEndSampleFile(pinnedStepIndex);
+    currentSampleLabel.setText(sceneTransitionEndSamplePickedLabel(pickedFile), juce::dontSendNotification);
+    currentSampleLabel.setTooltip(pickedFile.getFullPathName());
+    clearButton.setEnabled(pickedFile != juce::File());
+
+    auto directory = listedDirectory;
+    if (!sceneTransitionEndSampleDirectoryAvailable(directory))
+        directory = effectiveSceneTransitionEndSampleDirectory(processor, pinnedStepIndex);
+    if (directory != listedDirectory)
+    {
+        listedDirectory = directory;
+        rebuildSampleChoices();
+    }
+
+    if (sceneTransitionEndSampleDirectoryAvailable(directory))
+    {
+        folderLabel.setText("Folder: " + directory.getFullPathName(), juce::dontSendNotification);
+        folderLabel.setTooltip(directory.getFullPathName());
+    }
+    else
+    {
+        folderLabel.setText("Folder: not set", juce::dontSendNotification);
+        folderLabel.setTooltip({});
+    }
+
+    const auto settings = processor.getSceneChainStepTransitionEndSampleSettings(pinnedStepIndex);
+    const juce::ScopedValueSetter<bool> callbackGuard(suppressControlCallbacks, true);
+    gainSlider.setValue(settings.gainDb, juce::dontSendNotification);
+    pitchSlider.setValue(settings.pitchSemitones, juce::dontSendNotification);
+    fadeInSlider.setValue(settings.fadeInMs, juce::dontSendNotification);
+    fadeOutSlider.setValue(settings.fadeOutMs, juce::dontSendNotification);
+    lowpassSlider.setValue(settings.lowpassHz, juce::dontSendNotification);
+    highpassSlider.setValue(settings.highpassHz, juce::dontSendNotification);
+    duckSourceBox.setSelectedId(settings.duckSource + 1, juce::dontSendNotification);
+    duckAmountSlider.setValue(settings.duckAmount, juce::dontSendNotification);
+    chokeToggle.setToggleState(settings.chokePrevious, juce::dontSendNotification);
+    reverseToggle.setToggleState(settings.reverse, juce::dontSendNotification);
+
+    int selectedRow = -1;
+    for (int index = 0; index < static_cast<int>(sampleChoices.size()); ++index)
+    {
+        if (sceneTransitionEndSampleFilesMatch(sampleChoices[static_cast<size_t>(index)], pickedFile))
+        {
+            selectedRow = index;
+            break;
+        }
+    }
+
+    juce::String listSummary;
+    if (!directory.exists() || !directory.isDirectory())
+        listSummary = "Choose a folder to browse end samples.";
+    else if (sampleChoices.empty())
+        listSummary = "No supported audio files found here yet.";
+    else
+        listSummary = juce::String(sampleChoices.size()) + " files  •  click to audition + pick";
+    sampleListLabel.setText(listSummary, juce::dontSendNotification);
+
+    const juce::ScopedValueSetter<bool> listGuard(suppressListCallbacks, true);
+    sampleListBox.updateContent();
+    if (selectedRow >= 0)
+        sampleListBox.selectRow(selectedRow, false, true);
+    else
+        sampleListBox.deselectAllRows();
+    sampleListBox.repaint();
+    refreshDuckActivityIndicator();
+}
+
+void SceneTransitionEndSampleEditorPanel::rebuildSampleChoices()
+{
+    sampleChoices = collectSceneTransitionEndSampleChoices(listedDirectory);
+}
+
+void SceneTransitionEndSampleEditorPanel::refreshDuckActivityIndicator()
+{
+    int duckSource = juce::jmax(0, duckSourceBox.getSelectedId() - 1);
+    float duckAmount = static_cast<float>(duckAmountSlider.getValue());
+    if (pinnedStepIndex >= 0 && pinnedStepIndex < processor.getSceneChainLength())
+    {
+        const auto settings = processor.getSceneChainStepTransitionEndSampleSettings(pinnedStepIndex);
+        duckSource = settings.duckSource;
+        duckAmount = settings.duckAmount;
+    }
+
+    float activity = 0.0f;
+    if (duckSource > 0 && duckAmount > 0.001f)
+    {
+        if (const auto* engine = processor.getAudioEngine())
+        {
+            if (duckSource == 1)
+                activity = engine->getMasterOutputLevel();
+            else
+                activity = engine->getStripOutputLevel(duckSource - 2);
+        }
+    }
+
+    const bool active = duckSource > 0 && duckAmount > 0.001f;
+    const float shapedActivity = juce::jlimit(0.0f, 1.0f, std::sqrt(juce::jmax(0.0f, activity * 1.8f)));
+    const auto fillColour = active
+        ? kAccent.interpolatedWith(juce::Colours::white, 0.18f).withAlpha(0.18f + (0.78f * shapedActivity))
+        : juce::Colours::black.withAlpha(0.10f);
+    const auto outlineColour = active
+        ? kAccent.withAlpha(0.30f + (0.56f * shapedActivity))
+        : juce::Colours::white.withAlpha(0.08f);
+    duckActivityIndicator.setColour(juce::Label::backgroundColourId, fillColour);
+    duckActivityIndicator.setColour(juce::Label::outlineColourId, outlineColour);
+    duckActivityIndicator.setTooltip(active
+                                         ? ("Duck sidechain activity from "
+                                            + sceneTransitionEndSampleDuckSourceSummary(duckSource)
+                                            + ".")
+                                         : "Duck is off.");
+    duckActivityIndicator.repaint();
+}
+
+juce::String SceneTransitionEndSampleEditorPanel::sampleChoiceLabel(const juce::File& file) const
+{
+    return sceneTransitionEndSampleChoiceLabel(file, listedDirectory);
+}
+
+void SceneTransitionEndSampleEditorPanel::auditionAndPickRow(int row)
+{
+    if (pinnedStepIndex < 0 || row < 0 || row >= static_cast<int>(sampleChoices.size()))
+        return;
+
+    const auto file = sampleChoices[static_cast<size_t>(row)];
+    const auto settings = processor.getSceneChainStepTransitionEndSampleSettings(pinnedStepIndex);
+    processor.setSceneTransitionEndSampleDirectory(file.getParentDirectory());
+    processor.setSceneChainStepTransitionEndSampleFile(pinnedStepIndex, file);
+    processor.auditionSceneTransitionEndSampleFile(file, settings);
+    refreshFromProcessor();
+    if (onChanged != nullptr)
+        onChanged();
+}
+
+void SceneTransitionEndSampleEditorPanel::applyCurrentSettings()
+{
+    if (pinnedStepIndex < 0)
+        return;
+
+    MlrVSTAudioProcessor::SceneTransitionEndSampleSettings settings;
+    settings.gainDb = static_cast<float>(gainSlider.getValue());
+    settings.fadeInMs = static_cast<float>(fadeInSlider.getValue());
+    settings.fadeOutMs = static_cast<float>(fadeOutSlider.getValue());
+    settings.chokePrevious = chokeToggle.getToggleState();
+    settings.reverse = reverseToggle.getToggleState();
+    settings.pitchSemitones = static_cast<float>(pitchSlider.getValue());
+    settings.lowpassHz = static_cast<float>(lowpassSlider.getValue());
+    settings.highpassHz = static_cast<float>(highpassSlider.getValue());
+    settings.duckSource = juce::jmax(0, duckSourceBox.getSelectedId() - 1);
+    settings.duckAmount = static_cast<float>(duckAmountSlider.getValue());
+    processor.setSceneChainStepTransitionEndSampleSettings(pinnedStepIndex, settings);
+    refreshDuckActivityIndicator();
 }
 
 SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
@@ -3422,6 +4645,10 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     configureHeaderLabel(sceneTransitionDelayHeaderLabel, "Echo");
     configureHeaderLabel(sceneTransitionFilterHeaderLabel, "Tone");
     configureHeaderLabel(sceneTransitionChopHeaderLabel, "Gate");
+    configureHeaderLabel(sceneTransitionScopeHeaderLabel, "Scope");
+    configureHeaderLabel(sceneTransitionContourHeaderLabel, "Contour");
+    configureHeaderLabel(sceneTransitionConditionHeaderLabel, "When");
+    configureHeaderLabel(sceneTransitionEndSampleHeaderLabel, "End");
     addAndMakeVisible(sceneLengthHeaderLabel);
     addAndMakeVisible(sceneBarsHeaderLabel);
     addAndMakeVisible(sceneAnchorHeaderLabel);
@@ -3432,13 +4659,17 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(sceneTransitionDelayHeaderLabel);
     addAndMakeVisible(sceneTransitionFilterHeaderLabel);
     addAndMakeVisible(sceneTransitionChopHeaderLabel);
+    addAndMakeVisible(sceneTransitionScopeHeaderLabel);
+    addAndMakeVisible(sceneTransitionContourHeaderLabel);
+    addAndMakeVisible(sceneTransitionConditionHeaderLabel);
+    addAndMakeVisible(sceneTransitionEndSampleHeaderLabel);
     configureSummaryLabel(sceneTransitionSummaryLabel, false);
     configureSummaryLabel(sceneTransitionMetaLabel, true);
     addAndMakeVisible(sceneTransitionSummaryLabel);
     addAndMakeVisible(sceneTransitionMetaLabel);
     sceneAdvanceSummaryLabel.setVisible(false);
-    sceneTransitionSummaryLabel.setVisible(false);
-    sceneTransitionMetaLabel.setVisible(false);
+    sceneTransitionSummaryLabel.setVisible(true);
+    sceneTransitionMetaLabel.setVisible(true);
 
     for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
     {
@@ -3539,9 +4770,27 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
         if (focusedStep < 0 || selectedId <= 0)
             return;
 
+        const auto selectedType = static_cast<MlrVSTAudioProcessor::SceneChainTransitionType>(selectedId - 1);
         processor.setSceneChainStepTransitionType(
             focusedStep,
-            static_cast<MlrVSTAudioProcessor::SceneChainTransitionType>(selectedId - 1));
+            selectedType);
+
+        if (sceneTransitionSmartLinkEnabled
+            && selectedType != MlrVSTAudioProcessor::SceneChainTransitionType::None
+            && selectedType != MlrVSTAudioProcessor::SceneChainTransitionType::Return)
+        {
+            applySceneTransitionSmartTuning(
+                focusedStep,
+                selectedType,
+                processor.getSceneChainStepTransitionOption(focusedStep),
+                processor.getSceneChainStepTransitionIntensity(focusedStep),
+                processor.getSceneChainStepTransitionLengthBeats(focusedStep),
+                processor.getSceneChainStepTransitionSubtractsFromSceneLength(focusedStep),
+                false,
+                false);
+            return;
+        }
+
         refreshFromProcessor();
     };
     addAndMakeVisible(sceneTransitionTypeBox);
@@ -3563,9 +4812,27 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
         if (focusedStep < 0 || selectedId <= 0)
             return;
 
+        const auto selectedOption = static_cast<MlrVSTAudioProcessor::SceneChainTransitionOption>(selectedId - 1);
         processor.setSceneChainStepTransitionOption(
             focusedStep,
-            static_cast<MlrVSTAudioProcessor::SceneChainTransitionOption>(selectedId - 1));
+            selectedOption);
+
+        const auto currentType = processor.getSceneChainStepTransitionType(focusedStep);
+        if (sceneTransitionSmartLinkEnabled
+            && currentType != MlrVSTAudioProcessor::SceneChainTransitionType::None
+            && currentType != MlrVSTAudioProcessor::SceneChainTransitionType::Return)
+        {
+            applySceneTransitionSmartTuning(focusedStep,
+                                            currentType,
+                                            selectedOption,
+                                            processor.getSceneChainStepTransitionIntensity(focusedStep),
+                                            processor.getSceneChainStepTransitionLengthBeats(focusedStep),
+                                            processor.getSceneChainStepTransitionSubtractsFromSceneLength(focusedStep),
+                                            false,
+                                            false);
+            return;
+        }
+
         refreshFromProcessor();
     };
     addAndMakeVisible(sceneTransitionOptionsBox);
@@ -3581,21 +4848,157 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
         if (focusedStep < 0 || selectedId <= 0)
             return;
 
+        const float selectedLength = sceneTransitionValueForComboId(selectedId,
+                                                                    kSceneTransitionLengthOptions,
+                                                                    MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats);
         processor.setSceneChainStepTransitionLengthBeats(
             focusedStep,
-            sceneTransitionValueForComboId(selectedId,
-                                          kSceneTransitionLengthOptions,
-                                          MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats));
+            selectedLength);
+
+        const auto currentType = processor.getSceneChainStepTransitionType(focusedStep);
+        if (sceneTransitionSmartLinkEnabled
+            && currentType != MlrVSTAudioProcessor::SceneChainTransitionType::None
+            && currentType != MlrVSTAudioProcessor::SceneChainTransitionType::Return)
+        {
+            applySceneTransitionSmartTuning(focusedStep,
+                                            currentType,
+                                            processor.getSceneChainStepTransitionOption(focusedStep),
+                                            processor.getSceneChainStepTransitionIntensity(focusedStep),
+                                            selectedLength,
+                                            processor.getSceneChainStepTransitionSubtractsFromSceneLength(focusedStep),
+                                            false,
+                                            false);
+            return;
+        }
+
         refreshFromProcessor();
     };
     addAndMakeVisible(sceneTransitionLengthBox);
     styleSceneCombo(sceneTransitionLengthBox);
 
+    sceneTransitionScopeBox.addItem("All", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionScope::All) + 1);
+    sceneTransitionScopeBox.addItem("Loops", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionScope::Loops) + 1);
+    sceneTransitionScopeBox.addItem("Steps", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionScope::Steps) + 1);
+    sceneTransitionScopeBox.addItem("Grains", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionScope::Grains) + 1);
+    sceneTransitionScopeBox.addItem("Flip", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionScope::Flip) + 1);
+    sceneTransitionScopeBox.setTooltip("Choose which kinds of strips the focused Chain Fill should touch.");
+    sceneTransitionScopeBox.onChange = [this]()
+    {
+        const int focusedStep = getFocusedSceneChainStep();
+        const int selectedId = sceneTransitionScopeBox.getSelectedId();
+        if (focusedStep < 0 || selectedId <= 0)
+            return;
+
+        processor.setSceneChainStepTransitionScope(
+            focusedStep,
+            static_cast<MlrVSTAudioProcessor::SceneChainTransitionScope>(selectedId - 1));
+        refreshFromProcessor();
+    };
+    addAndMakeVisible(sceneTransitionScopeBox);
+    styleSceneCombo(sceneTransitionScopeBox);
+
+    sceneTransitionContourBox.addItem("Smooth", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionContour::Smooth) + 1);
+    sceneTransitionContourBox.addItem("Ramp", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionContour::Ramp) + 1);
+    sceneTransitionContourBox.addItem("Burst", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionContour::BurstEnd) + 1);
+    sceneTransitionContourBox.addItem("Duck/Lift", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionContour::DuckThenLift) + 1);
+    sceneTransitionContourBox.addItem("Late Hit", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionContour::LateHit) + 1);
+    sceneTransitionContourBox.setTooltip("Shape how the fill blooms over time without changing the core Chain Fill type.");
+    sceneTransitionContourBox.onChange = [this]()
+    {
+        const int focusedStep = getFocusedSceneChainStep();
+        const int selectedId = sceneTransitionContourBox.getSelectedId();
+        if (focusedStep < 0 || selectedId <= 0)
+            return;
+
+        processor.setSceneChainStepTransitionContour(
+            focusedStep,
+            static_cast<MlrVSTAudioProcessor::SceneChainTransitionContour>(selectedId - 1));
+        refreshFromProcessor();
+    };
+    addAndMakeVisible(sceneTransitionContourBox);
+    styleSceneCombo(sceneTransitionContourBox);
+
+    sceneTransitionConditionBox.addItem("Always", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionCondition::Always) + 1);
+    sceneTransitionConditionBox.addItem("50%", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionCondition::Chance50) + 1);
+    sceneTransitionConditionBox.addItem("25%", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionCondition::Chance25) + 1);
+    sceneTransitionConditionBox.addItem("Loop", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionCondition::LoopOnly) + 1);
+    sceneTransitionConditionBox.addItem("Forward", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionCondition::ForwardOnly) + 1);
+    sceneTransitionConditionBox.setTooltip("Decide when the focused Chain Fill is allowed to fire.");
+    sceneTransitionConditionBox.onChange = [this]()
+    {
+        const int focusedStep = getFocusedSceneChainStep();
+        const int selectedId = sceneTransitionConditionBox.getSelectedId();
+        if (focusedStep < 0 || selectedId <= 0)
+            return;
+
+        processor.setSceneChainStepTransitionCondition(
+            focusedStep,
+            static_cast<MlrVSTAudioProcessor::SceneChainTransitionCondition>(selectedId - 1));
+        refreshFromProcessor();
+    };
+    addAndMakeVisible(sceneTransitionConditionBox);
+    styleSceneCombo(sceneTransitionConditionBox);
+
+    sceneTransitionEndSampleBox.onChange = [this]()
+    {
+        if (sceneTransitionEndSampleBoxUpdating)
+            return;
+
+        const int focusedStep = getFocusedSceneChainStep() >= 0
+            ? getFocusedSceneChainStep()
+            : (sceneEndSampleEditorVisible ? sceneEndSampleEditorStep : -1);
+        if (focusedStep < 0)
+            return;
+
+        juce::File selectedFile;
+        const int selectedId = sceneTransitionEndSampleBox.getSelectedId();
+        if (selectedId >= 2)
+        {
+            const int choiceIndex = selectedId - 2;
+            if (choiceIndex >= 0 && choiceIndex < static_cast<int>(sceneTransitionEndSampleChoices.size()))
+                selectedFile = sceneTransitionEndSampleChoices[static_cast<size_t>(choiceIndex)];
+        }
+
+        if (selectedFile != juce::File())
+        {
+            sceneTransitionEndSampleListedDirectory = selectedFile.getParentDirectory();
+            processor.setSceneTransitionEndSampleDirectory(selectedFile.getParentDirectory());
+        }
+
+        processor.setSceneChainStepTransitionEndSampleFile(focusedStep, selectedFile);
+        refreshFromProcessor();
+    };
+    addAndMakeVisible(sceneTransitionEndSampleBox);
+    styleSceneCombo(sceneTransitionEndSampleBox);
+
+    sceneTransitionEndSampleFolderButton.setButtonText("Edit");
+    sceneTransitionEndSampleFolderButton.setTooltip("Open the fill-end sample editor for the focused bubble.");
+    sceneTransitionEndSampleFolderButton.onClick = [this]()
+    {
+        const int focusedStep = getFocusedSceneChainStep() >= 0
+            ? getFocusedSceneChainStep()
+            : (sceneEndSampleEditorVisible ? sceneEndSampleEditorStep : -1);
+        if (focusedStep < 0)
+            return;
+
+        if (sceneEndSampleEditorVisible && sceneEndSampleEditorStep == focusedStep)
+        {
+            closeSceneTransitionEndSampleEditor();
+            return;
+        }
+
+        openSceneTransitionEndSampleEditor(focusedStep);
+    };
+    addAndMakeVisible(sceneTransitionEndSampleFolderButton);
+    styleSceneUtilityButton(sceneTransitionEndSampleFolderButton);
+
     auto configureAmountSlider = [&](juce::Slider& slider,
                                      float defaultValue,
                                      const juce::String& suffix,
+                                     bool primaryMacroControl,
                                      auto&& onCommit)
     {
+        juce::ignoreUnused(primaryMacroControl);
         slider.setRange(0.0, 1.0, 0.01);
         slider.setValue(defaultValue, juce::dontSendNotification);
         slider.textFromValueFunction = [suffix](double value)
@@ -3608,6 +5011,26 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
             if (focusedStep < 0)
                 return;
 
+            if (&slider == &sceneTransitionMixSlider
+                && sceneTransitionSmartLinkEnabled
+                && !sceneTransitionApplyingLinkedTuning)
+            {
+                const auto currentType = processor.getSceneChainStepTransitionType(focusedStep);
+                if (currentType != MlrVSTAudioProcessor::SceneChainTransitionType::None
+                    && currentType != MlrVSTAudioProcessor::SceneChainTransitionType::Return)
+                {
+                    applySceneTransitionSmartTuning(focusedStep,
+                                                    currentType,
+                                                    processor.getSceneChainStepTransitionOption(focusedStep),
+                                                    static_cast<float>(slider.getValue()),
+                                                    processor.getSceneChainStepTransitionLengthBeats(focusedStep),
+                                                    processor.getSceneChainStepTransitionSubtractsFromSceneLength(focusedStep),
+                                                    false,
+                                                    false);
+                    return;
+                }
+            }
+
             onCommit(focusedStep, static_cast<float>(slider.getValue()));
             refreshFromProcessor();
         };
@@ -3619,6 +5042,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     configureAmountSlider(sceneTransitionMixSlider,
                           MlrVSTAudioProcessor::DefaultSceneTransitionIntensity,
                           "%",
+                          true,
                           [this](int focusedStep, float value)
                           {
                               processor.setSceneChainStepTransitionIntensity(focusedStep, value);
@@ -3628,6 +5052,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     configureAmountSlider(sceneTransitionDelaySlider,
                           MlrVSTAudioProcessor::DefaultSceneTransitionDelayAmount,
                           "%",
+                          false,
                           [this](int focusedStep, float value)
                           {
                               processor.setSceneChainStepTransitionDelayAmount(focusedStep, value);
@@ -3637,6 +5062,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     configureAmountSlider(sceneTransitionFilterSlider,
                           MlrVSTAudioProcessor::DefaultSceneTransitionFilterAmount,
                           "%",
+                          false,
                           [this](int focusedStep, float value)
                           {
                               processor.setSceneChainStepTransitionFilterAmount(focusedStep, value);
@@ -3646,6 +5072,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     configureAmountSlider(sceneTransitionChopSlider,
                           MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount,
                           "%",
+                          false,
                           [this](int focusedStep, float value)
                           {
                               processor.setSceneChainStepTransitionChopAmount(focusedStep, value);
@@ -3667,6 +5094,77 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     };
     addAndMakeVisible(sceneTransitionSubtractButton);
     styleSceneToolButton(sceneTransitionSubtractButton, true);
+
+    sceneTransitionSmartLinkButton.setButtonText("Linked");
+    sceneTransitionSmartLinkButton.setClickingTogglesState(true);
+    sceneTransitionSmartLinkButton.setToggleState(sceneTransitionSmartLinkEnabled, juce::dontSendNotification);
+    sceneTransitionSmartLinkButton.setTooltip("When Linked is on, Type, Style, Lead, and Blend automatically tune Echo, Tone, and Gate for the focused Chain Fill. Touch Echo, Tone, or Gate directly to switch back to manual editing.");
+    sceneTransitionSmartLinkButton.onClick = [this]()
+    {
+        sceneTransitionSmartLinkEnabled = sceneTransitionSmartLinkButton.getToggleState();
+        refreshFromProcessor();
+    };
+    styleSceneToolButton(sceneTransitionSmartLinkButton, true);
+
+    auto configureTransitionQuickAction = [this, &styleSceneUtilityButton](juce::TextButton& button,
+                                                                           const juce::String& text,
+                                                                           const juce::String& tooltip,
+                                                                           MlrVSTAudioProcessor::SceneChainTransitionType type,
+                                                                           MlrVSTAudioProcessor::SceneChainTransitionOption option,
+                                                                           float intensity,
+                                                                           float lengthBeats,
+                                                                           bool subtractFromSceneLength)
+    {
+        button.setButtonText(text);
+        button.setTooltip(tooltip);
+        button.onClick = [this, type, option, intensity, lengthBeats, subtractFromSceneLength]()
+        {
+            const int focusedStep = getFocusedSceneChainStep();
+            if (focusedStep < 0)
+                return;
+
+            applySceneTransitionQuickAction(focusedStep,
+                                            type,
+                                            option,
+                                            intensity,
+                                            lengthBeats,
+                                            subtractFromSceneLength);
+        };
+        styleSceneUtilityButton(button);
+    };
+
+    configureTransitionQuickAction(sceneTransitionPunchButton,
+                                   "Punch",
+                                   "Quick Chain Fill: tight stutter with a short lead and punchy gate.",
+                                   MlrVSTAudioProcessor::SceneChainTransitionType::Stutter,
+                                   MlrVSTAudioProcessor::SceneChainTransitionOption::Tight,
+                                   0.82f,
+                                   0.5f,
+                                   true);
+    configureTransitionQuickAction(sceneTransitionLiftButton,
+                                   "Lift",
+                                   "Quick Chain Fill: rising filter sweep with a longer musical lift into the next scene.",
+                                   MlrVSTAudioProcessor::SceneChainTransitionType::FilterRise,
+                                   MlrVSTAudioProcessor::SceneChainTransitionOption::Sweep,
+                                   0.80f,
+                                   2.0f,
+                                   false);
+    configureTransitionQuickAction(sceneTransitionEchoButton,
+                                   "Echo",
+                                   "Quick Chain Fill: delay-led handoff with a little movement and tail.",
+                                   MlrVSTAudioProcessor::SceneChainTransitionType::Fill,
+                                   MlrVSTAudioProcessor::SceneChainTransitionOption::Echo,
+                                   0.76f,
+                                   1.0f,
+                                   false);
+    configureTransitionQuickAction(sceneTransitionDropButton,
+                                   "Drop",
+                                   "Quick Chain Fill: short drop into the next scene with stronger cut and gate.",
+                                   MlrVSTAudioProcessor::SceneChainTransitionType::Drop,
+                                   MlrVSTAudioProcessor::SceneChainTransitionOption::Gate,
+                                   0.86f,
+                                   1.0f,
+                                   true);
 
     addAndMakeVisible(sceneChainCanvas);
 
@@ -3835,8 +5333,27 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(sceneLaneOverlayButton);
     styleSceneToolButton(sceneLaneOverlayButton);
 
+    sceneModPageLabel.setText("Mod Page", juce::dontSendNotification);
+    sceneModPageLabel.setJustificationType(juce::Justification::centredLeft);
+    sceneModPageLabel.setColour(juce::Label::textColourId, kTextMuted);
+    addAndMakeVisible(sceneModPageLabel);
+
+    styleSceneCombo(sceneModPageBox);
+    sceneModPageBox.addItem("Step Motion", static_cast<int>(MlrVSTAudioProcessor::SceneModPageMode::StepMotion) + 1);
+    sceneModPageBox.addItem("Main Mod", static_cast<int>(MlrVSTAudioProcessor::SceneModPageMode::MainModulation) + 1);
+    sceneModPageBox.onChange = [this]()
+    {
+        const int selectedId = sceneModPageBox.getSelectedId();
+        if (selectedId <= 0)
+            return;
+
+        processor.setSceneModPageMode(static_cast<MlrVSTAudioProcessor::SceneModPageMode>(selectedId - 1));
+        refreshFromProcessor();
+    };
+    addAndMakeVisible(sceneModPageBox);
+
     sceneMotionEditButton.setButtonText("Mod");
-    sceneMotionEditButton.setTooltip("Open the classic mod-step editor for the hovered or selected scene motion lane. Depth, Rate, Clock, and Length live inside the embedded motion editor.");
+    sceneMotionEditButton.setTooltip("Open the classic mod-step editor for the hovered or selected scene motion lane. Depth, Clock, Shape, and Length live inside the embedded motion editor.");
     sceneMotionEditButton.onClick = [this]()
     {
         if (sceneLegacyModEditorVisible)
@@ -3845,7 +5362,10 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
             return;
         }
 
-        const int stripIndex = sceneEditorState.hoverStripIndex >= 0 ? sceneEditorState.hoverStripIndex : 0;
+        const int fallbackStripIndex = juce::jlimit(0,
+                                                    juce::jmax(0, getVisibleSceneStripCount() - 1),
+                                                    sceneEditorState.selectedStripIndex);
+        const int stripIndex = sceneEditorState.hoverStripIndex >= 0 ? sceneEditorState.hoverStripIndex : fallbackStripIndex;
         const int laneIndex = sceneEditorState.hoverLaneIndex >= 0 ? sceneEditorState.hoverLaneIndex : 0;
         openLegacyModEditorForLane(stripIndex, laneIndex);
     };
@@ -3916,6 +5436,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     sceneSelectionLabel.setColour(juce::Label::textColourId, kTextSecondary.withAlpha(0.92f));
     sceneSelectionLabel.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(sceneSelectionLabel);
+    sceneSelectionLabel.setVisible(false);
 
     sceneViewport.setViewedComponent(&sceneTimelineCanvas, false);
     sceneViewport.setScrollBarsShown(true, true, true, true);
@@ -3970,10 +5491,35 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
 
     sceneLegacyModCloseButton.setButtonText("Close");
     sceneLegacyModCloseButton.setTooltip("Close the embedded scene motion editor.");
-    sceneLegacyModCloseButton.onClick = [this]() { closeLegacyModEditor(); };
+    sceneLegacyModCloseButton.onClick = [this]()
+    {
+        if (processor.isSceneModeEnabled()
+            && processor.isControlModeActive()
+            && processor.getCurrentControlMode() == MlrVSTAudioProcessor::ControlMode::Modulation)
+        {
+            processor.setControlModeFromGui(MlrVSTAudioProcessor::ControlMode::Normal, false);
+        }
+        closeLegacyModEditor();
+        refreshFromProcessor();
+    };
     addAndMakeVisible(sceneLegacyModCloseButton);
     styleSceneUtilityButton(sceneLegacyModCloseButton);
     sceneLegacyModCloseButton.setVisible(false);
+
+    sceneEndSampleEditorBackdrop.setVisible(false);
+    sceneEndSampleEditorBackdrop.setInterceptsMouseClicks(false, false);
+    addAndMakeVisible(sceneEndSampleEditorBackdrop);
+
+    sceneEndSampleEditor = std::make_unique<SceneTransitionEndSampleEditorPanel>(processor);
+    sceneEndSampleEditor->onChanged = [this]()
+    {
+        sceneTransitionEndSampleListedDirectory = processor.getSceneTransitionEndSampleDirectory();
+        rebuildSceneTransitionEndSampleChoices();
+        refreshFromProcessor();
+    };
+    sceneEndSampleEditor->onCloseRequested = [this]() { closeSceneTransitionEndSampleEditor(); };
+    addAndMakeVisible(*sceneEndSampleEditor);
+    sceneEndSampleEditor->setVisible(false);
 
     for (int stripIndex = 0; stripIndex < SceneEditorVisibleStrips; ++stripIndex)
     {
@@ -4018,6 +5564,11 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     }
 
     refreshFromProcessor();
+}
+
+SceneControlPanel::~SceneControlPanel()
+{
+    processor.setSceneStepMotionEditorOpen(false);
 }
 
 void SceneControlPanel::paint(juce::Graphics& g)
@@ -4110,6 +5661,22 @@ void SceneControlPanel::paint(juce::Graphics& g)
     unionVisibleBounds(fillBounds, sceneTransitionFilterSlider);
     unionVisibleBounds(fillBounds, sceneTransitionChopHeaderLabel);
     unionVisibleBounds(fillBounds, sceneTransitionChopSlider);
+    unionVisibleBounds(fillBounds, sceneTransitionScopeHeaderLabel);
+    unionVisibleBounds(fillBounds, sceneTransitionScopeBox);
+    unionVisibleBounds(fillBounds, sceneTransitionContourHeaderLabel);
+    unionVisibleBounds(fillBounds, sceneTransitionContourBox);
+    unionVisibleBounds(fillBounds, sceneTransitionConditionHeaderLabel);
+    unionVisibleBounds(fillBounds, sceneTransitionConditionBox);
+    unionVisibleBounds(fillBounds, sceneTransitionEndSampleHeaderLabel);
+    unionVisibleBounds(fillBounds, sceneTransitionEndSampleBox);
+    unionVisibleBounds(fillBounds, sceneTransitionEndSampleFolderButton);
+    unionVisibleBounds(fillBounds, sceneTransitionSmartLinkButton);
+    unionVisibleBounds(fillBounds, sceneTransitionPunchButton);
+    unionVisibleBounds(fillBounds, sceneTransitionLiftButton);
+    unionVisibleBounds(fillBounds, sceneTransitionEchoButton);
+    unionVisibleBounds(fillBounds, sceneTransitionDropButton);
+    unionVisibleBounds(fillBounds, sceneTransitionSummaryLabel);
+    unionVisibleBounds(fillBounds, sceneTransitionMetaLabel);
     drawInsetSection(fillBounds, sceneSlotUiColour(processor, getFocusedSceneSlot()).brighter(0.12f));
 
     juce::Rectangle<int> timelineBounds;
@@ -4171,6 +5738,74 @@ int SceneControlPanel::getFocusedSceneChainStep() const
     return -1;
 }
 
+void SceneControlPanel::applySceneTransitionSmartTuning(int stepIndex,
+                                                        MlrVSTAudioProcessor::SceneChainTransitionType type,
+                                                        MlrVSTAudioProcessor::SceneChainTransitionOption option,
+                                                        float intensity,
+                                                        float lengthBeats,
+                                                        bool subtractFromSceneLength,
+                                                        bool updateTypeAndOption,
+                                                        bool updateLength)
+{
+    if (stepIndex < 0 || stepIndex >= processor.getSceneChainLength())
+        return;
+
+    const auto tuned = sceneTransitionSuggestedSettings(type,
+                                                        option,
+                                                        intensity,
+                                                        lengthBeats,
+                                                        subtractFromSceneLength);
+    const juce::ScopedValueSetter<bool> tuningGuard(sceneTransitionApplyingLinkedTuning, true);
+
+    if (updateTypeAndOption)
+    {
+        processor.setSceneChainStepTransitionType(stepIndex, type);
+        processor.setSceneChainStepTransitionOption(stepIndex, option);
+    }
+
+    if (updateLength)
+        processor.setSceneChainStepTransitionLengthBeats(stepIndex, tuned.lengthBeats);
+
+    processor.setSceneChainStepTransitionIntensity(stepIndex, tuned.intensity);
+    processor.setSceneChainStepTransitionDelayAmount(stepIndex, tuned.delayAmount);
+    processor.setSceneChainStepTransitionFilterAmount(stepIndex, tuned.filterAmount);
+    processor.setSceneChainStepTransitionChopAmount(stepIndex, tuned.chopAmount);
+    processor.setSceneChainStepTransitionSubtractsFromSceneLength(stepIndex, tuned.subtractFromSceneLength);
+    refreshFromProcessor();
+}
+
+void SceneControlPanel::applySceneTransitionQuickAction(int stepIndex,
+                                                        MlrVSTAudioProcessor::SceneChainTransitionType type,
+                                                        MlrVSTAudioProcessor::SceneChainTransitionOption option,
+                                                        float intensity,
+                                                        float lengthBeats,
+                                                        bool subtractFromSceneLength)
+{
+    sceneTransitionSmartLinkEnabled = true;
+    sceneTransitionSmartLinkButton.setToggleState(true, juce::dontSendNotification);
+    applySceneTransitionSmartTuning(stepIndex,
+                                    type,
+                                    option,
+                                    intensity,
+                                    lengthBeats,
+                                    subtractFromSceneLength,
+                                    true,
+                                    true);
+}
+
+void SceneControlPanel::rebuildSceneTransitionEndSampleChoices()
+{
+    auto directory = sceneTransitionEndSampleListedDirectory;
+    if (!sceneTransitionEndSampleDirectoryAvailable(directory))
+        directory = effectiveSceneTransitionEndSampleDirectory(processor, getFocusedSceneChainStep());
+
+    if (directory == sceneTransitionEndSampleListedDirectory)
+        return;
+
+    sceneTransitionEndSampleListedDirectory = directory;
+    sceneTransitionEndSampleChoices = collectSceneTransitionEndSampleChoices(directory);
+}
+
 int SceneControlPanel::getVisibleSceneStripCount() const
 {
     const int maxVisibleStrips = juce::jmin(SceneEditorVisibleStrips, MlrVSTAudioProcessor::MaxStrips);
@@ -4208,6 +5843,23 @@ bool SceneControlPanel::isSceneEventIndexSelected(int eventIndex) const
 
 void SceneControlPanel::setSceneSelectionIndices(std::vector<int> indices, int primaryIndex)
 {
+    auto syncSelectedStripFromPrimary = [this]()
+    {
+        if (sceneEditorState.selectedEventIndex < 0
+            || sceneEditorState.selectedEventIndex >= static_cast<int>(sceneEditorState.events.size()))
+        {
+            return;
+        }
+
+        const auto& selectedEvent = sceneEditorState.events[static_cast<size_t>(sceneEditorState.selectedEventIndex)];
+        if (selectedEvent.stripIndex >= 0)
+        {
+            sceneEditorState.selectedStripIndex = juce::jlimit(0,
+                                                               juce::jmax(0, getVisibleSceneStripCount() - 1),
+                                                               selectedEvent.stripIndex);
+        }
+    };
+
     indices.erase(std::remove_if(indices.begin(),
                                  indices.end(),
                                  [this](int index)
@@ -4228,13 +5880,18 @@ void SceneControlPanel::setSceneSelectionIndices(std::vector<int> indices, int p
     if (primaryIndex >= 0 && isSceneEventIndexSelected(primaryIndex))
     {
         sceneEditorState.selectedEventIndex = primaryIndex;
+        syncSelectedStripFromPrimary();
         return;
     }
 
     if (sceneEditorState.selectedEventIndex >= 0 && isSceneEventIndexSelected(sceneEditorState.selectedEventIndex))
+    {
+        syncSelectedStripFromPrimary();
         return;
+    }
 
     sceneEditorState.selectedEventIndex = sceneEditorState.selectedEventIndices.front();
+    syncSelectedStripFromPrimary();
 }
 
 void SceneControlPanel::clearSceneSelection()
@@ -4649,7 +6306,8 @@ double SceneControlPanel::snapSceneBeatToGrid(double beat, double lengthBeats) c
 {
     const double maxBeat = juce::jmax(0.0, std::nextafter(lengthBeats, 0.0));
     double clampedBeat = juce::jlimit(0.0, maxBeat, beat);
-    if (!sceneGridEnabled)
+    const bool useGrid = sceneGridEnabled || sceneDrawModeEnabled;
+    if (!useGrid)
         return clampedBeat;
 
     const int safeDivision = juce::jlimit(1, 64, sceneGridDivision);
@@ -4681,8 +6339,9 @@ bool SceneControlPanel::applySceneDrawTrigger(int stripIndex, double timeBeats, 
 
     auto events = sceneEditorState.events;
     const int safeDivision = juce::jlimit(1, 64, sceneGridDivision);
-    const double gridStepBeats = sceneGridEnabled ? (4.0 / static_cast<double>(safeDivision)) : 0.0;
-    const double matchEpsilon = sceneGridEnabled ? juce::jmax(1.0e-4, gridStepBeats * 0.45) : 1.0e-3;
+    const bool useGrid = sceneGridEnabled || sceneDrawModeEnabled;
+    const double gridStepBeats = useGrid ? (4.0 / static_cast<double>(safeDivision)) : 0.0;
+    const double matchEpsilon = useGrid ? juce::jmax(1.0e-4, gridStepBeats * 0.45) : 1.0e-3;
 
     for (auto& event : events)
     {
@@ -4716,8 +6375,9 @@ bool SceneControlPanel::applySceneDrawPoint(int stripIndex, int laneIndex, doubl
 
     auto events = sceneEditorState.events;
     const int safeDivision = juce::jlimit(1, 64, sceneGridDivision);
-    const double gridStepBeats = sceneGridEnabled ? (4.0 / static_cast<double>(safeDivision)) : 0.0;
-    const double matchEpsilon = sceneGridEnabled ? juce::jmax(1.0e-4, gridStepBeats * 0.45) : 1.0e-3;
+    const bool useGrid = sceneGridEnabled || sceneDrawModeEnabled;
+    const double gridStepBeats = useGrid ? (4.0 / static_cast<double>(safeDivision)) : 0.0;
+    const double matchEpsilon = useGrid ? juce::jmax(1.0e-4, gridStepBeats * 0.45) : 1.0e-3;
 
     events.erase(std::remove_if(events.begin(),
                                 events.end(),
@@ -4757,20 +6417,148 @@ bool SceneControlPanel::applySceneDrawCurveSegment(int stripIndex,
     const double lengthBeats = getSceneTimelineLengthBeats(sceneSlot);
     const int safeLaneIndex = juce::jlimit(0, kSceneAutomationLaneCount - 1, laneIndex);
     const int safeStripIndex = sceneResolveAutomationStripIndex(stripIndex, safeLaneIndex);
+    const bool steppedHoldDrawing = sceneDrawModeEnabled && sceneEditorState.drawActive;
+    const double maxBeat = juce::jmax(0.0, std::nextafter(juce::jmax(1.0, lengthBeats), 0.0));
+    const double clampedStartBeat = juce::jlimit(0.0, maxBeat, startBeat);
+    const double clampedEndBeat = juce::jlimit(0.0, maxBeat, endBeat);
 
-    if (!sceneGridEnabled)
+    const int safeDivision = juce::jlimit(1, 64, sceneGridDivision);
+    const double gridStepBeats = (sceneGridEnabled || steppedHoldDrawing)
+        ? (4.0 / static_cast<double>(safeDivision))
+        : 0.0;
+    if (!(gridStepBeats > 0.0) || !std::isfinite(gridStepBeats))
     {
-        const double clampedStart = juce::jlimit(0.0, lengthBeats, startBeat);
-        const double clampedEnd = juce::jlimit(0.0, lengthBeats, endBeat);
-        const double segmentStart = juce::jmin(clampedStart, clampedEnd);
-        const double segmentEnd = juce::jmax(clampedStart, clampedEnd);
-        constexpr double matchEpsilon = 1.0e-4;
+        if (steppedHoldDrawing)
+            return applySceneDrawPoint(safeStripIndex, safeLaneIndex, clampedEndBeat, endValue);
+
+        if (std::abs(clampedStartBeat - clampedEndBeat) <= 1.0e-3)
+            return applySceneDrawPoint(safeStripIndex, safeLaneIndex, clampedEndBeat, endValue);
 
         auto events = sceneEditorState.events;
-        std::vector<ScenePerformanceEvent> drawnEvents;
+        const double segmentStart = juce::jmin(clampedStartBeat, clampedEndBeat);
+        const double segmentEnd = juce::jmax(clampedStartBeat, clampedEndBeat);
+        const double matchEpsilon = 1.0e-3;
+        auto drawnEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
+                                                              safeLaneIndex,
+                                                              clampedEndBeat,
+                                                              endValue);
+
         events.erase(std::remove_if(events.begin(),
                                     events.end(),
-                                    [safeStripIndex, safeLaneIndex, segmentStart, segmentEnd](const ScenePerformanceEvent& event)
+                                    [safeStripIndex,
+                                     safeLaneIndex,
+                                     segmentStart,
+                                     segmentEnd,
+                                     clampedStartBeat,
+                                     clampedEndBeat,
+                                     matchEpsilon](const ScenePerformanceEvent& event)
+                                    {
+                                        if (event.type != ScenePerformanceEventType::ControlPoint
+                                            || sceneAutomationLaneIndex(event) != safeLaneIndex)
+                                        {
+                                            return false;
+                                        }
+
+                                        if (!sceneAutomationLaneUsesGlobalStrip(safeLaneIndex)
+                                            && event.stripIndex != safeStripIndex)
+                                        {
+                                            return false;
+                                        }
+
+                                        if (std::abs(event.timeBeats - clampedStartBeat) <= matchEpsilon)
+                                            return false;
+
+                                        if (std::abs(event.timeBeats - clampedEndBeat) <= matchEpsilon)
+                                            return true;
+
+                                        return event.timeBeats > (segmentStart + matchEpsilon)
+                                            && event.timeBeats < (segmentEnd - matchEpsilon);
+                                    }),
+                     events.end());
+
+        events.push_back(drawnEvent);
+        return applyEditedSceneEvents(std::move(events), -1, &drawnEvent);
+    }
+
+    const auto snapDrawBeat = [gridStepBeats, maxBeat](double beat)
+    {
+        const double clampedBeat = juce::jlimit(0.0, maxBeat, beat);
+        const double steppedBeat = std::round(clampedBeat / gridStepBeats) * gridStepBeats;
+        return juce::jlimit(0.0, maxBeat, steppedBeat);
+    };
+
+    const double snappedStart = snapDrawBeat(startBeat);
+    const double snappedEnd = snapDrawBeat(endBeat);
+    const double segmentStart = juce::jmin(snappedStart, snappedEnd);
+    const double segmentEnd = juce::jmax(snappedStart, snappedEnd);
+    const double matchEpsilon = juce::jmax(1.0e-4, gridStepBeats * 0.45);
+
+    auto events = sceneEditorState.events;
+    std::vector<ScenePerformanceEvent> drawnEvents;
+    if (steppedHoldDrawing)
+    {
+        std::vector<double> beatsToWrite;
+        if (std::abs(snappedEnd - snappedStart) <= matchEpsilon)
+        {
+            beatsToWrite.push_back(snappedEnd);
+        }
+        else
+        {
+            const double direction = snappedEnd > snappedStart ? 1.0 : -1.0;
+            for (double beat = snappedStart + (direction * gridStepBeats);
+                 direction > 0.0 ? beat <= (snappedEnd + matchEpsilon) : beat >= (snappedEnd - matchEpsilon);
+                 beat += direction * gridStepBeats)
+            {
+                const double clampedBeat = snapDrawBeat(beat);
+                if (beatsToWrite.empty() || std::abs(beatsToWrite.back() - clampedBeat) > matchEpsilon)
+                    beatsToWrite.push_back(clampedBeat);
+            }
+
+            if (beatsToWrite.empty())
+                beatsToWrite.push_back(snappedEnd);
+        }
+
+        events.erase(std::remove_if(events.begin(),
+                                    events.end(),
+                                    [safeStripIndex, safeLaneIndex, &beatsToWrite, matchEpsilon](const ScenePerformanceEvent& event)
+                                    {
+                                        if (event.type != ScenePerformanceEventType::ControlPoint
+                                            || sceneAutomationLaneIndex(event) != safeLaneIndex)
+                                        {
+                                            return false;
+                                        }
+
+                                        if (!sceneAutomationLaneUsesGlobalStrip(safeLaneIndex)
+                                            && event.stripIndex != safeStripIndex)
+                                        {
+                                            return false;
+                                        }
+
+                                        return std::any_of(beatsToWrite.begin(),
+                                                           beatsToWrite.end(),
+                                                           [&event, matchEpsilon](double beat)
+                                                           {
+                                                               return std::abs(event.timeBeats - beat) <= matchEpsilon;
+                                                           });
+                                    }),
+                     events.end());
+
+        const float normalized = juce::jlimit(0.0f, 1.0f, endValue);
+        for (double beat : beatsToWrite)
+        {
+            auto drawnEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
+                                                                  safeLaneIndex,
+                                                                  beat,
+                                                                  normalized);
+            events.push_back(drawnEvent);
+            drawnEvents.push_back(drawnEvent);
+        }
+    }
+    else
+    {
+        events.erase(std::remove_if(events.begin(),
+                                    events.end(),
+                                    [safeStripIndex, safeLaneIndex, segmentStart, segmentEnd, matchEpsilon](const ScenePerformanceEvent& event)
                                     {
                                         return event.type == ScenePerformanceEventType::ControlPoint
                                             && sceneAutomationLaneIndex(event) == safeLaneIndex
@@ -4782,72 +6570,23 @@ bool SceneControlPanel::applySceneDrawCurveSegment(int stripIndex,
                                     }),
                      events.end());
 
-        auto startEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
-                                                              safeLaneIndex,
-                                                              clampedStart,
-                                                              juce::jlimit(0.0f, 1.0f, startValue));
-        auto endEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
-                                                            safeLaneIndex,
-                                                            clampedEnd,
-                                                            juce::jlimit(0.0f, 1.0f, endValue));
-
-        if (std::abs(clampedEnd - clampedStart) <= matchEpsilon)
+        const double span = std::abs(snappedEnd - snappedStart);
+        for (double beat = segmentStart; beat <= (segmentEnd + matchEpsilon); beat += gridStepBeats)
         {
-            events.push_back(endEvent);
-            drawnEvents.push_back(endEvent);
+            const double clampedBeat = snapDrawBeat(beat);
+            const double t = span <= 1.0e-6
+                ? 1.0
+                : juce::jlimit(0.0, 1.0, (clampedBeat - snappedStart) / (snappedEnd - snappedStart));
+            const float normalized = juce::jlimit(0.0f,
+                                                  1.0f,
+                                                  startValue + ((endValue - startValue) * static_cast<float>(t)));
+            auto drawnEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
+                                                                  safeLaneIndex,
+                                                                  clampedBeat,
+                                                                  normalized);
+            events.push_back(drawnEvent);
+            drawnEvents.push_back(drawnEvent);
         }
-        else
-        {
-            events.push_back(startEvent);
-            events.push_back(endEvent);
-            drawnEvents.push_back(startEvent);
-            drawnEvents.push_back(endEvent);
-        }
-
-        return applyEditedSceneEvents(std::move(events), -1, &drawnEvents.back(), &drawnEvents);
-    }
-
-    const int safeDivision = juce::jlimit(1, 64, sceneGridDivision);
-    const double gridStepBeats = 4.0 / static_cast<double>(safeDivision);
-    if (!(gridStepBeats > 0.0) || !std::isfinite(gridStepBeats))
-        return applySceneDrawPoint(safeStripIndex, safeLaneIndex, endBeat, endValue);
-
-    const double snappedStart = snapSceneBeatToGrid(startBeat, lengthBeats);
-    const double snappedEnd = snapSceneBeatToGrid(endBeat, lengthBeats);
-    const double segmentStart = juce::jmin(snappedStart, snappedEnd);
-    const double segmentEnd = juce::jmax(snappedStart, snappedEnd);
-    const double matchEpsilon = juce::jmax(1.0e-4, gridStepBeats * 0.45);
-
-    auto events = sceneEditorState.events;
-    std::vector<ScenePerformanceEvent> drawnEvents;
-    events.erase(std::remove_if(events.begin(),
-                                events.end(),
-                                [safeStripIndex, safeLaneIndex, segmentStart, segmentEnd, matchEpsilon](const ScenePerformanceEvent& event)
-                                {
-                                    return event.type == ScenePerformanceEventType::ControlPoint
-                                        && sceneAutomationLaneIndex(event) == safeLaneIndex
-                                        && (!sceneAutomationLaneUsesGlobalStrip(safeLaneIndex)
-                                                ? (event.stripIndex == safeStripIndex)
-                                                : true)
-                                        && event.timeBeats >= (segmentStart - matchEpsilon)
-                                        && event.timeBeats <= (segmentEnd + matchEpsilon);
-                                }),
-                 events.end());
-
-    const double span = std::abs(snappedEnd - snappedStart);
-    for (double beat = segmentStart; beat <= (segmentEnd + matchEpsilon); beat += gridStepBeats)
-    {
-        const double clampedBeat = snapSceneBeatToGrid(juce::jlimit(0.0, lengthBeats, beat), lengthBeats);
-        const double t = span <= 1.0e-6
-            ? 1.0
-            : juce::jlimit(0.0, 1.0, (clampedBeat - snappedStart) / (snappedEnd - snappedStart));
-        const float normalized = juce::jlimit(0.0f, 1.0f, startValue + ((endValue - startValue) * static_cast<float>(t)));
-        auto drawnEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
-                                                              safeLaneIndex,
-                                                              clampedBeat,
-                                                              normalized);
-        events.push_back(drawnEvent);
-        drawnEvents.push_back(drawnEvent);
     }
 
     if (drawnEvents.empty())
@@ -5147,7 +6886,7 @@ void SceneControlPanel::resized()
 
     auto timingRow = sceneActionRow;
     const int labelGap = 5;
-    const int transportWidth = 50;
+    const int transportWidth = compactButtonWidthForText("STOP", 64, 74);
     const int advanceLabelWidth = 34;
     const int advanceWidth = comboWidthForTexts({"Grid", "Pattern", "Scene", "Manual"},
                                                 66,
@@ -5200,9 +6939,6 @@ void SceneControlPanel::resized()
 
     settingsBounds.removeFromTop(sectionGap);
 
-    sceneTransitionSummaryLabel.setBounds({});
-    sceneTransitionMetaLabel.setBounds({});
-
     auto transitionRow = settingsBounds.removeFromTop(controlHeight);
     transitionRow.setX(sceneContentX);
     transitionRow.setWidth(sceneContentWidth);
@@ -5244,6 +6980,48 @@ void SceneControlPanel::resized()
     layoutTransitionParam(takeFillCell(transitionParamRow), sceneTransitionFilterHeaderLabel, sceneTransitionFilterSlider);
     layoutTransitionParam(takeFillCell(transitionParamRow, true), sceneTransitionChopHeaderLabel, sceneTransitionChopSlider);
 
+    settingsBounds.removeFromTop(4);
+
+    sceneTransitionSmartLinkButton.setBounds({});
+    sceneTransitionPunchButton.setBounds({});
+    sceneTransitionLiftButton.setBounds({});
+    sceneTransitionEchoButton.setBounds({});
+    sceneTransitionDropButton.setBounds({});
+    sceneTransitionScopeHeaderLabel.setBounds({});
+    sceneTransitionScopeBox.setBounds({});
+    sceneTransitionContourHeaderLabel.setBounds({});
+    sceneTransitionContourBox.setBounds({});
+    sceneTransitionConditionHeaderLabel.setBounds({});
+    sceneTransitionConditionBox.setBounds({});
+    sceneTransitionEndSampleHeaderLabel.setBounds({});
+    sceneTransitionEndSampleBox.setBounds({});
+    sceneTransitionEndSampleFolderButton.setBounds({});
+
+    auto transitionDetailRow = settingsBounds.removeFromTop(controlHeight);
+    transitionDetailRow.setX(sceneContentX);
+    transitionDetailRow.setWidth(sceneContentWidth);
+    layoutFillField(takeFillCell(transitionDetailRow), sceneTransitionScopeHeaderLabel, sceneTransitionScopeBox, 38);
+    layoutFillField(takeFillCell(transitionDetailRow), sceneTransitionContourHeaderLabel, sceneTransitionContourBox, 48);
+    layoutFillField(takeFillCell(transitionDetailRow), sceneTransitionConditionHeaderLabel, sceneTransitionConditionBox, 36);
+    auto endSampleCell = takeFillCell(transitionDetailRow, true);
+    sceneTransitionEndSampleHeaderLabel.setBounds(endSampleCell.removeFromLeft(24));
+    endSampleCell.removeFromLeft(4);
+    const int folderButtonWidth = juce::jlimit(54, 84, juce::jmax(54, endSampleCell.getWidth() / 3));
+    sceneTransitionEndSampleFolderButton.setBounds(endSampleCell.removeFromRight(folderButtonWidth));
+    endSampleCell.removeFromRight(4);
+    sceneTransitionEndSampleBox.setBounds(endSampleCell);
+
+    settingsBounds.removeFromTop(4);
+
+    auto summaryRow = settingsBounds.removeFromTop(controlHeight);
+    summaryRow.setX(sceneContentX);
+    summaryRow.setWidth(sceneContentWidth);
+    const int summaryGap = 6;
+    const int summaryWidth = juce::jmax(0, (summaryRow.getWidth() - summaryGap) / 2);
+    sceneTransitionSummaryLabel.setBounds(summaryRow.removeFromLeft(summaryWidth));
+    summaryRow.removeFromLeft(summaryGap);
+    sceneTransitionMetaLabel.setBounds(summaryRow);
+
     sceneAdvanceSummaryLabel.setBounds({});
 
     bounds.removeFromTop(4);
@@ -5252,6 +7030,8 @@ void SceneControlPanel::resized()
     const int clipGap = 4;
     const int reenableWidth = compactButtonWidthForText("Re-enable", 86, 100);
     const int recWidth = compactButtonWidthForText("Rec", 44, 50);
+    const int modPageLabelWidth = 54;
+    const int modPageWidth = comboWidthForTexts({"Step Motion", "Main Mod"}, 84, 106);
     sceneRecorderTitleLabel.setBounds({});
     sceneReenableAutomationButton.setBounds(recorderRow.removeFromRight(reenableWidth));
     recorderRow.removeFromRight(10);
@@ -5266,6 +7046,10 @@ void SceneControlPanel::resized()
     sceneZoomBox.setBounds(recorderRow.removeFromLeft(58));
     recorderRow.removeFromLeft(clipGap);
     sceneFollowButton.setBounds(recorderRow.removeFromLeft(60));
+    recorderRow.removeFromLeft(clipGap);
+    sceneModPageLabel.setBounds(recorderRow.removeFromLeft(modPageLabelWidth));
+    recorderRow.removeFromLeft(clipGap);
+    sceneModPageBox.setBounds(recorderRow.removeFromLeft(modPageWidth));
     sceneMotionEditButton.setBounds({});
     sceneStatusLabel.setBounds({});
     sceneClearButton.setBounds({});
@@ -5279,16 +7063,7 @@ void SceneControlPanel::resized()
     detailRow.removeFromRight(10);
     sceneDetailLabel.setBounds(detailRow);
     bounds.removeFromTop(2);
-    if (sceneSelectionLabel.isVisible())
-    {
-        sceneSelectionLabel.setBounds(bounds.removeFromTop(12));
-        bounds.removeFromTop(4);
-    }
-    else
-    {
-        sceneSelectionLabel.setBounds({});
-        bounds.removeFromTop(1);
-    }
+    sceneSelectionLabel.setBounds({});
 
     sceneViewport.setBounds(bounds);
     updateSceneTimelineContentSize();
@@ -5300,9 +7075,12 @@ void SceneControlPanel::resized()
     {
         const auto editorBounds = sceneViewport.getBounds().reduced(20);
         const int editorWidth = juce::jlimit(320, 520, editorBounds.getWidth());
-        const int editorHeight = juce::jlimit(184, 264, editorBounds.getHeight());
+        const int preferredEditorHeight = sceneLegacyModEditor->getPreferredEmbeddedSceneHeight();
+        const int editorHeight = juce::jmin(editorBounds.getHeight(),
+                                            juce::jmax(220, preferredEditorHeight));
         const auto centered = juce::Rectangle<int>(editorWidth, editorHeight)
-            .withCentre(editorBounds.getCentre());
+            .withCentre(editorBounds.getCentre())
+            .withBottomY(editorBounds.getBottom());
         sceneLegacyModEditor->setBounds(centered);
         sceneLegacyModCloseButton.setBounds(centered.getRight() - 60, centered.getY() + 6, 52, 20);
 
@@ -5350,6 +7128,25 @@ void SceneControlPanel::resized()
             sceneLegacyModCloseButton.toFront(true);
         }
     }
+
+    sceneEndSampleEditorBackdrop.setBounds(sceneViewport.getBounds());
+    sceneEndSampleEditorBackdrop.setVisible(sceneEndSampleEditorVisible);
+
+    if (sceneEndSampleEditor != nullptr)
+    {
+        const auto editorBounds = sceneViewport.getBounds().reduced(22);
+        const int editorWidth = juce::jlimit(360, 520, editorBounds.getWidth());
+        const int editorHeight = juce::jlimit(320, 424, editorBounds.getHeight());
+        const auto centered = juce::Rectangle<int>(editorWidth, editorHeight)
+            .withCentre(editorBounds.getCentre());
+        sceneEndSampleEditor->setBounds(centered);
+        sceneEndSampleEditor->setVisible(sceneEndSampleEditorVisible);
+        if (sceneEndSampleEditorVisible)
+        {
+            sceneEndSampleEditorBackdrop.toFront(false);
+            sceneEndSampleEditor->toFront(true);
+        }
+    }
 }
 
 void SceneControlPanel::updateSceneEditorState(double beat)
@@ -5373,6 +7170,7 @@ void SceneControlPanel::updateSceneEditorState(double beat)
     if (sceneEditorState.selectedSceneSlot != sceneSlot)
     {
         sceneEditorState.selectedSceneSlot = sceneSlot;
+        sceneEditorState.selectedStripIndex = 0;
         clearSceneSelection();
         sceneEditorState.dragActive = false;
         sceneEditorState.dragEventIndex = -1;
@@ -5427,6 +7225,9 @@ void SceneControlPanel::updateSceneEditorState(double beat)
     }
 
     const bool hasEngine = (processor.getAudioEngine() != nullptr);
+    sceneEditorState.selectedStripIndex = juce::jlimit(0,
+                                                       juce::jmax(0, getVisibleSceneStripCount() - 1),
+                                                       sceneEditorState.selectedStripIndex);
     auto& mutableProcessor = processor;
     for (int stripIndex = 0; stripIndex < getVisibleSceneStripCount(); ++stripIndex)
     {
@@ -5445,9 +7246,10 @@ void SceneControlPanel::updateSceneEditorState(double beat)
     sceneRecorderTitleLabel.setText("CLIP", juce::dontSendNotification);
     sceneCaptureButton.setToggleState(sceneDrawModeEnabled, juce::dontSendNotification);
     sceneCaptureButton.setButtonText("Draw");
+    const auto sceneModPageMode = processor.getSceneModPageMode();
     const int preferredStripIndex = sceneLegacyModEditorVisible && sceneLegacyModStripIndex >= 0
         ? sceneLegacyModStripIndex
-        : (sceneEditorState.hoverStripIndex >= 0 ? sceneEditorState.hoverStripIndex : 0);
+        : (sceneEditorState.hoverStripIndex >= 0 ? sceneEditorState.hoverStripIndex : sceneEditorState.selectedStripIndex);
     const int preferredLaneIndex = sceneEditorState.hoverLaneIndex >= 0 ? sceneEditorState.hoverLaneIndex : 0;
     const int preferredSlotIndex = sceneLegacyModEditorVisible && sceneLegacyModSlotIndex >= 0
         ? sceneLegacyModSlotIndex
@@ -5455,6 +7257,25 @@ void SceneControlPanel::updateSceneEditorState(double beat)
     const auto preferredTarget = (hasEngine && preferredSlotIndex >= 0)
         ? processor.getSceneMotionTargetForSlot(preferredStripIndex, preferredSlotIndex)
         : ModernAudioEngine::ModTarget::None;
+    const bool sceneModPageActive = processor.isSceneModeEnabled()
+        && processor.isControlModeActive()
+        && processor.getCurrentControlMode() == MlrVSTAudioProcessor::ControlMode::Modulation;
+    if (sceneModPageActive)
+    {
+        if (sceneModPageMode == MlrVSTAudioProcessor::SceneModPageMode::StepMotion)
+        {
+            if (!sceneLegacyModEditorVisible || sceneLegacyModSlotIndex < 0)
+                openLegacyModEditorForLane(preferredStripIndex, preferredLaneIndex);
+        }
+        else if (sceneLegacyModEditorVisible)
+        {
+            closeLegacyModEditor();
+        }
+    }
+    else if (sceneLegacyModEditorVisible && sceneLegacyModSlotIndex < 0)
+    {
+        closeLegacyModEditor();
+    }
     sceneMotionEditButton.setEnabled(false);
     sceneMotionEditButton.setToggleState(sceneLegacyModEditorVisible, juce::dontSendNotification);
     sceneMotionEditButton.setButtonText(sceneLegacyModEditorVisible
@@ -5467,6 +7288,9 @@ void SceneControlPanel::updateSceneEditorState(double beat)
                                                 ? "Open the scene motion editor and assign a target for the hovered strip."
                                                 : "Open the classic mod-step editor for the hovered or selected scene motion lane. Depth, Rate, Clock, and Length live inside the editor."));
     sceneMotionEditButton.setVisible(false);
+    sceneLegacyModCloseButton.setTooltip(sceneModPageMode == MlrVSTAudioProcessor::SceneModPageMode::StepMotion
+                                             ? "Close the scene motion editor and leave the monome Mod page."
+                                             : "Close the main modulation editor and leave the monome Mod page.");
     const bool recordingThisScene = processor.isScenePerformanceRecording()
         && processor.getScenePerformanceRecordingSceneSlot() == sceneSlot;
     const bool hasAutomationOverrides = focusedIsActive && processor.hasAnyActiveSceneAutomationOverrides();
@@ -5526,52 +7350,10 @@ void SceneControlPanel::updateSceneEditorState(double beat)
         ? (juce::String(sceneEditorState.triggerEventCount) + " trig • "
            + juce::String(sceneEditorState.controlEventCount) + " ctrl")
         : juce::String("No events recorded");
-    juce::String selectionText;
-    if (selectedCount > 1)
-    {
-        selectionText = juce::String("Selection • ") + juce::String(selectedCount)
-            + " events • Drag to move • Delete removes • D duplicates • Q quantizes";
-    }
-    else if (sceneEditorState.selectedEventIndex >= 0
-             && sceneEditorState.selectedEventIndex < static_cast<int>(sceneEditorState.events.size()))
-    {
-        selectionText = "Selection • "
-            + describeSceneEditorEvent(sceneEditorState.events[static_cast<size_t>(sceneEditorState.selectedEventIndex)])
-            + " • Drag to edit • Delete removes";
-    }
-    else if (!editingEnabled)
-    {
-        selectionText = "Recorder active • clip editing is locked until capture finishes";
-    }
-    else if (hasAutomationOverrides)
-    {
-        selectionText = "Manual override active • Re-enable restores the written automation";
-    }
-    else if (sceneDrawModeEnabled)
-    {
-        selectionText = "Draw mode • drag to paint • Alt-drag erases • Snap follows the grid";
-    }
-    else if (sceneEditorState.clickLinePending)
-    {
-        selectionText = "Line anchor set • click the next automation point to connect a segment";
-    }
-    else if (!focusedIsActive)
-    {
-        selectionText = juce::String("Editing S") + juce::String(sceneSlot + 1)
-            + " while S" + juce::String(activeSceneSlot + 1) + " is live";
-    }
-    else if (clipboardReady)
-    {
-        selectionText = clipboardSummary + " • Paste writes into the focused scene";
-    }
-    const bool shouldShowSelection = selectionText.isNotEmpty();
-    if (sceneSelectionLabel.isVisible() != shouldShowSelection)
-    {
-        sceneSelectionLabel.setVisible(shouldShowSelection);
-        resized();
-    }
-    sceneSelectionLabel.setText(selectionText, juce::dontSendNotification);
-    sceneSelectionLabel.setTooltip(selectionText);
+    juce::ignoreUnused(editingEnabled, hasAutomationOverrides, clipboardReady, clipboardSummary);
+    sceneSelectionLabel.setVisible(false);
+    sceneSelectionLabel.setText({}, juce::dontSendNotification);
+    sceneSelectionLabel.setTooltip({});
 
     if (recordingThisScene)
     {
@@ -5671,10 +7453,52 @@ int SceneControlPanel::preferredLegacyModEditorSlotForLane(int stripIndex, int l
     return activeSlot;
 }
 
+void SceneControlPanel::openLegacyModEditorForMainMod()
+{
+    if (sceneLegacyModEditor == nullptr)
+        return;
+
+    closeSceneTransitionEndSampleEditor();
+
+    const int fallbackStripIndex = juce::jlimit(0,
+                                                juce::jmax(0, getVisibleSceneStripCount() - 1),
+                                                sceneEditorState.selectedStripIndex);
+    sceneLegacyModStripIndex = juce::jlimit(0,
+                                            getVisibleSceneStripCount() - 1,
+                                            sceneEditorState.hoverStripIndex >= 0 ? sceneEditorState.hoverStripIndex : fallbackStripIndex);
+    sceneLegacyModSlotIndex = -1;
+    sceneEditorState.dragActive = false;
+    sceneEditorState.dragEventIndex = -1;
+    sceneEditorState.dragBaseEvents.clear();
+    sceneEditorState.drawActive = false;
+    sceneEditorState.drawTriggerLane = false;
+    sceneEditorState.drawStripIndex = -1;
+    sceneEditorState.drawLaneIndex = -1;
+    sceneEditorState.drawHasLastPoint = false;
+    sceneEditorState.eraseActive = false;
+    sceneEditorState.eraseTriggerLane = false;
+    sceneEditorState.eraseStripIndex = -1;
+    sceneEditorState.eraseLaneIndex = -1;
+    sceneEditorState.marqueeActive = false;
+    sceneEditorState.marqueeRect = {};
+    sceneEditorState.stepPatternPaintActive = false;
+    sceneEditorState.stepPatternPaintStripIndex = -1;
+    sceneEditorState.stepPatternPaintLastStep = -1;
+    sceneEditorState.stepPatternPaintEnabled = false;
+    sceneLegacyModEditorVisible = true;
+    processor.setSceneStepMotionEditorOpen(false);
+    sceneEditorState.selectedStripIndex = sceneLegacyModStripIndex;
+    sceneLegacyModEditor->clearPinnedStripAndSlot();
+    resized();
+    sceneTimelineCanvas.repaint();
+}
+
 void SceneControlPanel::openLegacyModEditorForSlot(int stripIndex, int slot)
 {
     if (sceneLegacyModEditor == nullptr)
         return;
+
+    closeSceneTransitionEndSampleEditor();
 
     const int safeStripIndex = juce::jlimit(0, getVisibleSceneStripCount() - 1, stripIndex);
     const int safeSlot = juce::jlimit(0, ModernAudioEngine::NumModSequencers - 1, slot);
@@ -5699,6 +7523,8 @@ void SceneControlPanel::openLegacyModEditorForSlot(int stripIndex, int slot)
     sceneEditorState.stepPatternPaintLastStep = -1;
     sceneEditorState.stepPatternPaintEnabled = false;
     sceneLegacyModEditorVisible = true;
+    processor.setSceneStepMotionEditorOpen(true);
+    sceneEditorState.selectedStripIndex = safeStripIndex;
     sceneLegacyModEditor->setPinnedStripAndSlot(
         safeStripIndex,
         safeSlot,
@@ -5731,6 +7557,7 @@ void SceneControlPanel::openLegacyModEditorForLane(int stripIndex, int laneIndex
 void SceneControlPanel::closeLegacyModEditor()
 {
     sceneLegacyModEditorVisible = false;
+    processor.setSceneStepMotionEditorOpen(false);
     sceneLegacyModStripIndex = -1;
     sceneLegacyModSlotIndex = -1;
     if (sceneLegacyModEditor != nullptr)
@@ -5741,6 +7568,37 @@ void SceneControlPanel::closeLegacyModEditor()
     sceneLegacyModBackdrop.setVisible(false);
     sceneLegacyModCloseButton.setVisible(false);
     sceneTimelineCanvas.repaint();
+}
+
+void SceneControlPanel::openSceneTransitionEndSampleEditor(int stepIndex)
+{
+    if (sceneEndSampleEditor == nullptr)
+        return;
+
+    const int chainLength = processor.getSceneChainLength();
+    if (stepIndex < 0 || stepIndex >= chainLength)
+        return;
+
+    closeLegacyModEditor();
+    selectedSceneChainStep = stepIndex;
+    sceneEndSampleEditorVisible = true;
+    sceneEndSampleEditorStep = stepIndex;
+    sceneEndSampleEditor->setPinnedStep(stepIndex, sceneTransitionEndSampleEditorContext(processor, stepIndex));
+    resized();
+    sceneChainCanvas.repaint();
+}
+
+void SceneControlPanel::closeSceneTransitionEndSampleEditor()
+{
+    sceneEndSampleEditorVisible = false;
+    sceneEndSampleEditorStep = -1;
+    if (sceneEndSampleEditor != nullptr)
+    {
+        sceneEndSampleEditor->clearPinnedStep();
+        sceneEndSampleEditor->setVisible(false);
+    }
+    sceneEndSampleEditorBackdrop.setVisible(false);
+    sceneChainCanvas.repaint();
 }
 
 void SceneControlPanel::refreshFromProcessor()
@@ -5786,7 +7644,7 @@ void SceneControlPanel::refreshFromProcessor()
         : juce::String("Scenes live up top. Click an empty rail slot to add the focused scene.");
     if (chainLength > 0)
         chainHint << "  " << processor.getSceneSequenceSummaryText() << ".";
-    juce::String chainHintTooltip = "Scene buttons focus and launch scenes. Playback controls decide when the chain moves next. Click a chain step to focus it without launching, drag steps to reorder, wheel steps to change repeats, and click connector bubbles or the loop clamp to edit fills. Chains auto-loop.";
+    juce::String chainHintTooltip = "Scene buttons focus and launch scenes. Playback controls decide when the chain moves next. Click a chain step to focus it without launching, drag steps to reorder, wheel steps to change repeats, and use connector bubbles or the loop clamp to shape Chain Fills. Drag a bubble horizontally for Lead and vertically for Blend. Plain wheel changes Style, Shift-wheel changes Lead, Cmd/Ctrl-wheel changes Blend, Alt-wheel changes Type, Shift+Cmd/Ctrl-wheel changes Scope, Shift+Alt-wheel changes Contour, Cmd/Ctrl+Alt-wheel changes When, and double-click toggles Shorten Scene vs Ride Over End. Chains auto-loop.";
     if (chainLength > 0)
         chainHintTooltip = processor.getSceneSequenceSummaryText() + ".  " + chainHintTooltip;
     hintLabel.setText(chainHint, juce::dontSendNotification);
@@ -5796,19 +7654,46 @@ void SceneControlPanel::refreshFromProcessor()
     if (selectedSceneActionSlot < 0 || selectedSceneActionSlot >= MlrVSTAudioProcessor::SceneSlots)
         selectedSceneActionSlot = processor.getFocusedSceneSlot();
     const int focusedSceneSlot = getFocusedSceneSlot();
+    const bool focusedSceneHasStoredData = processor.getSceneClipSlotState(focusedSceneSlot).hasStoredContent;
+    const auto sceneModPageMode = processor.getSceneModPageMode();
     if (sceneTimingLayoutFocusedSlot != focusedSceneSlot)
         resized();
     sceneSceneCaptureButton.setEnabled(processor.isSceneModeEnabled());
-    sceneSceneCopyButton.setEnabled(processor.isSceneModeEnabled());
+    sceneSceneCopyButton.setEnabled(processor.isSceneModeEnabled() && focusedSceneHasStoredData);
     sceneScenePasteButton.setEnabled(processor.isSceneModeEnabled() && sceneSlotClipboardReady);
+    sceneModPageBox.setSelectedId(static_cast<int>(sceneModPageMode) + 1, juce::dontSendNotification);
+    sceneModPageLabel.setTooltip("Choose what the monome Mod page edits while scene mode is active.");
+    sceneModPageBox.setTooltip(sceneModPageMode == MlrVSTAudioProcessor::SceneModPageMode::StepMotion
+                                   ? "Step Motion: the monome Mod page opens the scene motion step editor and writes per-scene motion."
+                                   : "Main Mod: the monome Mod page stays on the main scene automation lanes instead of opening the legacy modulation editor.");
+    const bool sceneChainPlaybackActive = processor.isSceneChainPlaybackActive();
     sceneChainPlayButton.setEnabled(chainLength >= 2);
-    sceneChainPlayButton.setToggleState(processor.isSceneChainPlaybackActive(), juce::dontSendNotification);
-    sceneChainPlayButton.setButtonText(processor.isSceneChainPlaybackActive() ? "Stop" : "Play");
+    sceneChainPlayButton.setToggleState(sceneChainPlaybackActive, juce::dontSendNotification);
+    sceneChainPlayButton.setButtonText(sceneChainPlaybackActive ? "STOP" : "PLAY");
+    sceneChainPlayButton.setColour(juce::TextButton::buttonColourId,
+                                   chainLength >= 2 ? juce::Colour(0xff315649)
+                                                    : juce::Colour(0xff2b3137));
+    sceneChainPlayButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffc9eb74));
+    sceneChainPlayButton.setColour(juce::TextButton::textColourOffId,
+                                   chainLength >= 2 ? juce::Colour(0xfff2f6f3)
+                                                    : kTextMuted.withAlpha(0.84f));
+    sceneChainPlayButton.setColour(juce::TextButton::textColourOnId, juce::Colour(0xff10150f));
     sceneChainClearButton.setEnabled(processor.isSceneModeEnabled());
     const int focusedLengthCount = processor.getSceneLengthCount(focusedSceneSlot);
     const auto focusedLengthMode = processor.getSceneLengthMode(focusedSceneSlot);
-    const int focusedStep = getFocusedSceneChainStep();
+    const int focusedStep = getFocusedSceneChainStep() >= 0
+        ? getFocusedSceneChainStep()
+        : (sceneEndSampleEditorVisible ? sceneEndSampleEditorStep : -1);
     const bool hasFocusedStep = focusedStep >= 0 && focusedStep < chainLength;
+    if (sceneEndSampleEditorVisible)
+    {
+        if (!hasFocusedStep)
+            closeSceneTransitionEndSampleEditor();
+        else if (sceneEndSampleEditorStep != focusedStep && sceneEndSampleEditor != nullptr)
+            sceneEndSampleEditor->setPinnedStep(focusedStep,
+                                                sceneTransitionEndSampleEditorContext(processor, focusedStep));
+        sceneEndSampleEditorStep = hasFocusedStep ? focusedStep : -1;
+    }
     sceneSlotHeaderLabel.setText("Edit S" + juce::String(focusedSceneSlot + 1), juce::dontSendNotification);
     sceneSlotHeaderLabel.setColour(juce::Label::textColourId, sceneSlotUiColour(processor, focusedSceneSlot).brighter(0.12f));
     sceneSlotHeaderLabel.setTooltip("The scene whose Length and Count settings are shown below.");
@@ -5829,7 +7714,9 @@ void SceneControlPanel::refreshFromProcessor()
                                                  + " is already at the maximum length count for 2x duplication."));
     sceneSceneCopyButton.setTooltip("Copy focused scene S"
                                     + juce::String(getFocusedSceneSlot() + 1)
-                                    + " so it can be pasted into another scene slot.");
+                                    + (focusedSceneHasStoredData
+                                           ? " so it can be pasted into another scene slot."
+                                           : " after you save something into it first."));
     sceneScenePasteButton.setTooltip(sceneSlotClipboardReady
                                          ? ("Paste copied scene from S"
                                             + juce::String(sceneSlotClipboardSourceSlot + 1)
@@ -5853,12 +7740,17 @@ void SceneControlPanel::refreshFromProcessor()
 
     sceneTransitionTypeBox.setEnabled(hasFocusedStep);
     sceneTransitionOptionsBox.setEnabled(hasFocusedStep);
+    sceneTransitionScopeBox.setEnabled(hasFocusedStep);
+    sceneTransitionContourBox.setEnabled(hasFocusedStep);
+    sceneTransitionConditionBox.setEnabled(hasFocusedStep);
     sceneTransitionLengthBox.setEnabled(hasFocusedStep);
     sceneTransitionMixSlider.setEnabled(hasFocusedStep);
     sceneTransitionDelaySlider.setEnabled(hasFocusedStep);
     sceneTransitionFilterSlider.setEnabled(hasFocusedStep);
     sceneTransitionChopSlider.setEnabled(hasFocusedStep);
     sceneTransitionSubtractButton.setEnabled(hasFocusedStep);
+    sceneTransitionEndSampleBox.setEnabled(hasFocusedStep);
+    sceneTransitionEndSampleFolderButton.setEnabled(hasFocusedStep);
     sceneTransitionTypeBox.setSelectedId(hasFocusedStep
                                              ? (static_cast<int>(processor.getSceneChainStepTransitionType(focusedStep)) + 1)
                                              : 0,
@@ -5867,6 +7759,18 @@ void SceneControlPanel::refreshFromProcessor()
                                                 ? (static_cast<int>(processor.getSceneChainStepTransitionOption(focusedStep)) + 1)
                                                 : 0,
                                             juce::dontSendNotification);
+    sceneTransitionScopeBox.setSelectedId(hasFocusedStep
+                                              ? (static_cast<int>(processor.getSceneChainStepTransitionScope(focusedStep)) + 1)
+                                              : 0,
+                                          juce::dontSendNotification);
+    sceneTransitionContourBox.setSelectedId(hasFocusedStep
+                                                ? (static_cast<int>(processor.getSceneChainStepTransitionContour(focusedStep)) + 1)
+                                                : 0,
+                                            juce::dontSendNotification);
+    sceneTransitionConditionBox.setSelectedId(hasFocusedStep
+                                                  ? (static_cast<int>(processor.getSceneChainStepTransitionCondition(focusedStep)) + 1)
+                                                  : 0,
+                                              juce::dontSendNotification);
     sceneTransitionLengthBox.setSelectedId(hasFocusedStep
                                                ? sceneTransitionComboIdForValue(
                                                      processor.getSceneChainStepTransitionLengthBeats(focusedStep),
@@ -5881,6 +7785,15 @@ void SceneControlPanel::refreshFromProcessor()
     const auto focusedTransitionOption = hasFocusedStep
         ? processor.getSceneChainStepTransitionOption(focusedStep)
         : MlrVSTAudioProcessor::SceneChainTransitionOption::Default;
+    const auto focusedTransitionScope = hasFocusedStep
+        ? processor.getSceneChainStepTransitionScope(focusedStep)
+        : MlrVSTAudioProcessor::SceneChainTransitionScope::All;
+    const auto focusedTransitionContour = hasFocusedStep
+        ? processor.getSceneChainStepTransitionContour(focusedStep)
+        : MlrVSTAudioProcessor::SceneChainTransitionContour::Smooth;
+    const auto focusedTransitionCondition = hasFocusedStep
+        ? processor.getSceneChainStepTransitionCondition(focusedStep)
+        : MlrVSTAudioProcessor::SceneChainTransitionCondition::Always;
     const float focusedTransitionLength = hasFocusedStep
         ? processor.getSceneChainStepTransitionLengthBeats(focusedStep)
         : MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats;
@@ -5899,6 +7812,10 @@ void SceneControlPanel::refreshFromProcessor()
     const float focusedTransitionChop = hasFocusedStep
         ? processor.getSceneChainStepTransitionChopAmount(focusedStep)
         : MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount;
+    const auto focusedTransitionEndSample = hasFocusedStep
+        ? processor.getSceneChainStepTransitionEndSampleFile(focusedStep)
+        : juce::File();
+    const auto endSampleDirectory = processor.getSceneTransitionEndSampleDirectory();
     const auto transitionColour = hasFocusedStep
         ? sceneChainTransitionColour(focusedTransitionType)
         : juce::Colour(0xff465158);
@@ -5917,8 +7834,61 @@ void SceneControlPanel::refreshFromProcessor()
     sceneTransitionSubtractButton.setToggleState(focusedTransitionSubtractsFromSceneLength, juce::dontSendNotification);
     sceneTransitionSubtractButton.setButtonText(
         sceneTransitionSubtractButtonLabel(focusedTransitionSubtractsFromSceneLength));
-    sceneTransitionSummaryLabel.setVisible(false);
-    sceneTransitionMetaLabel.setVisible(false);
+    rebuildSceneTransitionEndSampleChoices();
+    if (!sceneTransitionEndSampleBox.isPopupActive())
+    {
+        juce::StringArray endSampleLabels;
+        endSampleLabels.add("None");
+
+        int selectedEndSampleId = 1;
+        for (int choiceIndex = 0; choiceIndex < static_cast<int>(sceneTransitionEndSampleChoices.size()); ++choiceIndex)
+        {
+            const auto& file = sceneTransitionEndSampleChoices[static_cast<size_t>(choiceIndex)];
+            const juce::String label = sceneTransitionEndSampleChoiceLabel(file, endSampleDirectory);
+            endSampleLabels.add(label);
+            if (sceneTransitionEndSampleFilesMatch(focusedTransitionEndSample, file))
+                selectedEndSampleId = choiceIndex + 2;
+        }
+
+        if (selectedEndSampleId == 1
+            && focusedTransitionEndSample != juce::File()
+            && focusedTransitionEndSample.getFullPathName().trim().isNotEmpty())
+        {
+            selectedEndSampleId = endSampleLabels.size() + 1;
+            endSampleLabels.add("(Missing) " + focusedTransitionEndSample.getFileName());
+        }
+
+        bool needsRebuild = sceneTransitionEndSampleBox.getNumItems() != endSampleLabels.size();
+        if (!needsRebuild)
+        {
+            for (int itemIndex = 0; itemIndex < endSampleLabels.size(); ++itemIndex)
+            {
+                if (sceneTransitionEndSampleBox.getItemText(itemIndex) != endSampleLabels[itemIndex])
+                {
+                    needsRebuild = true;
+                    break;
+                }
+            }
+        }
+
+        sceneTransitionEndSampleBoxUpdating = true;
+        if (needsRebuild)
+        {
+            sceneTransitionEndSampleBox.clear(juce::dontSendNotification);
+            for (int itemIndex = 0; itemIndex < endSampleLabels.size(); ++itemIndex)
+                sceneTransitionEndSampleBox.addItem(endSampleLabels[itemIndex], itemIndex + 1);
+        }
+
+        const int desiredSelectedId = hasFocusedStep ? selectedEndSampleId : 0;
+        if (sceneTransitionEndSampleBox.getSelectedId() != desiredSelectedId)
+            sceneTransitionEndSampleBox.setSelectedId(desiredSelectedId, juce::dontSendNotification);
+        sceneTransitionEndSampleBoxUpdating = false;
+    }
+    sceneTransitionSummaryLabel.setVisible(true);
+    sceneTransitionMetaLabel.setVisible(true);
+    sceneTransitionSmartLinkButton.setEnabled(hasFocusedStep);
+    sceneTransitionSmartLinkButton.setToggleState(sceneTransitionSmartLinkEnabled, juce::dontSendNotification);
+    sceneTransitionSmartLinkButton.setButtonText(sceneTransitionSmartLinkEnabled ? "Linked" : "Manual");
     sceneTransitionHeaderLabel.setColour(juce::Label::textColourId,
                                          hasFocusedStep ? transitionColour.brighter(0.20f) : kTextMuted);
     sceneTransitionOptionsHeaderLabel.setColour(juce::Label::textColourId,
@@ -5933,24 +7903,120 @@ void SceneControlPanel::refreshFromProcessor()
                                                hasFocusedStep ? transitionColour.withAlpha(0.88f) : kTextMuted);
     sceneTransitionChopHeaderLabel.setColour(juce::Label::textColourId,
                                              hasFocusedStep ? transitionColour.withAlpha(0.88f) : kTextMuted);
+    sceneTransitionScopeHeaderLabel.setColour(juce::Label::textColourId,
+                                              hasFocusedStep ? transitionColour.withAlpha(0.88f) : kTextMuted);
+    sceneTransitionContourHeaderLabel.setColour(juce::Label::textColourId,
+                                                hasFocusedStep ? transitionColour.withAlpha(0.88f) : kTextMuted);
+    sceneTransitionConditionHeaderLabel.setColour(juce::Label::textColourId,
+                                                  hasFocusedStep ? transitionColour.withAlpha(0.88f) : kTextMuted);
+    sceneTransitionEndSampleHeaderLabel.setColour(juce::Label::textColourId,
+                                                  hasFocusedStep ? transitionColour.withAlpha(0.88f) : kTextMuted);
     sceneTransitionSummaryLabel.setColour(juce::Label::backgroundColourId, transitionColour.withAlpha(hasFocusedStep ? 0.18f : 0.10f));
     sceneTransitionSummaryLabel.setColour(juce::Label::outlineColourId, transitionColour.withAlpha(hasFocusedStep ? 0.40f : 0.18f));
     sceneTransitionSummaryLabel.setColour(juce::Label::textColourId, hasFocusedStep ? kTextPrimary : kTextMuted);
     sceneTransitionMetaLabel.setColour(juce::Label::backgroundColourId, transitionColour.withAlpha(hasFocusedStep ? 0.12f : 0.08f));
     sceneTransitionMetaLabel.setColour(juce::Label::outlineColourId, transitionColour.withAlpha(hasFocusedStep ? 0.24f : 0.14f));
     sceneTransitionMetaLabel.setColour(juce::Label::textColourId, hasFocusedStep ? kTextSecondary : kTextMuted);
+    sceneTransitionEndSampleFolderButton.setButtonText(sceneEndSampleEditorVisible && hasFocusedStep ? "Close" : "Edit");
+    sceneTransitionEndSampleFolderButton.setColour(juce::TextButton::buttonColourId,
+                                                   hasFocusedStep
+                                                       ? transitionColour.withAlpha(sceneEndSampleEditorVisible ? 0.92f
+                                                                                                : (endSampleDirectory.isDirectory() ? 0.82f : 0.36f))
+                                                       : juce::Colour(0xff3a4046));
+    sceneTransitionEndSampleFolderButton.setColour(juce::TextButton::buttonOnColourId,
+                                                   transitionColour.brighter(0.12f));
+    sceneTransitionEndSampleFolderButton.setColour(juce::TextButton::textColourOffId,
+                                                   hasFocusedStep && (sceneEndSampleEditorVisible || endSampleDirectory.isDirectory())
+                                                       ? juce::Colour(0xff111111)
+                                                       : kTextPrimary);
+    sceneTransitionEndSampleFolderButton.setColour(juce::TextButton::textColourOnId,
+                                                   juce::Colour(0xff111111));
+    sceneTransitionSmartLinkButton.setColour(juce::TextButton::buttonColourId,
+                                             hasFocusedStep
+                                                 ? (sceneTransitionSmartLinkEnabled
+                                                        ? transitionColour.withAlpha(0.88f)
+                                                        : juce::Colour(0xff454b52))
+                                                 : juce::Colour(0xff3a4046));
+    sceneTransitionSmartLinkButton.setColour(juce::TextButton::buttonOnColourId,
+                                             transitionColour.brighter(0.18f));
+    sceneTransitionSmartLinkButton.setColour(juce::TextButton::textColourOffId,
+                                             sceneTransitionSmartLinkEnabled && hasFocusedStep
+                                                 ? juce::Colour(0xff111111)
+                                                 : kTextPrimary);
+    sceneTransitionSmartLinkButton.setColour(juce::TextButton::textColourOnId,
+                                             juce::Colour(0xff111111));
+
+    auto tintQuickButton = [&](juce::TextButton& button,
+                               bool active,
+                               juce::Colour colour)
+    {
+        button.setEnabled(hasFocusedStep);
+        button.setColour(juce::TextButton::buttonColourId,
+                         active ? colour.withAlpha(0.90f)
+                                : juce::Colour(0xff3d4349));
+        button.setColour(juce::TextButton::buttonOnColourId,
+                         colour.brighter(0.12f));
+        button.setColour(juce::TextButton::textColourOffId,
+                         active ? juce::Colour(0xff111111) : kTextPrimary);
+        button.setColour(juce::TextButton::textColourOnId,
+                         juce::Colour(0xff111111));
+    };
+    tintQuickButton(sceneTransitionPunchButton,
+                    hasFocusedStep
+                        && focusedTransitionType == MlrVSTAudioProcessor::SceneChainTransitionType::Stutter
+                        && focusedTransitionOption == MlrVSTAudioProcessor::SceneChainTransitionOption::Tight,
+                    juce::Colour(0xffdf7b45));
+    tintQuickButton(sceneTransitionLiftButton,
+                    hasFocusedStep
+                        && focusedTransitionType == MlrVSTAudioProcessor::SceneChainTransitionType::FilterRise
+                        && focusedTransitionOption == MlrVSTAudioProcessor::SceneChainTransitionOption::Sweep,
+                    juce::Colour(0xff76b98f));
+    tintQuickButton(sceneTransitionEchoButton,
+                    hasFocusedStep
+                        && focusedTransitionType == MlrVSTAudioProcessor::SceneChainTransitionType::Fill
+                        && focusedTransitionOption == MlrVSTAudioProcessor::SceneChainTransitionOption::Echo,
+                    juce::Colour(0xff76a9d8));
+    tintQuickButton(sceneTransitionDropButton,
+                    hasFocusedStep
+                        && focusedTransitionType == MlrVSTAudioProcessor::SceneChainTransitionType::Drop
+                        && focusedTransitionOption == MlrVSTAudioProcessor::SceneChainTransitionOption::Gate,
+                    juce::Colour(0xffd5695a));
 
     if (hasFocusedStep)
     {
+        const juce::String focusedEndSampleLabel = focusedTransitionEndSample == juce::File()
+            ? juce::String("None")
+            : (!focusedTransitionEndSample.existsAsFile()
+                   ? juce::String("(Missing) ") + focusedTransitionEndSample.getFileName()
+                   : focusedTransitionEndSample.getFileName());
         sceneTransitionSummaryLabel.setText(sceneChainTransitionTypeLabel(focusedTransitionType)
                                                 + " / "
-                                                + sceneChainTransitionOptionLabel(focusedTransitionOption),
+                                                + sceneChainTransitionOptionLabel(focusedTransitionOption)
+                                                + " • "
+                                                + sceneTransitionFocusSummary(focusedTransitionDelay,
+                                                                             focusedTransitionFilter,
+                                                                             focusedTransitionChop)
+                                                + " • "
+                                                + sceneChainTransitionScopeLabel(focusedTransitionScope),
                                             juce::dontSendNotification);
-        sceneTransitionMetaLabel.setText(sceneTransitionParameterSummary(focusedTransitionLength,
-                                                                         focusedTransitionIntensity,
-                                                                         focusedTransitionDelay,
-                                                                         focusedTransitionFilter,
-                                                                         focusedTransitionChop),
+    sceneTransitionMetaLabel.setText(formatSceneTransitionLengthBeats(focusedTransitionLength)
+                                             + " • "
+                                             + sceneTransitionEnergySummary(focusedTransitionIntensity)
+                                             + " • "
+                                             + sceneChainTransitionContourLabel(focusedTransitionContour)
+                                             + " • "
+                                             + sceneChainTransitionConditionLabel(focusedTransitionCondition)
+                                             + " • "
+                                             + juce::String("D")
+                                             + juce::String(juce::roundToInt(focusedTransitionDelay * 100.0f))
+                                             + " F"
+                                             + juce::String(juce::roundToInt(focusedTransitionFilter * 100.0f))
+                                             + " G"
+                                             + juce::String(juce::roundToInt(focusedTransitionChop * 100.0f))
+                                             + " • "
+                                             + juce::String(focusedTransitionSubtractsFromSceneLength ? "Shorten" : "Ride")
+                                             + " • Picked "
+                                             + focusedEndSampleLabel,
                                          juce::dontSendNotification);
         const int currentSceneSlot = processor.getSceneChainStepSceneSlot(focusedStep);
         const bool loopbackStep = processor.isSceneChainLoopEnabled() && focusedStep == (chainLength - 1);
@@ -5968,46 +8034,79 @@ void SceneControlPanel::refreshFromProcessor()
             transitionTooltip << " -> stop";
         transitionTooltip << " • " << sceneChainTransitionTypeSummary(focusedTransitionType)
                           << " • " << sceneChainTransitionOptionSummary(focusedTransitionOption)
+                          << " • Scope: " << sceneChainTransitionScopeSummary(focusedTransitionScope)
+                          << " • Contour: " << sceneChainTransitionContourSummary(focusedTransitionContour)
+                          << " • Condition: " << sceneChainTransitionConditionSummary(focusedTransitionCondition)
                           << " • " << sceneTransitionParameterSummary(focusedTransitionLength,
+                                                                      focusedTransitionScope,
+                                                                      focusedTransitionContour,
+                                                                      focusedTransitionCondition,
                                                                       focusedTransitionIntensity,
                                                                       focusedTransitionDelay,
                                                                       focusedTransitionFilter,
                                                                       focusedTransitionChop)
+                          << " • End sample: " << focusedEndSampleLabel
+                          << " • Type, Style, Lead, and Blend retune the fill shape together"
+                          << " • Drag X: Lead | Drag Y: Blend | Wheel: Style | Shift-wheel: Lead | Cmd/Ctrl-wheel: Blend | Alt-wheel: Type | Shift+Cmd/Ctrl-wheel: Scope | Shift+Alt-wheel: Contour | Cmd/Ctrl+Alt-wheel: When | Double-click: timing mode"
                           << " • " << sceneTransitionTimingModeSummary(focusedTransitionSubtractsFromSceneLength);
         sceneTransitionSummaryLabel.setTooltip(transitionTooltip);
         sceneTransitionMetaLabel.setTooltip(transitionTooltip);
-        sceneTransitionTypeBox.setTooltip("Fill type for the focused connector bubble or loopback clamp. Safe to change during chain playback.");
-        sceneTransitionOptionsBox.setTooltip("Fill profile for the focused connector bubble or loopback clamp.");
-        sceneTransitionLengthBox.setTooltip("Lead-in length for the focused fill bubble.");
-        sceneTransitionMixSlider.setTooltip("Overall fill intensity for the focused fill bubble.");
-        sceneTransitionDelaySlider.setTooltip("Delay amount for the focused fill bubble.");
-        sceneTransitionFilterSlider.setTooltip("Filter sweep amount for the focused fill bubble.");
-        sceneTransitionChopSlider.setTooltip("Gate/stutter amount for the focused fill bubble.");
+        sceneTransitionTypeBox.setTooltip("Fill type for the focused connector bubble or loopback clamp. Changing Type also retunes the Echo, Tone, and Gate balance.");
+        sceneTransitionOptionsBox.setTooltip("Transition style for the focused fill bubble. Style steers the same Chain Fill toward tighter, wider, echo-led, sweep-led, or gate-led behaviour.");
+        sceneTransitionScopeBox.setTooltip("Scope decides which strip types the focused Chain Fill will touch: all strips, loop-style strips, steps, grains, or flip/sample strips.");
+        sceneTransitionContourBox.setTooltip("Contour shapes how the fill evolves across its lead time: smooth, ramped, burst-ending, duck-then-lift, or late-hit.");
+        sceneTransitionConditionBox.setTooltip("Condition decides when this Chain Fill is allowed to fire: every time, probabilistically, loop-only, or forward-only.");
+        sceneTransitionLengthBox.setTooltip("Lead-in length for the focused fill bubble. Longer leads lean more into Echo and Tone; shorter leads stay punchier.");
+        sceneTransitionMixSlider.setTooltip("Primary Chain Fill macro. Blend retunes Echo, Tone, and Gate together around the current Type, Style, and Lead.");
+        sceneTransitionDelaySlider.setTooltip("Delay amount used by the focused fill bubble.");
+        sceneTransitionFilterSlider.setTooltip("Filter sweep amount used by the focused fill bubble.");
+        sceneTransitionChopSlider.setTooltip("Gate/stutter amount used by the focused fill bubble.");
+        sceneTransitionEndSampleBox.setTooltip("Quick pick for the sample that fires on the next bar. Open Edit for audition and shaping.");
+        sceneTransitionEndSampleFolderButton.setTooltip(sceneEndSampleEditorVisible
+                                                            ? "Close the fill-end sample editor."
+                                                            : "Open the fill-end sample editor for audition, browsing, and playback shaping.");
         sceneTransitionSubtractButton.setTooltip(focusedTransitionSubtractsFromSceneLength
                                                      ? "On: the fill lead time is subtracted from the outgoing scene duration."
                                                      : "Off: the fill rides over the scene end without shortening the scene duration.");
+        sceneTransitionSmartLinkButton.setTooltip(sceneTransitionSmartLinkEnabled
+                                                      ? "Linked is on. Blend, Type, Style, and Lead all keep the Chain Fill musically balanced. Touch Echo, Tone, or Gate to break out into manual editing."
+                                                      : "Manual editing is on. Turn Linked back on to let Blend, Type, Style, and Lead retune the focused Chain Fill.");
+        sceneTransitionPunchButton.setTooltip("Punch preset: tight stutter with a short lead and stronger gate.");
+        sceneTransitionLiftButton.setTooltip("Lift preset: longer rising sweep into the next scene.");
+        sceneTransitionEchoButton.setTooltip("Echo preset: delay-led Chain Fill with a softer handoff.");
+        sceneTransitionDropButton.setTooltip("Drop preset: punchier cut into the next scene.");
     }
     else
     {
         sceneTransitionSummaryLabel.setText("No fill bubble", juce::dontSendNotification);
-        sceneTransitionMetaLabel.setText("Click a connector chip or the loop clamp to edit fills",
+        sceneTransitionMetaLabel.setText("Click a connector chip or the loop clamp to edit the current Chain Fill",
                                          juce::dontSendNotification);
         sceneTransitionSummaryLabel.setTooltip("The fill editor follows the focused connector bubble or loopback clamp.");
         sceneTransitionMetaLabel.setTooltip("Select a connector chip or loop clamp, then shape the fill here.");
         sceneTransitionTypeBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
         sceneTransitionOptionsBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
+        sceneTransitionScopeBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
+        sceneTransitionContourBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
+        sceneTransitionConditionBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
         sceneTransitionLengthBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
         sceneTransitionMixSlider.setTooltip("Select a connector chip or loop clamp to edit fills.");
         sceneTransitionDelaySlider.setTooltip("Select a connector chip or loop clamp to edit fills.");
         sceneTransitionFilterSlider.setTooltip("Select a connector chip or loop clamp to edit fills.");
         sceneTransitionChopSlider.setTooltip("Select a connector chip or loop clamp to edit fills.");
+        sceneTransitionEndSampleBox.setTooltip("Select a connector chip or loop clamp first, then choose its next-bar end sample.");
+        sceneTransitionEndSampleFolderButton.setTooltip("Select a connector chip or loop clamp first, then open the fill-end sample editor.");
         sceneTransitionSubtractButton.setTooltip("Select a connector chip or loop clamp, then decide whether its fill shortens the outgoing scene.");
+        sceneTransitionSmartLinkButton.setTooltip("Select a connector chip or loop clamp, then use Linked mode to keep that Chain Fill musically balanced while you edit it.");
+        sceneTransitionPunchButton.setTooltip("Select a connector chip or loop clamp first.");
+        sceneTransitionLiftButton.setTooltip("Select a connector chip or loop clamp first.");
+        sceneTransitionEchoButton.setTooltip("Select a connector chip or loop clamp first.");
+        sceneTransitionDropButton.setTooltip("Select a connector chip or loop clamp first.");
     }
 
+    const auto sceneWatcher = processor.getSceneWatcherState();
     for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
     {
         const auto idx = static_cast<size_t>(sceneSlot);
-        const auto sceneWatcher = processor.getSceneWatcherState();
         const auto& runtimeSlot = sceneWatcher.slots[idx];
         const auto& clipSlot = runtimeSlot.clipSlot;
         const auto lengthMode = processor.getSceneLengthMode(sceneSlot);
@@ -6021,9 +8120,13 @@ void SceneControlPanel::refreshFromProcessor()
         const bool isQueuedScene = runtimeSlot.queued;
         const bool isQueuedManualScene = isQueuedScene && sceneWatcher.manualPlaybackOwned;
         const bool isSelectedScene = runtimeSlot.focused;
+        const bool hasStoredSceneData = clipSlot.hasStoredContent;
         juce::ignoreUnused(resolvedBeats);
-        juce::String resolvedTooltip = sceneLengthModeSummary(processor, sceneSlot)
-            + " | " + juce::String(totalBeats, 2) + " beats";
+        juce::String resolvedTooltip = hasStoredSceneData
+            ? juce::String("Stored scene data")
+            : juce::String("Empty scene slot | no saved scene data yet");
+        resolvedTooltip << " | " << sceneLengthModeSummary(processor, sceneSlot)
+                        << " | " << juce::String(totalBeats, 2) << " beats";
         if (sequenceStepIndex >= 0)
             resolvedTooltip << " | Chain step " << juce::String(sequenceStepIndex + 1);
         if (isActiveScene)
@@ -6050,30 +8153,54 @@ void SceneControlPanel::refreshFromProcessor()
         auto& selectorButton = sceneSelectorButtons[idx];
         selectorButton.setButtonText(slotText);
         selectorButton.setToggleState(isSelectedScene, juce::dontSendNotification);
+        selectorButton.getProperties().set("sceneHasStoredData", hasStoredSceneData);
+        selectorButton.getProperties().set("sceneDataBadgeText",
+                                           hasStoredSceneData ? juce::String()
+                                                              : juce::String("EMPTY"));
         const auto identityColour = sceneSlotUiColour(processor, sceneSlot);
-        const auto queuedBlinkColour = identityColour.interpolatedWith(juce::Colour(0xffd6a345), 0.36f);
-        juce::Colour slotColour = identityColour.withAlpha(0.40f);
+        const auto emptySlotColour = juce::Colour(0xff394047);
+        const auto emptySlotFocusColour = juce::Colour(0xff56606b);
+        const auto queuedBlinkColour = hasStoredSceneData
+            ? identityColour.interpolatedWith(juce::Colour(0xffd6a345), 0.36f)
+            : emptySlotFocusColour.interpolatedWith(juce::Colour(0xffd6a345), 0.18f);
+        juce::Colour slotColour = hasStoredSceneData
+            ? identityColour.withAlpha(0.40f)
+            : emptySlotColour.withAlpha(0.92f);
         if (isActiveScene)
-            slotColour = identityColour.withMultipliedBrightness(1.08f);
+            slotColour = hasStoredSceneData
+                ? identityColour.withMultipliedBrightness(1.08f)
+                : emptySlotFocusColour;
         else if (isQueuedManualScene)
-            slotColour = queuedSceneBlinkOn ? queuedBlinkColour : identityColour.withAlpha(0.28f);
+            slotColour = queuedSceneBlinkOn
+                ? queuedBlinkColour
+                : (hasStoredSceneData ? identityColour.withAlpha(0.28f)
+                                      : emptySlotColour.withAlpha(0.82f));
         else if (isQueuedScene)
             slotColour = queuedBlinkColour;
         else if (isSelectedScene)
-            slotColour = identityColour.withAlpha(0.58f);
+            slotColour = hasStoredSceneData
+                ? identityColour.withAlpha(0.58f)
+                : emptySlotFocusColour.withAlpha(0.94f);
         else if (chainPlaybackActive && sequenceStepIndex >= 0)
-            slotColour = identityColour.withAlpha(0.72f);
+            slotColour = hasStoredSceneData
+                ? identityColour.withAlpha(0.72f)
+                : emptySlotFocusColour.withAlpha(0.88f);
         selectorButton.setColour(juce::TextButton::buttonColourId, slotColour);
         selectorButton.setColour(juce::TextButton::buttonOnColourId, slotColour.brighter(0.16f));
         selectorButton.setColour(juce::TextButton::textColourOffId,
                                  (isActiveScene || isQueuedScene || (chainPlaybackActive && sequenceStepIndex >= 0))
                                      ? juce::Colour(0xff101214)
-                                     : kTextPrimary);
+                                     : (hasStoredSceneData ? kTextPrimary
+                                                           : kTextMuted.withAlpha(0.90f)));
         selectorButton.setColour(juce::TextButton::textColourOnId,
                                  (isActiveScene || isQueuedScene || (chainPlaybackActive && sequenceStepIndex >= 0))
                                      ? juce::Colour(0xff0f0f0f)
-                                     : juce::Colour(0xfffafafa));
+                                     : (hasStoredSceneData ? juce::Colour(0xfffafafa)
+                                                           : juce::Colour(0xffdde4e9)));
         selectorButton.setTooltip(resolvedTooltip
+                                  + (hasStoredSceneData
+                                         ? " | This scene has saved content."
+                                         : " | Empty scenes stay grey until you save into them.")
                                   + " | Click manually launches this scene on the global trigger grid and takes over from chain playback."
                                   + " | This button also focuses the scene for Copy, Paste, Clear, Length, and Count editing."
                                   + " | Drag this scene into the chain rail below to add it to playback order."
@@ -6100,12 +8227,35 @@ void SceneControlPanel::refreshFromProcessor()
         }
     }
 
-    if (sceneLegacyModEditorVisible && sceneLegacyModEditor != nullptr && sceneLegacyModStripIndex >= 0 && sceneLegacyModSlotIndex >= 0)
+    if (sceneLegacyModEditorVisible && sceneLegacyModEditor != nullptr)
     {
-        sceneLegacyModEditor->setPinnedStripAndSlot(
-            sceneLegacyModStripIndex,
-            sceneLegacyModSlotIndex,
-            "Scene Motion  Strip " + juce::String(sceneLegacyModStripIndex + 1) + "  M" + juce::String(sceneLegacyModSlotIndex + 1));
+        if (sceneLegacyModStripIndex >= 0 && sceneLegacyModSlotIndex >= 0)
+        {
+            const bool sceneStepMotionMonomePageActive = processor.isSceneModeEnabled()
+                && processor.getSceneModPageMode() == MlrVSTAudioProcessor::SceneModPageMode::StepMotion;
+            if (sceneStepMotionMonomePageActive)
+            {
+                if (auto* engine = processor.getAudioEngine())
+                {
+                    sceneLegacyModStripIndex = juce::jlimit(0,
+                                                            juce::jmax(0, getVisibleSceneStripCount() - 1),
+                                                            processor.getLastMonomePressedStripRow());
+                    sceneLegacyModSlotIndex = juce::jlimit(0,
+                                                           ModernAudioEngine::NumModSequencers - 1,
+                                                           engine->getModSequencerSlot(sceneLegacyModStripIndex));
+                    sceneEditorState.selectedStripIndex = sceneLegacyModStripIndex;
+                }
+            }
+
+            sceneLegacyModEditor->setPinnedStripAndSlot(
+                sceneLegacyModStripIndex,
+                sceneLegacyModSlotIndex,
+                "Scene Motion  Strip " + juce::String(sceneLegacyModStripIndex + 1) + "  M" + juce::String(sceneLegacyModSlotIndex + 1));
+        }
+        else
+        {
+            sceneLegacyModEditor->clearPinnedStripAndSlot();
+        }
     }
 
     const double beat = (processor.getAudioEngine() != nullptr)
@@ -6171,27 +8321,28 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
             const auto chipBounds = layout.transitionBounds[static_cast<size_t>(stepIndex)];
             const float centerY = chipBounds.getCentreY();
             const auto transitionType = processor.getSceneChainStepTransitionType(stepIndex);
-            const auto transitionOption = processor.getSceneChainStepTransitionOption(stepIndex);
             const bool hovered = stepIndex == sceneChainHoverTransition;
             const bool focused = stepIndex == focusedStep;
+            const auto chipColour = sceneChainTransitionColour(transitionType);
+            const auto chipSecondaryColour = sceneChainTransitionSecondaryColour(transitionType);
+            const bool noTransition = transitionType == MlrVSTAudioProcessor::SceneChainTransitionType::None;
+            const bool transitionLive = !noTransition
+                && processor.getActiveSceneBoundaryTransitionStep() == stepIndex;
+            const auto connectorColour = noTransition
+                ? juce::Colours::white.withAlpha(0.12f)
+                : chipColour.withAlpha((hovered || focused || transitionLive) ? 0.34f : 0.22f);
+            g.setColour(connectorColour);
             g.drawLine(from.getRight() + 2.0f,
                        centerY,
                        chipBounds.getX() - 2.0f,
                        centerY,
-                       1.1f);
+                       noTransition ? 1.1f : 1.35f);
             g.drawLine(chipBounds.getRight() + 2.0f,
                        centerY,
                        to.getX() - 2.0f,
                        centerY,
-                       1.1f);
+                       noTransition ? 1.1f : 1.35f);
 
-            const auto chipColour = sceneChainTransitionColour(transitionType);
-            const bool noTransition = transitionType == MlrVSTAudioProcessor::SceneChainTransitionType::None;
-            const bool transitionLive = !noTransition
-                && processor.getActiveSceneBoundaryTransitionStep() == stepIndex;
-            const auto chipFill = chipColour.withAlpha(noTransition
-                                                           ? ((hovered || focused) ? 0.24f : 0.17f)
-                                                           : ((hovered || focused) ? 0.32f : 0.24f));
             const auto chipOutline = chipColour.withAlpha(noTransition
                                                               ? ((hovered || focused) ? 0.76f : 0.54f)
                                                               : ((hovered || focused) ? 0.86f : 0.62f));
@@ -6209,8 +8360,32 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
             }
             g.setColour(juce::Colours::black.withAlpha(0.22f));
             g.fillRoundedRectangle(chipBounds.translated(0.0f, 1.0f), 5.8f);
-            g.setColour(chipFill);
+            juce::ColourGradient chipGradient(chipSecondaryColour.withAlpha(noTransition
+                                                                                ? ((hovered || focused) ? 0.58f : 0.44f)
+                                                                                : ((hovered || focused || transitionLive) ? 0.94f : 0.82f)),
+                                              chipBounds.getX(),
+                                              chipBounds.getBottom(),
+                                              chipColour.withAlpha(noTransition
+                                                                       ? ((hovered || focused) ? 0.32f : 0.20f)
+                                                                       : ((hovered || focused || transitionLive) ? 0.98f : 0.88f)),
+                                              chipBounds.getRight(),
+                                              chipBounds.getY(),
+                                              false);
+            g.setGradientFill(chipGradient);
             g.fillRoundedRectangle(chipBounds, 5.8f);
+            if (!noTransition)
+            {
+                auto topSheen = chipBounds.reduced(1.0f).removeFromTop(chipBounds.getHeight() * 0.45f);
+                juce::ColourGradient sheenGradient(juce::Colours::white.withAlpha((hovered || focused) ? 0.14f : 0.09f),
+                                                   topSheen.getCentreX(),
+                                                   topSheen.getY(),
+                                                   juce::Colours::transparentBlack,
+                                                   topSheen.getCentreX(),
+                                                   topSheen.getBottom(),
+                                                   false);
+                g.setGradientFill(sheenGradient);
+                g.fillRoundedRectangle(topSheen, 4.8f);
+            }
             g.setColour(chipOutline);
             g.drawRoundedRectangle(chipBounds.reduced(0.5f), 5.8f, (hovered || focused) ? 1.15f : 1.0f);
 
@@ -6224,11 +8399,11 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
                 g.drawRoundedRectangle(chipBounds.expanded(2.4f, 2.0f), 7.2f, 1.0f);
             }
 
-            auto chipLabelBounds = chipBounds.reduced(4.0f, 2.5f);
-            auto meterBounds = chipLabelBounds.removeFromBottom(3.0f);
-            chipLabelBounds.removeFromBottom(1.0f);
-            g.setColour(kTextPrimary.withAlpha((hovered || focused) ? 0.97f : 0.88f));
-            g.setFont(juce::Font(juce::FontOptions(7.3f, juce::Font::bold)));
+            auto chipLabelBounds = chipBounds.reduced(4.0f, 2.0f);
+            g.setColour(noTransition
+                            ? kTextPrimary.withAlpha((hovered || focused) ? 0.92f : 0.78f)
+                            : chipColour.contrasting(0.82f).withAlpha((hovered || focused) ? 0.98f : 0.94f));
+            g.setFont(juce::Font(juce::FontOptions(7.0f, juce::Font::bold)));
             g.drawFittedText(sceneChainTransitionChipLabel(transitionType),
                              chipLabelBounds.toNearestInt(),
                              juce::Justification::centred,
@@ -6241,19 +8416,33 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
                 g.drawRoundedRectangle(chipBounds.reduced(0.5f), 6.0f, 1.0f);
             }
 
-            const int visualLevel = noTransition ? 0 : sceneChainTransitionOptionVisualLevel(transitionOption);
-            const float meterGap = 2.0f;
-            const float meterWidth = (meterBounds.getWidth() - (meterGap * 4.0f)) / 5.0f;
-            for (int bar = 0; bar < 5; ++bar)
+            if (sceneChainDragTransition == stepIndex)
             {
-                auto barBounds = juce::Rectangle<float>(meterBounds.getX() + (bar * (meterWidth + meterGap)),
-                                                        meterBounds.getY(),
-                                                        meterWidth,
-                                                        meterBounds.getHeight());
-                g.setColour((bar < visualLevel)
-                                ? chipColour.brighter(0.35f).withAlpha((hovered || focused) ? 0.82f : 0.62f)
-                                : chipColour.withAlpha(noTransition ? 0.10f : 0.18f));
-                g.fillRoundedRectangle(barBounds, 1.0f);
+                const juce::String dragText = formatSceneTransitionLengthBeats(
+                                                  processor.getSceneChainStepTransitionLengthBeats(stepIndex))
+                    + " • "
+                    + juce::String(juce::roundToInt(processor.getSceneChainStepTransitionIntensity(stepIndex) * 100.0f))
+                    + "%";
+                auto dragBounds = juce::Rectangle<float>(0.0f,
+                                                         chipBounds.getBottom() + 4.0f,
+                                                         juce::jlimit(42.0f,
+                                                                      78.0f,
+                                                                      18.0f + (static_cast<float>(dragText.length()) * 4.2f)),
+                                                         10.0f)
+                    .withCentre({ chipBounds.getCentreX(), chipBounds.getBottom() + 9.0f });
+                dragBounds.setX(juce::jlimit(layout.bounds.getX() + 4.0f,
+                                             layout.bounds.getRight() - dragBounds.getWidth() - 4.0f,
+                                             dragBounds.getX()));
+                g.setColour(juce::Colour(0xff0f1317).withAlpha(0.96f));
+                g.fillRoundedRectangle(dragBounds, 4.0f);
+                g.setColour(chipColour.withAlpha(0.82f));
+                g.drawRoundedRectangle(dragBounds.reduced(0.5f), 4.0f, 0.95f);
+                g.setColour(kTextPrimary.withAlpha(0.98f));
+                g.setFont(juce::Font(juce::FontOptions(5.8f, juce::Font::bold)));
+                g.drawFittedText(dragText,
+                                 dragBounds.reduced(3.0f, 0.0f).toNearestInt(),
+                                 juce::Justification::centred,
+                                 1);
             }
         }
     }
@@ -6466,12 +8655,14 @@ void SceneControlPanel::handleSceneChainMouseDown(const juce::MouseEvent& e)
 {
     const auto layout = makeSceneChainLayout(sceneChainCanvas.getLocalBounds().toFloat());
     const int hitStep = sceneChainStepAtPosition(layout, e.position);
-    const int hitTransition = sceneChainTransitionAtPosition(layout, e.position);
+    int hitTransition = sceneChainTransitionAtPosition(layout, e.position);
     sceneChainHoverStep = hitStep;
     sceneChainHoverTransition = hitTransition;
     sceneChainDragSourceStep = -1;
     sceneChainDragTargetStep = -1;
     sceneChainDragMoved = false;
+    sceneChainDragTransition = -1;
+    sceneChainDragTransitionMoved = false;
 
     auto chainSteps = snapshotSceneChainSteps(processor);
     const int chainLength = static_cast<int>(chainSteps.size());
@@ -6482,30 +8673,19 @@ void SceneControlPanel::handleSceneChainMouseDown(const juce::MouseEvent& e)
 
     if (loopEnabled && !loopClampBounds.isEmpty() && loopClampBounds.expanded(4.0f, 6.0f).contains(e.position))
     {
-        selectedSceneChainStep = loopEnd;
-        sceneChainCanvas.repaint();
-        refreshFromProcessor();
-        return;
+        hitTransition = chainLength - 1;
+        sceneChainHoverTransition = hitTransition;
     }
 
-    if (hitTransition >= 0 && hitTransition < (chainLength - 1))
+    if (hitTransition >= 0 && hitTransition < chainLength)
     {
-        auto transitionType = processor.getSceneChainStepTransitionType(hitTransition);
-        if (e.mods.isAltDown())
-        {
-            transitionType = MlrVSTAudioProcessor::SceneChainTransitionType::None;
-        }
-        else if (e.mods.isRightButtonDown() || e.mods.isCtrlDown())
-        {
-            transitionType = previousSceneChainTransitionType(transitionType);
-        }
-        else
-        {
-            transitionType = nextSceneChainTransitionType(transitionType);
-        }
-
         selectedSceneChainStep = hitTransition;
-        processor.setSceneChainStepTransitionType(hitTransition, transitionType);
+        sceneChainDragTransition = hitTransition;
+        sceneChainDragTransitionStartPosition = e.position;
+        sceneChainDragTransitionStartLengthBeats =
+            processor.getSceneChainStepTransitionLengthBeats(hitTransition);
+        sceneChainDragTransitionStartIntensity =
+            processor.getSceneChainStepTransitionIntensity(hitTransition);
         refreshFromProcessor();
         return;
     }
@@ -6568,11 +8748,98 @@ void SceneControlPanel::handleSceneChainMouseDown(const juce::MouseEvent& e)
 
 void SceneControlPanel::handleSceneChainMouseDoubleClick(const juce::MouseEvent& e)
 {
-    juce::ignoreUnused(e);
+    const auto layout = makeSceneChainLayout(sceneChainCanvas.getLocalBounds().toFloat());
+    const int chainLength = processor.getSceneChainLength();
+    if (chainLength <= 0)
+        return;
+
+    int hitTransition = sceneChainTransitionAtPosition(layout, e.position);
+    if (processor.isSceneChainLoopEnabled() && chainLength >= 2)
+    {
+        const auto loopClampBounds = sceneChainLoopClampBounds(layout,
+                                                               processor.getSceneChainLoopStartStep(),
+                                                               processor.getSceneChainLoopEndStep());
+        if (loopClampBounds.expanded(4.0f, 6.0f).contains(e.position))
+            hitTransition = chainLength - 1;
+    }
+
+    if (hitTransition < 0 || hitTransition >= chainLength)
+        return;
+
+    const auto transitionType = processor.getSceneChainStepTransitionType(hitTransition);
+    if (transitionType == MlrVSTAudioProcessor::SceneChainTransitionType::None)
+        return;
+
+    selectedSceneChainStep = hitTransition;
+    processor.setSceneChainStepTransitionSubtractsFromSceneLength(
+        hitTransition,
+        !processor.getSceneChainStepTransitionSubtractsFromSceneLength(hitTransition));
+    refreshFromProcessor();
 }
 
 void SceneControlPanel::handleSceneChainMouseDrag(const juce::MouseEvent& e)
 {
+    if (sceneChainDragTransition >= 0)
+    {
+        const int hitTransition = sceneChainDragTransition;
+        const int chainLength = processor.getSceneChainLength();
+        if (hitTransition < 0 || hitTransition >= chainLength)
+            return;
+
+        const float deltaX = e.position.x - sceneChainDragTransitionStartPosition.x;
+        const float deltaY = sceneChainDragTransitionStartPosition.y - e.position.y;
+        if (std::abs(deltaX) > 3.0f || std::abs(deltaY) > 3.0f)
+            sceneChainDragTransitionMoved = true;
+
+        if (!sceneChainDragTransitionMoved)
+        {
+            sceneChainCanvas.repaint();
+            return;
+        }
+
+        const float newLength = sceneTransitionLengthBeatsForDrag(sceneChainDragTransitionStartLengthBeats,
+                                                                  deltaX);
+        const float newIntensity = juce::jlimit(0.0f,
+                                                1.0f,
+                                                sceneChainDragTransitionStartIntensity + (deltaY / 90.0f));
+        const auto currentType = processor.getSceneChainStepTransitionType(hitTransition);
+        const auto currentOption = processor.getSceneChainStepTransitionOption(hitTransition);
+        const bool subtractFromSceneLength =
+            processor.getSceneChainStepTransitionSubtractsFromSceneLength(hitTransition);
+        const bool linkedType = currentType != MlrVSTAudioProcessor::SceneChainTransitionType::None
+            && currentType != MlrVSTAudioProcessor::SceneChainTransitionType::Return;
+        const bool canUseLinkedRetune = sceneTransitionSmartLinkEnabled && linkedType;
+
+        if (canUseLinkedRetune)
+        {
+            applySceneTransitionSmartTuning(hitTransition,
+                                            currentType,
+                                            currentOption,
+                                            newIntensity,
+                                            newLength,
+                                            subtractFromSceneLength,
+                                            false,
+                                            true);
+        }
+        else
+        {
+            const bool lengthChanged = std::abs(processor.getSceneChainStepTransitionLengthBeats(hitTransition) - newLength)
+                > 1.0e-4f;
+            const bool intensityChanged = std::abs(processor.getSceneChainStepTransitionIntensity(hitTransition) - newIntensity)
+                > 1.0e-4f;
+            if (!lengthChanged && !intensityChanged)
+            {
+                sceneChainCanvas.repaint();
+                return;
+            }
+
+            processor.setSceneChainStepTransitionLengthBeats(hitTransition, newLength);
+            processor.setSceneChainStepTransitionIntensity(hitTransition, newIntensity);
+            refreshFromProcessor();
+        }
+        return;
+    }
+
     if (sceneChainDragSourceStep < 0)
         return;
 
@@ -6595,6 +8862,9 @@ void SceneControlPanel::handleSceneChainMouseDrag(const juce::MouseEvent& e)
 
 void SceneControlPanel::handleSceneChainMouseMove(const juce::MouseEvent& e)
 {
+    if (sceneChainDragTransition >= 0)
+        return;
+
     const auto layout = makeSceneChainLayout(sceneChainCanvas.getLocalBounds().toFloat());
     const int hitStep = sceneChainStepAtPosition(layout, e.position);
     const int hitTransition = sceneChainTransitionAtPosition(layout, e.position);
@@ -6608,6 +8878,9 @@ void SceneControlPanel::handleSceneChainMouseMove(const juce::MouseEvent& e)
 
 void SceneControlPanel::handleSceneChainMouseExit(const juce::MouseEvent&)
 {
+    if (sceneChainDragTransition >= 0)
+        return;
+
     if (sceneChainHoverStep >= 0 || sceneChainHoverTransition >= 0)
     {
         sceneChainHoverStep = -1;
@@ -6616,8 +8889,56 @@ void SceneControlPanel::handleSceneChainMouseExit(const juce::MouseEvent&)
     }
 }
 
-void SceneControlPanel::handleSceneChainMouseUp(const juce::MouseEvent&)
+void SceneControlPanel::handleSceneChainMouseUp(const juce::MouseEvent& e)
 {
+    const int dragTransition = sceneChainDragTransition;
+    const bool transitionDragMoved = sceneChainDragTransitionMoved;
+    sceneChainDragTransition = -1;
+    sceneChainDragTransitionMoved = false;
+    if (dragTransition >= 0)
+    {
+        const int chainLength = processor.getSceneChainLength();
+        if (dragTransition >= 0 && dragTransition < chainLength)
+        {
+            selectedSceneChainStep = dragTransition;
+            if (!transitionDragMoved)
+            {
+                auto transitionType = processor.getSceneChainStepTransitionType(dragTransition);
+                if (e.mods.isAltDown())
+                {
+                    transitionType = MlrVSTAudioProcessor::SceneChainTransitionType::None;
+                }
+                else if (e.mods.isRightButtonDown() || e.mods.isCtrlDown())
+                {
+                    transitionType = previousSceneChainTransitionType(transitionType);
+                }
+                else
+                {
+                    transitionType = nextSceneChainTransitionType(transitionType);
+                }
+
+                processor.setSceneChainStepTransitionType(dragTransition, transitionType);
+                if (sceneTransitionSmartLinkEnabled
+                    && transitionType != MlrVSTAudioProcessor::SceneChainTransitionType::None
+                    && transitionType != MlrVSTAudioProcessor::SceneChainTransitionType::Return)
+                {
+                    applySceneTransitionSmartTuning(dragTransition,
+                                                    transitionType,
+                                                    processor.getSceneChainStepTransitionOption(dragTransition),
+                                                    processor.getSceneChainStepTransitionIntensity(dragTransition),
+                                                    processor.getSceneChainStepTransitionLengthBeats(dragTransition),
+                                                    processor.getSceneChainStepTransitionSubtractsFromSceneLength(dragTransition),
+                                                    false,
+                                                    false);
+                    return;
+                }
+            }
+
+            refreshFromProcessor();
+            return;
+        }
+    }
+
     const int sourceStep = sceneChainDragSourceStep;
     const int targetStep = sceneChainDragTargetStep;
     const bool dragMoved = sceneChainDragMoved;
@@ -6666,20 +8987,168 @@ void SceneControlPanel::handleSceneChainMouseUp(const juce::MouseEvent&)
 void SceneControlPanel::handleSceneChainMouseWheel(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel)
 {
     const auto layout = makeSceneChainLayout(sceneChainCanvas.getLocalBounds().toFloat());
-    const int hitTransition = sceneChainTransitionAtPosition(layout, e.position);
     const int chainLength = processor.getSceneChainLength();
     const float delta = std::abs(wheel.deltaY) >= std::abs(wheel.deltaX) ? wheel.deltaY : wheel.deltaX;
     if (std::abs(delta) < 1.0e-4f)
         return;
 
-    if (hitTransition >= 0 && hitTransition < chainLength - 1)
+    int hitTransition = sceneChainTransitionAtPosition(layout, e.position);
+    if (processor.isSceneChainLoopEnabled() && chainLength >= 2)
     {
-        auto option = processor.getSceneChainStepTransitionOption(hitTransition);
-        option = delta > 0.0f
-            ? nextSceneChainTransitionOption(option)
-            : previousSceneChainTransitionOption(option);
+        const auto loopClampBounds = sceneChainLoopClampBounds(layout,
+                                                               processor.getSceneChainLoopStartStep(),
+                                                               processor.getSceneChainLoopEndStep());
+        if (loopClampBounds.expanded(4.0f, 6.0f).contains(e.position))
+            hitTransition = chainLength - 1;
+    }
+
+    if (hitTransition >= 0 && hitTransition < chainLength)
+    {
         selectedSceneChainStep = hitTransition;
+        const bool increase = delta > 0.0f;
+        const bool shiftDown = e.mods.isShiftDown();
+        const bool altDown = e.mods.isAltDown();
+        const bool commandOrCtrlDown = e.mods.isCommandDown() || e.mods.isCtrlDown();
+        const auto currentType = processor.getSceneChainStepTransitionType(hitTransition);
+        const auto currentOption = processor.getSceneChainStepTransitionOption(hitTransition);
+        const auto currentScope = processor.getSceneChainStepTransitionScope(hitTransition);
+        const auto currentContour = processor.getSceneChainStepTransitionContour(hitTransition);
+        const auto currentCondition = processor.getSceneChainStepTransitionCondition(hitTransition);
+        const float currentLength = processor.getSceneChainStepTransitionLengthBeats(hitTransition);
+        const float currentIntensity = processor.getSceneChainStepTransitionIntensity(hitTransition);
+        const bool subtractFromSceneLength = processor.getSceneChainStepTransitionSubtractsFromSceneLength(hitTransition);
+
+        const bool linkedType = currentType != MlrVSTAudioProcessor::SceneChainTransitionType::None
+            && currentType != MlrVSTAudioProcessor::SceneChainTransitionType::Return;
+        const bool canUseLinkedRetune = sceneTransitionSmartLinkEnabled && linkedType;
+
+        if (shiftDown && commandOrCtrlDown)
+        {
+            const auto newScope = increase
+                ? nextSceneChainTransitionScope(currentScope)
+                : previousSceneChainTransitionScope(currentScope);
+            if (newScope == currentScope)
+                return;
+
+            processor.setSceneChainStepTransitionScope(hitTransition, newScope);
+            refreshFromProcessor();
+            return;
+        }
+
+        if (shiftDown && altDown)
+        {
+            const auto newContour = increase
+                ? nextSceneChainTransitionContour(currentContour)
+                : previousSceneChainTransitionContour(currentContour);
+            if (newContour == currentContour)
+                return;
+
+            processor.setSceneChainStepTransitionContour(hitTransition, newContour);
+            refreshFromProcessor();
+            return;
+        }
+
+        if (commandOrCtrlDown && altDown)
+        {
+            const auto newCondition = increase
+                ? nextSceneChainTransitionCondition(currentCondition)
+                : previousSceneChainTransitionCondition(currentCondition);
+            if (newCondition == currentCondition)
+                return;
+
+            processor.setSceneChainStepTransitionCondition(hitTransition, newCondition);
+            refreshFromProcessor();
+            return;
+        }
+
+        if (shiftDown)
+        {
+            const float newLength = steppedSceneTransitionLengthBeats(currentLength, increase);
+            if (std::abs(newLength - currentLength) <= 1.0e-4f)
+                return;
+
+            if (canUseLinkedRetune)
+                applySceneTransitionSmartTuning(hitTransition,
+                                                currentType,
+                                                currentOption,
+                                                currentIntensity,
+                                                newLength,
+                                                subtractFromSceneLength,
+                                                false,
+                                                true);
+            else
+            {
+                processor.setSceneChainStepTransitionLengthBeats(hitTransition, newLength);
+                refreshFromProcessor();
+            }
+            return;
+        }
+
+        if (commandOrCtrlDown)
+        {
+            const float newIntensity = juce::jlimit(0.0f,
+                                                    1.0f,
+                                                    currentIntensity + (increase ? 0.08f : -0.08f));
+            if (std::abs(newIntensity - currentIntensity) <= 1.0e-4f)
+                return;
+
+            if (canUseLinkedRetune)
+                applySceneTransitionSmartTuning(hitTransition,
+                                                currentType,
+                                                currentOption,
+                                                newIntensity,
+                                                currentLength,
+                                                subtractFromSceneLength,
+                                                false,
+                                                false);
+            else
+            {
+                processor.setSceneChainStepTransitionIntensity(hitTransition, newIntensity);
+                refreshFromProcessor();
+            }
+            return;
+        }
+
+        if (altDown)
+        {
+            auto nextType = increase
+                ? nextSceneChainTransitionType(currentType)
+                : previousSceneChainTransitionType(currentType);
+            processor.setSceneChainStepTransitionType(hitTransition, nextType);
+            if (sceneTransitionSmartLinkEnabled
+                && nextType != MlrVSTAudioProcessor::SceneChainTransitionType::None
+                && nextType != MlrVSTAudioProcessor::SceneChainTransitionType::Return)
+            {
+                applySceneTransitionSmartTuning(hitTransition,
+                                                nextType,
+                                                currentOption,
+                                                currentIntensity,
+                                                currentLength,
+                                                subtractFromSceneLength,
+                                                false,
+                                                false);
+                return;
+            }
+            refreshFromProcessor();
+            return;
+        }
+
+        auto option = increase
+            ? nextSceneChainTransitionOption(currentOption)
+            : previousSceneChainTransitionOption(currentOption);
         processor.setSceneChainStepTransitionOption(hitTransition, option);
+        if (canUseLinkedRetune)
+        {
+            applySceneTransitionSmartTuning(hitTransition,
+                                            currentType,
+                                            option,
+                                            currentIntensity,
+                                            currentLength,
+                                            subtractFromSceneLength,
+                                            false,
+                                            false);
+            return;
+        }
         refreshFromProcessor();
         return;
     }
@@ -6894,7 +9363,24 @@ bool SceneControlPanel::clearStripSceneEvents(int stripIndex)
 {
     auto events = sceneEditorState.events;
     const int safeStripIndex = juce::jlimit(0, getVisibleSceneStripCount() - 1, stripIndex);
-    const auto oldSize = events.size();
+    const int sceneSlot = getFocusedSceneSlot();
+    bool removedAnyEvent = false;
+    bool removedControlPoint = false;
+    std::vector<ScenePerformanceControlTarget> clearedTargets;
+    for (const auto& event : events)
+    {
+        if (event.stripIndex != safeStripIndex)
+            continue;
+
+        removedAnyEvent = true;
+        if (event.type != ScenePerformanceEventType::ControlPoint)
+            continue;
+
+        removedControlPoint = true;
+        if (std::find(clearedTargets.begin(), clearedTargets.end(), event.controlTarget) == clearedTargets.end())
+            clearedTargets.push_back(event.controlTarget);
+    }
+
     events.erase(std::remove_if(events.begin(),
                                 events.end(),
                                 [safeStripIndex](const ScenePerformanceEvent& event)
@@ -6902,14 +9388,25 @@ bool SceneControlPanel::clearStripSceneEvents(int stripIndex)
                                     return event.stripIndex == safeStripIndex;
                                 }),
                  events.end());
-    processor.clearSceneMotionStripState(getFocusedSceneSlot(), safeStripIndex);
-    if (events.size() == oldSize)
+
+    if (removedControlPoint)
+        appendSceneStripStoredDefaultAutomationStartPoints(processor, sceneSlot, safeStripIndex, events);
+
+    processor.clearSceneMotionStripState(sceneSlot, safeStripIndex);
+    if (!removedAnyEvent)
     {
         refreshFromProcessor();
         return true;
     }
 
-    return applyEditedSceneEvents(std::move(events));
+    const bool applied = applyEditedSceneEvents(std::move(events));
+    if (applied)
+    {
+        processor.restoreSceneStripControlTargetsToStoredState(sceneSlot, safeStripIndex, clearedTargets);
+        refreshFromProcessor();
+    }
+
+    return applied;
 }
 
 bool SceneControlPanel::writeCurrentStripAutomation(int stripIndex)
@@ -7221,6 +9718,12 @@ bool SceneControlPanel::handleEditorKeyPress(const juce::KeyPress& key)
 
     if (key == juce::KeyPress::escapeKey)
     {
+        if (sceneEndSampleEditorVisible)
+        {
+            closeSceneTransitionEndSampleEditor();
+            return true;
+        }
+
         if (sceneLegacyModEditorVisible)
         {
             closeLegacyModEditor();
@@ -7250,6 +9753,37 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
     const bool focusedSceneIsActive = sceneSlot == processor.getActiveSceneSlot();
     const double lengthBeats = getSceneTimelineLengthBeats(sceneSlot);
     const juce::String sceneLengthLabel = sceneLengthSummaryLabel(processor, sceneSlot);
+    const bool mainModSceneLaneSelectionActive = processor.isSceneModeEnabled()
+        && processor.isControlModeActive()
+        && processor.getCurrentControlMode() == MlrVSTAudioProcessor::ControlMode::Modulation
+        && processor.getSceneModPageMode() == MlrVSTAudioProcessor::SceneModPageMode::MainModulation
+        && processor.getAudioEngine() != nullptr;
+    const int mainModSceneStripIndex = mainModSceneLaneSelectionActive
+        ? juce::jlimit(0,
+                       juce::jmax(0, getVisibleSceneStripCount() - 1),
+                       processor.getLastMonomePressedStripRow())
+        : -1;
+    const auto mainModSceneTarget = mainModSceneLaneSelectionActive
+        ? processor.getSceneMainAutomationDisplayTargetForStrip(mainModSceneStripIndex)
+        : ModernAudioEngine::ModTarget::None;
+    auto laneIsModSelected = [this, mainModSceneLaneSelectionActive, mainModSceneStripIndex, mainModSceneTarget]
+        (int stripIndex, int laneIndex) -> bool
+    {
+        if (sceneLegacyModEditorVisible
+            && sceneLegacyModSlotIndex >= 0
+            && sceneLegacyModStripIndex == stripIndex)
+        {
+            return sceneLaneMatchesModTarget(processor,
+                                             stripIndex,
+                                             laneIndex,
+                                             processor.getSceneMotionTargetForSlot(stripIndex, sceneLegacyModSlotIndex));
+        }
+
+        return mainModSceneLaneSelectionActive
+            && mainModSceneStripIndex == stripIndex
+            && mainModSceneTarget != ModernAudioEngine::ModTarget::None
+            && sceneLaneMatchesModTarget(processor, stripIndex, laneIndex, mainModSceneTarget);
+    };
     const int globalLane = sceneGlobalAutomationLaneIndex();
     if (globalLane >= 0)
     {
@@ -7327,7 +9861,8 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
         }
 
         const int safeGridDivision = juce::jlimit(4, 32, sceneGridDivision);
-        const double gridStepBeats = sceneGridEnabled ? (4.0 / static_cast<double>(safeGridDivision)) : 0.0;
+        const bool drawGridVisible = sceneGridEnabled || sceneDrawModeEnabled;
+        const double gridStepBeats = drawGridVisible ? (4.0 / static_cast<double>(safeGridDivision)) : 0.0;
         const int barCount = juce::jmax(1, static_cast<int>(std::ceil(lengthBeats / 4.0)));
         for (int barIndex = 0; barIndex < barCount; ++barIndex)
         {
@@ -7347,7 +9882,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                               juce::jmax(0.0f, globalLayout.laneBounds.getHeight() - 2.0f)));
         }
 
-        if (sceneGridEnabled && gridStepBeats > 0.0)
+        if (drawGridVisible && gridStepBeats > 0.0)
         {
             const int steps = juce::jmax(1, static_cast<int>(std::ceil(lengthBeats / gridStepBeats)));
             for (int step = 0; step <= steps; ++step)
@@ -7384,7 +9919,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
             const float x = globalLayout.laneBounds.getX()
                 + (globalLayout.laneBounds.getWidth()
                    * static_cast<float>(sceneEditorState.hoverBeat / juce::jmax(1.0, lengthBeats)));
-            if (sceneGridEnabled && gridStepBeats > 0.0)
+            if (drawGridVisible && gridStepBeats > 0.0)
             {
                 const double cellBeatStart = juce::jlimit(0.0,
                                                           juce::jmax(0.0, std::nextafter(lengthBeats, 0.0)),
@@ -7428,7 +9963,8 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                               previousPoint,
                                               point,
                                               globalColour.withAlpha(0.4f),
-                                              sceneAutomationTargetUsesSteppedSegments(event.controlTarget),
+                                              sceneDrawModeEnabled
+                                                  || sceneAutomationTargetUsesSteppedSegments(event.controlTarget),
                                               1.2f);
             }
             previousPoint = point;
@@ -7489,9 +10025,18 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                                      automationExpanded,
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
         const auto stripColour = getStripColor(visibleStrip);
+        const bool stripIsSelected = visibleStrip
+            == juce::jlimit(0,
+                            juce::jmax(0, getVisibleSceneStripCount() - 1),
+                            sceneEditorState.selectedStripIndex);
         const bool scenePlaybackAvailable = layout.scenePlaybackAvailable;
 
         drawPanel(g, cardBounds.reduced(1.0f), stripColour, 8.0f);
+        if (stripIsSelected)
+        {
+            g.setColour(stripColour.withAlpha(layout.compactOverview ? 0.96f : 0.84f));
+            g.drawRoundedRectangle(cardBounds.reduced(1.4f), 8.0f, layout.compactOverview ? 1.3f : 1.6f);
+        }
         g.setColour(stripColour.withAlpha(0.9f));
         g.fillRoundedRectangle(cardBounds.withWidth(3.0f).reduced(0.0f, 6.0f), 1.5f);
 
@@ -7529,14 +10074,21 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                   stripColour,
                                   scenePlaybackAvailable && stripHasEvents);
 
+        auto summaryBounds = layout.summaryBounds;
+        if (stripIsSelected)
+        {
+            auto selectedChipBounds = summaryBounds.removeFromRight(58.0f).reduced(0.0f, 1.0f);
+            drawSceneHeaderActionChip(g, selectedChipBounds, "Selected", stripColour, true);
+            summaryBounds.removeFromRight(6.0f);
+        }
         g.setColour(kTextSecondary);
         g.setFont(juce::Font(juce::FontOptions(9.5f)));
         g.drawText(scenePlaybackAvailable
                        ? (juce::String(triggerCount) + " trig  •  "
                           + juce::String(controlCount) + " ctrl  •  " + sceneLengthLabel
-                          + (layout.compactOverview ? "  •  dbl-click edit" : ""))
+                          + (layout.compactOverview ? "  •  click edit" : ""))
                        : "Sample mode not available in scene playback",
-                   layout.summaryBounds.toNearestInt(),
+                   summaryBounds.toNearestInt(),
                    juce::Justification::centredRight);
 
         const auto triggerTimeBounds = layout.stepTriggerLane && !layout.stepLaunchBounds.isEmpty()
@@ -7573,7 +10125,8 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
         }
 
         const int safeGridDivision = juce::jlimit(4, 32, sceneGridDivision);
-        const double gridStepBeats = sceneGridEnabled ? (4.0 / static_cast<double>(safeGridDivision)) : 0.0;
+        const bool drawGridVisible = sceneGridEnabled || sceneDrawModeEnabled;
+        const double gridStepBeats = drawGridVisible ? (4.0 / static_cast<double>(safeGridDivision)) : 0.0;
         auto drawBarBlocks = [&](juce::Rectangle<float> timelineBounds)
         {
             if (timelineBounds.isEmpty())
@@ -7599,7 +10152,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
 
         auto drawSubGrid = [&](juce::Rectangle<float> timelineBounds)
         {
-            if (!sceneGridEnabled || gridStepBeats <= 0.0 || timelineBounds.isEmpty())
+            if (!drawGridVisible || gridStepBeats <= 0.0 || timelineBounds.isEmpty())
                 return;
 
             const int steps = juce::jmax(1, static_cast<int>(std::ceil(lengthBeats / gridStepBeats)));
@@ -7634,7 +10187,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
 
             const float x = laneBounds.getX()
                 + (laneBounds.getWidth() * static_cast<float>(sceneEditorState.hoverBeat / juce::jmax(1.0, lengthBeats)));
-            if (sceneGridEnabled && gridStepBeats > 0.0)
+            if (drawGridVisible && gridStepBeats > 0.0)
             {
                 const double cellBeatStart = juce::jlimit(0.0, juce::jmax(0.0, std::nextafter(lengthBeats, 0.0)), sceneEditorState.hoverBeat);
                 const double cellBeatEnd = juce::jlimit(0.0,
@@ -8255,6 +10808,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                 const bool bipolarLane = sceneAutomationLaneIsBipolar(lane);
                 const bool hasTargetDropdown = showMotionTargetSelectors
                     && !layout.motionTargetBounds[static_cast<size_t>(lane)].isEmpty();
+                const bool laneModSelected = laneIsModSelected(visibleStrip, lane);
                 int laneEventCount = 0;
                 for (const auto& event : sceneEditorState.events)
                 {
@@ -8283,6 +10837,23 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                                         labelBounds.getY(),
                                                         labelBounds.getWidth(),
                                                         juce::jmax(7.0f, labelBounds.getHeight() * 0.42f));
+                auto laneSelectionBounds = labelBounds.getUnion(laneBounds).expanded(5.0f, 1.5f);
+                if (hasTargetDropdown)
+                    laneSelectionBounds = laneSelectionBounds.getUnion(
+                        layout.motionTargetBounds[static_cast<size_t>(lane)]).expanded(2.0f, 0.0f);
+                if (laneModSelected)
+                {
+                    g.setColour(laneTint.withAlpha(mainModSceneLaneSelectionActive ? 0.12f : 0.09f));
+                    g.fillRoundedRectangle(laneSelectionBounds, 4.0f);
+                    g.setColour(laneTint.withAlpha(mainModSceneLaneSelectionActive ? 0.30f : 0.22f));
+                    g.drawRoundedRectangle(laneSelectionBounds.reduced(0.5f), 4.0f, 1.0f);
+                    g.setColour(laneTint.withAlpha(mainModSceneLaneSelectionActive ? 0.88f : 0.72f));
+                    g.fillRoundedRectangle(juce::Rectangle<float>(laneSelectionBounds.getX() + 1.0f,
+                                                                  laneSelectionBounds.getY() + 2.0f,
+                                                                  2.5f,
+                                                                  juce::jmax(4.0f, laneSelectionBounds.getHeight() - 4.0f)),
+                                           1.25f);
+                }
                 g.setColour(kTextMuted);
                 g.setFont(juce::Font(juce::FontOptions(8.8f, juce::Font::bold)));
                 g.drawText(sceneAutomationLaneName(lane), nameBounds.toNearestInt(), juce::Justification::centredLeft);
@@ -8396,7 +10967,8 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                                       laneOverrideActive
                                                           ? kTextMuted.withAlpha(0.28f)
                                                           : sceneAutomationColour(event).withAlpha(0.4f),
-                                                      sceneAutomationTargetUsesSteppedSegments(event.controlTarget),
+                                                      sceneDrawModeEnabled
+                                                          || sceneAutomationTargetUsesSteppedSegments(event.controlTarget),
                                                       1.2f);
                     }
                     previousPoints[targetIndex] = point;
@@ -8648,6 +11220,8 @@ void SceneControlPanel::handleSceneTimelineMouseDown(const juce::MouseEvent& e)
                                                      cardBounds,
                                                      stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+        if (cardBounds.expanded(0.0f, 2.0f).contains(e.position))
+            sceneEditorState.selectedStripIndex = visibleStrip;
         if (layout.scenePlaybackAvailable && layout.stripWriteBounds.contains(e.position))
         {
             writeCurrentStripAutomation(visibleStrip);
@@ -9436,6 +12010,8 @@ void SceneControlPanel::handleSceneTimelineMouseDoubleClick(const juce::MouseEve
                                                      cardBounds,
                                                      stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
                                                      stripHeightExpanded[static_cast<size_t>(visibleStrip)]);
+        if (cardBounds.expanded(0.0f, 2.0f).contains(e.position))
+            sceneEditorState.selectedStripIndex = visibleStrip;
 
         const bool compactCardHit = layout.compactOverview
             && layout.scenePlaybackAvailable
@@ -11545,8 +14121,7 @@ void MonomePagesPanel::refreshFromProcessor()
         auto& row = rows[static_cast<size_t>(i)];
         const auto modeAtButton = order[static_cast<size_t>(i)];
         const bool hideSceneOwnedPage = processor.isSceneModeEnabled()
-            && (modeAtButton == MlrVSTAudioProcessor::ControlMode::GroupAssign
-                || modeAtButton == MlrVSTAudioProcessor::ControlMode::Modulation);
+            && modeAtButton == MlrVSTAudioProcessor::ControlMode::GroupAssign;
         const bool isActive = (activeMode == modeAtButton) && (activeMode != MlrVSTAudioProcessor::ControlMode::Normal);
 
         row.positionLabel.setVisible(!hideSceneOwnedPage);

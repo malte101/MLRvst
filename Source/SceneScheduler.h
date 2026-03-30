@@ -9,11 +9,10 @@
 
 #pragma once
 
+#include "PluginProcessor.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <memory>
 #include <cstdint>
-
-class MlrVSTAudioProcessor;
 
 class SceneScheduler
 {
@@ -41,15 +40,29 @@ public:
     static int getSceneChainStepRepeatCount(const MlrVSTAudioProcessor& processor, int stepIndex);
     static int getSceneChainStepTransitionTypeIndex(const MlrVSTAudioProcessor& processor, int stepIndex);
     static int getSceneChainStepTransitionOptionIndex(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static int getSceneChainStepTransitionScopeIndex(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static int getSceneChainStepTransitionContourIndex(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static int getSceneChainStepTransitionConditionIndex(const MlrVSTAudioProcessor& processor, int stepIndex);
     static float getSceneChainStepTransitionLengthBeats(const MlrVSTAudioProcessor& processor, int stepIndex);
     static bool getSceneChainStepTransitionSubtractsFromSceneLength(const MlrVSTAudioProcessor& processor, int stepIndex);
     static float getSceneChainStepTransitionIntensity(const MlrVSTAudioProcessor& processor, int stepIndex);
     static float getSceneChainStepTransitionDelayAmount(const MlrVSTAudioProcessor& processor, int stepIndex);
     static float getSceneChainStepTransitionFilterAmount(const MlrVSTAudioProcessor& processor, int stepIndex);
     static float getSceneChainStepTransitionChopAmount(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static juce::File getSceneTransitionEndSampleDirectory(const MlrVSTAudioProcessor& processor);
+    static juce::File getSceneChainStepTransitionEndSampleFile(const MlrVSTAudioProcessor& processor, int stepIndex);
+    static MlrVSTAudioProcessor::SceneTransitionEndSampleSettings
+        getSceneChainStepTransitionEndSampleSettings(const MlrVSTAudioProcessor& processor, int stepIndex);
     static void setSceneChainStep(MlrVSTAudioProcessor& processor, int stepIndex, int sceneSlot, int repeats);
     static void setSceneChainStepTransitionTypeIndex(MlrVSTAudioProcessor& processor, int stepIndex, int typeIndex);
     static void setSceneChainStepTransitionOptionIndex(MlrVSTAudioProcessor& processor, int stepIndex, int optionIndex);
+    static void setSceneChainStepTransitionScopeIndex(MlrVSTAudioProcessor& processor, int stepIndex, int scopeIndex);
+    static void setSceneChainStepTransitionContourIndex(MlrVSTAudioProcessor& processor,
+                                                        int stepIndex,
+                                                        int contourIndex);
+    static void setSceneChainStepTransitionConditionIndex(MlrVSTAudioProcessor& processor,
+                                                          int stepIndex,
+                                                          int conditionIndex);
     static void setSceneChainStepTransitionLengthBeats(MlrVSTAudioProcessor& processor, int stepIndex, float beats);
     static void setSceneChainStepTransitionSubtractsFromSceneLength(MlrVSTAudioProcessor& processor,
                                                                     int stepIndex,
@@ -58,6 +71,14 @@ public:
     static void setSceneChainStepTransitionDelayAmount(MlrVSTAudioProcessor& processor, int stepIndex, float amount);
     static void setSceneChainStepTransitionFilterAmount(MlrVSTAudioProcessor& processor, int stepIndex, float amount);
     static void setSceneChainStepTransitionChopAmount(MlrVSTAudioProcessor& processor, int stepIndex, float amount);
+    static void setSceneTransitionEndSampleDirectory(MlrVSTAudioProcessor& processor, const juce::File& directory);
+    static void setSceneChainStepTransitionEndSampleFile(MlrVSTAudioProcessor& processor,
+                                                         int stepIndex,
+                                                         const juce::File& file);
+    static void setSceneChainStepTransitionEndSampleSettings(
+        MlrVSTAudioProcessor& processor,
+        int stepIndex,
+        const MlrVSTAudioProcessor::SceneTransitionEndSampleSettings& settings);
     static void clearSceneChain(MlrVSTAudioProcessor& processor);
     static bool isSceneChainLoopEnabled(const MlrVSTAudioProcessor& processor);
     static void setSceneChainLoopEnabled(MlrVSTAudioProcessor& processor, bool enabled);

@@ -11496,7 +11496,11 @@ ModernAudioEngine::ModernAudioEngine()
         momentaryStutterNextPpq[static_cast<size_t>(i)].store(0.0, std::memory_order_release);
         macroRetriggerAmounts[static_cast<size_t>(i)].store(0.0f, std::memory_order_release);
         duckDetectorEnvelopeStates[static_cast<size_t>(i)] = 0.0f;
+        stripOutputLevelStates[static_cast<size_t>(i)] = 0.0f;
+        stripOutputLevels[static_cast<size_t>(i)].store(0.0f, std::memory_order_release);
     }
+    masterOutputLevel.store(0.0f, std::memory_order_release);
+    masterOutputLevelState = 0.0f;
 }
 
 void ModernAudioEngine::prepareToPlay(double sampleRate, int maxBlockSize)
@@ -11548,6 +11552,7 @@ void ModernAudioEngine::prepareToPlay(double sampleRate, int maxBlockSize)
     }
 
     inputMonitorScratch.setSize(juce::jmax(1, 2), juce::jmax(1, maxBlockSize), false, false, true);
+    stripOutputLevelScratch.setSize(2, juce::jmax(1, maxBlockSize), false, false, true);
     for (size_t i = 0; i < static_cast<size_t>(MaxStrips); ++i)
     {
         duckStripScratchBuffers[i].setSize(2, juce::jmax(1, maxBlockSize), false, false, true);
@@ -11555,9 +11560,14 @@ void ModernAudioEngine::prepareToPlay(double sampleRate, int maxBlockSize)
         duckStripScratchBuffers[i].clear();
         duckDetectorEnvelopeBuffers[i].clear();
         duckDetectorEnvelopeStates[i] = 0.0f;
+        stripOutputLevelStates[i] = 0.0f;
+        stripOutputLevels[i].store(0.0f, std::memory_order_release);
         if (auto* strip = strips[i].get())
             strip->resetDuckGainSmoothing();
     }
+    stripOutputLevelScratch.clear();
+    masterOutputLevel.store(0.0f, std::memory_order_release);
+    masterOutputLevelState = 0.0f;
 }
 
 void ModernAudioEngine::seedTransportState(int64_t globalSamplePosition, double ppqPosition)
@@ -11693,6 +11703,17 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             duckDetectorEnvelopeBuffers[i].clear(0, numSamples);
         }
     }
+
+    auto outputLevelSmoothingCoeffFromMs = [this](float ms)
+    {
+        const double safeMs = juce::jmax(0.001, static_cast<double>(ms));
+        const double safeRate = juce::jmax(1.0, currentSampleRate);
+        return static_cast<float>(std::exp(-1.0 / ((safeMs * 0.001) * safeRate)));
+    };
+    const float stripLevelAttackCoeff = outputLevelSmoothingCoeffFromMs(3.0f);
+    const float stripLevelReleaseCoeff = outputLevelSmoothingCoeffFromMs(55.0f);
+    std::array<bool, MaxStrips> stripOutputLevelTouched{};
+    stripOutputLevelTouched.fill(false);
 
     auto processStripsSegment = [&](int startSample, int segmentSamples)
     {
@@ -12536,6 +12557,15 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 }
             };
 
+            if (targetBuffer != nullptr && targetBuffer->getNumChannels() > 0)
+            {
+                stripOutputLevelScratch.copyFrom(0, 0, *targetBuffer, 0, startSample, segmentSamples);
+                if (targetBuffer->getNumChannels() > 1)
+                    stripOutputLevelScratch.copyFrom(1, 0, *targetBuffer, 1, startSample, segmentSamples);
+                else
+                    stripOutputLevelScratch.copyFrom(1, 0, *targetBuffer, 0, startSample, segmentSamples);
+            }
+
             int groupId = strip->getGroup();
             if (groupId >= 0 && groupId < MaxGroups && groups[static_cast<size_t>(groupId)])
             {
@@ -12552,6 +12582,29 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             else
             {
                 renderCurrentStrip();
+            }
+
+            if (targetBuffer != nullptr && targetBuffer->getNumChannels() > 0)
+            {
+                const auto* beforeL = stripOutputLevelScratch.getReadPointer(0);
+                const auto* beforeR = stripOutputLevelScratch.getReadPointer(1);
+                const auto* afterL = targetBuffer->getReadPointer(0, startSample);
+                const auto* afterR = targetBuffer->getNumChannels() > 1
+                    ? targetBuffer->getReadPointer(1, startSample)
+                    : afterL;
+                float outputLevelState = stripOutputLevelStates[i];
+                for (int sample = 0; sample < segmentSamples; ++sample)
+                {
+                    const float deltaL = afterL[sample] - beforeL[sample];
+                    const float deltaR = afterR[sample] - beforeR[sample];
+                    const float mono = 0.5f * (std::abs(deltaL) + std::abs(deltaR));
+                    const float coeff = (mono > outputLevelState) ? stripLevelAttackCoeff : stripLevelReleaseCoeff;
+                    outputLevelState = mono + (coeff * (outputLevelState - mono));
+                }
+
+                stripOutputLevelStates[i] = outputLevelState;
+                stripOutputLevels[static_cast<size_t>(i)].store(outputLevelState, std::memory_order_release);
+                stripOutputLevelTouched[static_cast<size_t>(i)] = true;
             }
 
             strip->clearGrainSizeModulation();
@@ -12998,10 +13051,35 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
     // Render remaining tail after the last event
     processStripsSegment(processedSamples, numSamples - processedSamples);
 
+    const float stripReleaseBlockCoeff = std::pow(stripLevelReleaseCoeff, static_cast<float>(juce::jmax(1, numSamples)));
+    for (size_t stripIndex = 0; stripIndex < static_cast<size_t>(MaxStrips); ++stripIndex)
+    {
+        if (stripOutputLevelTouched[stripIndex])
+            continue;
+
+        stripOutputLevelStates[stripIndex] *= stripReleaseBlockCoeff;
+        stripOutputLevels[stripIndex].store(stripOutputLevelStates[stripIndex], std::memory_order_release);
+    }
+
     if (useDuckProcessing)
         applyDuckPostProcessing(buffer, stripOutputs, numSamples, masterDuckTrigger);
 
     applyOutputPostProcessing(buffer, stripOutputs, inputCopy, numSamples, numChannels, inputMonitorVol);
+
+    float updatedMasterOutputLevel = masterOutputLevelState;
+    if (buffer.getNumChannels() > 0)
+    {
+        const auto* masterL = buffer.getReadPointer(0);
+        const auto* masterR = buffer.getNumChannels() > 1 ? buffer.getReadPointer(1) : masterL;
+        for (int sample = 0; sample < numSamples; ++sample)
+        {
+            const float mono = 0.5f * (std::abs(masterL[sample]) + std::abs(masterR[sample]));
+            const float coeff = (mono > updatedMasterOutputLevel) ? stripLevelAttackCoeff : stripLevelReleaseCoeff;
+            updatedMasterOutputLevel = mono + (coeff * (updatedMasterOutputLevel - mono));
+        }
+    }
+    masterOutputLevelState = updatedMasterOutputLevel;
+    masterOutputLevel.store(updatedMasterOutputLevel, std::memory_order_release);
     
     // Only advance clocks when host is playing
     // This keeps everything locked to host timeline

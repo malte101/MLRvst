@@ -2033,18 +2033,21 @@ public:
     void setModStepValue(int stripIndex, int step, float value01);
     float getModStepValue(int stripIndex, int step) const;
     void setModStepValueAbsolute(int stripIndex, int absoluteStep, float value01);
+    void setModStepValueAbsoluteForSlot(int stripIndex, int slot, int absoluteStep, float value01);
     float getModStepValueAbsolute(int stripIndex, int absoluteStep) const;
     float getModStepValueAbsoluteForSlot(int stripIndex, int slot, int absoluteStep) const;
     void writeModStepNormalized(int stripIndex, int slot, int absoluteStep, float value01);
     void clearModStepsForSlot(int stripIndex, int slot, float value01);
     void setModStepShape(int stripIndex, int step, int subdivisions, float endValue01);
     void setModStepShapeAbsolute(int stripIndex, int absoluteStep, int subdivisions, float endValue01);
+    void setModStepShapeAbsoluteForSlot(int stripIndex, int slot, int absoluteStep, int subdivisions, float endValue01);
     int getModStepSubdivisionAbsolute(int stripIndex, int absoluteStep) const;
     int getModStepSubdivisionAbsoluteForSlot(int stripIndex, int slot, int absoluteStep) const;
     float getModStepEndValueAbsolute(int stripIndex, int absoluteStep) const;
     float getModStepEndValueAbsoluteForSlot(int stripIndex, int slot, int absoluteStep) const;
     void setModStepCurveShape(int stripIndex, int step, ModCurveShape shape);
     void setModStepCurveShapeAbsolute(int stripIndex, int absoluteStep, ModCurveShape shape);
+    void setModStepCurveShapeAbsoluteForSlot(int stripIndex, int slot, int absoluteStep, ModCurveShape shape);
     ModCurveShape getModStepCurveShapeAbsolute(int stripIndex, int absoluteStep) const;
     ModCurveShape getModStepCurveShapeAbsoluteForSlot(int stripIndex, int slot, int absoluteStep) const;
     void toggleModStep(int stripIndex, int step);
@@ -2059,16 +2062,20 @@ public:
     void setModLengthBarsForSlot(int stripIndex, int slot, int bars);
     int getModLengthBarsForSlot(int stripIndex, int slot) const;
     void setModEditPage(int stripIndex, int page);
+    void setModEditPageForSlot(int stripIndex, int slot, int page);
     int getModEditPage(int stripIndex) const;
     int getModEditPageForSlot(int stripIndex, int slot) const;
     void setModSmoothingMs(int stripIndex, float ms);
     float getModSmoothingMs(int stripIndex) const;
+    void setModSmoothingMsForSlot(int stripIndex, int slot, float ms);
     float getModSmoothingMsForSlot(int stripIndex, int slot) const;
     void setModCurveBend(int stripIndex, float bend);
     float getModCurveBend(int stripIndex) const;
+    void setModCurveBendForSlot(int stripIndex, int slot, float bend);
     float getModCurveBendForSlot(int stripIndex, int slot) const;
     void setModCurveShape(int stripIndex, ModCurveShape shape);
     ModCurveShape getModCurveShape(int stripIndex) const;
+    void setModCurveShapeForSlot(int stripIndex, int slot, ModCurveShape shape);
     ModCurveShape getModCurveShapeForSlot(int stripIndex, int slot) const;
     void setModPitchScaleQuantize(int stripIndex, bool enabled);
     bool isModPitchScaleQuantize(int stripIndex) const;
@@ -2127,6 +2134,13 @@ public:
     // Input metering
     float getInputLevelL() const { return inputLevelL.load(); }
     float getInputLevelR() const { return inputLevelR.load(); }
+    float getStripOutputLevel(int stripIndex) const
+    {
+        if (stripIndex < 0 || stripIndex >= MaxStrips)
+            return 0.0f;
+        return stripOutputLevels[static_cast<size_t>(stripIndex)].load(std::memory_order_acquire);
+    }
+    float getMasterOutputLevel() const { return masterOutputLevel.load(std::memory_order_acquire); }
     
     // Current state
     double getCurrentTempo() const { return currentTempo; }
@@ -2237,6 +2251,8 @@ private:
     std::atomic<float> inputMonitorVolume{0.0f};  // Default off, range 0-1.0
     std::atomic<float> inputLevelL{0.0f};  // Input meter level left (0-1)
     std::atomic<float> inputLevelR{0.0f};  // Input meter level right (0-1)
+    std::array<std::atomic<float>, MaxStrips> stripOutputLevels{};
+    std::atomic<float> masterOutputLevel{0.0f};
     std::atomic<float> crossfadeLengthMs{10.0f}; // Inner-loop and capture-loop crossfade (ms)
     std::atomic<float> triggerFadeInMs{12.0f}; // Trigger fade-in de-click time (ms)
     std::atomic<int> soundTouchEnabled{1};
@@ -2256,9 +2272,12 @@ private:
     double currentSampleRate = 44100.0;
     int currentBlockSize = 512;
     juce::AudioBuffer<float> inputMonitorScratch;
+    juce::AudioBuffer<float> stripOutputLevelScratch;
     std::array<juce::AudioBuffer<float>, MaxStrips> duckStripScratchBuffers;
     std::array<juce::AudioBuffer<float>, MaxStrips> duckDetectorEnvelopeBuffers;
     std::array<float, MaxStrips> duckDetectorEnvelopeStates{};
+    std::array<float, MaxStrips> stripOutputLevelStates{};
+    float masterOutputLevelState = 0.0f;
 
     void updateTempo(const juce::AudioPlayHead::PositionInfo& positionInfo);
     void advanceBeat(int numSamples, bool hasHostPpq);

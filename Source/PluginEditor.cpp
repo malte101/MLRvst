@@ -84,6 +84,69 @@ juce::Colour patternControlEventColour(int controlMode)
     }
 }
 
+juce::Colour sceneMotionLaneColourForTarget(ModernAudioEngine::ModTarget target)
+{
+    using ControlMode = MlrVSTAudioProcessor::ControlMode;
+    using ModTarget = ModernAudioEngine::ModTarget;
+
+    const auto safeTarget = sanitizeModPerformanceTarget(target);
+    ControlMode controlMode = ControlMode::Normal;
+
+    switch (safeTarget)
+    {
+        case ModTarget::Speed:
+            controlMode = ControlMode::Speed;
+            break;
+        case ModTarget::Pitch:
+        case ModTarget::GrainPitch:
+            controlMode = ControlMode::Pitch;
+            break;
+        case ModTarget::Pan:
+            controlMode = ControlMode::Pan;
+            break;
+        case ModTarget::Volume:
+            controlMode = ControlMode::Volume;
+            break;
+        case ModTarget::GrainSize:
+        case ModTarget::GrainDensity:
+        case ModTarget::GrainPitchJitter:
+        case ModTarget::GrainSpread:
+        case ModTarget::GrainJitter:
+        case ModTarget::GrainPositionJitter:
+        case ModTarget::GrainRandom:
+        case ModTarget::GrainArp:
+        case ModTarget::GrainCloud:
+        case ModTarget::GrainEmitter:
+        case ModTarget::GrainEnvelope:
+        case ModTarget::GrainShape:
+            controlMode = ControlMode::GrainSize;
+            break;
+        case ModTarget::Cutoff:
+        case ModTarget::Resonance:
+        case ModTarget::FilterEnable:
+        case ModTarget::FilterMorph:
+            controlMode = ControlMode::Filter;
+            break;
+        case ModTarget::DelayMix:
+        case ModTarget::DelayTime:
+        case ModTarget::DelayFeedback:
+        case ModTarget::DelayLowCut:
+        case ModTarget::DelayHighCut:
+            controlMode = ControlMode::Delay;
+            break;
+        case ModTarget::SliceLength:
+        case ModTarget::Scratch:
+        case ModTarget::Retrigger:
+        case ModTarget::Rearrange:
+        case ModTarget::None:
+        default:
+            controlMode = ControlMode::Normal;
+            break;
+    }
+
+    return patternControlEventColour(static_cast<int>(controlMode));
+}
+
 int sceneControlLaneIndex(const ScenePerformanceEvent& event)
 {
     using ControlMode = MlrVSTAudioProcessor::ControlMode;
@@ -7833,7 +7896,10 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
             const auto mode = juce::ModifierKeys::getCurrentModifiersRealtime().isAltDown()
                 ? ModernAudioEngine::ModBipolarToggleMode::Reinterpret
                 : ModernAudioEngine::ModBipolarToggleMode::ConvertPreserveNeutral;
-            engine->setModBipolar(selectedStrip, bipolarToggle.getToggleState(), mode);
+            if (pinnedContextActive && selectedSlotOverride >= 0)
+                engine->setModBipolarForSlot(selectedStrip, selectedSlotOverride, bipolarToggle.getToggleState(), mode);
+            else
+                engine->setModBipolar(selectedStrip, bipolarToggle.getToggleState(), mode);
             syncPinnedSceneMotionIfNeeded();
         }
     };
@@ -7851,7 +7917,10 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         if (auto* engine = processor.getAudioEngine())
         {
             ensurePinnedSlotSelected(*engine);
-            engine->setModDepth(selectedStrip, static_cast<float>(depthSlider.getValue()));
+            if (pinnedContextActive && selectedSlotOverride >= 0)
+                engine->setModDepthForSlot(selectedStrip, selectedSlotOverride, static_cast<float>(depthSlider.getValue()));
+            else
+                engine->setModDepth(selectedStrip, static_cast<float>(depthSlider.getValue()));
             syncPinnedSceneMotionIfNeeded();
         }
     };
@@ -7868,7 +7937,10 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         if (auto* engine = processor.getAudioEngine())
         {
             ensurePinnedSlotSelected(*engine);
-            engine->setModRate(selectedStrip, comboIdToModRate(rateBox.getSelectedId()));
+            if (pinnedContextActive && selectedSlotOverride >= 0)
+                engine->setModRateForSlot(selectedStrip, selectedSlotOverride, comboIdToModRate(rateBox.getSelectedId()));
+            else
+                engine->setModRate(selectedStrip, comboIdToModRate(rateBox.getSelectedId()));
             syncPinnedSceneMotionIfNeeded();
         }
     };
@@ -7886,11 +7958,14 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         if (auto* engine = processor.getAudioEngine())
         {
             ensurePinnedSlotSelected(*engine);
-            engine->setModTransportMode(selectedStrip,
-                static_cast<ModernAudioEngine::ModTransportMode>(juce::jlimit(
-                    0,
-                    static_cast<int>(ModernAudioEngine::ModTransportMode::Scene),
-                    transportBox.getSelectedId() - 1)));
+            const auto mode = static_cast<ModernAudioEngine::ModTransportMode>(juce::jlimit(
+                0,
+                static_cast<int>(ModernAudioEngine::ModTransportMode::Scene),
+                transportBox.getSelectedId() - 1));
+            if (pinnedContextActive && selectedSlotOverride >= 0)
+                engine->setModTransportModeForSlot(selectedStrip, selectedSlotOverride, mode);
+            else
+                engine->setModTransportMode(selectedStrip, mode);
             syncPinnedSceneMotionIfNeeded();
         }
     };
@@ -7917,7 +7992,9 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
             if (pinnedContextActive && selectedSlotOverride >= 0)
             {
                 engine->setModLengthBarsForSlot(selectedStrip, selectedSlotOverride, bars);
-                engine->setModEditPage(selectedStrip, juce::jlimit(0, juce::jmax(0, bars - 1), currentPage));
+                engine->setModEditPageForSlot(selectedStrip,
+                                              selectedSlotOverride,
+                                              juce::jlimit(0, juce::jmax(0, bars - 1), currentPage));
             }
             else
             {
@@ -7941,7 +8018,11 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         {
             ensurePinnedSlotSelected(*engine);
             const int maxPage = juce::jmax(0, maxLengthBarsForCurrentContext() - 1);
-            engine->setModEditPage(selectedStrip, juce::jlimit(0, maxPage, pageBox.getSelectedId() - 1));
+            const int targetPage = juce::jlimit(0, maxPage, pageBox.getSelectedId() - 1);
+            if (pinnedContextActive && selectedSlotOverride >= 0)
+                engine->setModEditPageForSlot(selectedStrip, selectedSlotOverride, targetPage);
+            else
+                engine->setModEditPage(selectedStrip, targetPage);
             syncPinnedSceneMotionIfNeeded();
         }
         refreshFromEngine();
@@ -7961,7 +8042,10 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         if (auto* engine = processor.getAudioEngine())
         {
             ensurePinnedSlotSelected(*engine);
-            engine->setModSmoothingMs(selectedStrip, static_cast<float>(smoothSlider.getValue()));
+            if (pinnedContextActive && selectedSlotOverride >= 0)
+                engine->setModSmoothingMsForSlot(selectedStrip, selectedSlotOverride, static_cast<float>(smoothSlider.getValue()));
+            else
+                engine->setModSmoothingMs(selectedStrip, static_cast<float>(smoothSlider.getValue()));
             syncPinnedSceneMotionIfNeeded();
         }
     };
@@ -7979,7 +8063,10 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         {
             ensurePinnedSlotSelected(*engine);
             const bool curveMode = (shapeBox.getSelectedId() == 1);
-            engine->setModCurveMode(selectedStrip, curveMode);
+            if (pinnedContextActive && selectedSlotOverride >= 0)
+                engine->setModCurveModeForSlot(selectedStrip, selectedSlotOverride, curveMode);
+            else
+                engine->setModCurveMode(selectedStrip, curveMode);
             syncPinnedSceneMotionIfNeeded();
         }
         refreshFromEngine();
@@ -8000,7 +8087,10 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         if (auto* engine = processor.getAudioEngine())
         {
             ensurePinnedSlotSelected(*engine);
-            engine->setModCurveBend(selectedStrip, static_cast<float>(curveBendSlider.getValue()));
+            if (pinnedContextActive && selectedSlotOverride >= 0)
+                engine->setModCurveBendForSlot(selectedStrip, selectedSlotOverride, static_cast<float>(curveBendSlider.getValue()));
+            else
+                engine->setModCurveBend(selectedStrip, static_cast<float>(curveBendSlider.getValue()));
             syncPinnedSceneMotionIfNeeded();
         }
     };
@@ -8020,7 +8110,10 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         if (auto* engine = processor.getAudioEngine())
         {
             ensurePinnedSlotSelected(*engine);
-            engine->setModCurveShape(selectedStrip, comboIdToCurveShape(curveTypeBox.getSelectedId()));
+            if (pinnedContextActive && selectedSlotOverride >= 0)
+                engine->setModCurveShapeForSlot(selectedStrip, selectedSlotOverride, comboIdToCurveShape(curveTypeBox.getSelectedId()));
+            else
+                engine->setModCurveShape(selectedStrip, comboIdToCurveShape(curveTypeBox.getSelectedId()));
             syncPinnedSceneMotionIfNeeded();
         }
     };
@@ -8032,7 +8125,10 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         if (auto* engine = processor.getAudioEngine())
         {
             ensurePinnedSlotSelected(*engine);
-            engine->setModPitchScaleQuantize(selectedStrip, pitchScaleToggle.getToggleState());
+            if (pinnedContextActive && selectedSlotOverride >= 0)
+                engine->setModPitchScaleQuantizeForSlot(selectedStrip, selectedSlotOverride, pitchScaleToggle.getToggleState());
+            else
+                engine->setModPitchScaleQuantize(selectedStrip, pitchScaleToggle.getToggleState());
             syncPinnedSceneMotionIfNeeded();
         }
     };
@@ -8052,7 +8148,10 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         if (auto* engine = processor.getAudioEngine())
         {
             ensurePinnedSlotSelected(*engine);
-            engine->setModPitchScale(selectedStrip, comboIdToPitchScale(pitchScaleBox.getSelectedId()));
+            if (pinnedContextActive && selectedSlotOverride >= 0)
+                engine->setModPitchScaleForSlot(selectedStrip, selectedSlotOverride, comboIdToPitchScale(pitchScaleBox.getSelectedId()));
+            else
+                engine->setModPitchScale(selectedStrip, comboIdToPitchScale(pitchScaleBox.getSelectedId()));
             syncPinnedSceneMotionIfNeeded();
         }
     };
@@ -8090,21 +8189,47 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
             {
                 ensurePinnedSlotSelected(*engine);
                 const int absoluteStep = absoluteLegacyModStepForVisibleIndex(i);
-                if (engine->getModSequencerState(selectedStrip).target == ModernAudioEngine::ModTarget::Rearrange)
+                const int slot = selectedSlotOverride >= 0
+                    ? selectedSlotOverride
+                    : engine->getModSequencerSlot(selectedStrip);
+                const auto target = pinnedContextActive
+                    ? engine->getModTargetForSlot(selectedStrip, slot)
+                    : engine->getModSequencerState(selectedStrip).target;
+                if (target == ModernAudioEngine::ModTarget::Rearrange)
                 {
-                    const float currentValue = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(selectedStrip, absoluteStep));
+                    const float currentValue = juce::jlimit(
+                        0.0f,
+                        1.0f,
+                        pinnedContextActive
+                            ? engine->getModStepValueAbsoluteForSlot(selectedStrip, slot, absoluteStep)
+                            : engine->getModStepValueAbsolute(selectedStrip, absoluteStep));
                     const int nextSlice = (rearrangeSliceDisplayIndex(currentValue) % ModernAudioEngine::MaxColumns) + 1;
-                    engine->setModStepValueAbsolute(selectedStrip,
-                                                    absoluteStep,
-                                                    quantizeRearrangeStepValue((static_cast<float>(nextSlice) - 1.0f)
-                                                                               / static_cast<float>(juce::jmax(1, ModernAudioEngine::MaxColumns - 1))));
+                    const float nextValue = quantizeRearrangeStepValue((static_cast<float>(nextSlice) - 1.0f)
+                                                                       / static_cast<float>(juce::jmax(1, ModernAudioEngine::MaxColumns - 1)));
+                    if (pinnedContextActive)
+                        engine->setModStepValueAbsoluteForSlot(selectedStrip, slot, absoluteStep, nextValue);
+                    else
+                        engine->setModStepValueAbsolute(selectedStrip, absoluteStep, nextValue);
                 }
                 else
                 {
-                    const float currentValue = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(selectedStrip, absoluteStep));
+                    const float currentValue = juce::jlimit(
+                        0.0f,
+                        1.0f,
+                        pinnedContextActive
+                            ? engine->getModStepValueAbsoluteForSlot(selectedStrip, slot, absoluteStep)
+                            : engine->getModStepValueAbsolute(selectedStrip, absoluteStep));
                     const float nextValue = currentValue > 0.001f ? 0.0f : 1.0f;
-                    engine->setModStepValueAbsolute(selectedStrip, absoluteStep, nextValue);
-                    engine->setModStepShapeAbsolute(selectedStrip, absoluteStep, 1, nextValue);
+                    if (pinnedContextActive)
+                    {
+                        engine->setModStepValueAbsoluteForSlot(selectedStrip, slot, absoluteStep, nextValue);
+                        engine->setModStepShapeAbsoluteForSlot(selectedStrip, slot, absoluteStep, 1, nextValue);
+                    }
+                    else
+                    {
+                        engine->setModStepValueAbsolute(selectedStrip, absoluteStep, nextValue);
+                        engine->setModStepShapeAbsolute(selectedStrip, absoluteStep, 1, nextValue);
+                    }
                 }
                 syncPinnedSceneMotionIfNeeded();
             }
@@ -8114,7 +8239,7 @@ ModulationControlPanel::ModulationControlPanel(MlrVSTAudioProcessor& p)
         addAndMakeVisible(b);
     }
 
-    startTimer(80);
+    startTimerHz(30);
     refreshFromEngine();
 }
 
@@ -8137,6 +8262,40 @@ void ModulationControlPanel::clearPinnedStripAndSlot()
     refreshFromEngine();
 }
 
+bool ModulationControlPanel::isPinnedSceneMotionFollowMode() const
+{
+    return pinnedContextActive
+        && processor.isSceneModeEnabled()
+        && processor.isControlModeActive()
+        && processor.getCurrentControlMode() == MlrVSTAudioProcessor::ControlMode::Modulation
+        && processor.getSceneModPageMode() == MlrVSTAudioProcessor::SceneModPageMode::StepMotion;
+}
+
+bool ModulationControlPanel::followPinnedSceneMotionContextFromMonome(ModernAudioEngine& engine)
+{
+    if (!isPinnedSceneMotionFollowMode())
+        return false;
+
+    const int nextStrip = juce::jlimit(0,
+                                       MlrVSTAudioProcessor::MaxStrips - 1,
+                                       processor.getLastMonomePressedStripRow());
+    const int nextSlot = juce::jlimit(0,
+                                      ModernAudioEngine::NumModSequencers - 1,
+                                      engine.getModSequencerSlot(nextStrip));
+    if (selectedStrip == nextStrip && selectedSlotOverride == nextSlot)
+        return false;
+
+    selectedStrip = nextStrip;
+    selectedSlotOverride = nextSlot;
+    pinnedContextLabel = buildPinnedSceneMotionContextLabel(nextStrip, nextSlot);
+    return true;
+}
+
+juce::String ModulationControlPanel::buildPinnedSceneMotionContextLabel(int stripIndex, int slot) const
+{
+    return "Scene Motion  Strip " + juce::String(stripIndex + 1) + "  M" + juce::String(slot + 1);
+}
+
 int ModulationControlPanel::maxLengthBarsForCurrentContext() const
 {
     if (!pinnedContextActive)
@@ -8144,7 +8303,7 @@ int ModulationControlPanel::maxLengthBarsForCurrentContext() const
 
     const int sceneSlot = juce::jlimit(0,
                                        MlrVSTAudioProcessor::SceneSlots - 1,
-                                       processor.getActiveSceneSlot());
+                                       processor.getFocusedSceneSlot());
     const double resolvedBeats = processor.getResolvedSceneLengthBeats(sceneSlot);
     if (!std::isfinite(resolvedBeats) || resolvedBeats <= 0.0)
         return ModernAudioEngine::MaxModBars;
@@ -8183,6 +8342,60 @@ juce::Rectangle<int> ModulationControlPanel::getEmbeddedSceneOverlayToolsBounds(
     return embeddedSceneOverlayToolsBounds;
 }
 
+int ModulationControlPanel::getPreferredEmbeddedSceneHeight() const
+{
+    const bool showPitchControls = pitchScaleToggle.isVisible();
+    const bool showTargetHint = targetHintLabel.isVisible();
+    const bool showCurveControls = (shapeBox.getSelectedId() == 1);
+    const bool showSceneStripTools = sceneStripToolsLabel.isVisible();
+
+    int height = 16; // `getLocalBounds().reduced(8)`
+    height += 18; // title
+    height += 14; // strip label
+    height += 2;
+
+    if (showSceneStripTools)
+    {
+        height += 18; // strip tools row
+        height += 2;
+        height += 18; // selection tools row
+        height += 2;
+        height += 18; // overlay tools row
+        height += 1;
+    }
+
+    height += 20; // target row
+    height += 2;
+    height += 20; // length/page/transport row
+    height += 2;
+    height += 20; // depth row
+    height += 2;
+    height += 20; // smooth/shape row
+
+    if (showCurveControls)
+    {
+        height += 2;
+        height += 20;
+    }
+
+    if (showPitchControls && !showTargetHint)
+    {
+        height += 2;
+        height += 20;
+    }
+
+    if (showTargetHint)
+    {
+        height += 2;
+        height += 16;
+    }
+
+    height += 12; // gesture hint
+    height += 2;
+    height += showSceneStripTools ? 104 : 64; // graph
+    return height;
+}
+
 void ModulationControlPanel::paint(juce::Graphics& g)
 {
     drawPanel(g, getLocalBounds().toFloat(), kAccent, 8.0f);
@@ -8196,29 +8409,42 @@ void ModulationControlPanel::paintLegacyModulationGraph(juce::Graphics& g) const
         return;
 
     ensurePinnedSlotSelected(*engine);
-    const auto seq = engine->getModSequencerState(selectedStrip);
     const int slot = selectedSlotOverride >= 0
         ? selectedSlotOverride
         : engine->getModSequencerSlot(selectedStrip);
-    const int lengthBars = juce::jlimit(1, ModernAudioEngine::MaxModBars, engine->getModLengthBars(selectedStrip));
+    const auto seq = engine->getModSequencerState(selectedStrip);
+    const bool bipolar = pinnedContextActive
+        ? engine->isModBipolarForSlot(selectedStrip, slot)
+        : seq.bipolar;
+    const int editPage = pinnedContextActive
+        ? engine->getModEditPageForSlot(selectedStrip, slot)
+        : seq.editPage;
+    const int lengthBars = juce::jlimit(1,
+                                        ModernAudioEngine::MaxModBars,
+                                        pinnedContextActive
+                                            ? engine->getModLengthBarsForSlot(selectedStrip, slot)
+                                            : engine->getModLengthBars(selectedStrip));
     const int totalSteps = juce::jmax(ModernAudioEngine::ModSteps, lengthBars * ModernAudioEngine::ModSteps);
     const int activeStep = juce::jlimit(0, totalSteps - 1, engine->getModCurrentGlobalStep(selectedStrip));
     if (totalSteps <= 0)
         return;
 
-    const auto stripColour = getStripColor(selectedStrip);
+    const auto target = pinnedContextActive
+        ? engine->getModTargetForSlot(selectedStrip, slot)
+        : seq.target;
+    const auto laneColour = sceneMotionLaneColourForTarget(target);
     auto lane = graphBounds;
     g.setColour(juce::Colour(0xff1f1f1f));
     g.fillRoundedRectangle(lane, 6.0f);
-    g.setColour(stripColour.withAlpha(0.35f));
+    g.setColour(laneColour.withAlpha(0.35f));
     g.drawRoundedRectangle(lane.reduced(0.5f), 6.0f, 1.0f);
 
     const juce::String laneInfo = "M" + juce::String(slot + 1)
-        + "  PAGE " + juce::String(seq.editPage + 1) + "/" + juce::String(lengthBars);
+        + "  PAGE " + juce::String(editPage + 1) + "/" + juce::String(lengthBars);
     auto infoBadge = juce::Rectangle<float>(lane.getX() + 8.0f, lane.getY() + 4.0f, 108.0f, 14.0f);
     g.setColour(juce::Colour(0xff111111).withAlpha(0.72f));
     g.fillRoundedRectangle(infoBadge, 3.0f);
-    g.setColour(stripColour.withAlpha(0.22f));
+    g.setColour(laneColour.withAlpha(0.22f));
     g.drawRoundedRectangle(infoBadge, 3.0f, 1.0f);
     g.setColour(kTextPrimary.withAlpha(0.88f));
     g.setFont(8.5f);
@@ -8236,7 +8462,7 @@ void ModulationControlPanel::paintLegacyModulationGraph(juce::Graphics& g) const
     const float stepWidth = juce::jmax(0.25f, width / static_cast<float>(juce::jmax(1, totalSteps)));
     const float centerY = top + (height * 0.5f);
 
-    if (seq.bipolar)
+    if (bipolar)
     {
         g.setColour(juce::Colour(0xff454545));
         g.drawLine(left, centerY, right, centerY, 1.0f);
@@ -8245,8 +8471,8 @@ void ModulationControlPanel::paintLegacyModulationGraph(juce::Graphics& g) const
     auto valueToY = [&](float v) -> float
     {
         const float clamped = juce::jlimit(0.0f, 1.0f, v);
-        const float n = seq.bipolar ? ((clamped * 2.0f) - 1.0f) : clamped;
-        return seq.bipolar
+        const float n = bipolar ? ((clamped * 2.0f) - 1.0f) : clamped;
+        return bipolar
             ? (centerY - (n * (height * 0.48f)))
             : (bottom - (n * height));
     };
@@ -8258,12 +8484,24 @@ void ModulationControlPanel::paintLegacyModulationGraph(juce::Graphics& g) const
                                                                   ModernAudioEngine::ModCurveShape::Linear);
     for (int i = 0; i < totalSteps; ++i)
     {
-        const float startValue = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(selectedStrip, i));
+        const float startValue = juce::jlimit(0.0f,
+                                              1.0f,
+                                              pinnedContextActive
+                                                  ? engine->getModStepValueAbsoluteForSlot(selectedStrip, slot, i)
+                                                  : engine->getModStepValueAbsolute(selectedStrip, i));
         const int subdiv = juce::jlimit(1,
                                         ModernAudioEngine::ModMaxStepSubdivisions,
-                                        engine->getModStepSubdivisionAbsolute(selectedStrip, i));
-        float endValue = juce::jlimit(0.0f, 1.0f, engine->getModStepEndValueAbsolute(selectedStrip, i));
-        const auto stepCurveShape = engine->getModStepCurveShapeAbsolute(selectedStrip, i);
+                                        pinnedContextActive
+                                            ? engine->getModStepSubdivisionAbsoluteForSlot(selectedStrip, slot, i)
+                                            : engine->getModStepSubdivisionAbsolute(selectedStrip, i));
+        float endValue = juce::jlimit(0.0f,
+                                      1.0f,
+                                      pinnedContextActive
+                                          ? engine->getModStepEndValueAbsoluteForSlot(selectedStrip, slot, i)
+                                          : engine->getModStepEndValueAbsolute(selectedStrip, i));
+        const auto stepCurveShape = pinnedContextActive
+            ? engine->getModStepCurveShapeAbsoluteForSlot(selectedStrip, slot, i)
+            : engine->getModStepCurveShapeAbsolute(selectedStrip, i);
         if (subdiv <= 1)
             endValue = startValue;
         startValues[static_cast<size_t>(i)] = startValue;
@@ -8276,11 +8514,18 @@ void ModulationControlPanel::paintLegacyModulationGraph(juce::Graphics& g) const
     g.setColour(kAccent.withAlpha(0.10f));
     g.fillRect(activeStepX, top, juce::jmax(1.0f, stepWidth), juce::jmax(1.0f, height));
 
-    const float bend = juce::jlimit(-1.0f, 1.0f, seq.curveBend);
+    const bool curveMode = pinnedContextActive
+        ? engine->isModCurveModeForSlot(selectedStrip, slot)
+        : seq.curveMode;
+    const float bend = juce::jlimit(-1.0f,
+                                    1.0f,
+                                    pinnedContextActive
+                                        ? engine->getModCurveBendForSlot(selectedStrip, slot)
+                                        : seq.curveBend);
     std::vector<juce::Point<float>> stepMarkerPoints(static_cast<size_t>(totalSteps));
     for (int i = 0; i < totalSteps; ++i)
     {
-        const float markerPhase = seq.curveMode ? shapeSubdivisionBendPhaseUi(0.5f, bend) : 0.5f;
+        const float markerPhase = curveMode ? shapeSubdivisionBendPhaseUi(0.5f, bend) : 0.5f;
         const float markerValue = (subdivisions[static_cast<size_t>(i)] > 1)
             ? sampleModSubdivisionValueUi(startValues[static_cast<size_t>(i)],
                                           endValues[static_cast<size_t>(i)],
@@ -8291,7 +8536,7 @@ void ModulationControlPanel::paintLegacyModulationGraph(juce::Graphics& g) const
         stepMarkerPoints[static_cast<size_t>(i)] = { x, valueToY(markerValue) };
     }
 
-    if (seq.curveMode)
+    if (curveMode)
     {
         juce::Path rawPath;
         std::vector<float> sampledX;
@@ -8336,10 +8581,14 @@ void ModulationControlPanel::paintLegacyModulationGraph(juce::Graphics& g) const
             }
         }
 
-        const float smoothingMs = juce::jlimit(0.0f, 250.0f, seq.smoothingMs);
+        const float smoothingMs = juce::jlimit(0.0f,
+                                               250.0f,
+                                               pinnedContextActive
+                                                   ? engine->getModSmoothingMsForSlot(selectedStrip, slot)
+                                                   : seq.smoothingMs);
         const bool showSmoothedOverlay = (smoothingMs > 0.05f && sampledValues.size() > 2);
 
-        g.setColour(stripColour.withAlpha(showSmoothedOverlay ? 0.58f : 0.9f));
+        g.setColour(laneColour.withAlpha(showSmoothedOverlay ? 0.58f : 0.9f));
         g.strokePath(rawPath, juce::PathStrokeType(showSmoothedOverlay ? 1.6f : 2.0f));
 
         if (showSmoothedOverlay)
@@ -8361,7 +8610,7 @@ void ModulationControlPanel::paintLegacyModulationGraph(juce::Graphics& g) const
 
             g.setColour(juce::Colour(0xff101010).withAlpha(0.68f));
             g.strokePath(smoothPath, juce::PathStrokeType(3.4f));
-            g.setColour(kAccent.brighter(0.35f).withAlpha(0.92f));
+            g.setColour(laneColour.brighter(0.28f).withAlpha(0.92f));
             g.strokePath(smoothPath, juce::PathStrokeType(2.2f));
         }
     }
@@ -8395,7 +8644,7 @@ void ModulationControlPanel::paintLegacyModulationGraph(juce::Graphics& g) const
                     : juce::jmap(static_cast<float>(s) / static_cast<float>(juce::jmax(1, subdiv - 1)),
                                  0.72f,
                                  0.44f);
-                g.setColour(stripColour.withAlpha(shade));
+                g.setColour(laneColour.withAlpha(shade));
                 g.fillRoundedRectangle(x, yTop, barWidth, h, 1.5f);
             }
         }
@@ -8404,7 +8653,7 @@ void ModulationControlPanel::paintLegacyModulationGraph(juce::Graphics& g) const
     for (int i = 0; i < totalSteps; ++i)
     {
         const auto point = stepMarkerPoints[static_cast<size_t>(i)];
-        g.setColour(i == activeStep ? kAccent : stripColour.withMultipliedBrightness(0.8f));
+        g.setColour(i == activeStep ? laneColour.brighter(0.25f) : laneColour.withMultipliedBrightness(0.8f));
         g.fillEllipse(point.x - (dotSize * 0.5f), point.y - (dotSize * 0.5f), dotSize, dotSize);
     }
 }
@@ -8415,6 +8664,7 @@ void ModulationControlPanel::resized()
     const bool showPitchControls = pitchScaleToggle.isVisible();
     const bool showTargetHint = targetHintLabel.isVisible();
     const bool showCurveControls = (shapeBox.getSelectedId() == 1);
+    const bool showRateControls = rateBox.isVisible();
     const bool showPageControls = true;
     const bool showSceneStripTools = sceneStripToolsLabel.isVisible();
     embeddedSceneSelectionToolsBounds = {};
@@ -8453,9 +8703,12 @@ void ModulationControlPanel::resized()
         sceneStripCopyButton.setBounds({});
     }
 
+    auto targetRow = bounds.removeFromTop(20);
+    targetLabel.setBounds(targetRow.removeFromLeft(40));
+    targetBox.setBounds(targetRow);
+
+    bounds.removeFromTop(2);
     auto top = bounds.removeFromTop(20);
-    targetLabel.setBounds({});
-    targetBox.setBounds({});
     lengthLabel.setBounds(top.removeFromLeft(38));
     lengthBox.setBounds(top.removeFromLeft(56));
     if (showPageControls)
@@ -8476,11 +8729,20 @@ void ModulationControlPanel::resized()
     bounds.removeFromTop(2);
     auto depthRow = bounds.removeFromTop(20);
     depthLabel.setBounds(depthRow.removeFromLeft(44));
-    depthSlider.setBounds(depthRow.removeFromLeft(110));
-    depthRow.removeFromLeft(4);
-    rateLabel.setBounds(depthRow.removeFromLeft(34));
-    rateBox.setBounds(depthRow.removeFromLeft(84));
-    depthRow.removeFromLeft(4);
+    depthSlider.setBounds(depthRow.removeFromLeft(showRateControls ? 110 : 156));
+    if (showRateControls)
+    {
+        depthRow.removeFromLeft(4);
+        rateLabel.setBounds(depthRow.removeFromLeft(34));
+        rateBox.setBounds(depthRow.removeFromLeft(84));
+        depthRow.removeFromLeft(4);
+    }
+    else
+    {
+        rateLabel.setBounds({});
+        rateBox.setBounds({});
+        depthRow.removeFromLeft(6);
+    }
     bipolarToggle.setBounds(depthRow.removeFromLeft(74));
 
     bounds.removeFromTop(2);
@@ -8532,15 +8794,21 @@ void ModulationControlPanel::resized()
         pitchScaleBox.setBounds({});
     }
 
-    if (showTargetHint && !targetHintLabel.isVisible())
+    if (showTargetHint)
     {
         bounds.removeFromTop(2);
         targetHintLabel.setBounds(bounds.removeFromTop(16));
     }
+    else
+    {
+        targetHintLabel.setBounds({});
+    }
 
     gestureHintLabel.setBounds(bounds.removeFromTop(12));
     bounds.removeFromTop(2);
-    const int graphHeight = juce::jlimit(14, 18, bounds.getHeight() / 8);
+    const int graphHeight = juce::jlimit(showSceneStripTools ? 92 : 48,
+                                         showSceneStripTools ? 120 : 72,
+                                         bounds.getHeight());
     graphBounds = bounds.removeFromTop(graphHeight).toFloat();
 
     for (auto& button : stepButtons)
@@ -8553,6 +8821,7 @@ void ModulationControlPanel::resized()
 void ModulationControlPanel::timerCallback()
 {
     refreshFromEngine();
+    repaint();
 }
 
 void ModulationControlPanel::mouseDown(const juce::MouseEvent& e)
@@ -8576,12 +8845,27 @@ void ModulationControlPanel::mouseDown(const juce::MouseEvent& e)
     const auto modifierGesture = getStepCellModifierGesture(e.mods);
     if (modifierGesture != StepCellModifierGesture::None)
     {
-        gestureSourceValue = juce::jlimit(0.0f, 1.0f, engine->getModStepValueAbsolute(selectedStrip, step));
+        const int slot = selectedSlotOverride >= 0
+            ? selectedSlotOverride
+            : engine->getModSequencerSlot(selectedStrip);
+        gestureSourceValue = juce::jlimit(
+            0.0f,
+            1.0f,
+            pinnedContextActive
+                ? engine->getModStepValueAbsoluteForSlot(selectedStrip, slot, step)
+                : engine->getModStepValueAbsolute(selectedStrip, step));
         gestureSourceSubdivision = juce::jlimit(
             1,
             ModernAudioEngine::ModMaxStepSubdivisions,
-            engine->getModStepSubdivisionAbsolute(selectedStrip, step));
-        gestureSourceEndValue = juce::jlimit(0.0f, 1.0f, engine->getModStepEndValueAbsolute(selectedStrip, step));
+            pinnedContextActive
+                ? engine->getModStepSubdivisionAbsoluteForSlot(selectedStrip, slot, step)
+                : engine->getModStepSubdivisionAbsolute(selectedStrip, step));
+        gestureSourceEndValue = juce::jlimit(
+            0.0f,
+            1.0f,
+            pinnedContextActive
+                ? engine->getModStepEndValueAbsoluteForSlot(selectedStrip, slot, step)
+                : engine->getModStepEndValueAbsolute(selectedStrip, step));
         switch (modifierGesture)
         {
             case StepCellModifierGesture::Divide:
@@ -8764,8 +9048,17 @@ float ModulationControlPanel::normalizedLegacyModDrawValueAtPosition(juce::Point
                                                  1.0f,
                                                  (position.y - top) / juce::jmax(1.0f, bottom - top));
     auto* engine = processor.getAudioEngine();
-    if (engine != nullptr && engine->getModSequencerState(selectedStrip).target == ModernAudioEngine::ModTarget::Rearrange)
-        return quantizeRearrangeStepValue(normalized);
+    if (engine != nullptr)
+    {
+        const int slot = selectedSlotOverride >= 0
+            ? selectedSlotOverride
+            : engine->getModSequencerSlot(selectedStrip);
+        const auto target = pinnedContextActive
+            ? engine->getModTargetForSlot(selectedStrip, slot)
+            : engine->getModSequencerState(selectedStrip).target;
+        if (target == ModernAudioEngine::ModTarget::Rearrange)
+            return quantizeRearrangeStepValue(normalized);
+    }
     return juce::jlimit(0.0f, 1.0f, normalized);
 }
 
@@ -8779,7 +9072,7 @@ void ModulationControlPanel::syncPinnedSceneMotionIfNeeded()
 {
     if (pinnedContextActive && processor.isSceneModeEnabled())
     {
-        processor.syncActiveSceneMotionState();
+        processor.syncFocusedSceneMotionState();
         if (onPinnedSceneMotionChange != nullptr)
             onPinnedSceneMotionChange();
     }
@@ -8814,14 +9107,28 @@ void ModulationControlPanel::applyDrawGesture(juce::Point<float> position)
         return;
 
     const float value = normalizedLegacyModDrawValueAtPosition(position);
+    const int slot = selectedSlotOverride >= 0
+        ? selectedSlotOverride
+        : engine->getModSequencerSlot(selectedStrip);
+    const float currentValue = pinnedContextActive
+        ? engine->getModStepValueAbsoluteForSlot(selectedStrip, slot, absoluteStep)
+        : engine->getModStepValueAbsolute(selectedStrip, absoluteStep);
     if (absoluteStep == lastDrawVisibleStep
-        && std::abs(engine->getModStepValueAbsolute(selectedStrip, absoluteStep) - value) < 0.001f)
+        && std::abs(currentValue - value) < 0.001f)
     {
         return;
     }
 
-    engine->setModStepValueAbsolute(selectedStrip, absoluteStep, value);
-    engine->setModStepShapeAbsolute(selectedStrip, absoluteStep, 1, value);
+    if (pinnedContextActive)
+    {
+        engine->setModStepValueAbsoluteForSlot(selectedStrip, slot, absoluteStep, value);
+        engine->setModStepShapeAbsoluteForSlot(selectedStrip, slot, absoluteStep, 1, value);
+    }
+    else
+    {
+        engine->setModStepValueAbsolute(selectedStrip, absoluteStep, value);
+        engine->setModStepShapeAbsolute(selectedStrip, absoluteStep, 1, value);
+    }
     lastDrawVisibleStep = absoluteStep;
     syncPinnedSceneMotionIfNeeded();
 }
@@ -8834,12 +9141,18 @@ void ModulationControlPanel::applyDuplicateGesture(int deltaY)
         return;
 
     ensurePinnedSlotSelected(*engine);
+    const int slot = selectedSlotOverride >= 0
+        ? selectedSlotOverride
+        : engine->getModSequencerSlot(selectedStrip);
     const int nextSubdivision = juce::jlimit(
         1,
         ModernAudioEngine::ModMaxStepSubdivisions,
         gestureSourceSubdivision + ((-deltaY) / 14));
     const float endValue = (nextSubdivision > 1) ? gestureSourceEndValue : gestureSourceValue;
-    engine->setModStepShapeAbsolute(selectedStrip, gestureStep, nextSubdivision, endValue);
+    if (pinnedContextActive)
+        engine->setModStepShapeAbsoluteForSlot(selectedStrip, slot, gestureStep, nextSubdivision, endValue);
+    else
+        engine->setModStepShapeAbsolute(selectedStrip, gestureStep, nextSubdivision, endValue);
     syncPinnedSceneMotionIfNeeded();
 }
 
@@ -8851,6 +9164,9 @@ void ModulationControlPanel::applyShapeGesture(int deltaY, bool rampUpMode)
         return;
 
     ensurePinnedSlotSelected(*engine);
+    const int slot = selectedSlotOverride >= 0
+        ? selectedSlotOverride
+        : engine->getModSequencerSlot(selectedStrip);
     int subdivisions = gestureSourceSubdivision;
     if (subdivisions <= 1)
     {
@@ -8863,8 +9179,16 @@ void ModulationControlPanel::applyShapeGesture(int deltaY, bool rampUpMode)
     float startValue = gestureSourceValue;
     float endValue = gestureSourceEndValue;
     computeSingleModCellRamp(gestureSourceValue, gestureSourceEndValue, deltaY, rampUpMode, startValue, endValue);
-    engine->setModStepValueAbsolute(selectedStrip, gestureStep, startValue);
-    engine->setModStepShapeAbsolute(selectedStrip, gestureStep, subdivisions, endValue);
+    if (pinnedContextActive)
+    {
+        engine->setModStepValueAbsoluteForSlot(selectedStrip, slot, gestureStep, startValue);
+        engine->setModStepShapeAbsoluteForSlot(selectedStrip, slot, gestureStep, subdivisions, endValue);
+    }
+    else
+    {
+        engine->setModStepValueAbsolute(selectedStrip, gestureStep, startValue);
+        engine->setModStepShapeAbsolute(selectedStrip, gestureStep, subdivisions, endValue);
+    }
     syncPinnedSceneMotionIfNeeded();
 }
 
@@ -8874,18 +9198,25 @@ void ModulationControlPanel::refreshFromEngine()
     if (!engine)
         return;
 
+    const bool pinnedSelectionChanged = followPinnedSceneMotionContextFromMonome(*engine);
     if (!pinnedContextActive)
         selectedStrip = juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, processor.getLastMonomePressedStripRow());
+
+    if (!pinnedContextActive
+        && processor.isControlModeActive()
+        && processor.getCurrentControlMode() == MlrVSTAudioProcessor::ControlMode::Modulation)
+    {
+        if (auto* strip = engine->getStrip(selectedStrip); strip != nullptr && strip->isPlaying())
+        {
+            const int playbackPage = engine->getModCurrentPage(selectedStrip);
+            if (engine->getModEditPage(selectedStrip) != playbackPage)
+                engine->setModEditPage(selectedStrip, playbackPage);
+        }
+    }
 
     ensurePinnedSlotSelected(*engine);
 
     titleLabel.setText(pinnedContextActive ? "Scene Motion Step Editor" : "Per-Row Modulation Sequencer",
-                       juce::dontSendNotification);
-    stripLabel.setText(pinnedContextActive
-                           ? (pinnedContextLabel.isNotEmpty()
-                                  ? pinnedContextLabel
-                                  : ("Scene Motion  Strip " + juce::String(selectedStrip + 1)))
-                           : ("Selected Row: " + juce::String(selectedStrip + 1) + " (last pressed)"),
                        juce::dontSendNotification);
 
     const bool showSceneStripTools = pinnedContextActive;
@@ -8904,6 +9235,11 @@ void ModulationControlPanel::refreshFromEngine()
     sceneStripCopyButton.setEnabled(showSceneStripTools
                                     && onSceneStripCopyTo != nullptr
                                     && MlrVSTAudioProcessor::MaxStrips > 1);
+    const bool showRateControls = !pinnedContextActive;
+    const bool rateUiChanged = (rateLabel.isVisible() != showRateControls)
+        || (rateBox.isVisible() != showRateControls);
+    rateLabel.setVisible(showRateControls);
+    rateBox.setVisible(showRateControls);
 
     const int slot = selectedSlotOverride >= 0 ? selectedSlotOverride : engine->getModSequencerSlot(selectedStrip);
     const auto state = engine->getModSequencerState(selectedStrip);
@@ -8946,6 +9282,13 @@ void ModulationControlPanel::refreshFromEngine()
     const auto pitchScale = pinnedContextActive
         ? engine->getModPitchScaleForSlot(selectedStrip, slot)
         : static_cast<ModernAudioEngine::PitchScale>(state.pitchScale);
+    stripLabel.setText(pinnedContextActive
+                           ? ((pinnedContextLabel.isNotEmpty()
+                                   ? pinnedContextLabel
+                                   : ("Scene Motion  Strip " + juce::String(selectedStrip + 1)))
+                              + "  •  " + modTargetDisplayName(target))
+                           : ("Selected Row: " + juce::String(selectedStrip + 1) + " (last pressed)"),
+                       juce::dontSendNotification);
     const int maxBars = maxLengthBarsForCurrentContext();
     const int effectiveLengthBars = juce::jlimit(1, maxBars, lengthBars);
     const int effectiveEditPage = juce::jlimit(0, juce::jmax(0, effectiveLengthBars - 1), editPage);
@@ -8955,7 +9298,7 @@ void ModulationControlPanel::refreshFromEngine()
         && (lengthBars != effectiveLengthBars || editPage != effectiveEditPage))
     {
         engine->setModLengthBarsForSlot(selectedStrip, slot, effectiveLengthBars);
-        engine->setModEditPage(selectedStrip, effectiveEditPage);
+        engine->setModEditPageForSlot(selectedStrip, slot, effectiveEditPage);
         syncPinnedSceneMotionIfNeeded();
     }
 
@@ -8963,7 +9306,8 @@ void ModulationControlPanel::refreshFromEngine()
     bipolarToggle.setToggleState(bipolar, juce::dontSendNotification);
     bipolarToggle.setEnabled(modTargetAllowsBipolar(target));
     depthSlider.setValue(depth, juce::dontSendNotification);
-    rateBox.setSelectedId(modRateToComboId(rate), juce::dontSendNotification);
+    if (showRateControls)
+        rateBox.setSelectedId(modRateToComboId(rate), juce::dontSendNotification);
     transportBox.setSelectedId(static_cast<int>(transportMode) + 1, juce::dontSendNotification);
     lengthBox.setSelectedId(effectiveLengthBars, juce::dontSendNotification);
     pageBox.setSelectedId(effectiveEditPage + 1, juce::dontSendNotification);
@@ -9074,8 +9418,11 @@ void ModulationControlPanel::refreshFromEngine()
                          + "Click: toggle step. Drag: draw. Cmd+drag: divide. Ctrl+drag: ramp up. Opt+drag: ramp down.");
         }
     }
-    if (targetUiChanged)
+    if (targetUiChanged || rateUiChanged)
         resized();
+    if (pinnedSelectionChanged && onPinnedSceneMotionChange != nullptr)
+        onPinnedSceneMotionChange();
+    repaint();
 }
 
 void ModulationControlPanel::showSceneStripCopyMenu()
@@ -9703,4 +10050,13 @@ void MlrVSTAudioProcessorEditor::timerCallback()
         if (monomeGrid)
             monomeGrid->updateFromEngine();
     }
+}
+
+void MlrVSTAudioProcessorEditor::refreshSceneControlNow()
+{
+    if (sceneControl == nullptr)
+        return;
+
+    sceneControl->refreshFromProcessor();
+    sceneControl->repaint();
 }

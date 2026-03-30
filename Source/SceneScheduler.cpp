@@ -21,8 +21,12 @@ using SceneLengthMode = MlrVSTAudioProcessor::SceneLengthMode;
 using SceneRecallMode = MlrVSTAudioProcessor::SceneRecallMode;
 using SceneChainTransitionType = MlrVSTAudioProcessor::SceneChainTransitionType;
 using SceneChainTransitionOption = MlrVSTAudioProcessor::SceneChainTransitionOption;
+using SceneChainTransitionScope = MlrVSTAudioProcessor::SceneChainTransitionScope;
+using SceneChainTransitionContour = MlrVSTAudioProcessor::SceneChainTransitionContour;
+using SceneChainTransitionCondition = MlrVSTAudioProcessor::SceneChainTransitionCondition;
 using SceneChainState = MlrVSTAudioProcessor::SceneChainState;
 using SceneChainStep = MlrVSTAudioProcessor::SceneChainStep;
+using SceneChainTransitionFavorite = MlrVSTAudioProcessor::SceneChainTransitionFavorite;
 
 void appendSceneDebugLog(const juce::String& message)
 {
@@ -80,12 +84,44 @@ void clearSceneChainStep(SceneChainStep& step)
     step.repeats = 1;
     step.transitionToNext = SceneChainTransitionType::None;
     step.transitionOption = SceneChainTransitionOption::Default;
+    step.transitionScope = SceneChainTransitionScope::All;
+    step.transitionContour = SceneChainTransitionContour::Smooth;
+    step.transitionCondition = SceneChainTransitionCondition::Always;
     step.transitionLengthBeats = MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats;
     step.transitionSubtractsFromSceneLength = false;
     step.transitionIntensity = MlrVSTAudioProcessor::DefaultSceneTransitionIntensity;
     step.transitionDelayAmount = MlrVSTAudioProcessor::DefaultSceneTransitionDelayAmount;
     step.transitionFilterAmount = MlrVSTAudioProcessor::DefaultSceneTransitionFilterAmount;
     step.transitionChopAmount = MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount;
+    step.transitionEndSampleFile = juce::File();
+    step.transitionEndSampleSettings = {};
+}
+
+juce::File normalizedSceneTransitionEndSampleDirectory(const juce::File& directory)
+{
+    const auto path = directory.getFullPathName().trim();
+    if (path.isEmpty() || !juce::File::isAbsolutePath(path))
+        return {};
+
+    return directory;
+}
+
+juce::File inferSceneTransitionEndSampleDirectory(const SceneChainState& chainState,
+                                                  const juce::File& fallbackDirectory)
+{
+    const auto normalizedFallback = normalizedSceneTransitionEndSampleDirectory(fallbackDirectory);
+    if (normalizedFallback != juce::File())
+        return normalizedFallback;
+
+    for (const auto& step : chainState.steps)
+    {
+        const auto parentDirectory =
+            normalizedSceneTransitionEndSampleDirectory(step.transitionEndSampleFile.getParentDirectory());
+        if (parentDirectory != juce::File())
+            return parentDirectory;
+    }
+
+    return {};
 }
 
 int sanitizeSceneChainSceneSlot(int rawSceneSlot)
@@ -126,6 +162,45 @@ SceneChainTransitionOption sanitizeSceneChainTransitionOption(int rawOption)
     return sanitizeSceneChainTransitionOption(static_cast<SceneChainTransitionOption>(rawOption));
 }
 
+SceneChainTransitionScope sanitizeSceneChainTransitionScope(SceneChainTransitionScope scope)
+{
+    return static_cast<SceneChainTransitionScope>(juce::jlimit(
+        0,
+        static_cast<int>(SceneChainTransitionScope::Flip),
+        static_cast<int>(scope)));
+}
+
+SceneChainTransitionScope sanitizeSceneChainTransitionScope(int rawScope)
+{
+    return sanitizeSceneChainTransitionScope(static_cast<SceneChainTransitionScope>(rawScope));
+}
+
+SceneChainTransitionContour sanitizeSceneChainTransitionContour(SceneChainTransitionContour contour)
+{
+    return static_cast<SceneChainTransitionContour>(juce::jlimit(
+        0,
+        static_cast<int>(SceneChainTransitionContour::LateHit),
+        static_cast<int>(contour)));
+}
+
+SceneChainTransitionContour sanitizeSceneChainTransitionContour(int rawContour)
+{
+    return sanitizeSceneChainTransitionContour(static_cast<SceneChainTransitionContour>(rawContour));
+}
+
+SceneChainTransitionCondition sanitizeSceneChainTransitionCondition(SceneChainTransitionCondition condition)
+{
+    return static_cast<SceneChainTransitionCondition>(juce::jlimit(
+        0,
+        static_cast<int>(SceneChainTransitionCondition::ForwardOnly),
+        static_cast<int>(condition)));
+}
+
+SceneChainTransitionCondition sanitizeSceneChainTransitionCondition(int rawCondition)
+{
+    return sanitizeSceneChainTransitionCondition(static_cast<SceneChainTransitionCondition>(rawCondition));
+}
+
 float sanitizeSceneChainTransitionLengthBeats(float beats)
 {
     if (!std::isfinite(beats))
@@ -142,8 +217,76 @@ float sanitizeSceneChainTransitionAmount(float amount, float fallback)
     return juce::jlimit(0.0f, 1.0f, amount);
 }
 
+MlrVSTAudioProcessor::SceneTransitionEndSampleSettings sanitizeSceneTransitionEndSampleSettings(
+    MlrVSTAudioProcessor::SceneTransitionEndSampleSettings settings)
+{
+    auto sanitizeFinite = [](float value, float fallback, float minValue, float maxValue)
+    {
+        if (!std::isfinite(value))
+            value = fallback;
+        return juce::jlimit(minValue, maxValue, value);
+    };
+
+    settings.gainDb = sanitizeFinite(settings.gainDb,
+                                     MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleGainDb,
+                                     -36.0f,
+                                     24.0f);
+    settings.fadeInMs = sanitizeFinite(settings.fadeInMs,
+                                       MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleFadeInMs,
+                                       0.0f,
+                                       500.0f);
+    settings.fadeOutMs = sanitizeFinite(settings.fadeOutMs,
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleFadeOutMs,
+                                        0.0f,
+                                        500.0f);
+    settings.pitchSemitones = sanitizeFinite(settings.pitchSemitones,
+                                             MlrVSTAudioProcessor::DefaultSceneTransitionEndSamplePitchSemitones,
+                                             -24.0f,
+                                             24.0f);
+    settings.lowpassHz = sanitizeFinite(settings.lowpassHz,
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleLowpassHz,
+                                        20.0f,
+                                        20000.0f);
+    settings.highpassHz = sanitizeFinite(settings.highpassHz,
+                                         MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleHighpassHz,
+                                         20.0f,
+                                         20000.0f);
+    settings.highpassHz = juce::jmin(settings.highpassHz, settings.lowpassHz);
+    settings.duckSource = juce::jlimit(MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleDuckSource,
+                                       MlrVSTAudioProcessor::MaxStrips + 1,
+                                       settings.duckSource);
+    settings.duckAmount = sanitizeFinite(settings.duckAmount,
+                                         MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleDuckAmount,
+                                         0.0f,
+                                         1.0f);
+    return settings;
+}
+
+bool sceneTransitionEndSampleSettingsEqual(const MlrVSTAudioProcessor::SceneTransitionEndSampleSettings& a,
+                                           const MlrVSTAudioProcessor::SceneTransitionEndSampleSettings& b)
+{
+    auto nearlyEqual = [](float lhs, float rhs)
+    {
+        return std::abs(lhs - rhs) <= 1.0e-4f;
+    };
+
+    return nearlyEqual(a.gainDb, b.gainDb)
+        && nearlyEqual(a.fadeInMs, b.fadeInMs)
+        && nearlyEqual(a.fadeOutMs, b.fadeOutMs)
+        && a.chokePrevious == b.chokePrevious
+        && a.reverse == b.reverse
+        && nearlyEqual(a.pitchSemitones, b.pitchSemitones)
+        && nearlyEqual(a.lowpassHz, b.lowpassHz)
+        && nearlyEqual(a.highpassHz, b.highpassHz)
+        && a.duckSource == b.duckSource
+        && nearlyEqual(a.duckAmount, b.duckAmount);
+}
+
 void sanitizeSceneChainTransitionParameters(SceneChainStep& step)
 {
+    step.transitionScope = sanitizeSceneChainTransitionScope(step.transitionScope);
+    step.transitionContour = sanitizeSceneChainTransitionContour(step.transitionContour);
+    step.transitionCondition = sanitizeSceneChainTransitionCondition(step.transitionCondition);
     step.transitionLengthBeats = sanitizeSceneChainTransitionLengthBeats(step.transitionLengthBeats);
     step.transitionIntensity = sanitizeSceneChainTransitionAmount(
         step.transitionIntensity,
@@ -157,6 +300,72 @@ void sanitizeSceneChainTransitionParameters(SceneChainStep& step)
     step.transitionChopAmount = sanitizeSceneChainTransitionAmount(
         step.transitionChopAmount,
         MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount);
+    step.transitionEndSampleSettings = sanitizeSceneTransitionEndSampleSettings(step.transitionEndSampleSettings);
+}
+
+void sanitizeSceneChainTransitionFavorite(SceneChainTransitionFavorite& favorite)
+{
+    favorite.type = sanitizeSceneChainTransitionType(favorite.type);
+    favorite.option = sanitizeSceneChainTransitionOption(favorite.option);
+    favorite.scope = sanitizeSceneChainTransitionScope(favorite.scope);
+    favorite.contour = sanitizeSceneChainTransitionContour(favorite.contour);
+    favorite.condition = sanitizeSceneChainTransitionCondition(favorite.condition);
+    favorite.lengthBeats = sanitizeSceneChainTransitionLengthBeats(favorite.lengthBeats);
+    favorite.intensity = sanitizeSceneChainTransitionAmount(
+        favorite.intensity,
+        MlrVSTAudioProcessor::DefaultSceneTransitionIntensity);
+    favorite.delayAmount = sanitizeSceneChainTransitionAmount(
+        favorite.delayAmount,
+        MlrVSTAudioProcessor::DefaultSceneTransitionDelayAmount);
+    favorite.filterAmount = sanitizeSceneChainTransitionAmount(
+        favorite.filterAmount,
+        MlrVSTAudioProcessor::DefaultSceneTransitionFilterAmount);
+    favorite.chopAmount = sanitizeSceneChainTransitionAmount(
+        favorite.chopAmount,
+        MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount);
+}
+
+uint64_t sceneChainTransitionConditionSeed(int fromStepIndex, int toStepIndex, double targetPpq)
+{
+    const auto safeFrom = static_cast<uint64_t>(juce::jmax(0, fromStepIndex) + 1);
+    const auto safeTo = static_cast<uint64_t>(juce::jmax(0, toStepIndex) + 1);
+    uint64_t seed = safeFrom * 0x9e3779b97f4a7c15ULL;
+    seed ^= safeTo * 0xbf58476d1ce4e5b9ULL;
+    if (std::isfinite(targetPpq))
+    {
+        const auto ppqTicks = static_cast<uint64_t>(std::llround(juce::jmax(0.0, targetPpq) * 960.0));
+        seed ^= ppqTicks + 0x94d049bb133111ebULL;
+    }
+    seed ^= (seed >> 30);
+    seed *= 0xbf58476d1ce4e5b9ULL;
+    seed ^= (seed >> 27);
+    seed *= 0x94d049bb133111ebULL;
+    seed ^= (seed >> 31);
+    return seed;
+}
+
+bool sceneChainTransitionConditionAllows(SceneChainTransitionCondition condition,
+                                         int fromStepIndex,
+                                         int toStepIndex,
+                                         double targetPpq,
+                                         bool isLoopbackHandoff)
+{
+    switch (sanitizeSceneChainTransitionCondition(condition))
+    {
+        case SceneChainTransitionCondition::Chance50:
+            return (sceneChainTransitionConditionSeed(fromStepIndex, toStepIndex, targetPpq)
+                    & 0xffffffffULL) < 0x80000000ULL;
+        case SceneChainTransitionCondition::Chance25:
+            return (sceneChainTransitionConditionSeed(fromStepIndex, toStepIndex, targetPpq)
+                    & 0xffffffffULL) < 0x40000000ULL;
+        case SceneChainTransitionCondition::LoopOnly:
+            return isLoopbackHandoff;
+        case SceneChainTransitionCondition::ForwardOnly:
+            return !isLoopbackHandoff;
+        case SceneChainTransitionCondition::Always:
+        default:
+            return true;
+    }
 }
 
 bool isValidSceneStoredSamplePath(const juce::File& file)
@@ -247,6 +456,9 @@ void normalizeSceneChainState(SceneChainState& state)
         normalized.repeats = sanitizeSceneChainRepeats(step.repeats);
         normalized.transitionToNext = sanitizeSceneChainTransitionType(step.transitionToNext);
         normalized.transitionOption = sanitizeSceneChainTransitionOption(step.transitionOption);
+        normalized.transitionScope = sanitizeSceneChainTransitionScope(step.transitionScope);
+        normalized.transitionContour = sanitizeSceneChainTransitionContour(step.transitionContour);
+        normalized.transitionCondition = sanitizeSceneChainTransitionCondition(step.transitionCondition);
         normalized.transitionLengthBeats = step.transitionLengthBeats;
         normalized.transitionSubtractsFromSceneLength = step.transitionSubtractsFromSceneLength;
         normalized.transitionIntensity = step.transitionIntensity;
@@ -400,6 +612,28 @@ void SceneScheduler::markSceneChainTransitionEdited(MlrVSTAudioProcessor& proces
                     processor.sceneChainState.steps[static_cast<size_t>(safeEditedStep)].transitionChopAmount,
                     MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount),
                 std::memory_order_release);
+            const auto updatedEndSampleSettings = sanitizeSceneTransitionEndSampleSettings(
+                processor.sceneChainState.steps[static_cast<size_t>(safeEditedStep)].transitionEndSampleSettings);
+            processor.sceneBoundaryTransitionEndSampleGainDb.store(updatedEndSampleSettings.gainDb,
+                                                                   std::memory_order_release);
+            processor.sceneBoundaryTransitionEndSampleFadeInMs.store(updatedEndSampleSettings.fadeInMs,
+                                                                     std::memory_order_release);
+            processor.sceneBoundaryTransitionEndSampleFadeOutMs.store(updatedEndSampleSettings.fadeOutMs,
+                                                                      std::memory_order_release);
+            processor.sceneBoundaryTransitionEndSampleChokePrevious.store(updatedEndSampleSettings.chokePrevious ? 1 : 0,
+                                                                          std::memory_order_release);
+            processor.sceneBoundaryTransitionEndSampleReverse.store(updatedEndSampleSettings.reverse ? 1 : 0,
+                                                                    std::memory_order_release);
+            processor.sceneBoundaryTransitionEndSamplePitchSemitones.store(updatedEndSampleSettings.pitchSemitones,
+                                                                           std::memory_order_release);
+            processor.sceneBoundaryTransitionEndSampleLowpassHz.store(updatedEndSampleSettings.lowpassHz,
+                                                                      std::memory_order_release);
+            processor.sceneBoundaryTransitionEndSampleHighpassHz.store(updatedEndSampleSettings.highpassHz,
+                                                                       std::memory_order_release);
+            processor.sceneBoundaryTransitionEndSampleDuckSource.store(updatedEndSampleSettings.duckSource,
+                                                                       std::memory_order_release);
+            processor.sceneBoundaryTransitionEndSampleDuckAmount.store(updatedEndSampleSettings.duckAmount,
+                                                                       std::memory_order_release);
         }
     }
 
@@ -450,6 +684,22 @@ void SceneScheduler::setSceneRepeatCount(MlrVSTAudioProcessor& processor, int sc
         return;
 
     processor.sceneRepeatCounts[idx] = clampedRepeats;
+    {
+        const int mainPresetIndex = processor.getActiveMainPresetIndexForScenes();
+        auto& storedState = processor.storedSceneSlotStates[idx];
+        if (storedState.mainPresetIndex == juce::jlimit(0, MlrVSTAudioProcessor::MaxPresetSlots - 1, mainPresetIndex)
+            && storedState.sceneSlot == safeSceneSlot
+            && storedState.preparedSwitchPayloadTemplate != nullptr)
+        {
+            auto& timingState = storedState.preparedSwitchPayloadTemplate->sceneTimingState;
+            timingState.valid = true;
+            timingState.repeatCount = clampedRepeats;
+            timingState.lengthModeIndex = getSceneLengthModeIndex(processor, safeSceneSlot);
+            timingState.manualBars = getSceneManualBars(processor, safeSceneSlot);
+            timingState.anchorStrip = getSceneAnchorStrip(processor, safeSceneSlot);
+        }
+    }
+    processor.syncScenePerformanceClipLengthToResolvedLength(safeSceneSlot);
     if (safeSceneSlot == processor.activeSceneSlot)
         processor.queueActiveSceneAutosave();
     if (processor.sceneSequenceActive
@@ -472,6 +722,21 @@ void SceneScheduler::setSceneLengthModeIndex(MlrVSTAudioProcessor& processor, in
         return;
 
     processor.sceneLengthModes[idx] = clampedMode;
+    {
+        const int mainPresetIndex = processor.getActiveMainPresetIndexForScenes();
+        auto& storedState = processor.storedSceneSlotStates[idx];
+        if (storedState.mainPresetIndex == juce::jlimit(0, MlrVSTAudioProcessor::MaxPresetSlots - 1, mainPresetIndex)
+            && storedState.sceneSlot == safeSceneSlot
+            && storedState.preparedSwitchPayloadTemplate != nullptr)
+        {
+            auto& timingState = storedState.preparedSwitchPayloadTemplate->sceneTimingState;
+            timingState.valid = true;
+            timingState.repeatCount = getSceneRepeatCount(processor, safeSceneSlot);
+            timingState.lengthModeIndex = clampedMode;
+            timingState.manualBars = getSceneManualBars(processor, safeSceneSlot);
+            timingState.anchorStrip = getSceneAnchorStrip(processor, safeSceneSlot);
+        }
+    }
     processor.syncScenePerformanceClipLengthToResolvedLength(safeSceneSlot);
     if (safeSceneSlot == processor.activeSceneSlot)
         processor.queueActiveSceneAutosave();
@@ -525,6 +790,21 @@ void SceneScheduler::setSceneManualBars(MlrVSTAudioProcessor& processor, int sce
         return;
 
     processor.sceneManualBars[idx] = clampedBars;
+    {
+        const int mainPresetIndex = processor.getActiveMainPresetIndexForScenes();
+        auto& storedState = processor.storedSceneSlotStates[idx];
+        if (storedState.mainPresetIndex == juce::jlimit(0, MlrVSTAudioProcessor::MaxPresetSlots - 1, mainPresetIndex)
+            && storedState.sceneSlot == safeSceneSlot
+            && storedState.preparedSwitchPayloadTemplate != nullptr)
+        {
+            auto& timingState = storedState.preparedSwitchPayloadTemplate->sceneTimingState;
+            timingState.valid = true;
+            timingState.repeatCount = getSceneRepeatCount(processor, safeSceneSlot);
+            timingState.lengthModeIndex = getSceneLengthModeIndex(processor, safeSceneSlot);
+            timingState.manualBars = clampedBars;
+            timingState.anchorStrip = getSceneAnchorStrip(processor, safeSceneSlot);
+        }
+    }
     processor.syncScenePerformanceClipLengthToResolvedLength(safeSceneSlot);
     if (safeSceneSlot == processor.activeSceneSlot)
         processor.queueActiveSceneAutosave();
@@ -548,6 +828,21 @@ void SceneScheduler::setSceneAnchorStrip(MlrVSTAudioProcessor& processor, int sc
         return;
 
     processor.sceneAnchorStrips[idx] = clampedStrip;
+    {
+        const int mainPresetIndex = processor.getActiveMainPresetIndexForScenes();
+        auto& storedState = processor.storedSceneSlotStates[idx];
+        if (storedState.mainPresetIndex == juce::jlimit(0, MlrVSTAudioProcessor::MaxPresetSlots - 1, mainPresetIndex)
+            && storedState.sceneSlot == safeSceneSlot
+            && storedState.preparedSwitchPayloadTemplate != nullptr)
+        {
+            auto& timingState = storedState.preparedSwitchPayloadTemplate->sceneTimingState;
+            timingState.valid = true;
+            timingState.repeatCount = getSceneRepeatCount(processor, safeSceneSlot);
+            timingState.lengthModeIndex = getSceneLengthModeIndex(processor, safeSceneSlot);
+            timingState.manualBars = getSceneManualBars(processor, safeSceneSlot);
+            timingState.anchorStrip = clampedStrip;
+        }
+    }
     processor.syncScenePerformanceClipLengthToResolvedLength(safeSceneSlot);
     if (safeSceneSlot == processor.activeSceneSlot)
         processor.queueActiveSceneAutosave();
@@ -728,6 +1023,27 @@ int SceneScheduler::getSceneChainStepTransitionOptionIndex(const MlrVSTAudioProc
         processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)].transitionOption));
 }
 
+int SceneScheduler::getSceneChainStepTransitionScopeIndex(const MlrVSTAudioProcessor& processor, int stepIndex)
+{
+    const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
+    return static_cast<int>(sanitizeSceneChainTransitionScope(
+        processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)].transitionScope));
+}
+
+int SceneScheduler::getSceneChainStepTransitionContourIndex(const MlrVSTAudioProcessor& processor, int stepIndex)
+{
+    const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
+    return static_cast<int>(sanitizeSceneChainTransitionContour(
+        processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)].transitionContour));
+}
+
+int SceneScheduler::getSceneChainStepTransitionConditionIndex(const MlrVSTAudioProcessor& processor, int stepIndex)
+{
+    const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
+    return static_cast<int>(sanitizeSceneChainTransitionCondition(
+        processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)].transitionCondition));
+}
+
 float SceneScheduler::getSceneChainStepTransitionLengthBeats(const MlrVSTAudioProcessor& processor, int stepIndex)
 {
     const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
@@ -774,6 +1090,27 @@ float SceneScheduler::getSceneChainStepTransitionChopAmount(const MlrVSTAudioPro
         MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount);
 }
 
+juce::File SceneScheduler::getSceneTransitionEndSampleDirectory(const MlrVSTAudioProcessor& processor)
+{
+    return processor.sceneChainState.transitionEndSampleDirectory;
+}
+
+juce::File SceneScheduler::getSceneChainStepTransitionEndSampleFile(const MlrVSTAudioProcessor& processor,
+                                                                    int stepIndex)
+{
+    const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
+    return processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)].transitionEndSampleFile;
+}
+
+MlrVSTAudioProcessor::SceneTransitionEndSampleSettings
+SceneScheduler::getSceneChainStepTransitionEndSampleSettings(const MlrVSTAudioProcessor& processor,
+                                                             int stepIndex)
+{
+    const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
+    return sanitizeSceneTransitionEndSampleSettings(
+        processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)].transitionEndSampleSettings);
+}
+
 void SceneScheduler::setSceneChainStep(MlrVSTAudioProcessor& processor, int stepIndex, int sceneSlot, int repeats)
 {
     const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
@@ -808,6 +1145,48 @@ void SceneScheduler::setSceneChainStepTransitionOptionIndex(MlrVSTAudioProcessor
         return;
 
     step.transitionOption = safeOption;
+    markSceneChainTransitionEdited(processor, safeStepIndex);
+}
+
+void SceneScheduler::setSceneChainStepTransitionScopeIndex(MlrVSTAudioProcessor& processor,
+                                                           int stepIndex,
+                                                           int scopeIndex)
+{
+    const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
+    const auto safeScope = sanitizeSceneChainTransitionScope(scopeIndex);
+    auto& step = processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)];
+    if (step.transitionScope == safeScope)
+        return;
+
+    step.transitionScope = safeScope;
+    markSceneChainTransitionEdited(processor, safeStepIndex);
+}
+
+void SceneScheduler::setSceneChainStepTransitionContourIndex(MlrVSTAudioProcessor& processor,
+                                                             int stepIndex,
+                                                             int contourIndex)
+{
+    const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
+    const auto safeContour = sanitizeSceneChainTransitionContour(contourIndex);
+    auto& step = processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)];
+    if (step.transitionContour == safeContour)
+        return;
+
+    step.transitionContour = safeContour;
+    markSceneChainTransitionEdited(processor, safeStepIndex);
+}
+
+void SceneScheduler::setSceneChainStepTransitionConditionIndex(MlrVSTAudioProcessor& processor,
+                                                               int stepIndex,
+                                                               int conditionIndex)
+{
+    const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
+    const auto safeCondition = sanitizeSceneChainTransitionCondition(conditionIndex);
+    auto& step = processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)];
+    if (step.transitionCondition == safeCondition)
+        return;
+
+    step.transitionCondition = safeCondition;
     markSceneChainTransitionEdited(processor, safeStepIndex);
 }
 
@@ -899,6 +1278,45 @@ void SceneScheduler::setSceneChainStepTransitionChopAmount(MlrVSTAudioProcessor&
         return;
 
     step.transitionChopAmount = safeAmount;
+    markSceneChainTransitionEdited(processor, safeStepIndex);
+}
+
+void SceneScheduler::setSceneTransitionEndSampleDirectory(MlrVSTAudioProcessor& processor, const juce::File& directory)
+{
+    const juce::File normalized = directory.getFullPathName().trim().isEmpty() ? juce::File() : directory;
+    if (processor.sceneChainState.transitionEndSampleDirectory == normalized)
+        return;
+
+    processor.sceneChainState.transitionEndSampleDirectory = normalized;
+    processor.markPersistentGlobalUserChange();
+}
+
+void SceneScheduler::setSceneChainStepTransitionEndSampleFile(MlrVSTAudioProcessor& processor,
+                                                              int stepIndex,
+                                                              const juce::File& file)
+{
+    const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
+    auto& step = processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)];
+    const juce::File normalized = file.getFullPathName().trim().isEmpty() ? juce::File() : file;
+    if (step.transitionEndSampleFile == normalized)
+        return;
+
+    step.transitionEndSampleFile = normalized;
+    markSceneChainTransitionEdited(processor, safeStepIndex);
+}
+
+void SceneScheduler::setSceneChainStepTransitionEndSampleSettings(
+    MlrVSTAudioProcessor& processor,
+    int stepIndex,
+    const MlrVSTAudioProcessor::SceneTransitionEndSampleSettings& settings)
+{
+    const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
+    auto& step = processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)];
+    const auto sanitized = sanitizeSceneTransitionEndSampleSettings(settings);
+    if (sceneTransitionEndSampleSettingsEqual(step.transitionEndSampleSettings, sanitized))
+        return;
+
+    step.transitionEndSampleSettings = sanitized;
     markSceneChainTransitionEdited(processor, safeStepIndex);
 }
 
@@ -1080,6 +1498,7 @@ std::unique_ptr<juce::XmlElement> SceneScheduler::createSceneChainStateXml(const
     xml->setAttribute("chainLoopEnabled", isSceneChainLoopEnabled(processor));
     xml->setAttribute("chainLoopStart", getSceneChainLoopStartStep(processor));
     xml->setAttribute("chainLoopEnd", getSceneChainLoopEndStep(processor));
+    xml->setAttribute("chainTransitionSampleDir", getSceneTransitionEndSampleDirectory(processor).getFullPathName());
     for (int stepIndex = 0; stepIndex < chainLength; ++stepIndex)
     {
         xml->setAttribute("chainScene" + juce::String(stepIndex), getSceneChainStepSceneSlot(processor, stepIndex));
@@ -1088,6 +1507,12 @@ std::unique_ptr<juce::XmlElement> SceneScheduler::createSceneChainStateXml(const
                           getSceneChainStepTransitionTypeIndex(processor, stepIndex));
         xml->setAttribute("chainTransitionOption" + juce::String(stepIndex),
                           getSceneChainStepTransitionOptionIndex(processor, stepIndex));
+        xml->setAttribute("chainTransitionScope" + juce::String(stepIndex),
+                          getSceneChainStepTransitionScopeIndex(processor, stepIndex));
+        xml->setAttribute("chainTransitionContour" + juce::String(stepIndex),
+                          getSceneChainStepTransitionContourIndex(processor, stepIndex));
+        xml->setAttribute("chainTransitionCondition" + juce::String(stepIndex),
+                          getSceneChainStepTransitionConditionIndex(processor, stepIndex));
         xml->setAttribute("chainTransitionLength" + juce::String(stepIndex),
                           getSceneChainStepTransitionLengthBeats(processor, stepIndex));
         xml->setAttribute("chainTransitionSubtractFromScene" + juce::String(stepIndex),
@@ -1100,6 +1525,36 @@ std::unique_ptr<juce::XmlElement> SceneScheduler::createSceneChainStateXml(const
                           getSceneChainStepTransitionFilterAmount(processor, stepIndex));
         xml->setAttribute("chainTransitionChop" + juce::String(stepIndex),
                           getSceneChainStepTransitionChopAmount(processor, stepIndex));
+        xml->setAttribute("chainTransitionEndSample" + juce::String(stepIndex),
+                          getSceneChainStepTransitionEndSampleFile(processor, stepIndex).getFullPathName());
+        const auto endSampleSettings = getSceneChainStepTransitionEndSampleSettings(processor, stepIndex);
+        xml->setAttribute("chainTransitionEndSampleGainDb" + juce::String(stepIndex), endSampleSettings.gainDb);
+        xml->setAttribute("chainTransitionEndSampleFadeIn" + juce::String(stepIndex), endSampleSettings.fadeInMs);
+        xml->setAttribute("chainTransitionEndSampleFadeOut" + juce::String(stepIndex), endSampleSettings.fadeOutMs);
+        xml->setAttribute("chainTransitionEndSampleChoke" + juce::String(stepIndex), endSampleSettings.chokePrevious);
+        xml->setAttribute("chainTransitionEndSampleReverse" + juce::String(stepIndex), endSampleSettings.reverse);
+        xml->setAttribute("chainTransitionEndSamplePitch" + juce::String(stepIndex), endSampleSettings.pitchSemitones);
+        xml->setAttribute("chainTransitionEndSampleLowpass" + juce::String(stepIndex), endSampleSettings.lowpassHz);
+        xml->setAttribute("chainTransitionEndSampleHighpass" + juce::String(stepIndex), endSampleSettings.highpassHz);
+        xml->setAttribute("chainTransitionEndSampleDuckSource" + juce::String(stepIndex), endSampleSettings.duckSource);
+        xml->setAttribute("chainTransitionEndSampleDuckAmount" + juce::String(stepIndex), endSampleSettings.duckAmount);
+    }
+
+    for (int favoriteIndex = 0; favoriteIndex < MlrVSTAudioProcessor::SceneTransitionFavoriteSlots; ++favoriteIndex)
+    {
+        const auto& favorite = processor.sceneTransitionFavorites[static_cast<size_t>(favoriteIndex)];
+        xml->setAttribute("chainFillFavoriteValid" + juce::String(favoriteIndex), favorite.valid);
+        xml->setAttribute("chainFillFavoriteType" + juce::String(favoriteIndex), static_cast<int>(favorite.type));
+        xml->setAttribute("chainFillFavoriteOption" + juce::String(favoriteIndex), static_cast<int>(favorite.option));
+        xml->setAttribute("chainFillFavoriteScope" + juce::String(favoriteIndex), static_cast<int>(favorite.scope));
+        xml->setAttribute("chainFillFavoriteContour" + juce::String(favoriteIndex), static_cast<int>(favorite.contour));
+        xml->setAttribute("chainFillFavoriteCondition" + juce::String(favoriteIndex), static_cast<int>(favorite.condition));
+        xml->setAttribute("chainFillFavoriteLength" + juce::String(favoriteIndex), favorite.lengthBeats);
+        xml->setAttribute("chainFillFavoriteSubtract" + juce::String(favoriteIndex), favorite.subtractFromSceneLength);
+        xml->setAttribute("chainFillFavoriteIntensity" + juce::String(favoriteIndex), favorite.intensity);
+        xml->setAttribute("chainFillFavoriteDelay" + juce::String(favoriteIndex), favorite.delayAmount);
+        xml->setAttribute("chainFillFavoriteFilter" + juce::String(favoriteIndex), favorite.filterAmount);
+        xml->setAttribute("chainFillFavoriteChop" + juce::String(favoriteIndex), favorite.chopAmount);
     }
 
     auto* storedScenesXml = xml->createNewChildElement("StoredScenes");
@@ -1107,7 +1562,9 @@ std::unique_ptr<juce::XmlElement> SceneScheduler::createSceneChainStateXml(const
     for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
     {
         const auto* storedSceneState = processor.getStoredSceneSlotState(activeMainPresetIndex, sceneSlot);
-        if (storedSceneState == nullptr || storedSceneState->preparedSwitchPayloadTemplate == nullptr)
+        if (storedSceneState == nullptr
+            || storedSceneState->implicitMainPresetFallback
+            || storedSceneState->preparedSwitchPayloadTemplate == nullptr)
             continue;
 
         auto* sceneSlotXml = storedScenesXml->createNewChildElement("SceneSlot");
@@ -1188,25 +1645,49 @@ void SceneScheduler::applySceneChainStateXml(MlrVSTAudioProcessor& processor,
     bool hasChainAttributes = xml->hasAttribute("chainStepCount")
         || xml->hasAttribute("chainLoopEnabled")
         || xml->hasAttribute("chainLoopStart")
-        || xml->hasAttribute("chainLoopEnd");
+        || xml->hasAttribute("chainLoopEnd")
+        || xml->hasAttribute("chainTransitionSampleDir");
     for (int stepIndex = 0; stepIndex < MlrVSTAudioProcessor::MaxSceneChainSteps && !hasChainAttributes; ++stepIndex)
     {
             hasChainAttributes = xml->hasAttribute("chainScene" + juce::String(stepIndex))
                 || xml->hasAttribute("chainRepeats" + juce::String(stepIndex))
                 || xml->hasAttribute("chainTransition" + juce::String(stepIndex))
                 || xml->hasAttribute("chainTransitionOption" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionScope" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionContour" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionCondition" + juce::String(stepIndex))
                 || xml->hasAttribute("chainTransitionLength" + juce::String(stepIndex))
                 || xml->hasAttribute("chainTransitionSubtractFromScene" + juce::String(stepIndex))
                 || xml->hasAttribute("chainTransitionIntensity" + juce::String(stepIndex))
                 || xml->hasAttribute("chainTransitionDelay" + juce::String(stepIndex))
                 || xml->hasAttribute("chainTransitionFilter" + juce::String(stepIndex))
-                || xml->hasAttribute("chainTransitionChop" + juce::String(stepIndex));
+                || xml->hasAttribute("chainTransitionChop" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionEndSample" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionEndSampleGainDb" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionEndSampleFadeIn" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionEndSampleFadeOut" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionEndSampleChoke" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionEndSampleReverse" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionEndSamplePitch" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionEndSampleLowpass" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionEndSampleHighpass" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionEndSampleDuckSource" + juce::String(stepIndex))
+                || xml->hasAttribute("chainTransitionEndSampleDuckAmount" + juce::String(stepIndex));
     }
 
     if (hasChainAttributes)
     {
+        const auto previousEndSampleDirectory = processor.sceneChainState.transitionEndSampleDirectory;
         for (auto& step : processor.sceneChainState.steps)
             clearSceneChainStep(step);
+
+        juce::File loadedEndSampleDirectory = previousEndSampleDirectory;
+        if (xml->hasAttribute("chainTransitionSampleDir"))
+        {
+            const auto endSampleDirectoryPath = xml->getStringAttribute("chainTransitionSampleDir").trim();
+            loadedEndSampleDirectory =
+                endSampleDirectoryPath.isEmpty() ? juce::File() : juce::File(endSampleDirectoryPath);
+        }
 
         const int chainLength = juce::jlimit(0,
                                              MlrVSTAudioProcessor::MaxSceneChainSteps,
@@ -1222,6 +1703,15 @@ void SceneScheduler::applySceneChainStateXml(MlrVSTAudioProcessor& processor,
             step.transitionOption = sanitizeSceneChainTransitionOption(
                 xml->getIntAttribute("chainTransitionOption" + juce::String(stepIndex),
                                      static_cast<int>(SceneChainTransitionOption::Default)));
+            step.transitionScope = sanitizeSceneChainTransitionScope(
+                xml->getIntAttribute("chainTransitionScope" + juce::String(stepIndex),
+                                     static_cast<int>(SceneChainTransitionScope::All)));
+            step.transitionContour = sanitizeSceneChainTransitionContour(
+                xml->getIntAttribute("chainTransitionContour" + juce::String(stepIndex),
+                                     static_cast<int>(SceneChainTransitionContour::Smooth)));
+            step.transitionCondition = sanitizeSceneChainTransitionCondition(
+                xml->getIntAttribute("chainTransitionCondition" + juce::String(stepIndex),
+                                     static_cast<int>(SceneChainTransitionCondition::Always)));
             step.transitionLengthBeats = static_cast<float>(
                 xml->getDoubleAttribute("chainTransitionLength" + juce::String(stepIndex),
                                         MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats));
@@ -1239,13 +1729,108 @@ void SceneScheduler::applySceneChainStateXml(MlrVSTAudioProcessor& processor,
             step.transitionChopAmount = static_cast<float>(
                 xml->getDoubleAttribute("chainTransitionChop" + juce::String(stepIndex),
                                         MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount));
+            const auto endSamplePath =
+                xml->getStringAttribute("chainTransitionEndSample" + juce::String(stepIndex)).trim();
+            step.transitionEndSampleFile = endSamplePath.isEmpty() ? juce::File() : juce::File(endSamplePath);
+            step.transitionEndSampleSettings.gainDb = static_cast<float>(
+                xml->getDoubleAttribute("chainTransitionEndSampleGainDb" + juce::String(stepIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleGainDb));
+            step.transitionEndSampleSettings.fadeInMs = static_cast<float>(
+                xml->getDoubleAttribute("chainTransitionEndSampleFadeIn" + juce::String(stepIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleFadeInMs));
+            step.transitionEndSampleSettings.fadeOutMs = static_cast<float>(
+                xml->getDoubleAttribute("chainTransitionEndSampleFadeOut" + juce::String(stepIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleFadeOutMs));
+            step.transitionEndSampleSettings.chokePrevious =
+                xml->getBoolAttribute("chainTransitionEndSampleChoke" + juce::String(stepIndex), false);
+            step.transitionEndSampleSettings.reverse =
+                xml->getBoolAttribute("chainTransitionEndSampleReverse" + juce::String(stepIndex), false);
+            step.transitionEndSampleSettings.pitchSemitones = static_cast<float>(
+                xml->getDoubleAttribute("chainTransitionEndSamplePitch" + juce::String(stepIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionEndSamplePitchSemitones));
+            step.transitionEndSampleSettings.lowpassHz = static_cast<float>(
+                xml->getDoubleAttribute("chainTransitionEndSampleLowpass" + juce::String(stepIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleLowpassHz));
+            step.transitionEndSampleSettings.highpassHz = static_cast<float>(
+                xml->getDoubleAttribute("chainTransitionEndSampleHighpass" + juce::String(stepIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleHighpassHz));
+            step.transitionEndSampleSettings.duckSource =
+                xml->getIntAttribute("chainTransitionEndSampleDuckSource" + juce::String(stepIndex),
+                                     MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleDuckSource);
+            step.transitionEndSampleSettings.duckAmount = static_cast<float>(
+                xml->getDoubleAttribute("chainTransitionEndSampleDuckAmount" + juce::String(stepIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleDuckAmount));
             sanitizeSceneChainTransitionParameters(step);
         }
 
+        processor.sceneChainState.transitionEndSampleDirectory =
+            inferSceneTransitionEndSampleDirectory(processor.sceneChainState, loadedEndSampleDirectory);
         processor.sceneChainState.loopEnabled = static_cast<bool>(xml->getBoolAttribute("chainLoopEnabled", false));
         processor.sceneChainState.loopStart = xml->getIntAttribute("chainLoopStart", 0);
         processor.sceneChainState.loopEnd = xml->getIntAttribute("chainLoopEnd", juce::jmax(0, chainLength - 1));
         sanitizeSceneChainRuntimeState(processor);
+    }
+
+    bool hasFavoriteAttributes = false;
+    for (int favoriteIndex = 0;
+         favoriteIndex < MlrVSTAudioProcessor::SceneTransitionFavoriteSlots && !hasFavoriteAttributes;
+         ++favoriteIndex)
+    {
+        hasFavoriteAttributes = xml->hasAttribute("chainFillFavoriteValid" + juce::String(favoriteIndex))
+            || xml->hasAttribute("chainFillFavoriteType" + juce::String(favoriteIndex))
+            || xml->hasAttribute("chainFillFavoriteOption" + juce::String(favoriteIndex))
+            || xml->hasAttribute("chainFillFavoriteScope" + juce::String(favoriteIndex))
+            || xml->hasAttribute("chainFillFavoriteContour" + juce::String(favoriteIndex))
+            || xml->hasAttribute("chainFillFavoriteCondition" + juce::String(favoriteIndex))
+            || xml->hasAttribute("chainFillFavoriteLength" + juce::String(favoriteIndex))
+            || xml->hasAttribute("chainFillFavoriteSubtract" + juce::String(favoriteIndex))
+            || xml->hasAttribute("chainFillFavoriteIntensity" + juce::String(favoriteIndex))
+            || xml->hasAttribute("chainFillFavoriteDelay" + juce::String(favoriteIndex))
+            || xml->hasAttribute("chainFillFavoriteFilter" + juce::String(favoriteIndex))
+            || xml->hasAttribute("chainFillFavoriteChop" + juce::String(favoriteIndex));
+    }
+
+    if (hasFavoriteAttributes)
+    {
+        processor.sceneTransitionFavorites = {};
+        for (int favoriteIndex = 0; favoriteIndex < MlrVSTAudioProcessor::SceneTransitionFavoriteSlots; ++favoriteIndex)
+        {
+            auto& favorite = processor.sceneTransitionFavorites[static_cast<size_t>(favoriteIndex)];
+            favorite.valid = xml->getBoolAttribute("chainFillFavoriteValid" + juce::String(favoriteIndex), false);
+            favorite.type = sanitizeSceneChainTransitionType(
+                xml->getIntAttribute("chainFillFavoriteType" + juce::String(favoriteIndex),
+                                     static_cast<int>(SceneChainTransitionType::None)));
+            favorite.option = sanitizeSceneChainTransitionOption(
+                xml->getIntAttribute("chainFillFavoriteOption" + juce::String(favoriteIndex),
+                                     static_cast<int>(SceneChainTransitionOption::Default)));
+            favorite.scope = sanitizeSceneChainTransitionScope(
+                xml->getIntAttribute("chainFillFavoriteScope" + juce::String(favoriteIndex),
+                                     static_cast<int>(SceneChainTransitionScope::All)));
+            favorite.contour = sanitizeSceneChainTransitionContour(
+                xml->getIntAttribute("chainFillFavoriteContour" + juce::String(favoriteIndex),
+                                     static_cast<int>(SceneChainTransitionContour::Smooth)));
+            favorite.condition = sanitizeSceneChainTransitionCondition(
+                xml->getIntAttribute("chainFillFavoriteCondition" + juce::String(favoriteIndex),
+                                     static_cast<int>(SceneChainTransitionCondition::Always)));
+            favorite.lengthBeats = static_cast<float>(
+                xml->getDoubleAttribute("chainFillFavoriteLength" + juce::String(favoriteIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats));
+            favorite.subtractFromSceneLength = xml->getBoolAttribute("chainFillFavoriteSubtract" + juce::String(favoriteIndex),
+                                                                     false);
+            favorite.intensity = static_cast<float>(
+                xml->getDoubleAttribute("chainFillFavoriteIntensity" + juce::String(favoriteIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionIntensity));
+            favorite.delayAmount = static_cast<float>(
+                xml->getDoubleAttribute("chainFillFavoriteDelay" + juce::String(favoriteIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionDelayAmount));
+            favorite.filterAmount = static_cast<float>(
+                xml->getDoubleAttribute("chainFillFavoriteFilter" + juce::String(favoriteIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionFilterAmount));
+            favorite.chopAmount = static_cast<float>(
+                xml->getDoubleAttribute("chainFillFavoriteChop" + juce::String(favoriteIndex),
+                                        MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount));
+            sanitizeSceneChainTransitionFavorite(favorite);
+        }
     }
 }
 
@@ -1666,10 +2251,14 @@ void SceneScheduler::applySceneModeState(MlrVSTAudioProcessor& processor, bool e
             processor.applySceneMotionStateToEngine(activeSceneSlot);
         else
             processor.syncSceneMotionStateFromEngine(activeSceneSlot);
+        juce::ignoreUnused(processor.ensureSceneSlotFallbackState(processor.getActiveMainPresetIndexForScenes(),
+                                                                 activeSceneSlot));
+        juce::ignoreUnused(processor.ensureActiveScenePlaybackHandleInitialized());
     }
     else
     {
-        captureSceneSlot(processor, processor.activeSceneSlot);
+        juce::ignoreUnused(processor.refreshStoredSceneSlotSnapshot(processor.getActiveMainPresetIndexForScenes(),
+                                                                   processor.activeSceneSlot));
         restoreSceneModeGroupSnapshot(processor);
     }
 
@@ -2252,9 +2841,39 @@ void SceneScheduler::updateSceneQuantizedRecall(MlrVSTAudioProcessor& processor,
             ? sanitizeSceneChainTransitionOption(
                   processor.sceneChainState.steps[static_cast<size_t>(outgoingStepIndex)].transitionOption)
             : SceneChainTransitionOption::Default;
+    const auto outgoingTransitionScope =
+        (sequenceDrivenHandoff && outgoingStepIndex >= 0)
+            ? sanitizeSceneChainTransitionScope(
+                  processor.sceneChainState.steps[static_cast<size_t>(outgoingStepIndex)].transitionScope)
+            : SceneChainTransitionScope::All;
+    const auto outgoingTransitionContour =
+        (sequenceDrivenHandoff && outgoingStepIndex >= 0)
+            ? sanitizeSceneChainTransitionContour(
+                  processor.sceneChainState.steps[static_cast<size_t>(outgoingStepIndex)].transitionContour)
+            : SceneChainTransitionContour::Smooth;
+    const auto outgoingTransitionCondition =
+        (sequenceDrivenHandoff && outgoingStepIndex >= 0)
+            ? sanitizeSceneChainTransitionCondition(
+                  processor.sceneChainState.steps[static_cast<size_t>(outgoingStepIndex)].transitionCondition)
+            : SceneChainTransitionCondition::Always;
     const double targetPpq = launchQuantisation.targetPpq;
     const int64_t targetGlobalSample = launchQuantisation.targetGlobalSample;
-    const auto preloadTransitionType = sequenceDrivenHandoff ? outgoingTransitionType : SceneChainTransitionType::None;
+    const bool isLoopbackHandoff = sequenceDrivenHandoff
+        && processor.sceneChainState.loopEnabled
+        && processor.pendingSceneRecall.sequenceStepIndex >= 0
+        && processor.pendingSceneRecall.sequenceStepIndex <= outgoingStepIndex;
+    const bool shouldApplyBoundaryTransition = sequenceDrivenHandoff
+        && outgoingStepIndex >= 0
+        && outgoingTransitionType != SceneChainTransitionType::None
+        && outgoingTransitionType != SceneChainTransitionType::Return
+        && sceneChainTransitionConditionAllows(outgoingTransitionCondition,
+                                               outgoingStepIndex,
+                                               processor.pendingSceneRecall.sequenceStepIndex,
+                                               targetPpq,
+                                               isLoopbackHandoff);
+    const auto preloadTransitionType = shouldApplyBoundaryTransition
+        ? outgoingTransitionType
+        : SceneChainTransitionType::None;
     const double beatsUntilTarget = (std::isfinite(targetPpq) && std::isfinite(currentPpq))
         ? (targetPpq - currentPpq)
         : std::numeric_limits<double>::infinity();
@@ -2280,13 +2899,13 @@ void SceneScheduler::updateSceneQuantizedRecall(MlrVSTAudioProcessor& processor,
                                       preloadTransitionType);
     }
 
-    if (sequenceDrivenHandoff
-        && outgoingTransitionType != SceneChainTransitionType::None
-        && outgoingTransitionType != SceneChainTransitionType::Return
-        && std::isfinite(targetPpq))
+    if (shouldApplyBoundaryTransition && std::isfinite(targetPpq))
     {
+        const double nextBarDelayBeats = getSceneLaunchBarLengthBeats(posInfo);
         processor.armSceneBoundaryTransition(outgoingTransitionType,
                                              outgoingTransitionOption,
+                                             outgoingTransitionScope,
+                                             outgoingTransitionContour,
                                              processor.sceneChainState.steps[static_cast<size_t>(outgoingStepIndex)].transitionLengthBeats,
                                              processor.sceneChainState.steps[static_cast<size_t>(outgoingStepIndex)].transitionIntensity,
                                              processor.sceneChainState.steps[static_cast<size_t>(outgoingStepIndex)].transitionDelayAmount,
@@ -2298,7 +2917,8 @@ void SceneScheduler::updateSceneQuantizedRecall(MlrVSTAudioProcessor& processor,
                                              currentTempo,
                                              sceneChainTransitionLeadBeats(outgoingTransitionType,
                                                                            processor.sceneChainState.steps[static_cast<size_t>(outgoingStepIndex)].transitionLengthBeats),
-                                             targetGlobalSample);
+                                             targetGlobalSample,
+                                             nextBarDelayBeats);
     }
     else
     {
@@ -2776,6 +3396,8 @@ void SceneScheduler::performEmptySceneLoad(MlrVSTAudioProcessor& processor)
     sanitizeSceneChainRuntimeState(processor);
     for (auto& f : processor.currentStripFiles)
         f = juce::File();
+    juce::ignoreUnused(processor.ensureSceneSlotFallbackState(processor.getActiveMainPresetIndexForScenes(),
+                                                             processor.getActiveSceneSlot()));
 
     syncSceneModeFromParameters(processor);
     if (processor.isSceneModeEnabled())
@@ -2870,12 +3492,7 @@ void SceneScheduler::performSceneLoad(MlrVSTAudioProcessor& processor,
         processor.resolveLoopPitchRecallStateImmediately();
         processor.syncScenePerformanceClipLengthToResolvedLength(sceneSlot);
         if (processor.isSceneModeEnabled() && processor.audioEngine != nullptr)
-        {
-            if (processor.sceneSlotHasMotionState(sceneSlot))
-                processor.applySceneMotionStateToEngine(sceneSlot);
-            else
-                processor.syncSceneMotionStateFromEngine(sceneSlot);
-        }
+            processor.applySceneMotionStateOrDefaultsToEngine(sceneSlot);
 
         if (std::isfinite(hostPpqSnapshot))
         {
@@ -2931,6 +3548,9 @@ void SceneScheduler::appendSceneModeStateToState(const MlrVSTAudioProcessor& pro
     sceneState.setProperty("chainLoopEnabled", isSceneChainLoopEnabled(processor), nullptr);
     sceneState.setProperty("chainLoopStart", getSceneChainLoopStartStep(processor), nullptr);
     sceneState.setProperty("chainLoopEnd", getSceneChainLoopEndStep(processor), nullptr);
+    sceneState.setProperty("chainTransitionSampleDir",
+                           getSceneTransitionEndSampleDirectory(processor).getFullPathName(),
+                           nullptr);
 
     for (int stripIndex = 0; stripIndex < MlrVSTAudioProcessor::MaxStrips; ++stripIndex)
     {
@@ -2979,6 +3599,15 @@ void SceneScheduler::appendSceneModeStateToState(const MlrVSTAudioProcessor& pro
         sceneState.setProperty("chainTransitionOption" + juce::String(stepIndex),
                                getSceneChainStepTransitionOptionIndex(processor, stepIndex),
                                nullptr);
+        sceneState.setProperty("chainTransitionScope" + juce::String(stepIndex),
+                               getSceneChainStepTransitionScopeIndex(processor, stepIndex),
+                               nullptr);
+        sceneState.setProperty("chainTransitionContour" + juce::String(stepIndex),
+                               getSceneChainStepTransitionContourIndex(processor, stepIndex),
+                               nullptr);
+        sceneState.setProperty("chainTransitionCondition" + juce::String(stepIndex),
+                               getSceneChainStepTransitionConditionIndex(processor, stepIndex),
+                               nullptr);
         sceneState.setProperty("chainTransitionLength" + juce::String(stepIndex),
                                getSceneChainStepTransitionLengthBeats(processor, stepIndex),
                                nullptr);
@@ -2997,6 +3626,57 @@ void SceneScheduler::appendSceneModeStateToState(const MlrVSTAudioProcessor& pro
         sceneState.setProperty("chainTransitionChop" + juce::String(stepIndex),
                                getSceneChainStepTransitionChopAmount(processor, stepIndex),
                                nullptr);
+        sceneState.setProperty("chainTransitionEndSample" + juce::String(stepIndex),
+                               getSceneChainStepTransitionEndSampleFile(processor, stepIndex).getFullPathName(),
+                               nullptr);
+        const auto endSampleSettings = getSceneChainStepTransitionEndSampleSettings(processor, stepIndex);
+        sceneState.setProperty("chainTransitionEndSampleGainDb" + juce::String(stepIndex),
+                               endSampleSettings.gainDb,
+                               nullptr);
+        sceneState.setProperty("chainTransitionEndSampleFadeIn" + juce::String(stepIndex),
+                               endSampleSettings.fadeInMs,
+                               nullptr);
+        sceneState.setProperty("chainTransitionEndSampleFadeOut" + juce::String(stepIndex),
+                               endSampleSettings.fadeOutMs,
+                               nullptr);
+        sceneState.setProperty("chainTransitionEndSampleChoke" + juce::String(stepIndex),
+                               endSampleSettings.chokePrevious,
+                               nullptr);
+        sceneState.setProperty("chainTransitionEndSampleReverse" + juce::String(stepIndex),
+                               endSampleSettings.reverse,
+                               nullptr);
+        sceneState.setProperty("chainTransitionEndSamplePitch" + juce::String(stepIndex),
+                               endSampleSettings.pitchSemitones,
+                               nullptr);
+        sceneState.setProperty("chainTransitionEndSampleLowpass" + juce::String(stepIndex),
+                               endSampleSettings.lowpassHz,
+                               nullptr);
+        sceneState.setProperty("chainTransitionEndSampleHighpass" + juce::String(stepIndex),
+                               endSampleSettings.highpassHz,
+                               nullptr);
+        sceneState.setProperty("chainTransitionEndSampleDuckSource" + juce::String(stepIndex),
+                               endSampleSettings.duckSource,
+                               nullptr);
+        sceneState.setProperty("chainTransitionEndSampleDuckAmount" + juce::String(stepIndex),
+                               endSampleSettings.duckAmount,
+                               nullptr);
+    }
+
+    for (int favoriteIndex = 0; favoriteIndex < MlrVSTAudioProcessor::SceneTransitionFavoriteSlots; ++favoriteIndex)
+    {
+        const auto& favorite = processor.sceneTransitionFavorites[static_cast<size_t>(favoriteIndex)];
+        sceneState.setProperty("chainFillFavoriteValid" + juce::String(favoriteIndex), favorite.valid, nullptr);
+        sceneState.setProperty("chainFillFavoriteType" + juce::String(favoriteIndex), static_cast<int>(favorite.type), nullptr);
+        sceneState.setProperty("chainFillFavoriteOption" + juce::String(favoriteIndex), static_cast<int>(favorite.option), nullptr);
+        sceneState.setProperty("chainFillFavoriteScope" + juce::String(favoriteIndex), static_cast<int>(favorite.scope), nullptr);
+        sceneState.setProperty("chainFillFavoriteContour" + juce::String(favoriteIndex), static_cast<int>(favorite.contour), nullptr);
+        sceneState.setProperty("chainFillFavoriteCondition" + juce::String(favoriteIndex), static_cast<int>(favorite.condition), nullptr);
+        sceneState.setProperty("chainFillFavoriteLength" + juce::String(favoriteIndex), favorite.lengthBeats, nullptr);
+        sceneState.setProperty("chainFillFavoriteSubtract" + juce::String(favoriteIndex), favorite.subtractFromSceneLength, nullptr);
+        sceneState.setProperty("chainFillFavoriteIntensity" + juce::String(favoriteIndex), favorite.intensity, nullptr);
+        sceneState.setProperty("chainFillFavoriteDelay" + juce::String(favoriteIndex), favorite.delayAmount, nullptr);
+        sceneState.setProperty("chainFillFavoriteFilter" + juce::String(favoriteIndex), favorite.filterAmount, nullptr);
+        sceneState.setProperty("chainFillFavoriteChop" + juce::String(favoriteIndex), favorite.chopAmount, nullptr);
     }
 
     sceneState.setProperty("scenePerformanceBlob", processor.createScenePerformanceStateData(-1), nullptr);
@@ -3019,6 +3699,9 @@ void SceneScheduler::appendSceneModeStateToState(const MlrVSTAudioProcessor& pro
         juce::ValueTree storedSceneValue("StoredScene");
         storedSceneValue.setProperty("slot", sceneSlot, nullptr);
         storedSceneValue.setProperty("name", storedSceneState->name, nullptr);
+        storedSceneValue.setProperty("implicitMainPresetFallback",
+                                     storedSceneState->implicitMainPresetFallback,
+                                     nullptr);
         if (auto snapshotXml = processor.createSceneSnapshotPresetXml(
                 *storedSceneState->preparedSwitchPayloadTemplate,
                 storedSceneState->name))
@@ -3040,6 +3723,7 @@ void SceneScheduler::loadSceneModeStateFromState(MlrVSTAudioProcessor& processor
     processor.sceneManualBars.fill(4);
     processor.sceneAnchorStrips.fill(0);
     processor.sceneChainState = {};
+    processor.sceneTransitionFavorites = {};
     processor.activeSceneMainPresetIndex = 0;
     processor.activeSceneSlot = 0;
     processor.focusedSceneSlot = 0;
@@ -3117,6 +3801,14 @@ void SceneScheduler::loadSceneModeStateFromState(MlrVSTAudioProcessor& processor
     const int storedChainLength = juce::jlimit(0,
                                                MlrVSTAudioProcessor::MaxSceneChainSteps,
                                                static_cast<int>(sceneState.getProperty("chainStepCount", 0)));
+    juce::File loadedEndSampleDirectory = processor.sceneChainState.transitionEndSampleDirectory;
+    if (sceneState.hasProperty("chainTransitionSampleDir"))
+    {
+        const auto endSampleDirectoryPath =
+            sceneState.getProperty("chainTransitionSampleDir", juce::var()).toString().trim();
+        loadedEndSampleDirectory =
+            endSampleDirectoryPath.isEmpty() ? juce::File() : juce::File(endSampleDirectoryPath);
+    }
     for (int stepIndex = 0; stepIndex < storedChainLength; ++stepIndex)
     {
         auto& step = processor.sceneChainState.steps[static_cast<size_t>(stepIndex)];
@@ -3128,6 +3820,15 @@ void SceneScheduler::loadSceneModeStateFromState(MlrVSTAudioProcessor& processor
         step.transitionOption = sanitizeSceneChainTransitionOption(
             static_cast<int>(sceneState.getProperty("chainTransitionOption" + juce::String(stepIndex),
                                                     static_cast<int>(SceneChainTransitionOption::Default))));
+        step.transitionScope = sanitizeSceneChainTransitionScope(
+            static_cast<int>(sceneState.getProperty("chainTransitionScope" + juce::String(stepIndex),
+                                                    static_cast<int>(SceneChainTransitionScope::All))));
+        step.transitionContour = sanitizeSceneChainTransitionContour(
+            static_cast<int>(sceneState.getProperty("chainTransitionContour" + juce::String(stepIndex),
+                                                    static_cast<int>(SceneChainTransitionContour::Smooth))));
+        step.transitionCondition = sanitizeSceneChainTransitionCondition(
+            static_cast<int>(sceneState.getProperty("chainTransitionCondition" + juce::String(stepIndex),
+                                                    static_cast<int>(SceneChainTransitionCondition::Always))));
         step.transitionLengthBeats = static_cast<float>(
             sceneState.getProperty("chainTransitionLength" + juce::String(stepIndex),
                                    MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats));
@@ -3145,13 +3846,87 @@ void SceneScheduler::loadSceneModeStateFromState(MlrVSTAudioProcessor& processor
         step.transitionChopAmount = static_cast<float>(
             sceneState.getProperty("chainTransitionChop" + juce::String(stepIndex),
                                    MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount));
+        const auto endSamplePath =
+            sceneState.getProperty("chainTransitionEndSample" + juce::String(stepIndex), juce::var())
+                .toString()
+                .trim();
+        step.transitionEndSampleFile = endSamplePath.isEmpty() ? juce::File() : juce::File(endSamplePath);
+        step.transitionEndSampleSettings.gainDb = static_cast<float>(
+            sceneState.getProperty("chainTransitionEndSampleGainDb" + juce::String(stepIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleGainDb));
+        step.transitionEndSampleSettings.fadeInMs = static_cast<float>(
+            sceneState.getProperty("chainTransitionEndSampleFadeIn" + juce::String(stepIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleFadeInMs));
+        step.transitionEndSampleSettings.fadeOutMs = static_cast<float>(
+            sceneState.getProperty("chainTransitionEndSampleFadeOut" + juce::String(stepIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleFadeOutMs));
+        step.transitionEndSampleSettings.chokePrevious = static_cast<bool>(
+            sceneState.getProperty("chainTransitionEndSampleChoke" + juce::String(stepIndex), false));
+        step.transitionEndSampleSettings.reverse = static_cast<bool>(
+            sceneState.getProperty("chainTransitionEndSampleReverse" + juce::String(stepIndex), false));
+        step.transitionEndSampleSettings.pitchSemitones = static_cast<float>(
+            sceneState.getProperty("chainTransitionEndSamplePitch" + juce::String(stepIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionEndSamplePitchSemitones));
+        step.transitionEndSampleSettings.lowpassHz = static_cast<float>(
+            sceneState.getProperty("chainTransitionEndSampleLowpass" + juce::String(stepIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleLowpassHz));
+        step.transitionEndSampleSettings.highpassHz = static_cast<float>(
+            sceneState.getProperty("chainTransitionEndSampleHighpass" + juce::String(stepIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleHighpassHz));
+        step.transitionEndSampleSettings.duckSource = static_cast<int>(
+            sceneState.getProperty("chainTransitionEndSampleDuckSource" + juce::String(stepIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleDuckSource));
+        step.transitionEndSampleSettings.duckAmount = static_cast<float>(
+            sceneState.getProperty("chainTransitionEndSampleDuckAmount" + juce::String(stepIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionEndSampleDuckAmount));
         sanitizeSceneChainTransitionParameters(step);
     }
+    processor.sceneChainState.transitionEndSampleDirectory =
+        inferSceneTransitionEndSampleDirectory(processor.sceneChainState, loadedEndSampleDirectory);
     processor.sceneChainState.loopEnabled = static_cast<bool>(sceneState.getProperty("chainLoopEnabled", false));
     processor.sceneChainState.loopStart = static_cast<int>(sceneState.getProperty("chainLoopStart", 0));
     processor.sceneChainState.loopEnd = static_cast<int>(sceneState.getProperty("chainLoopEnd",
                                                                                 juce::jmax(0, storedChainLength - 1)));
     sanitizeSceneChainRuntimeState(processor);
+
+    for (int favoriteIndex = 0; favoriteIndex < MlrVSTAudioProcessor::SceneTransitionFavoriteSlots; ++favoriteIndex)
+    {
+        auto& favorite = processor.sceneTransitionFavorites[static_cast<size_t>(favoriteIndex)];
+        favorite.valid = static_cast<bool>(sceneState.getProperty("chainFillFavoriteValid" + juce::String(favoriteIndex), false));
+        favorite.type = sanitizeSceneChainTransitionType(
+            static_cast<int>(sceneState.getProperty("chainFillFavoriteType" + juce::String(favoriteIndex),
+                                                    static_cast<int>(SceneChainTransitionType::None))));
+        favorite.option = sanitizeSceneChainTransitionOption(
+            static_cast<int>(sceneState.getProperty("chainFillFavoriteOption" + juce::String(favoriteIndex),
+                                                    static_cast<int>(SceneChainTransitionOption::Default))));
+        favorite.scope = sanitizeSceneChainTransitionScope(
+            static_cast<int>(sceneState.getProperty("chainFillFavoriteScope" + juce::String(favoriteIndex),
+                                                    static_cast<int>(SceneChainTransitionScope::All))));
+        favorite.contour = sanitizeSceneChainTransitionContour(
+            static_cast<int>(sceneState.getProperty("chainFillFavoriteContour" + juce::String(favoriteIndex),
+                                                    static_cast<int>(SceneChainTransitionContour::Smooth))));
+        favorite.condition = sanitizeSceneChainTransitionCondition(
+            static_cast<int>(sceneState.getProperty("chainFillFavoriteCondition" + juce::String(favoriteIndex),
+                                                    static_cast<int>(SceneChainTransitionCondition::Always))));
+        favorite.lengthBeats = static_cast<float>(
+            sceneState.getProperty("chainFillFavoriteLength" + juce::String(favoriteIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionLengthBeats));
+        favorite.subtractFromSceneLength = static_cast<bool>(
+            sceneState.getProperty("chainFillFavoriteSubtract" + juce::String(favoriteIndex), false));
+        favorite.intensity = static_cast<float>(
+            sceneState.getProperty("chainFillFavoriteIntensity" + juce::String(favoriteIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionIntensity));
+        favorite.delayAmount = static_cast<float>(
+            sceneState.getProperty("chainFillFavoriteDelay" + juce::String(favoriteIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionDelayAmount));
+        favorite.filterAmount = static_cast<float>(
+            sceneState.getProperty("chainFillFavoriteFilter" + juce::String(favoriteIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionFilterAmount));
+        favorite.chopAmount = static_cast<float>(
+            sceneState.getProperty("chainFillFavoriteChop" + juce::String(favoriteIndex),
+                                   MlrVSTAudioProcessor::DefaultSceneTransitionChopAmount));
+        sanitizeSceneChainTransitionFavorite(favorite);
+    }
 
     processor.applyScenePerformanceStateData({}, -1);
     if (sceneState.hasProperty("scenePerformanceBlob"))
@@ -3180,6 +3955,8 @@ void SceneScheduler::loadSceneModeStateFromState(MlrVSTAudioProcessor& processor
             storedState.mainPresetIndex = processor.activeSceneMainPresetIndex;
             storedState.sceneSlot = sceneSlot;
             storedState.hasStoredContent = true;
+            storedState.implicitMainPresetFallback =
+                static_cast<bool>(storedSceneValue.getProperty("implicitMainPresetFallback", false));
             storedState.name = storedSceneValue.getProperty("name").toString();
             auto templatePayload = std::make_unique<MlrVSTAudioProcessor::PreparedSceneSwitchPayload>();
             if (!processor.parsePreparedSceneSwitchPayloadTemplate(*templatePayload,

@@ -11,8 +11,16 @@
 
 namespace
 {
-constexpr int kMonomeModCycleColumn = 15;
+constexpr int kMonomeModPrevColumn = 14;
+constexpr int kMonomeModNextColumn = 15;
+constexpr int kMonomeSceneRecorderColumn = 7;
+constexpr int kMonomeSceneLaunchColumns = 7;
+constexpr int kSceneLengthFirstColumn = 8;
+constexpr int kSceneLengthLastColumn = 12;
 constexpr float kScratchZeroEpsilon = 1.0e-6f;
+constexpr uint32_t kSceneRecorderIdleBlinkIntervalMs = 480;
+constexpr uint32_t kSceneRecorderActiveBlinkIntervalMs = 180;
+constexpr std::array<int, 5> kSceneLengthButtonValues{ 1, 2, 4, 8, 16 };
 
 double stutterDivisionBeatsFromButton(int x)
 {
@@ -47,12 +55,582 @@ int stutterColumnFromMask(uint8_t mask)
     return -1;
 }
 
+int sceneLengthCountFromButton(int x)
+{
+    if (x < kSceneLengthFirstColumn || x > kSceneLengthLastColumn)
+        return 0;
+
+    return kSceneLengthButtonValues[static_cast<size_t>(x - kSceneLengthFirstColumn)];
+}
+
 float quantizeMonomeRearrangeValue(float value01)
 {
     return juce::jlimit(0.0f, 1.0f,
                         std::round(juce::jlimit(0.0f, 1.0f, value01)
                                    * static_cast<float>(ModernAudioEngine::MaxColumns - 1))
                             / static_cast<float>(juce::jmax(1, ModernAudioEngine::MaxColumns - 1)));
+}
+
+MlrVSTAudioProcessor::ControlMode sceneControlModeForTarget(ScenePerformanceControlTarget target)
+{
+    using ControlMode = MlrVSTAudioProcessor::ControlMode;
+
+    switch (target)
+    {
+        case ScenePerformanceControlTarget::Speed:            return ControlMode::Speed;
+        case ScenePerformanceControlTarget::Pitch:
+        case ScenePerformanceControlTarget::GrainPitch:       return ControlMode::Pitch;
+        case ScenePerformanceControlTarget::Pan:              return ControlMode::Pan;
+        case ScenePerformanceControlTarget::Volume:           return ControlMode::Volume;
+        case ScenePerformanceControlTarget::Swing:            return ControlMode::Swing;
+        case ScenePerformanceControlTarget::GrainSize:
+        case ScenePerformanceControlTarget::GrainDensity:
+        case ScenePerformanceControlTarget::GrainPitchJitter:
+        case ScenePerformanceControlTarget::GrainSpread:
+        case ScenePerformanceControlTarget::GrainJitter:
+        case ScenePerformanceControlTarget::GrainPositionJitter:
+        case ScenePerformanceControlTarget::GrainRandomDepth:
+        case ScenePerformanceControlTarget::GrainArp:
+        case ScenePerformanceControlTarget::GrainCloud:
+        case ScenePerformanceControlTarget::GrainEmitter:
+        case ScenePerformanceControlTarget::GrainEnvelope:
+        case ScenePerformanceControlTarget::GrainShape:       return ControlMode::GrainSize;
+        case ScenePerformanceControlTarget::FilterFrequency:
+        case ScenePerformanceControlTarget::FilterResonance:
+        case ScenePerformanceControlTarget::FilterEnabled:
+        case ScenePerformanceControlTarget::FilterMorph:      return ControlMode::Filter;
+        case ScenePerformanceControlTarget::DelayMix:
+        case ScenePerformanceControlTarget::DelayTime:
+        case ScenePerformanceControlTarget::DelayFeedback:
+        case ScenePerformanceControlTarget::DelayLowCut:
+        case ScenePerformanceControlTarget::DelayHighCut:
+        case ScenePerformanceControlTarget::DelayMode:
+        case ScenePerformanceControlTarget::DelaySyncEnabled: return ControlMode::Delay;
+        case ScenePerformanceControlTarget::SliceLength:
+        case ScenePerformanceControlTarget::Scratch:
+        case ScenePerformanceControlTarget::Retrigger:
+        case ScenePerformanceControlTarget::Rearrange:
+        case ScenePerformanceControlTarget::None:
+        default:                                              return ControlMode::Normal;
+    }
+}
+
+ScenePerformanceControlTarget sceneControlTargetForModTarget(bool grainMode,
+                                                             ModernAudioEngine::ModTarget target)
+{
+    using ModTarget = ModernAudioEngine::ModTarget;
+
+    switch (sanitizeModPerformanceTarget(target))
+    {
+        case ModTarget::Volume:              return ScenePerformanceControlTarget::Volume;
+        case ModTarget::Pan:                 return ScenePerformanceControlTarget::Pan;
+        case ModTarget::Pitch:               return grainMode ? ScenePerformanceControlTarget::GrainPitch
+                                                              : ScenePerformanceControlTarget::Pitch;
+        case ModTarget::GrainPitch:          return ScenePerformanceControlTarget::GrainPitch;
+        case ModTarget::Cutoff:              return ScenePerformanceControlTarget::FilterFrequency;
+        case ModTarget::Resonance:           return ScenePerformanceControlTarget::FilterResonance;
+        case ModTarget::FilterMorph:         return ScenePerformanceControlTarget::FilterMorph;
+        case ModTarget::Speed:               return ScenePerformanceControlTarget::Speed;
+        case ModTarget::Retrigger:           return ScenePerformanceControlTarget::Retrigger;
+        case ModTarget::SliceLength:         return ScenePerformanceControlTarget::SliceLength;
+        case ModTarget::Scratch:             return ScenePerformanceControlTarget::Scratch;
+        case ModTarget::DelayMix:            return ScenePerformanceControlTarget::DelayMix;
+        case ModTarget::DelayTime:           return ScenePerformanceControlTarget::DelayTime;
+        case ModTarget::DelayFeedback:       return ScenePerformanceControlTarget::DelayFeedback;
+        case ModTarget::GrainSize:           return ScenePerformanceControlTarget::GrainSize;
+        case ModTarget::GrainDensity:        return ScenePerformanceControlTarget::GrainDensity;
+        case ModTarget::GrainPitchJitter:    return ScenePerformanceControlTarget::GrainPitchJitter;
+        case ModTarget::GrainSpread:         return ScenePerformanceControlTarget::GrainSpread;
+        case ModTarget::GrainJitter:         return ScenePerformanceControlTarget::GrainJitter;
+        case ModTarget::GrainPositionJitter: return ScenePerformanceControlTarget::GrainPositionJitter;
+        case ModTarget::GrainRandom:         return ScenePerformanceControlTarget::GrainRandomDepth;
+        case ModTarget::GrainArp:            return ScenePerformanceControlTarget::GrainArp;
+        case ModTarget::GrainCloud:          return ScenePerformanceControlTarget::GrainCloud;
+        case ModTarget::GrainEmitter:        return ScenePerformanceControlTarget::GrainEmitter;
+        case ModTarget::GrainEnvelope:       return ScenePerformanceControlTarget::GrainEnvelope;
+        case ModTarget::GrainShape:          return ScenePerformanceControlTarget::GrainShape;
+        case ModTarget::None:
+        default:                             return ScenePerformanceControlTarget::None;
+    }
+}
+
+float defaultNormalizedSceneAutomationValue(ScenePerformanceControlTarget target)
+{
+    switch (target)
+    {
+        case ScenePerformanceControlTarget::Volume:           return 1.0f;
+        case ScenePerformanceControlTarget::Pan:              return 0.5f;
+        case ScenePerformanceControlTarget::Pitch:            return 0.5f;
+        case ScenePerformanceControlTarget::FilterFrequency:  return 1.0f;
+        case ScenePerformanceControlTarget::FilterResonance:  return 0.0613131f;
+        case ScenePerformanceControlTarget::FilterMorph:      return 0.0f;
+        case ScenePerformanceControlTarget::Speed:            return 0.5f;
+        case ScenePerformanceControlTarget::Retrigger:        return 0.0f;
+        case ScenePerformanceControlTarget::SliceLength:      return 1.0f;
+        case ScenePerformanceControlTarget::Scratch:          return 0.0f;
+        case ScenePerformanceControlTarget::DelayMix:         return 0.0f;
+        case ScenePerformanceControlTarget::DelayTime:        return 0.0f;
+        case ScenePerformanceControlTarget::DelayFeedback:    return 0.0f;
+        case ScenePerformanceControlTarget::GrainPitch:       return 0.5f;
+        case ScenePerformanceControlTarget::GrainSize:        return 0.5156576f;
+        case ScenePerformanceControlTarget::GrainDensity:     return 0.0f;
+        case ScenePerformanceControlTarget::GrainPitchJitter: return 0.0f;
+        case ScenePerformanceControlTarget::GrainSpread:      return 0.0f;
+        case ScenePerformanceControlTarget::GrainJitter:      return 0.0f;
+        case ScenePerformanceControlTarget::GrainPositionJitter: return 0.0f;
+        case ScenePerformanceControlTarget::GrainRandomDepth: return 0.0f;
+        case ScenePerformanceControlTarget::GrainArp:         return 0.0f;
+        case ScenePerformanceControlTarget::GrainCloud:       return 0.0f;
+        case ScenePerformanceControlTarget::GrainEmitter:     return 0.0f;
+        case ScenePerformanceControlTarget::GrainEnvelope:    return 0.0f;
+        case ScenePerformanceControlTarget::GrainShape:       return 0.5f;
+        case ScenePerformanceControlTarget::None:
+        default:                                              return 0.5f;
+    }
+}
+
+float normalizeSceneAutomationValueForMonome(const ScenePerformanceEvent& event)
+{
+    switch (event.controlTarget)
+    {
+        case ScenePerformanceControlTarget::Speed:
+        {
+            const float safeValue = juce::jlimit(0.125f, 8.0f, event.value);
+            return juce::jlimit(0.0f, 1.0f, (std::log2(safeValue) + 3.0f) / 6.0f);
+        }
+        case ScenePerformanceControlTarget::Pitch:
+            return juce::jlimit(0.0f, 1.0f, (event.value + 24.0f) / 48.0f);
+        case ScenePerformanceControlTarget::GrainPitch:
+            return juce::jlimit(0.0f, 1.0f, (event.value + 48.0f) / 96.0f);
+        case ScenePerformanceControlTarget::Pan:
+            return juce::jlimit(0.0f, 1.0f, (event.value + 1.0f) * 0.5f);
+        case ScenePerformanceControlTarget::Volume:
+        case ScenePerformanceControlTarget::Swing:
+        case ScenePerformanceControlTarget::GrainSpread:
+        case ScenePerformanceControlTarget::GrainJitter:
+        case ScenePerformanceControlTarget::GrainPositionJitter:
+        case ScenePerformanceControlTarget::GrainRandomDepth:
+        case ScenePerformanceControlTarget::GrainArp:
+        case ScenePerformanceControlTarget::GrainCloud:
+        case ScenePerformanceControlTarget::GrainEmitter:
+        case ScenePerformanceControlTarget::GrainEnvelope:
+        case ScenePerformanceControlTarget::DelayMix:
+        case ScenePerformanceControlTarget::FilterMorph:
+        case ScenePerformanceControlTarget::FilterEnabled:
+        case ScenePerformanceControlTarget::Retrigger:
+        case ScenePerformanceControlTarget::Rearrange:
+        case ScenePerformanceControlTarget::DelaySyncEnabled:
+            return juce::jlimit(0.0f, 1.0f, event.value);
+        case ScenePerformanceControlTarget::SliceLength:
+            return juce::jlimit(0.0f, 1.0f, (event.value - 0.02f) / 0.98f);
+        case ScenePerformanceControlTarget::Scratch:
+            return juce::jlimit(0.0f, 1.0f, event.value / 100.0f);
+        case ScenePerformanceControlTarget::GrainSize:
+            return juce::jlimit(0.0f, 1.0f, (event.value - 5.0f) / (2400.0f - 5.0f));
+        case ScenePerformanceControlTarget::GrainDensity:
+            return juce::jlimit(0.0f, 1.0f, (event.value - 0.05f) / (0.9f - 0.05f));
+        case ScenePerformanceControlTarget::GrainPitchJitter:
+            return juce::jlimit(0.0f, 1.0f, event.value / 48.0f);
+        case ScenePerformanceControlTarget::GrainShape:
+            return juce::jlimit(0.0f, 1.0f, (event.value + 1.0f) * 0.5f);
+        case ScenePerformanceControlTarget::FilterFrequency:
+        {
+            const float safeValue = juce::jlimit(20.0f, 20000.0f, event.value);
+            return juce::jlimit(0.0f, 1.0f, std::log(safeValue / 20.0f) / std::log(1000.0f));
+        }
+        case ScenePerformanceControlTarget::FilterResonance:
+            return juce::jlimit(0.0f, 1.0f, (event.value - 0.1f) / 9.9f);
+        case ScenePerformanceControlTarget::DelayTime:
+            return juce::jlimit(0.0f, 1.0f, (event.value - 0.25f) / (4.0f - 0.25f));
+        case ScenePerformanceControlTarget::DelayFeedback:
+            return juce::jlimit(0.0f, 1.0f, event.value / 0.97f);
+        case ScenePerformanceControlTarget::DelayLowCut:
+        {
+            const juce::NormalisableRange<float> range(20.0f, 12000.0f, 1.0f, 0.25f);
+            return juce::jlimit(0.0f, 1.0f, range.convertTo0to1(event.value));
+        }
+        case ScenePerformanceControlTarget::DelayHighCut:
+        {
+            const juce::NormalisableRange<float> range(200.0f, 20000.0f, 1.0f, 0.3f);
+            return juce::jlimit(0.0f, 1.0f, range.convertTo0to1(event.value));
+        }
+        case ScenePerformanceControlTarget::DelayMode:
+            return juce::jlimit(0.0f, 1.0f, event.value / 2.0f);
+        case ScenePerformanceControlTarget::None:
+        default:
+            return 0.5f;
+    }
+}
+
+float denormalizeSceneAutomationValueForMonome(const ScenePerformanceEvent& event, float normalizedValue)
+{
+    const float t = juce::jlimit(0.0f, 1.0f, normalizedValue);
+
+    switch (event.controlTarget)
+    {
+        case ScenePerformanceControlTarget::Speed:
+            return juce::jlimit(0.125f, 8.0f, std::pow(2.0f, -3.0f + (t * 6.0f)));
+        case ScenePerformanceControlTarget::Pitch:
+            return -24.0f + (t * 48.0f);
+        case ScenePerformanceControlTarget::GrainPitch:
+            return -48.0f + (t * 96.0f);
+        case ScenePerformanceControlTarget::Pan:
+            return (t * 2.0f) - 1.0f;
+        case ScenePerformanceControlTarget::Volume:
+        case ScenePerformanceControlTarget::Swing:
+        case ScenePerformanceControlTarget::GrainSpread:
+        case ScenePerformanceControlTarget::GrainJitter:
+        case ScenePerformanceControlTarget::GrainPositionJitter:
+        case ScenePerformanceControlTarget::GrainRandomDepth:
+        case ScenePerformanceControlTarget::GrainArp:
+        case ScenePerformanceControlTarget::GrainCloud:
+        case ScenePerformanceControlTarget::GrainEmitter:
+        case ScenePerformanceControlTarget::GrainEnvelope:
+        case ScenePerformanceControlTarget::DelayMix:
+        case ScenePerformanceControlTarget::FilterMorph:
+        case ScenePerformanceControlTarget::FilterEnabled:
+        case ScenePerformanceControlTarget::Retrigger:
+        case ScenePerformanceControlTarget::Rearrange:
+            return t;
+        case ScenePerformanceControlTarget::SliceLength:
+            return 0.02f + (t * 0.98f);
+        case ScenePerformanceControlTarget::Scratch:
+            return 100.0f * t;
+        case ScenePerformanceControlTarget::GrainSize:
+            return 5.0f + (t * (2400.0f - 5.0f));
+        case ScenePerformanceControlTarget::GrainDensity:
+            return 0.05f + (t * (0.9f - 0.05f));
+        case ScenePerformanceControlTarget::GrainPitchJitter:
+            return 48.0f * t;
+        case ScenePerformanceControlTarget::GrainShape:
+            return (t * 2.0f) - 1.0f;
+        case ScenePerformanceControlTarget::FilterFrequency:
+            return 20.0f * std::pow(1000.0f, t);
+        case ScenePerformanceControlTarget::FilterResonance:
+            return 0.1f + (t * 9.9f);
+        case ScenePerformanceControlTarget::DelayTime:
+            return 0.25f + (t * (4.0f - 0.25f));
+        case ScenePerformanceControlTarget::DelayFeedback:
+            return 0.97f * t;
+        case ScenePerformanceControlTarget::DelayLowCut:
+        {
+            const juce::NormalisableRange<float> range(20.0f, 12000.0f, 1.0f, 0.25f);
+            return range.convertFrom0to1(t);
+        }
+        case ScenePerformanceControlTarget::DelayHighCut:
+        {
+            const juce::NormalisableRange<float> range(200.0f, 20000.0f, 1.0f, 0.3f);
+            return range.convertFrom0to1(t);
+        }
+        case ScenePerformanceControlTarget::DelayMode:
+            return static_cast<float>(juce::jlimit(0, 2, static_cast<int>(std::round(t * 2.0f))));
+        case ScenePerformanceControlTarget::DelaySyncEnabled:
+            return t >= 0.5f ? 1.0f : 0.0f;
+        case ScenePerformanceControlTarget::None:
+        default:
+            return event.value;
+    }
+}
+
+bool isSceneMainAutomationMonomeActive(const MlrVSTAudioProcessor& processor)
+{
+    return processor.isSceneModeEnabled()
+        && processor.isControlModeActive()
+        && processor.getCurrentControlMode() == MlrVSTAudioProcessor::ControlMode::Modulation
+        && processor.getSceneModPageMode() == MlrVSTAudioProcessor::SceneModPageMode::MainModulation
+        && processor.getAudioEngine() != nullptr;
+}
+
+bool sceneAutomationTargetIsBipolarForMonome(ScenePerformanceControlTarget target)
+{
+    switch (target)
+    {
+        case ScenePerformanceControlTarget::Pan:
+        case ScenePerformanceControlTarget::Pitch:
+        case ScenePerformanceControlTarget::GrainPitch:
+        case ScenePerformanceControlTarget::Speed:
+        case ScenePerformanceControlTarget::GrainShape:
+            return true;
+        case ScenePerformanceControlTarget::None:
+        case ScenePerformanceControlTarget::Volume:
+        case ScenePerformanceControlTarget::Swing:
+        case ScenePerformanceControlTarget::GrainSize:
+        case ScenePerformanceControlTarget::GrainDensity:
+        case ScenePerformanceControlTarget::GrainPitchJitter:
+        case ScenePerformanceControlTarget::GrainSpread:
+        case ScenePerformanceControlTarget::GrainJitter:
+        case ScenePerformanceControlTarget::GrainPositionJitter:
+        case ScenePerformanceControlTarget::GrainRandomDepth:
+        case ScenePerformanceControlTarget::GrainArp:
+        case ScenePerformanceControlTarget::GrainCloud:
+        case ScenePerformanceControlTarget::GrainEmitter:
+        case ScenePerformanceControlTarget::GrainEnvelope:
+        case ScenePerformanceControlTarget::FilterFrequency:
+        case ScenePerformanceControlTarget::FilterResonance:
+        case ScenePerformanceControlTarget::FilterEnabled:
+        case ScenePerformanceControlTarget::FilterMorph:
+        case ScenePerformanceControlTarget::SliceLength:
+        case ScenePerformanceControlTarget::Scratch:
+        case ScenePerformanceControlTarget::DelayMix:
+        case ScenePerformanceControlTarget::DelayTime:
+        case ScenePerformanceControlTarget::DelayFeedback:
+        case ScenePerformanceControlTarget::DelayLowCut:
+        case ScenePerformanceControlTarget::DelayHighCut:
+        case ScenePerformanceControlTarget::DelayMode:
+        case ScenePerformanceControlTarget::DelaySyncEnabled:
+        case ScenePerformanceControlTarget::Retrigger:
+        case ScenePerformanceControlTarget::Rearrange:
+        default:
+            return false;
+    }
+}
+
+bool sceneAutomationTargetUsesGlobalStripForMonome(ScenePerformanceControlTarget target)
+{
+    return target == ScenePerformanceControlTarget::Retrigger;
+}
+
+ScenePerformanceControlTarget activeSceneMainAutomationTarget(const MlrVSTAudioProcessor& processor,
+                                                             int stripIndex)
+{
+    const int safeStripIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
+    const auto activeTarget = processor.getSceneMainAutomationDisplayTargetForStrip(safeStripIndex);
+    return sceneControlTargetForModTarget(processor.stripUsesGrainSceneLanes(safeStripIndex), activeTarget);
+}
+
+int sceneMainAutomationDisplayPage(const MlrVSTAudioProcessor& processor,
+                                   int sceneSlot,
+                                   double currentBeat)
+{
+    const int safeSceneSlot = juce::jlimit(0, MlrVSTAudioProcessor::SceneSlots - 1, sceneSlot);
+    const double lengthBeats = juce::jmax(1.0, processor.getResolvedSceneLengthBeats(safeSceneSlot));
+    const int maxPage = juce::jmax(0, static_cast<int>(std::ceil(lengthBeats / 4.0)) - 1);
+
+    if (!processor.isSceneModeEnabled() || safeSceneSlot != processor.getActiveSceneSlot())
+        return 0;
+
+    const double progressBeats = processor.getScenePerformancePlaybackBeat(safeSceneSlot, currentBeat);
+    if (!std::isfinite(progressBeats) || progressBeats < 0.0)
+        return 0;
+
+    return juce::jlimit(0, maxPage, static_cast<int>(std::floor(progressBeats / 4.0)));
+}
+
+bool sceneMainAutomationBeatForColumn(const MlrVSTAudioProcessor& processor,
+                                      int sceneSlot,
+                                      int column,
+                                      double currentBeat,
+                                      double& beatOut,
+                                      int* pageIndexOut = nullptr)
+{
+    const int safeSceneSlot = juce::jlimit(0, MlrVSTAudioProcessor::SceneSlots - 1, sceneSlot);
+    const int safeColumn = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, column);
+    const double lengthBeats = juce::jmax(1.0, processor.getResolvedSceneLengthBeats(safeSceneSlot));
+    const double maxBeat = juce::jmax(0.0, std::nextafter(lengthBeats, 0.0));
+    const int pageIndex = sceneMainAutomationDisplayPage(processor, safeSceneSlot, currentBeat);
+    const double beat = (static_cast<double>(pageIndex) * 4.0) + (static_cast<double>(safeColumn) * 0.25);
+
+    if (pageIndexOut != nullptr)
+        *pageIndexOut = pageIndex;
+
+    if (beat > (maxBeat + 1.0e-6))
+        return false;
+
+    beatOut = juce::jlimit(0.0, maxBeat, beat);
+    return true;
+}
+
+bool sceneMainAutomationPlaybackStepForPage(const MlrVSTAudioProcessor& processor,
+                                            int sceneSlot,
+                                            int displayPage,
+                                            double currentBeat,
+                                            int& stepOut)
+{
+    const int safeSceneSlot = juce::jlimit(0, MlrVSTAudioProcessor::SceneSlots - 1, sceneSlot);
+    if (!processor.isSceneModeEnabled() || safeSceneSlot != processor.getActiveSceneSlot())
+        return false;
+
+    const double progressBeats = processor.getScenePerformancePlaybackBeat(safeSceneSlot, currentBeat);
+    if (!std::isfinite(progressBeats) || progressBeats < 0.0)
+        return false;
+
+    const int pageIndex = juce::jmax(0, static_cast<int>(std::floor(progressBeats / 4.0)));
+    if (pageIndex != displayPage)
+        return false;
+
+    const double pageBeat = progressBeats - (static_cast<double>(pageIndex) * 4.0);
+    stepOut = juce::jlimit(0,
+                           ModernAudioEngine::MaxColumns - 1,
+                           static_cast<int>(std::floor(pageBeat / 0.25)));
+    return true;
+}
+
+float defaultSceneAutomationNormalizedValueForMonome(ScenePerformanceControlTarget target)
+{
+    return defaultNormalizedSceneAutomationValue(target);
+}
+
+float storedSceneAutomationNormalizedValueForMonome(const MlrVSTAudioProcessor& processor,
+                                                    int sceneSlot,
+                                                    int stripIndex,
+                                                    ScenePerformanceControlTarget target)
+{
+    const int resolvedStripIndex = sceneAutomationTargetUsesGlobalStripForMonome(target)
+        ? -1
+        : juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
+
+    float normalizedValue = defaultSceneAutomationNormalizedValueForMonome(target);
+    if (processor.getStoredSceneControlNormalizedValue(sceneSlot,
+                                                       resolvedStripIndex,
+                                                       target,
+                                                       normalizedValue)
+        && std::isfinite(normalizedValue))
+    {
+        return juce::jlimit(0.0f, 1.0f, normalizedValue);
+    }
+
+    if (processor.getSceneControlBaseNormalizedValue(resolvedStripIndex, target, normalizedValue)
+        && std::isfinite(normalizedValue))
+    {
+        return juce::jlimit(0.0f, 1.0f, normalizedValue);
+    }
+
+    return juce::jlimit(0.0f, 1.0f, normalizedValue);
+}
+
+float sceneMainAutomationColumnNormalizedValue(const MlrVSTAudioProcessor& processor,
+                                               const std::vector<ScenePerformanceEvent>& events,
+                                               int sceneSlot,
+                                               int stripIndex,
+                                               ScenePerformanceControlTarget target,
+                                               double beat,
+                                               double lengthBeats)
+{
+    const int safeStripIndex = sceneAutomationTargetUsesGlobalStripForMonome(target)
+        ? -1
+        : juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
+    const double safeBeat = juce::jlimit(0.0, std::nextafter(juce::jmax(1.0, lengthBeats), 0.0), beat);
+    const ScenePerformanceEvent* lastEvent = nullptr;
+    const ScenePerformanceEvent* chosenEvent = nullptr;
+
+    for (const auto& event : events)
+    {
+        if (event.type != ScenePerformanceEventType::ControlPoint
+            || event.controlTarget != target)
+        {
+            continue;
+        }
+
+        if (!sceneAutomationTargetUsesGlobalStripForMonome(target))
+        {
+            if (event.stripIndex != safeStripIndex)
+                continue;
+        }
+        else if (event.stripIndex != -1)
+        {
+            continue;
+        }
+
+        lastEvent = &event;
+        if (event.timeBeats <= safeBeat + 1.0e-6)
+            chosenEvent = &event;
+    }
+
+    if (chosenEvent == nullptr)
+        chosenEvent = lastEvent;
+    if (chosenEvent != nullptr)
+    {
+        const float normalized = normalizeSceneAutomationValueForMonome(*chosenEvent);
+        if (std::isfinite(normalized))
+            return juce::jlimit(0.0f, 1.0f, normalized);
+    }
+
+    return storedSceneAutomationNormalizedValueForMonome(processor,
+                                                         sceneSlot,
+                                                         safeStripIndex,
+                                                         target);
+}
+
+bool writeSceneMainAutomationColumn(MlrVSTAudioProcessor& processor,
+                                    int stripIndex,
+                                    int column,
+                                    float normalizedValue,
+                                    double currentBeat)
+{
+    if (!isSceneMainAutomationMonomeActive(processor) || processor.isScenePerformanceRecording())
+        return false;
+
+    const int sceneSlot = processor.getFocusedSceneSlot();
+    double beat = 0.0;
+    if (!sceneMainAutomationBeatForColumn(processor, sceneSlot, column, currentBeat, beat))
+        return false;
+
+    const int safeStripIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
+    const auto target = activeSceneMainAutomationTarget(processor, safeStripIndex);
+    if (target == ScenePerformanceControlTarget::None)
+        return false;
+
+    const int eventStripIndex = sceneAutomationTargetUsesGlobalStripForMonome(target) ? -1 : safeStripIndex;
+    const double matchEpsilon = 0.1125;
+    const double nextBeat = beat + 0.25;
+    const double lengthBeats = juce::jmax(1.0, processor.getResolvedSceneLengthBeats(sceneSlot));
+    const double maxBeat = juce::jmax(0.0, std::nextafter(lengthBeats, 0.0));
+    auto events = processor.getScenePerformanceEventsSnapshot(sceneSlot);
+    events.erase(std::remove_if(events.begin(),
+                                events.end(),
+                                [target, eventStripIndex, beat, matchEpsilon](const ScenePerformanceEvent& event)
+                                {
+                                    return event.type == ScenePerformanceEventType::ControlPoint
+                                        && event.controlTarget == target
+                                        && event.stripIndex == eventStripIndex
+                                        && std::abs(event.timeBeats - beat) <= matchEpsilon;
+                                }),
+                 events.end());
+
+    ScenePerformanceEvent event;
+    event.type = ScenePerformanceEventType::ControlPoint;
+    event.stripIndex = eventStripIndex;
+    event.timeBeats = beat;
+    event.controlRow = 0;
+    event.column = juce::jlimit(0,
+                                ModernAudioEngine::MaxColumns - 1,
+                                static_cast<int>(std::round(juce::jlimit(0.0f, 1.0f, normalizedValue)
+                                                            * static_cast<float>(ModernAudioEngine::MaxColumns - 1))));
+    event.controlTarget = target;
+    event.controlMode = static_cast<int>(sceneControlModeForTarget(target));
+    event.value = denormalizeSceneAutomationValueForMonome(event, normalizedValue);
+    events.push_back(event);
+
+    if (nextBeat <= maxBeat + 1.0e-6)
+    {
+        const bool hasNextStepAnchor = std::any_of(events.begin(),
+                                                   events.end(),
+                                                   [target, eventStripIndex, nextBeat, matchEpsilon](const ScenePerformanceEvent& existingEvent)
+                                                   {
+                                                       return existingEvent.type == ScenePerformanceEventType::ControlPoint
+                                                           && existingEvent.controlTarget == target
+                                                           && existingEvent.stripIndex == eventStripIndex
+                                                           && std::abs(existingEvent.timeBeats - nextBeat) <= matchEpsilon;
+                                                   });
+
+        if (!hasNextStepAnchor)
+        {
+            ScenePerformanceEvent resetEvent = event;
+            resetEvent.timeBeats = juce::jlimit(0.0, maxBeat, nextBeat);
+            const float resetNormalizedValue = storedSceneAutomationNormalizedValueForMonome(processor,
+                                                                                            sceneSlot,
+                                                                                            safeStripIndex,
+                                                                                            target);
+            resetEvent.column = juce::jlimit(0,
+                                             ModernAudioEngine::MaxColumns - 1,
+                                             static_cast<int>(std::round(juce::jlimit(0.0f, 1.0f, resetNormalizedValue)
+                                                                         * static_cast<float>(ModernAudioEngine::MaxColumns - 1))));
+            resetEvent.value = denormalizeSceneAutomationValueForMonome(resetEvent, resetNormalizedValue);
+            events.push_back(resetEvent);
+        }
+    }
+
+    return processor.replaceScenePerformanceClipEvents(sceneSlot, events);
 }
 }
 
@@ -460,16 +1038,70 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         return juce::jlimit(0.0f, 1.0f, static_cast<float>((CONTROL_ROW - 1) - row)
             / static_cast<float>(stripRowsDenom));
     };
-    const auto modulationRowToUnitForColumn = [CONTROL_ROW, visibleStripCount, modulationRowsDenom](int row, int column)
+    const auto modPageDirectionForColumn = [](int column)
     {
-        const int denom = (column == kMonomeModCycleColumn)
+        if (column == kMonomeModPrevColumn)
+            return -1;
+        if (column == kMonomeModNextColumn)
+            return 1;
+        return 0;
+    };
+    const auto sceneStepMotionPageNavigationActive = [&]()
+    {
+        const bool sceneStepMotionMonomePageActive = isControlModeActive()
+            && getCurrentControlMode() == ControlMode::Modulation;
+        return isSceneModeEnabled()
+            && getSceneModPageMode() == SceneModPageMode::StepMotion
+            && (isSceneStepMotionEditorOpen() || sceneStepMotionMonomePageActive);
+    };
+    const auto sceneStepMotionLaneNavigationAvailable = [this](int stripIndex)
+    {
+        const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+        return getSceneVisibleModTargetsForStrip(safeStripIndex).size() > 1;
+    };
+    const auto sceneMainAutomationMonomeActive = [this]()
+    {
+        return isSceneMainAutomationMonomeActive(*this);
+    };
+    const auto sceneModRepeatButtonsVisible = [&]()
+    {
+        return isSceneModeEnabled()
+            && controlModeActive
+            && currentControlMode == ControlMode::Modulation
+            && (layout.topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch
+                || layout.topRowMode == MonomeLayoutState::TopRowMode::Modulation);
+    };
+    const auto modulationRowToUnitForColumn = [this, CONTROL_ROW, visibleStripCount, modulationRowsDenom, &sceneStepMotionPageNavigationActive](int row, int column)
+    {
+        const bool modulationPageActive = isControlModeActive()
+            && getCurrentControlMode() == ControlMode::Modulation;
+        const bool reservedTopCell = modulationPageActive
+            ? (column == kMonomeModPrevColumn || column == kMonomeModNextColumn)
+            : (sceneStepMotionPageNavigationActive()
+                ? (column == kMonomeModPrevColumn || column == kMonomeModNextColumn)
+                : (column == kMonomeModNextColumn));
+        const int denom = reservedTopCell
             ? juce::jmax(1, visibleStripCount - 1)
             : modulationRowsDenom;
         return juce::jlimit(0.0f, 1.0f, static_cast<float>((CONTROL_ROW - 1) - row)
             / static_cast<float>(denom));
     };
+    const auto sceneMainAutomationRowToUnit = [GROUP_ROW, CONTROL_ROW](int row)
+    {
+        const int topWritableRow = GROUP_ROW + 1;
+        const int bottomWritableRow = juce::jmax(topWritableRow, CONTROL_ROW - 1);
+        const int clampedRow = juce::jlimit(topWritableRow, bottomWritableRow, row);
+        const int denom = juce::jmax(1, bottomWritableRow - topWritableRow);
+        return juce::jlimit(0.0f,
+                            1.0f,
+                            static_cast<float>(bottomWritableRow - clampedRow)
+                                / static_cast<float>(denom));
+    };
     const auto syncMonomeModEditPageToPlayback = [&](ModernAudioEngine& engine, int stripIndex)
     {
+        if (sceneStepMotionPageNavigationActive() || sceneMainAutomationMonomeActive())
+            return false;
+
         if (stripIndex < 0 || stripIndex >= MaxStrips)
             return false;
 
@@ -482,6 +1114,38 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             engine.setModEditPage(stripIndex, playbackPage);
         return true;
     };
+    const auto navigateSceneStepMotionLane = [&](int stripIndex, int direction)
+    {
+        if (!sceneStepMotionPageNavigationActive())
+            return false;
+
+        const int safeDirection = (direction > 0) ? 1 : ((direction < 0) ? -1 : 0);
+        if (safeDirection == 0 || stripIndex < 0 || stripIndex >= MaxStrips)
+            return false;
+
+        if (!sceneStepMotionLaneNavigationAvailable(stripIndex))
+            return false;
+
+        stepSceneModLaneTarget(stripIndex, safeDirection);
+        return true;
+    };
+    const auto regularModPageLaneNavigationVisible = [&]()
+    {
+        return controlModeActive
+            && currentControlMode == ControlMode::Modulation
+            && layout.topRowMode != MonomeLayoutState::TopRowMode::Modulation
+            && !sceneStepMotionPageNavigationActive();
+    };
+    const auto navigatePerRowModLane = [&](ModernAudioEngine& engine, int stripIndex, int direction)
+    {
+        const int safeDirection = (direction > 0) ? 1 : ((direction < 0) ? -1 : 0);
+        if (safeDirection == 0 || stripIndex < 0 || stripIndex >= MaxStrips)
+            return false;
+
+        syncMonomeModEditPageToPlayback(engine, stripIndex);
+        stepVisibleModLaneTarget(stripIndex, safeDirection);
+        return true;
+    };
     const auto isPresetCell = [&layout](int gridX, int gridY)
     {
         return layout.isPresetCell(gridX, gridY);
@@ -490,76 +1154,35 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
     {
         return layout.toPresetIndex(gridX, gridY);
     };
-    const auto isSceneTopCell = [&layout](int gridX, int gridY)
+    const auto isSceneLaunchCell = [topRowMode = layout.topRowMode, GROUP_ROW, gridWidth](int gridX, int gridY)
     {
-        return layout.isSceneTopCell(gridX, gridY);
+        return topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch
+            && gridY == GROUP_ROW
+            && gridX >= 0
+            && gridX < juce::jmin(gridWidth, kMonomeSceneLaunchColumns);
+    };
+    const auto isSceneRecorderCell = [topRowMode = layout.topRowMode, GROUP_ROW, gridWidth](int gridX, int gridY)
+    {
+        return topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch
+            && gridY == GROUP_ROW
+            && kMonomeSceneRecorderColumn >= 0
+            && kMonomeSceneRecorderColumn < gridWidth
+            && gridX == kMonomeSceneRecorderColumn;
     };
     const bool presetModeActive = layout.presetModeActive;
     const bool stepEditModeActive = layout.stepEditModeActive;
     const bool sceneModeActive = layout.sceneModeActive;
-    const int sceneActionStartColumn = layout.sceneActionStartColumn;
     const auto topRowMode = layout.topRowMode;
-    const auto isSceneActionCell = [&layout](int gridX, int gridY)
+    const auto topRowUsesScratchAndStutter = [&]()
     {
-        return layout.isSceneActionCell(gridX, gridY);
+        return (!controlModeActive || currentControlMode == ControlMode::Normal)
+            && (topRowMode == MonomeLayoutState::TopRowMode::Launch
+                || (topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch
+                    && !sceneStepMotionPageNavigationActive()));
     };
     const auto isDisplayedDataRow = [&layout](int row)
     {
         return layout.isDisplayedDataRow(row);
-    };
-    const auto handleSceneActionCellPress = [&](int cellX)
-    {
-        const int actionIndex = cellX - sceneActionStartColumn;
-        if (!sceneModeActive || actionIndex < 0 || actionIndex > 3)
-            return false;
-
-        const uint32_t nowMs = juce::Time::getMillisecondCounter();
-        const int mainPresetIndex = getActiveMainPresetIndexForScenes();
-        const int activeScene = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
-
-        switch (actionIndex)
-        {
-            case 0:
-                handleMonomeSceneRecorderButtonPress(nowMs);
-                break;
-            case 1:
-                if (sceneCopySourceSlot == activeScene && sceneCopyMainPresetIndex == mainPresetIndex)
-                {
-                    sceneCopySourceSlot = -1;
-                    sceneCopyMainPresetIndex = 0;
-                }
-                else if (sceneSlotExistsForMainPreset(mainPresetIndex, activeScene))
-                {
-                    sceneCopySourceSlot = activeScene;
-                    sceneCopyMainPresetIndex = mainPresetIndex;
-                }
-                else
-                {
-                    sceneCopySourceSlot = -1;
-                    sceneCopyMainPresetIndex = 0;
-                }
-                break;
-            case 2:
-                if (deleteSceneForMainPreset(mainPresetIndex, activeScene))
-                {
-                    if (sceneCopySourceSlot == activeScene && sceneCopyMainPresetIndex == mainPresetIndex)
-                    {
-                        sceneCopySourceSlot = -1;
-                        sceneCopyMainPresetIndex = 0;
-                    }
-                    scenePadActionBurstUntilMs[static_cast<size_t>(activeScene)] = nowMs + sceneActionBurstDurationMs;
-                }
-                break;
-            case 3:
-                if (captureSceneSlot(activeScene))
-                    scenePadActionBurstUntilMs[static_cast<size_t>(activeScene)] = nowMs + sceneActionBurstDurationMs;
-                break;
-            default:
-                return false;
-        }
-
-        updateMonomeLEDs();
-        return true;
     };
     
     static int loopSetFirstButton = -1;
@@ -570,7 +1193,61 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
         // GROUP ROW (y=0): Groups 0-3 + Pattern Recorders 4-7
         if (y == GROUP_ROW)
         {
-            if (topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch && isSceneTopCell(x, y))
+            const int sceneLaunchStepMotionLaneStep = topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch
+                && sceneStepMotionPageNavigationActive()
+                ? modPageDirectionForColumn(x)
+                : 0;
+
+            if (sceneLaunchStepMotionLaneStep != 0)
+            {
+                const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
+                navigateSceneStepMotionLane(targetStrip, sceneLaunchStepMotionLaneStep);
+                updateMonomeLEDs();
+                return;
+            }
+
+            const int regularModPageLaneStep = regularModPageLaneNavigationVisible()
+                ? modPageDirectionForColumn(x)
+                : 0;
+
+            if (regularModPageLaneStep != 0)
+            {
+                auto* engine = getAudioEngine();
+                if (!engine)
+                    return;
+
+                const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
+                if (navigatePerRowModLane(*engine, targetStrip, regularModPageLaneStep))
+                {
+                    updateMonomeLEDs();
+                    return;
+                }
+            }
+
+            if (sceneModRepeatButtonsVisible())
+            {
+                const int sceneLengthCount = sceneLengthCountFromButton(x);
+                if (sceneLengthCount > 0)
+                {
+                    const int sceneSlot = getFocusedSceneSlot();
+                    setSceneLengthCount(sceneSlot, sceneLengthCount);
+                    persistSceneTimingForSlot(sceneSlot);
+                    updateMonomeLEDs();
+                    return;
+                }
+            }
+
+            if (isSceneRecorderCell(x, y))
+            {
+                monomeSceneRecorderHeld = true;
+                monomeSceneRecorderHoldClearTriggered = false;
+                monomeSceneRecorderPressStartMs = juce::Time::getMillisecondCounter();
+                monomeSceneRecorderClearBurstUntilMs = 0;
+                updateMonomeLEDs();
+                return;
+            }
+
+            if (topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch && isSceneLaunchCell(x, y))
             {
                 const int sceneSlot = juce::jlimit(0, SceneSlots - 1, x);
                 const auto slotIdx = static_cast<size_t>(sceneSlot);
@@ -731,12 +1408,6 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 return;
             }
 
-            if (topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch && isSceneActionCell(x, y))
-            {
-                if (handleSceneActionCellPress(x))
-                    return;
-            }
-
             if (topRowMode == MonomeLayoutState::TopRowMode::PresetGrid && isPresetCell(x, y))
             {
                 const int presetIndex = toPresetIndex(x, y);
@@ -858,7 +1529,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
 
             // Row 0 col 8: original momentary scratch hold.
-            if (x == 8 && topRowMode == MonomeLayoutState::TopRowMode::Launch)
+            if (x == 8 && topRowUsesScratchAndStutter())
             {
                 setMomentaryScratchHold(true);
                 updateMonomeLEDs();
@@ -867,7 +1538,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
             // Row 0, cols 9-15: momentary stutter rates (timeline-synced):
             // 9=1/2 ... 15=1/128.
-            if (x >= 9 && x <= 15 && topRowMode == MonomeLayoutState::TopRowMode::Launch)
+            if (x >= 9 && x <= 15 && topRowUsesScratchAndStutter())
             {
                 const uint8_t bit = stutterButtonBitForColumn(x);
                 if (bit != 0)
@@ -910,33 +1581,55 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 if (!engine)
                     return;
                 syncMonomeModEditPageToPlayback(*engine, targetStrip);
+                const bool sceneModPageWritesSceneMotion = isSceneModeEnabled()
+                    && getSceneModPageMode() == SceneModPageMode::StepMotion;
+                const bool sceneMainModPageWritesAutomation = sceneMainAutomationMonomeActive();
+                const int sceneModStepMotionLaneStep = sceneModPageWritesSceneMotion
+                    && sceneStepMotionPageNavigationActive()
+                    ? modPageDirectionForColumn(x)
+                    : 0;
 
-                if (x == kMonomeModCycleColumn)
+                if (sceneModStepMotionLaneStep != 0)
                 {
-                    if (isSceneModeEnabled())
-                        cycleSceneModLaneTarget(targetStrip);
-                    else
-                    {
-                        const int activeSlot = engine->getModSequencerSlot(targetStrip);
-                        const int nextSlot = (activeSlot + 1) % ModernAudioEngine::NumModSequencers;
-                        engine->setModSequencerSlot(targetStrip, nextSlot);
-                    }
+                    navigateSceneStepMotionLane(targetStrip, sceneModStepMotionLaneStep);
                     updateMonomeLEDs();
                     return;
                 }
 
-                const bool bipolar = engine->isModBipolar(targetStrip);
-                const bool rearrangeTarget = (engine->getModTarget(targetStrip) == ModernAudioEngine::ModTarget::Rearrange);
-                const float normalizedY = 1.0f; // y=0 is highest value
-                float value = normalizedY;
-                if (bipolar)
+                const int modulationLaneStep = modPageDirectionForColumn(x);
+                if (modulationLaneStep != 0)
                 {
-                    const float signedValue = (normalizedY * 2.0f) - 1.0f;
-                    value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
+                    if (sceneModPageWritesSceneMotion && sceneStepMotionPageNavigationActive())
+                        navigateSceneStepMotionLane(targetStrip, modulationLaneStep);
+                    else
+                        navigatePerRowModLane(*engine, targetStrip, modulationLaneStep);
+                    updateMonomeLEDs();
+                    return;
                 }
-                if (rearrangeTarget)
-                    value = quantizeMonomeRearrangeValue(value);
-                engine->setModStepValue(targetStrip, x, value);
+
+                if (sceneMainModPageWritesAutomation)
+                {
+                    // In scene main automation mode the top row is navigation/indicator only.
+                    updateMonomeLEDs();
+                    return;
+                }
+                else
+                {
+                    const float normalizedY = 1.0f; // y=0 is highest value
+                    const bool bipolar = engine->isModBipolar(targetStrip);
+                    const bool rearrangeTarget = (engine->getModTarget(targetStrip) == ModernAudioEngine::ModTarget::Rearrange);
+                    float value = normalizedY;
+                    if (bipolar)
+                    {
+                        const float signedValue = (normalizedY * 2.0f) - 1.0f;
+                        value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
+                    }
+                    if (rearrangeTarget)
+                        value = quantizeMonomeRearrangeValue(value);
+                    engine->setModStepValue(targetStrip, x, value);
+                    if (sceneModPageWritesSceneMotion)
+                        syncFocusedSceneMotionState();
+                }
 
                 updateMonomeLEDs();
                 return;
@@ -1586,19 +2279,32 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                         {
                             const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
                             syncMonomeModEditPageToPlayback(*audioEngine, targetStrip);
-                            const bool bipolar = audioEngine->isModBipolar(targetStrip);
-                            const bool rearrangeTarget = (audioEngine->getModTarget(targetStrip) == ModernAudioEngine::ModTarget::Rearrange);
-                            const float normalizedY = modulationRowToUnitForColumn(y, x);
-                            float value = normalizedY;
-                            if (bipolar)
+                            const bool sceneModPageWritesSceneMotion = isSceneModeEnabled()
+                                && getSceneModPageMode() == SceneModPageMode::StepMotion;
+                            if (sceneMainAutomationMonomeActive())
                             {
-                                // In bipolar mode, center row maps to 0.5 and extremes map to 0/1.
-                                const float signedValue = (normalizedY * 2.0f) - 1.0f;
-                                value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
+                                const float normalizedY = sceneMainAutomationRowToUnit(y);
+                                const double currentBeat = audioEngine->getTimelineBeat();
+                                writeSceneMainAutomationColumn(*this, targetStrip, x, normalizedY, currentBeat);
                             }
-                            if (rearrangeTarget)
-                                value = quantizeMonomeRearrangeValue(value);
-                            audioEngine->setModStepValue(targetStrip, x, value);
+                            else
+                            {
+                                const float normalizedY = modulationRowToUnitForColumn(y, x);
+                                const bool bipolar = audioEngine->isModBipolar(targetStrip);
+                                const bool rearrangeTarget = (audioEngine->getModTarget(targetStrip) == ModernAudioEngine::ModTarget::Rearrange);
+                                float value = normalizedY;
+                                if (bipolar)
+                                {
+                                    // In bipolar mode, center row maps to 0.5 and extremes map to 0/1.
+                                    const float signedValue = (normalizedY * 2.0f) - 1.0f;
+                                    value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
+                                }
+                                if (rearrangeTarget)
+                                    value = quantizeMonomeRearrangeValue(value);
+                                audioEngine->setModStepValue(targetStrip, x, value);
+                                if (sceneModPageWritesSceneMotion)
+                                    syncFocusedSceneMotionState();
+                            }
                             updateMonomeLEDs();
                             break;
                         }
@@ -1651,7 +2357,21 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
     }
     else if (state == 0) // Key up
     {
-        if (topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch && isSceneTopCell(x, y))
+        if (isSceneRecorderCell(x, y))
+        {
+            const bool holdTriggered = monomeSceneRecorderHoldClearTriggered;
+            monomeSceneRecorderHeld = false;
+            monomeSceneRecorderHoldClearTriggered = false;
+            monomeSceneRecorderPressStartMs = 0;
+
+            if (!holdTriggered)
+                handleMonomeSceneRecorderButtonPress(juce::Time::getMillisecondCounter());
+
+            updateMonomeLEDs();
+            return;
+        }
+
+        if (topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch && isSceneLaunchCell(x, y))
         {
             const int sceneSlot = juce::jlimit(0, SceneSlots - 1, x);
             const auto slotIdx = static_cast<size_t>(sceneSlot);
@@ -1865,8 +2585,10 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     const int maxStepEditBank = layout.maxStepEditBank;
     stepEditStripBank = juce::jlimit(0, maxStepEditBank, stepEditStripBank);
     const int modulationMaxRow = juce::jmax(1, visibleStripCount);
+    const int sceneAutomationTopRow = GROUP_ROW + 1;
+    const int sceneAutomationBottomRow = juce::jmax(sceneAutomationTopRow, modulationMaxRow);
+    const int sceneAutomationUsableRows = juce::jmax(1, sceneAutomationBottomRow - sceneAutomationTopRow);
     const bool sceneModeActive = layout.sceneModeActive;
-    const int sceneActionStartColumn = layout.sceneActionStartColumn;
     const auto topRowMode = layout.topRowMode;
     const auto clampVisibleStrip = [&layout](int index)
     {
@@ -1878,8 +2600,75 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         return juce::jlimit(0.0f, 1.0f,
             static_cast<float>((CONTROL_ROW - 1) - row) / static_cast<float>(denom));
     };
+    const auto sceneAutomationValueToRow = [sceneAutomationTopRow, sceneAutomationBottomRow, sceneAutomationUsableRows](float v)
+    {
+        return juce::jlimit(sceneAutomationTopRow,
+                            sceneAutomationBottomRow,
+                            sceneAutomationTopRow + static_cast<int>(std::round((1.0f - juce::jlimit(0.0f, 1.0f, v))
+                                                                               * static_cast<float>(sceneAutomationUsableRows))));
+    };
+    const auto sceneAutomationRowValue01 = [sceneAutomationTopRow, sceneAutomationBottomRow, sceneAutomationUsableRows](int row)
+    {
+        return juce::jlimit(0.0f,
+                            1.0f,
+                            static_cast<float>(sceneAutomationBottomRow - juce::jlimit(sceneAutomationTopRow,
+                                                                                       sceneAutomationBottomRow,
+                                                                                       row))
+                                / static_cast<float>(sceneAutomationUsableRows));
+    };
+    const auto sceneStepMotionPageNavigationActive = [&]()
+    {
+        const bool sceneStepMotionMonomePageActive = isControlModeActive()
+            && getCurrentControlMode() == ControlMode::Modulation;
+        return isSceneModeEnabled()
+            && getSceneModPageMode() == SceneModPageMode::StepMotion
+            && (isSceneStepMotionEditorOpen() || sceneStepMotionMonomePageActive);
+    };
+    const auto topRowUsesScratchAndStutter = [&]()
+    {
+        return (!controlModeActive || currentControlMode == ControlMode::Normal)
+            && (topRowMode == MonomeLayoutState::TopRowMode::Launch
+                || (topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch
+                    && !sceneStepMotionPageNavigationActive()));
+    };
+    const auto sceneStepMotionLaneNavigationAvailable = [this](int stripIndex)
+    {
+        const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+        return getSceneVisibleModTargetsForStrip(safeStripIndex).size() > 1;
+    };
+    const auto sceneMainAutomationMonomeActive = [this]()
+    {
+        return isSceneMainAutomationMonomeActive(*this);
+    };
+    const auto sceneModRepeatButtonsVisible = [&]()
+    {
+        return sceneModeActive
+            && controlModeActive
+            && currentControlMode == ControlMode::Modulation
+            && (topRowMode == MonomeLayoutState::TopRowMode::SceneLaunch
+                || topRowMode == MonomeLayoutState::TopRowMode::Modulation);
+    };
+    const auto regularModLaneNavigationAvailable = [this](int stripIndex)
+    {
+        const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+        return getVisibleModTargetsForStrip(safeStripIndex).size() > 1;
+    };
+    const auto sceneStepMotionLaneNavigationLevel = [](bool canNavigate)
+    {
+        return canNavigate ? 10 : 3;
+    };
+    const auto regularModPageLaneNavigationVisible = [&]()
+    {
+        return controlModeActive
+            && currentControlMode == ControlMode::Modulation
+            && topRowMode != MonomeLayoutState::TopRowMode::Modulation
+            && !sceneStepMotionPageNavigationActive();
+    };
     const auto syncMonomeModEditPageToPlayback = [&](int stripIndex)
     {
+        if (sceneStepMotionPageNavigationActive() || sceneMainAutomationMonomeActive())
+            return false;
+
         if (stripIndex < 0 || stripIndex >= MaxStrips)
             return false;
 
@@ -1907,57 +2696,47 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     const int metroBeatLevel = 10;
     const int metroDownbeatLevel = 15;
     const auto nowMs = juce::Time::getMillisecondCounter();
+    const int sceneMainModStripIndex = sceneMainAutomationMonomeActive()
+        ? clampVisibleStrip(getLastMonomePressedStripRow())
+        : -1;
+    const int sceneMainModSceneSlot = sceneMainAutomationMonomeActive()
+        ? getFocusedSceneSlot()
+        : -1;
+    const auto sceneMainModTarget = sceneMainAutomationMonomeActive()
+        ? activeSceneMainAutomationTarget(*this, sceneMainModStripIndex)
+        : ScenePerformanceControlTarget::None;
+    const bool sceneMainModTargetBipolar = sceneAutomationTargetIsBipolarForMonome(sceneMainModTarget);
+    const double sceneMainModLengthBeats = sceneMainAutomationMonomeActive()
+        ? juce::jmax(1.0, getResolvedSceneLengthBeats(sceneMainModSceneSlot))
+        : 1.0;
+    const auto sceneMainModEvents = sceneMainAutomationMonomeActive()
+        ? getScenePerformanceEventsSnapshot(sceneMainModSceneSlot)
+        : std::vector<ScenePerformanceEvent>{};
+    const int sceneMainModDisplayPage = sceneMainAutomationMonomeActive()
+        ? sceneMainAutomationDisplayPage(*this, sceneMainModSceneSlot, beatNow)
+        : 0;
+    int sceneMainModActiveStep = -1;
+    if (sceneMainAutomationMonomeActive())
+        sceneMainAutomationPlaybackStepForPage(*this, sceneMainModSceneSlot, sceneMainModDisplayPage, beatNow, sceneMainModActiveStep);
+    const auto sceneMainModColumnValue = [&](int column, float& normalizedOut)
+    {
+        if (!sceneMainAutomationMonomeActive() || sceneMainModTarget == ScenePerformanceControlTarget::None)
+            return false;
+
+        double beat = 0.0;
+        if (!sceneMainAutomationBeatForColumn(*this, sceneMainModSceneSlot, column, beatNow, beat))
+            return false;
+
+        normalizedOut = sceneMainAutomationColumnNormalizedValue(*this,
+                                                                 sceneMainModEvents,
+                                                                 sceneMainModSceneSlot,
+                                                                 sceneMainModStripIndex,
+                                                                 sceneMainModTarget,
+                                                                 beat,
+                                                                 sceneMainModLengthBeats);
+        return true;
+    };
     const int activeSceneMainPreset = getActiveMainPresetIndexForScenes();
-    auto getSceneRecorderLevel = [&]() -> int
-    {
-        const int sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
-        const auto queuedRecorderAction = static_cast<SceneRecorderAction>(
-            pendingSceneRecorderApplyAction.load(std::memory_order_acquire));
-        const bool tapArmed = monomeSceneRecorderPendingAction != MonomeSceneRecorderTapAction::None
-            && monomeSceneRecorderPendingUntilMs != 0
-            && static_cast<int32_t>(monomeSceneRecorderPendingUntilMs - nowMs) >= 0;
-        const bool armed = pendingSceneRecorderAction.active
-            || queuedRecorderAction != SceneRecorderAction::None
-            || tapArmed;
-        const bool recording = isScenePerformanceRecording();
-        const bool overdubbing = isScenePerformanceOverdubbing();
-
-        if (armed)
-        {
-            if (recording || queuedRecorderAction == SceneRecorderAction::StopRecording)
-                return fastBlinkOn ? 15 : 3;
-
-            return slowBlinkOn ? 15 : 2;
-        }
-
-        if (recording)
-            return overdubbing ? (fastBlinkOn ? 15 : 8)
-                               : (metroPulseOn ? 15 : 11);
-
-        const double progress = getScenePerformancePlaybackProgress(sceneSlot, beatNow);
-        if (progress >= 0.0)
-            return slowBlinkOn ? 12 : 4;
-
-        return hasScenePerformanceClip(sceneSlot) ? 6 : 2;
-    };
-    auto renderSceneActionCells = [&](int activeScene)
-    {
-        const bool activeSceneExists = sceneSlotExistsForMainPreset(activeSceneMainPreset, activeScene);
-        const bool copyArmedForMainPreset = sceneCopySourceSlot >= 0
-            && sceneCopyMainPresetIndex == activeSceneMainPreset;
-        const std::array<int, 4> sceneActionLevels{
-            getSceneRecorderLevel(),
-            copyArmedForMainPreset ? (slowBlinkOn ? 15 : 8) : (activeSceneExists ? 6 : 3),
-            activeSceneExists ? 3 : 1,
-            activeSceneExists ? 9 : 2
-        };
-        for (int actionIndex = 0; actionIndex < static_cast<int>(sceneActionLevels.size()); ++actionIndex)
-        {
-            const int column = sceneActionStartColumn + actionIndex;
-            if (column >= 0 && column < gridWidth)
-                newLedState[column][GROUP_ROW] = sceneActionLevels[static_cast<size_t>(actionIndex)];
-        }
-    };
     auto updateSceneSlotLeds = [&]()
     {
         const bool chainPlaying = isSceneChainPlaybackActive();
@@ -1965,9 +2744,30 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         const int chainPlaybackScene = chainPlaybackStep >= 0
             ? getSceneChainStepSceneSlot(chainPlaybackStep)
             : -1;
-        const int activeScene = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+        const int visibleSceneSlots = juce::jmin(SceneSlots, kMonomeSceneLaunchColumns);
+        for (int sceneSlot = 0; sceneSlot < visibleSceneSlots; ++sceneSlot)
+        {
+            const auto slotIdx = static_cast<size_t>(sceneSlot);
+            if (!scenePadHeld[slotIdx] || scenePadHoldDeleteTriggered[slotIdx])
+                continue;
 
-        for (int sceneSlot = 0; sceneSlot < SceneSlots; ++sceneSlot)
+            const uint32_t elapsed = nowMs - scenePadPressStartMs[slotIdx];
+            if (elapsed < sceneHoldDeleteMs)
+                continue;
+
+            const bool saved = saveSceneForMainPreset(activeSceneMainPreset, sceneSlot);
+            if (!saved && !sceneSlotExistsForMainPreset(activeSceneMainPreset, sceneSlot))
+                continue;
+
+            sceneCopySourceSlot = sceneSlot;
+            sceneCopyMainPresetIndex = activeSceneMainPreset;
+            scenePadHoldDeleteTriggered[slotIdx] = true;
+            scenePadLaunchConsumed[slotIdx] = true;
+            scenePadLastTapMs[slotIdx] = 0;
+            scenePadActionBurstUntilMs[slotIdx] = nowMs + sceneActionBurstDurationMs;
+        }
+
+        for (int sceneSlot = 0; sceneSlot < visibleSceneSlots; ++sceneSlot)
         {
             const auto slotIdx = static_cast<size_t>(sceneSlot);
             const bool exists = sceneSlotExistsForMainPreset(activeSceneMainPreset, sceneSlot);
@@ -1990,10 +2790,10 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                 level = fastBlinkOn ? 15 : 9;
             if (queued)
                 level = slowBlinkOn ? 15 : 7;
-            if (copyArmed)
-                level = slowBlinkOn ? 15 : 4;
-            if (held)
+            if (held && !copyArmed)
                 level = 15;
+            if (copyArmed)
+                level = fastBlinkOn ? 15 : 4;
             if (burstActive)
             {
                 const bool burstOn = ((nowMs / sceneActionBurstIntervalMs) & 1u) == 0u;
@@ -2003,7 +2803,61 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             newLedState[sceneSlot][GROUP_ROW] = level;
         }
 
-        renderSceneActionCells(activeScene);
+        if (kMonomeSceneRecorderColumn >= 0 && kMonomeSceneRecorderColumn < gridWidth)
+        {
+            if (monomeSceneRecorderHeld
+                && !monomeSceneRecorderHoldClearTriggered
+                && !isScenePerformanceRecording()
+                && monomeSceneRecorderPressStartMs != 0)
+            {
+                const uint32_t elapsed = nowMs - monomeSceneRecorderPressStartMs;
+                if (elapsed >= sceneHoldDeleteMs)
+                {
+                    monomeSceneRecorderHoldClearTriggered = true;
+                    clearPendingMonomeSceneRecorderTap();
+                    clearPendingSceneRecorderAction();
+                    const int targetSceneSlot = getFocusedSceneSlot();
+                    const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
+                    if (clearSceneStripAutomationAndMotion(targetSceneSlot, targetStrip))
+                        monomeSceneRecorderClearBurstUntilMs = nowMs + sceneActionBurstDurationMs;
+                }
+            }
+
+            const bool recordingThisScene = isScenePerformanceRecording()
+                && getScenePerformanceRecordingSceneSlot() == juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+            const bool overdubbingThisScene = recordingThisScene && isScenePerformanceOverdubbing();
+            const bool pendingTap = monomeSceneRecorderPendingAction != MonomeSceneRecorderTapAction::None;
+            const bool pendingQuantized = pendingSceneRecorderAction.active
+                || pendingSceneRecorderApplyAction.load(std::memory_order_acquire)
+                    != static_cast<int>(SceneRecorderAction::None);
+            const bool recorderHeld = monomeSceneRecorderHeld;
+            const bool clearBurstActive = nowMs < monomeSceneRecorderClearBurstUntilMs;
+            const bool idleBlinkOn = ((nowMs / kSceneRecorderIdleBlinkIntervalMs) & 1u) == 0u;
+            const bool activeBlinkOn = ((nowMs / kSceneRecorderActiveBlinkIntervalMs) & 1u) == 0u;
+
+            int recorderLevel = idleBlinkOn ? 10 : 0;
+            if (clearBurstActive)
+            {
+                const bool burstOn = ((nowMs / sceneActionBurstIntervalMs) & 1u) == 0u;
+                recorderLevel = burstOn ? 15 : 0;
+            }
+            else if (recordingThisScene || pendingTap || pendingQuantized)
+                recorderLevel = activeBlinkOn ? 15 : (overdubbingThisScene ? 5 : 0);
+            else if (recorderHeld)
+                recorderLevel = 15;
+
+            newLedState[kMonomeSceneRecorderColumn][GROUP_ROW] = recorderLevel;
+        }
+
+        if (sceneStepMotionPageNavigationActive())
+        {
+            const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
+            const bool canNavigate = sceneStepMotionLaneNavigationAvailable(targetStrip);
+            if (kMonomeModPrevColumn >= 0 && kMonomeModPrevColumn < gridWidth)
+                newLedState[kMonomeModPrevColumn][GROUP_ROW] = sceneStepMotionLaneNavigationLevel(canNavigate);
+            if (kMonomeModNextColumn >= 0 && kMonomeModNextColumn < gridWidth)
+                newLedState[kMonomeModNextColumn][GROUP_ROW] = sceneStepMotionLaneNavigationLevel(canNavigate);
+        }
     };
 
     if (controlModeActive && currentControlMode == ControlMode::FileBrowser)
@@ -2178,95 +3032,125 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
     else if (topRowMode == MonomeLayoutState::TopRowMode::Modulation)
     {
         const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
-        syncMonomeModEditPageToPlayback(targetStrip);
-        const auto seq = audioEngine->getModSequencerState(targetStrip);
-        const int activeGlobalStep = audioEngine->getModCurrentGlobalStep(targetStrip);
-        const int playbackPage = juce::jlimit(
-            0,
-            ModernAudioEngine::MaxModBars - 1,
-            activeGlobalStep / ModernAudioEngine::ModSteps);
-        const int activeStep = (playbackPage == seq.editPage)
-            ? (activeGlobalStep % ModernAudioEngine::ModSteps)
-            : -1;
-        const bool stripPlaying = audioEngine->getStrip(targetStrip) && audioEngine->getStrip(targetStrip)->isPlaying();
-        const int displayRow = 0; // Top row is highest value in modulation mode.
-        const int modulationBaseRow = seq.bipolar ? (modulationMaxRow / 2) : modulationMaxRow;
-
-        auto valueToRow = [&](float v)
+        if (sceneMainAutomationMonomeActive())
         {
-            v = juce::jlimit(0.0f, 1.0f, v);
-            if (seq.bipolar)
+            const bool canNavigate = regularModLaneNavigationAvailable(targetStrip);
+            for (int x = 0; x < 16; ++x)
             {
-                const float signedV = (v * 2.0f) - 1.0f;
-                const float n = (signedV + 1.0f) * 0.5f;
-                return juce::jlimit(0, modulationMaxRow, static_cast<int>(std::round((1.0f - n) * modulationMaxRow)));
-            }
-            return juce::jlimit(0, modulationMaxRow, static_cast<int>(std::round((1.0f - v) * modulationMaxRow)));
-        };
-        auto curveLevelForRow = [&](int row, bool isPoint)
-        {
-            // Value-encoded intensity: high values (top rows) are more solid,
-            // low values (bottom rows) are dimmer.
-            const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
-            const int base = juce::jlimit(1, 15, static_cast<int>(std::round(juce::jmap(rowValue01, 2.0f, 12.0f))));
-            return juce::jlimit(1, 15, isPoint ? (base + 2) : base);
-        };
-        auto stepLevelForRow = [&](int row, int pointRow, int baseRow)
-        {
-            const int minRow = juce::jmin(baseRow, pointRow);
-            const int maxRow = juce::jmax(baseRow, pointRow);
-            if (row < minRow || row > maxRow)
-                return 0;
-
-            const float barRange = static_cast<float>(std::abs(pointRow - baseRow));
-            const float fromBase = static_cast<float>(std::abs(row - baseRow));
-            const float t = (barRange > 0.0f) ? (fromBase / barRange) : 1.0f; // 0 at base, 1 at point
-            const float shapedT = std::pow(juce::jlimit(0.0f, 1.0f, t), 0.72f);
-
-            const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
-            const float minLevel = seq.bipolar ? 3.0f : 2.0f;
-            const float maxLevel = 9.0f + (4.0f * rowValue01); // 9..13, brighter for higher values
-            int level = static_cast<int>(std::round(minLevel + ((maxLevel - minLevel) * shapedT)));
-            if (row == pointRow)
-                level += 2;
-            return juce::jlimit(1, 15, level);
-        };
-
-        for (int x = 0; x < 16; ++x)
-        {
-            if (x == kMonomeModCycleColumn)
-            {
-                newLedState[x][GROUP_ROW] = slowBlinkOn ? 15 : 5;
-                continue;
-            }
-
-            newLedState[x][GROUP_ROW] = 0;
-            const float v = seq.steps[static_cast<size_t>(x)];
-            const int pointRow = valueToRow(v);
-
-            if (seq.curveMode)
-            {
-                int level = 0;
-                if (displayRow == pointRow)
-                    level = juce::jmax(level, curveLevelForRow(displayRow, true));
-                if (x < 15)
+                if (x == kMonomeModPrevColumn || x == kMonomeModNextColumn)
                 {
-                    const int nextRow = valueToRow(seq.steps[static_cast<size_t>(x + 1)]);
-                    const int minRow = juce::jmin(pointRow, nextRow);
-                    const int maxRow = juce::jmax(pointRow, nextRow);
-                    if (displayRow >= minRow && displayRow <= maxRow)
-                        level = juce::jmax(level, curveLevelForRow(displayRow, false));
+                    newLedState[x][GROUP_ROW] = sceneStepMotionLaneNavigationLevel(canNavigate);
+                    continue;
                 }
-                newLedState[x][GROUP_ROW] = level;
-            }
-            else
-            {
-                newLedState[x][GROUP_ROW] = stepLevelForRow(displayRow, pointRow, modulationBaseRow);
-            }
 
-            if (stripPlaying && x == activeStep)
-                newLedState[x][GROUP_ROW] = juce::jmax(newLedState[x][GROUP_ROW], 15);
+                newLedState[x][GROUP_ROW] = 0;
+            }
         }
+        else
+        {
+            syncMonomeModEditPageToPlayback(targetStrip);
+            const auto seq = audioEngine->getModSequencerState(targetStrip);
+            const int activeGlobalStep = audioEngine->getModCurrentGlobalStep(targetStrip);
+            const int playbackPage = juce::jlimit(
+                0,
+                ModernAudioEngine::MaxModBars - 1,
+                activeGlobalStep / ModernAudioEngine::ModSteps);
+            const int activeStep = (playbackPage == seq.editPage)
+                ? (activeGlobalStep % ModernAudioEngine::ModSteps)
+                : -1;
+            const bool stripPlaying = audioEngine->getStrip(targetStrip) && audioEngine->getStrip(targetStrip)->isPlaying();
+            const int displayRow = 0; // Top row is highest value in modulation mode.
+            const int modulationBaseRow = seq.bipolar ? (modulationMaxRow / 2) : modulationMaxRow;
+            const bool sceneStepMotionPageNavigationVisible = sceneStepMotionPageNavigationActive()
+                && isControlModeActive()
+                && getCurrentControlMode() == ControlMode::Modulation;
+            const bool sceneStepMotionLaneNavigationEnabled = sceneStepMotionPageNavigationVisible
+                && sceneStepMotionLaneNavigationAvailable(targetStrip);
+
+            auto valueToRow = [&](float v)
+            {
+                v = juce::jlimit(0.0f, 1.0f, v);
+                if (seq.bipolar)
+                {
+                    const float signedV = (v * 2.0f) - 1.0f;
+                    const float n = (signedV + 1.0f) * 0.5f;
+                    return juce::jlimit(0, modulationMaxRow, static_cast<int>(std::round((1.0f - n) * modulationMaxRow)));
+                }
+                return juce::jlimit(0, modulationMaxRow, static_cast<int>(std::round((1.0f - v) * modulationMaxRow)));
+            };
+            auto curveLevelForRow = [&](int row, bool isPoint)
+            {
+                // Value-encoded intensity: high values (top rows) are more solid,
+                // low values (bottom rows) are dimmer.
+                const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
+                const int base = juce::jlimit(1, 15, static_cast<int>(std::round(juce::jmap(rowValue01, 2.0f, 12.0f))));
+                return juce::jlimit(1, 15, isPoint ? (base + 2) : base);
+            };
+            auto stepLevelForRow = [&](int row, int pointRow, int baseRow)
+            {
+                const int minRow = juce::jmin(baseRow, pointRow);
+                const int maxRow = juce::jmax(baseRow, pointRow);
+                if (row < minRow || row > maxRow)
+                    return 0;
+
+                const float barRange = static_cast<float>(std::abs(pointRow - baseRow));
+                const float fromBase = static_cast<float>(std::abs(row - baseRow));
+                const float t = (barRange > 0.0f) ? (fromBase / barRange) : 1.0f; // 0 at base, 1 at point
+                const float shapedT = std::pow(juce::jlimit(0.0f, 1.0f, t), 0.72f);
+
+                const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
+                const float minLevel = seq.bipolar ? 3.0f : 2.0f;
+                const float maxLevel = 9.0f + (4.0f * rowValue01); // 9..13, brighter for higher values
+                int level = static_cast<int>(std::round(minLevel + ((maxLevel - minLevel) * shapedT)));
+                if (row == pointRow)
+                    level += 2;
+                return juce::jlimit(1, 15, level);
+            };
+
+            for (int x = 0; x < 16; ++x)
+            {
+                if (x == kMonomeModPrevColumn || x == kMonomeModNextColumn)
+                {
+                    if (sceneStepMotionPageNavigationVisible)
+                    {
+                        newLedState[x][GROUP_ROW] = sceneStepMotionLaneNavigationLevel(sceneStepMotionLaneNavigationEnabled);
+                    }
+                    else
+                    {
+                        newLedState[x][GROUP_ROW] = slowBlinkOn ? 15 : 5;
+                    }
+                    continue;
+                }
+
+                newLedState[x][GROUP_ROW] = 0;
+                const float v = seq.steps[static_cast<size_t>(x)];
+                const int pointRow = valueToRow(v);
+
+                if (seq.curveMode)
+                {
+                    int level = 0;
+                    if (displayRow == pointRow)
+                        level = juce::jmax(level, curveLevelForRow(displayRow, true));
+                    if (x < 15)
+                    {
+                        const int nextRow = valueToRow(seq.steps[static_cast<size_t>(x + 1)]);
+                        const int minRow = juce::jmin(pointRow, nextRow);
+                        const int maxRow = juce::jmax(pointRow, nextRow);
+                        if (displayRow >= minRow && displayRow <= maxRow)
+                            level = juce::jmax(level, curveLevelForRow(displayRow, false));
+                    }
+                    newLedState[x][GROUP_ROW] = level;
+                }
+                else
+                {
+                    newLedState[x][GROUP_ROW] = stepLevelForRow(displayRow, pointRow, modulationBaseRow);
+                }
+
+                if (stripPlaying && x == activeStep)
+                    newLedState[x][GROUP_ROW] = juce::jmax(newLedState[x][GROUP_ROW], 15);
+            }
+        }
+
     }
     else
     {
@@ -2332,13 +3216,37 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
     }  // End else (normal mode)
 
-    // Row 0 col 8: momentary scratch indicator in normal mode.
-    if (topRowMode == MonomeLayoutState::TopRowMode::Launch)
+    if (sceneModRepeatButtonsVisible())
+    {
+        const int selectedSceneSlot = getFocusedSceneSlot();
+        const int currentLengthCount = getSceneLengthCount(selectedSceneSlot);
+        for (int x = kSceneLengthFirstColumn; x <= kSceneLengthLastColumn && x < gridWidth; ++x)
+        {
+            const int lengthCount = sceneLengthCountFromButton(x);
+            if (lengthCount <= 0)
+                continue;
+
+            newLedState[x][GROUP_ROW] = (currentLengthCount == lengthCount) ? 15 : 4;
+        }
+    }
+
+    if (regularModPageLaneNavigationVisible())
+    {
+        const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
+        const bool canNavigate = regularModLaneNavigationAvailable(targetStrip);
+        if (kMonomeModPrevColumn >= 0 && kMonomeModPrevColumn < gridWidth)
+            newLedState[kMonomeModPrevColumn][GROUP_ROW] = sceneStepMotionLaneNavigationLevel(canNavigate);
+        if (kMonomeModNextColumn >= 0 && kMonomeModNextColumn < gridWidth)
+            newLedState[kMonomeModNextColumn][GROUP_ROW] = sceneStepMotionLaneNavigationLevel(canNavigate);
+    }
+
+    // Row 0 col 8: momentary scratch indicator on the main launch surface.
+    if (topRowUsesScratchAndStutter())
         newLedState[8][GROUP_ROW] = momentaryScratchHoldActive ? 15 : 4;
 
     // Row 0, cols 9-15: momentary stutter division selectors.
-    // Visible on the launch layer only.
-    if (topRowMode == MonomeLayoutState::TopRowMode::Launch)
+    // Visible on the main launch surface only.
+    if (topRowUsesScratchAndStutter())
     {
         const uint8_t heldMask = momentaryStutterButtonMask.load(std::memory_order_acquire);
         for (int x = 9; x <= 15; ++x)
@@ -2583,102 +3491,144 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         else if (controlModeActive && currentControlMode == ControlMode::Modulation)
         {
             const int selectedStrip = clampVisibleStrip(getLastMonomePressedStripRow());
-            const auto seq = audioEngine->getModSequencerState(selectedStrip);
-            const int activeGlobalStep = audioEngine->getModCurrentGlobalStep(selectedStrip);
-            const int playbackPage = juce::jlimit(
-                0,
-                ModernAudioEngine::MaxModBars - 1,
-                activeGlobalStep / ModernAudioEngine::ModSteps);
-            const int activeStep = (playbackPage == seq.editPage)
-                ? (activeGlobalStep % ModernAudioEngine::ModSteps)
-                : -1;
-            const bool stripPlaying = audioEngine->getStrip(selectedStrip) && audioEngine->getStrip(selectedStrip)->isPlaying();
-            const int displayRow = y; // Strip rows, with row 0 rendered in GROUP_ROW branch.
-            auto baseRowForColumn = [&](int column)
+            if (sceneMainAutomationMonomeActive())
             {
-                if (column == kMonomeModCycleColumn)
-                    return seq.bipolar ? (1 + ((modulationMaxRow - 1) / 2)) : modulationMaxRow;
-                return seq.bipolar ? (modulationMaxRow / 2) : modulationMaxRow;
-            };
-
-            auto valueToRow = [&](float v, int column)
-            {
-                v = juce::jlimit(0.0f, 1.0f, v);
-                const bool reservedTopCell = (column == kMonomeModCycleColumn);
-                const int topRow = reservedTopCell ? 1 : 0;
-                const int usableRows = reservedTopCell ? juce::jmax(1, modulationMaxRow - 1) : modulationMaxRow;
-                if (seq.bipolar)
+                const int displayRow = y; // Row 0 stays reserved for navigation/indication.
+                const int modulationBaseRow = sceneMainModTargetBipolar ? sceneAutomationValueToRow(0.5f)
+                                                                        : sceneAutomationBottomRow;
+                auto stepLevelForRow = [&](int row, int pointRow, int baseRow)
                 {
-                    const float signedV = (v * 2.0f) - 1.0f;
-                    const float n = (signedV + 1.0f) * 0.5f;
+                    const int minRow = juce::jmin(baseRow, pointRow);
+                    const int maxRow = juce::jmax(baseRow, pointRow);
+                    if (row < minRow || row > maxRow)
+                        return 0;
+
+                    const float barRange = static_cast<float>(std::abs(pointRow - baseRow));
+                    const float fromBase = static_cast<float>(std::abs(row - baseRow));
+                    const float t = (barRange > 0.0f) ? (fromBase / barRange) : 1.0f;
+                    const float shapedT = std::pow(juce::jlimit(0.0f, 1.0f, t), 0.72f);
+                    const float rowValue01 = sceneAutomationRowValue01(row);
+                    const float minLevel = sceneMainModTargetBipolar ? 3.0f : 2.0f;
+                    const float maxLevel = 9.0f + (4.0f * rowValue01);
+                    int level = static_cast<int>(std::round(minLevel + ((maxLevel - minLevel) * shapedT)));
+                    if (row == pointRow)
+                        level += 2;
+                    return juce::jlimit(1, 15, level);
+                };
+
+                for (int x = 0; x < 16; ++x)
+                {
+                    newLedState[x][y] = 0;
+                    float normalizedValue = 0.0f;
+                    if (!sceneMainModColumnValue(x, normalizedValue))
+                        continue;
+
+                    const int pointRow = sceneAutomationValueToRow(normalizedValue);
+                    newLedState[x][y] = stepLevelForRow(displayRow, pointRow, modulationBaseRow);
+
+                    if (sceneMainModActiveStep == x)
+                        newLedState[x][y] = juce::jmax(newLedState[x][y], 15);
+                }
+            }
+            else
+            {
+                const auto seq = audioEngine->getModSequencerState(selectedStrip);
+                const int activeGlobalStep = audioEngine->getModCurrentGlobalStep(selectedStrip);
+                const int playbackPage = juce::jlimit(
+                    0,
+                    ModernAudioEngine::MaxModBars - 1,
+                    activeGlobalStep / ModernAudioEngine::ModSteps);
+                const int activeStep = (playbackPage == seq.editPage)
+                    ? (activeGlobalStep % ModernAudioEngine::ModSteps)
+                    : -1;
+                const bool stripPlaying = audioEngine->getStrip(selectedStrip) && audioEngine->getStrip(selectedStrip)->isPlaying();
+                const int displayRow = y; // Strip rows, with row 0 rendered in GROUP_ROW branch.
+                auto baseRowForColumn = [&](int column)
+                {
+                    if (column == kMonomeModPrevColumn || column == kMonomeModNextColumn)
+                        return seq.bipolar ? (1 + ((modulationMaxRow - 1) / 2)) : modulationMaxRow;
+                    return seq.bipolar ? (modulationMaxRow / 2) : modulationMaxRow;
+                };
+
+                auto valueToRow = [&](float v, int column)
+                {
+                    v = juce::jlimit(0.0f, 1.0f, v);
+                    const bool reservedTopCell = (column == kMonomeModPrevColumn || column == kMonomeModNextColumn);
+                    const int topRow = reservedTopCell ? 1 : 0;
+                    const int usableRows = reservedTopCell ? juce::jmax(1, modulationMaxRow - 1) : modulationMaxRow;
+                    if (seq.bipolar)
+                    {
+                        const float signedV = (v * 2.0f) - 1.0f;
+                        const float n = (signedV + 1.0f) * 0.5f;
+                        return juce::jlimit(topRow,
+                                            modulationMaxRow,
+                                            topRow + static_cast<int>(std::round((1.0f - n) * usableRows)));
+                    }
                     return juce::jlimit(topRow,
                                         modulationMaxRow,
-                                        topRow + static_cast<int>(std::round((1.0f - n) * usableRows)));
-                }
-                return juce::jlimit(topRow,
-                                    modulationMaxRow,
-                                    topRow + static_cast<int>(std::round((1.0f - v) * usableRows)));
-            };
-            auto curveLevelForRow = [&](int row, bool isPoint)
-            {
-                // Value-encoded intensity: high values (top rows) are more solid,
-                // low values (bottom rows) are dimmer.
-                const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
-                const int base = juce::jlimit(1, 15, static_cast<int>(std::round(juce::jmap(rowValue01, 2.0f, 12.0f))));
-                return juce::jlimit(1, 15, isPoint ? (base + 2) : base);
-            };
-            auto stepLevelForRow = [&](int row, int pointRow, int baseRow)
-            {
-                const int minRow = juce::jmin(baseRow, pointRow);
-                const int maxRow = juce::jmax(baseRow, pointRow);
-                if (row < minRow || row > maxRow)
-                    return 0;
-
-                const float barRange = static_cast<float>(std::abs(pointRow - baseRow));
-                const float fromBase = static_cast<float>(std::abs(row - baseRow));
-                const float t = (barRange > 0.0f) ? (fromBase / barRange) : 1.0f; // 0 at base, 1 at point
-                const float shapedT = std::pow(juce::jlimit(0.0f, 1.0f, t), 0.72f);
-
-                const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
-                const float minLevel = seq.bipolar ? 3.0f : 2.0f;
-                const float maxLevel = 9.0f + (4.0f * rowValue01); // 9..13, brighter for higher values
-                int level = static_cast<int>(std::round(minLevel + ((maxLevel - minLevel) * shapedT)));
-                if (row == pointRow)
-                    level += 2;
-                return juce::jlimit(1, 15, level);
-            };
-
-            for (int x = 0; x < 16; ++x)
-            {
-                newLedState[x][y] = 0;
-                const float v = seq.steps[static_cast<size_t>(x)];
-                const int pointRow = valueToRow(v, x);
-                const int modulationBaseRow = baseRowForColumn(x);
-
-                if (seq.curveMode)
+                                        topRow + static_cast<int>(std::round((1.0f - v) * usableRows)));
+                };
+                auto curveLevelForRow = [&](int row, bool isPoint)
                 {
-                    // Draw point + interpolated line to next point for readable curve graph.
-                    int level = 0;
-                    if (displayRow == pointRow)
-                        level = juce::jmax(level, curveLevelForRow(displayRow, true));
-                    if (x < 15)
+                    // Value-encoded intensity: high values (top rows) are more solid,
+                    // low values (bottom rows) are dimmer.
+                    const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
+                    const int base = juce::jlimit(1, 15, static_cast<int>(std::round(juce::jmap(rowValue01, 2.0f, 12.0f))));
+                    return juce::jlimit(1, 15, isPoint ? (base + 2) : base);
+                };
+                auto stepLevelForRow = [&](int row, int pointRow, int baseRow)
+                {
+                    const int minRow = juce::jmin(baseRow, pointRow);
+                    const int maxRow = juce::jmax(baseRow, pointRow);
+                    if (row < minRow || row > maxRow)
+                        return 0;
+
+                    const float barRange = static_cast<float>(std::abs(pointRow - baseRow));
+                    const float fromBase = static_cast<float>(std::abs(row - baseRow));
+                    const float t = (barRange > 0.0f) ? (fromBase / barRange) : 1.0f; // 0 at base, 1 at point
+                    const float shapedT = std::pow(juce::jlimit(0.0f, 1.0f, t), 0.72f);
+
+                    const float rowValue01 = juce::jlimit(0.0f, 1.0f, 1.0f - (static_cast<float>(row) / static_cast<float>(modulationMaxRow)));
+                    const float minLevel = seq.bipolar ? 3.0f : 2.0f;
+                    const float maxLevel = 9.0f + (4.0f * rowValue01); // 9..13, brighter for higher values
+                    int level = static_cast<int>(std::round(minLevel + ((maxLevel - minLevel) * shapedT)));
+                    if (row == pointRow)
+                        level += 2;
+                    return juce::jlimit(1, 15, level);
+                };
+
+                for (int x = 0; x < 16; ++x)
+                {
+                    newLedState[x][y] = 0;
+                    const float v = seq.steps[static_cast<size_t>(x)];
+                    const int pointRow = valueToRow(v, x);
+                    const int modulationBaseRow = baseRowForColumn(x);
+
+                    if (seq.curveMode)
                     {
-                        const int nextRow = valueToRow(seq.steps[static_cast<size_t>(x + 1)], x + 1);
-                        const int minRow = juce::jmin(pointRow, nextRow);
-                        const int maxRow = juce::jmax(pointRow, nextRow);
-                        if (displayRow >= minRow && displayRow <= maxRow)
-                            level = juce::jmax(level, curveLevelForRow(displayRow, false));
+                        // Draw point + interpolated line to next point for readable curve graph.
+                        int level = 0;
+                        if (displayRow == pointRow)
+                            level = juce::jmax(level, curveLevelForRow(displayRow, true));
+                        if (x < 15)
+                        {
+                            const int nextRow = valueToRow(seq.steps[static_cast<size_t>(x + 1)], x + 1);
+                            const int minRow = juce::jmin(pointRow, nextRow);
+                            const int maxRow = juce::jmax(pointRow, nextRow);
+                            if (displayRow >= minRow && displayRow <= maxRow)
+                                level = juce::jmax(level, curveLevelForRow(displayRow, false));
+                        }
+                        newLedState[x][y] = level;
                     }
-                    newLedState[x][y] = level;
-                }
-                else
-                {
-                    // Step-slider mode: vertical bar to value.
-                    newLedState[x][y] = stepLevelForRow(displayRow, pointRow, modulationBaseRow);
-                }
+                    else
+                    {
+                        // Step-slider mode: vertical bar to value.
+                        newLedState[x][y] = stepLevelForRow(displayRow, pointRow, modulationBaseRow);
+                    }
 
-                if (stripPlaying && x == activeStep)
-                    newLedState[x][y] = juce::jmax(newLedState[x][y], 15);
+                    if (stripPlaying && x == activeStep)
+                        newLedState[x][y] = juce::jmax(newLedState[x][y], 15);
+                }
             }
         }
         else // Normal - playhead or step sequencer

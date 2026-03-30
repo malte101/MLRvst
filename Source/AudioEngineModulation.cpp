@@ -752,6 +752,11 @@ void ModernAudioEngine::setModStepValueAbsolute(int stripIndex, int absoluteStep
     seq.stepCurveShapes[static_cast<size_t>(absoluteStep)].store(activeCurveShape, std::memory_order_release);
 }
 
+void ModernAudioEngine::setModStepValueAbsoluteForSlot(int stripIndex, int slot, int absoluteStep, float value01)
+{
+    writeModStepNormalized(stripIndex, slot, absoluteStep, value01);
+}
+
 void ModernAudioEngine::writeModStepNormalized(int stripIndex, int slot, int absoluteStep, float value01)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
@@ -843,6 +848,27 @@ void ModernAudioEngine::setModStepShapeAbsolute(int stripIndex, int absoluteStep
     seq.stepEndValues[static_cast<size_t>(absoluteStep)].store(clampedEndValue, std::memory_order_release);
 }
 
+void ModernAudioEngine::setModStepShapeAbsoluteForSlot(int stripIndex,
+                                                       int slot,
+                                                       int absoluteStep,
+                                                       int subdivisions,
+                                                       float endValue01)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
+        return;
+
+    auto& seq = getModSequencer(stripIndex, slot);
+    const int clampedSubdivisions = juce::jlimit(1, ModMaxStepSubdivisions, subdivisions);
+    const float startValue = juce::jlimit(
+        0.0f, 1.0f, seq.steps[static_cast<size_t>(absoluteStep)].load(std::memory_order_acquire));
+    float clampedEndValue = juce::jlimit(0.0f, 1.0f, endValue01);
+    if (clampedSubdivisions <= 1)
+        clampedEndValue = startValue;
+
+    seq.stepSubdivisions[static_cast<size_t>(absoluteStep)].store(clampedSubdivisions, std::memory_order_release);
+    seq.stepEndValues[static_cast<size_t>(absoluteStep)].store(clampedEndValue, std::memory_order_release);
+}
+
 int ModernAudioEngine::getModStepSubdivisionAbsolute(int stripIndex, int absoluteStep) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
@@ -920,6 +946,22 @@ void ModernAudioEngine::setModStepCurveShapeAbsolute(int stripIndex, int absolut
         return;
 
     auto& seq = getActiveModSequencer(stripIndex);
+    const int clampedShape = juce::jlimit(
+        0,
+        static_cast<int>(ModCurveShape::Square),
+        static_cast<int>(shape));
+    seq.stepCurveShapes[static_cast<size_t>(absoluteStep)].store(clampedShape, std::memory_order_release);
+}
+
+void ModernAudioEngine::setModStepCurveShapeAbsoluteForSlot(int stripIndex,
+                                                            int slot,
+                                                            int absoluteStep,
+                                                            ModCurveShape shape)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips || absoluteStep < 0 || absoluteStep >= ModTotalSteps)
+        return;
+
+    auto& seq = getModSequencer(stripIndex, slot);
     const int clampedShape = juce::jlimit(
         0,
         static_cast<int>(ModCurveShape::Square),
@@ -1069,6 +1111,16 @@ void ModernAudioEngine::setModEditPage(int stripIndex, int page)
     seq.editPage.store(juce::jlimit(0, maxPage, page), std::memory_order_release);
 }
 
+void ModernAudioEngine::setModEditPageForSlot(int stripIndex, int slot, int page)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    auto& seq = getModSequencer(stripIndex, slot);
+    const int maxPage = juce::jmax(0, getModLengthBarsForSlot(stripIndex, slot) - 1);
+    seq.editPage.store(juce::jlimit(0, maxPage, page), std::memory_order_release);
+}
+
 int ModernAudioEngine::getModEditPage(int stripIndex) const
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
@@ -1090,9 +1142,7 @@ int ModernAudioEngine::getModEditPageForSlot(int stripIndex, int slot) const
 
 void ModernAudioEngine::setModSmoothingMs(int stripIndex, float ms)
 {
-    if (stripIndex < 0 || stripIndex >= MaxStrips)
-        return;
-    getActiveModSequencer(stripIndex).smoothingMs.store(juce::jlimit(0.0f, 250.0f, ms), std::memory_order_release);
+    setModSmoothingMsForSlot(stripIndex, getActiveModSequencerSlot(stripIndex), ms);
 }
 
 float ModernAudioEngine::getModSmoothingMs(int stripIndex) const
@@ -1100,6 +1150,14 @@ float ModernAudioEngine::getModSmoothingMs(int stripIndex) const
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 0.0f;
     return juce::jlimit(0.0f, 250.0f, getActiveModSequencer(stripIndex).smoothingMs.load(std::memory_order_acquire));
+}
+
+void ModernAudioEngine::setModSmoothingMsForSlot(int stripIndex, int slot, float ms)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    getModSequencer(stripIndex, slot).smoothingMs.store(juce::jlimit(0.0f, 250.0f, ms), std::memory_order_release);
 }
 
 float ModernAudioEngine::getModSmoothingMsForSlot(int stripIndex, int slot) const
@@ -1114,9 +1172,7 @@ float ModernAudioEngine::getModSmoothingMsForSlot(int stripIndex, int slot) cons
 
 void ModernAudioEngine::setModCurveBend(int stripIndex, float bend)
 {
-    if (stripIndex < 0 || stripIndex >= MaxStrips)
-        return;
-    getActiveModSequencer(stripIndex).curveBend.store(juce::jlimit(-1.0f, 1.0f, bend), std::memory_order_release);
+    setModCurveBendForSlot(stripIndex, getActiveModSequencerSlot(stripIndex), bend);
 }
 
 float ModernAudioEngine::getModCurveBend(int stripIndex) const
@@ -1124,6 +1180,14 @@ float ModernAudioEngine::getModCurveBend(int stripIndex) const
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 0.0f;
     return juce::jlimit(-1.0f, 1.0f, getActiveModSequencer(stripIndex).curveBend.load(std::memory_order_acquire));
+}
+
+void ModernAudioEngine::setModCurveBendForSlot(int stripIndex, int slot, float bend)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    getModSequencer(stripIndex, slot).curveBend.store(juce::jlimit(-1.0f, 1.0f, bend), std::memory_order_release);
 }
 
 float ModernAudioEngine::getModCurveBendForSlot(int stripIndex, int slot) const
@@ -1138,11 +1202,7 @@ float ModernAudioEngine::getModCurveBendForSlot(int stripIndex, int slot) const
 
 void ModernAudioEngine::setModCurveShape(int stripIndex, ModCurveShape shape)
 {
-    if (stripIndex < 0 || stripIndex >= MaxStrips)
-        return;
-    getActiveModSequencer(stripIndex).curveShape.store(
-        juce::jlimit(0, static_cast<int>(ModCurveShape::Square), static_cast<int>(shape)),
-        std::memory_order_release);
+    setModCurveShapeForSlot(stripIndex, getActiveModSequencerSlot(stripIndex), shape);
 }
 
 ModernAudioEngine::ModCurveShape ModernAudioEngine::getModCurveShape(int stripIndex) const
@@ -1152,6 +1212,16 @@ ModernAudioEngine::ModCurveShape ModernAudioEngine::getModCurveShape(int stripIn
     return static_cast<ModCurveShape>(juce::jlimit(
         0, static_cast<int>(ModCurveShape::Square),
         getActiveModSequencer(stripIndex).curveShape.load(std::memory_order_acquire)));
+}
+
+void ModernAudioEngine::setModCurveShapeForSlot(int stripIndex, int slot, ModCurveShape shape)
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return;
+
+    getModSequencer(stripIndex, slot).curveShape.store(
+        juce::jlimit(0, static_cast<int>(ModCurveShape::Square), static_cast<int>(shape)),
+        std::memory_order_release);
 }
 
 ModernAudioEngine::ModCurveShape ModernAudioEngine::getModCurveShapeForSlot(int stripIndex, int slot) const
