@@ -2330,18 +2330,51 @@ bool SceneScheduler::copySceneForMainPreset(MlrVSTAudioProcessor& processor,
     if (clampedSource == clampedDest)
         return true;
 
+    const bool copyingActiveMainPreset = processor.activeSceneMainPresetIndex == clampedMain;
+    const bool sourceIsActiveScene = copyingActiveMainPreset
+        && processor.activeSceneSlot == clampedSource;
+    if (sourceIsActiveScene)
+        juce::ignoreUnused(processor.refreshStoredSceneSlotSnapshot(clampedMain, clampedSource));
+
     const bool sourceExists = processor.hasStoredSceneSlotState(clampedMain, clampedSource);
-    const bool copied = processor.copyStoredSceneSlotState(clampedMain, clampedSource, clampedDest)
-        && processor.persistStoredSceneSlotStatesToMainPreset(clampedMain);
+    juce::MemoryBlock sourceScenePerformanceState;
+    if (copyingActiveMainPreset && sourceExists)
+        sourceScenePerformanceState = processor.createScenePerformanceStateData(clampedSource);
+
+    const bool copied = processor.copyStoredSceneSlotState(clampedMain, clampedSource, clampedDest);
     if (copied)
     {
+        if (sourceExists && sourceScenePerformanceState.getSize() > 0)
+        {
+            auto syncStoredPayloadPerformanceState = [&](int sceneSlot)
+            {
+                auto& storedState = processor.storedSceneSlotStates[static_cast<size_t>(sceneSlot)];
+                if (storedState.mainPresetIndex != clampedMain
+                    || !storedState.hasStoredContent
+                    || storedState.preparedSwitchPayloadTemplate == nullptr)
+                {
+                    return;
+                }
+
+                storedState.preparedSwitchPayloadTemplate->scenePerformanceStateData = sourceScenePerformanceState;
+                storedState.preparedSwitchPayloadTemplate->snapshotPresetXml.reset();
+            };
+
+            syncStoredPayloadPerformanceState(clampedSource);
+            syncStoredPayloadPerformanceState(clampedDest);
+        }
+
+        if (!processor.persistStoredSceneSlotStatesToMainPreset(clampedMain))
+            return false;
+
         processor.copySceneClipSlotRuntimeState(clampedMain, clampedSource, clampedDest);
-        if (processor.activeSceneMainPresetIndex == clampedMain)
+
+        if (copyingActiveMainPreset)
         {
             if (sourceExists)
-                processor.copyScenePerformanceClip(clampedSource, clampedDest);
+                processor.applyScenePerformanceStateData(sourceScenePerformanceState, clampedDest);
             else
-                processor.clearScenePerformanceClip(clampedDest);
+                processor.applyScenePerformanceStateData({}, clampedDest);
         }
         processor.presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
     }

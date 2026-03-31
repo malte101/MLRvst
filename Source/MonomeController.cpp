@@ -2131,29 +2131,13 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                          float value,
                          auto&& applyWrite)
                     {
-                        float liveValue = 0.0f;
-                        const bool shouldSeedTransition = shouldSmoothLiveSceneControlTarget(target)
-                            && getSceneControlCurrentValue(stripIndex, target, liveValue);
-                        const bool shouldSuppressSceneHandling = isSceneModeEnabled();
-                        if (shouldSuppressSceneHandling)
-                            beginSceneManualControlHandlingSuppression();
-                        applyWrite(StripControlWriteMode::NotifyHost);
-                        if (shouldSuppressSceneHandling)
-                            endSceneManualControlHandlingSuppression();
-                        notifyDirectSceneControlChange(stripIndex,
-                                                       target,
-                                                       controlMode,
-                                                       controlRow,
-                                                       value,
-                                                       x);
-                        if (shouldSeedTransition)
-                        {
-                            seedSceneControlTransition(stripIndex,
-                                                       target,
-                                                       liveValue,
-                                                       value,
-                                                       getSceneAutomationTransitionSeconds(target));
-                        }
+                        applyLiveSceneControlTouch(stripIndex,
+                                                   target,
+                                                   controlMode,
+                                                   controlRow,
+                                                   value,
+                                                   x,
+                                                   std::forward<decltype(applyWrite)>(applyWrite));
                     };
 
                     switch (currentControlMode)
@@ -2783,7 +2767,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
 
             int level = exists ? 5 : 2;
             if (active)
-                level = 11;
+                level = exists ? 11 : 3;
             if (inSequence)
                 level = chainPlaying ? (fastBlinkOn ? 15 : 6) : juce::jmax(level, 5);
             if (sequenceCurrent)

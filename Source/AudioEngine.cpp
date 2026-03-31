@@ -12723,6 +12723,32 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
             return juce::jlimit(0.0f, 1.0f, startA + ((rawB - startA) * shapedPhase));
         };
 
+        std::array<int64_t, MaxStrips> earliestLaunchSamplesInBlock{};
+        std::array<double, MaxStrips> earliestLaunchPpqInBlock{};
+        std::array<int, MaxStrips> earliestLaunchColumnsInBlock{};
+        earliestLaunchSamplesInBlock.fill(-1);
+        earliestLaunchPpqInBlock.fill(std::numeric_limits<double>::quiet_NaN());
+        earliestLaunchColumnsInBlock.fill(-1);
+
+        for (const auto& pendingEvent : eventsInBlock)
+        {
+            if (pendingEvent.stripIndex < 0 || pendingEvent.stripIndex >= MaxStrips)
+                continue;
+            if (pendingEvent.isMomentaryStutter || pendingEvent.isSequencerRetrigger)
+                continue;
+
+            const auto idx = static_cast<size_t>(pendingEvent.stripIndex);
+            if (earliestLaunchSamplesInBlock[idx] >= 0
+                && earliestLaunchSamplesInBlock[idx] <= pendingEvent.targetSample)
+            {
+                continue;
+            }
+
+            earliestLaunchSamplesInBlock[idx] = pendingEvent.targetSample;
+            earliestLaunchPpqInBlock[idx] = pendingEvent.targetPPQ;
+            earliestLaunchColumnsInBlock[idx] = pendingEvent.column;
+        }
+
         for (int stripIdx = 0; stripIdx < MaxStrips; ++stripIdx)
         {
             auto* strip = strips[static_cast<size_t>(stripIdx)].get();
@@ -12784,11 +12810,16 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
         for (int stripIdx = 0; stripIdx < MaxStrips; ++stripIdx)
         {
             auto* strip = strips[static_cast<size_t>(stripIdx)].get();
-            if (strip == nullptr || !strip->isPlaying())
+            if (strip == nullptr)
+                continue;
+
+            const bool stripPlayingAtBlockStart = strip->isPlaying();
+            const auto idx = static_cast<size_t>(stripIdx);
+            if (!stripPlayingAtBlockStart && earliestLaunchSamplesInBlock[idx] < 0)
                 continue;
 
             const float amount = juce::jlimit(
-                0.0f, 1.0f, macroRetriggerAmounts[static_cast<size_t>(stripIdx)].load(std::memory_order_acquire));
+                0.0f, 1.0f, macroRetriggerAmounts[idx].load(std::memory_order_acquire));
             if (amount <= 1.0e-4f)
                 continue;
 
@@ -12797,6 +12828,17 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 continue;
 
             double cursorPpq = blockStartPpq;
+            int retriggerColumn = strip->getStutterEntryColumn();
+            double retriggerOffsetRatio = strip->getStutterEntryOffsetRatio();
+            if (!stripPlayingAtBlockStart)
+            {
+                cursorPpq = earliestLaunchPpqInBlock[idx];
+                retriggerColumn = juce::jlimit(0, MaxColumns - 1, earliestLaunchColumnsInBlock[idx]);
+                retriggerOffsetRatio = 0.0;
+                if (!std::isfinite(cursorPpq))
+                    continue;
+            }
+
             int lastOffsetSamples = -1;
             int safety = 0;
             while (cursorPpq < blockEndPpq && safety++ < 256)
@@ -12815,7 +12857,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     t.targetSample = blockStart + offsetSamples;
                     t.targetPPQ = boundaryPpq;
                     t.stripIndex = stripIdx;
-                    t.column = strip->getCurrentColumn();
+                    t.column = retriggerColumn;
+                    t.stutterOffsetRatioOverride = retriggerOffsetRatio;
                     t.clearPendingOnFire = false;
                     t.isSequencerRetrigger = true;
                     eventsInBlock.push_back(t);
@@ -13024,8 +13067,9 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                     }
 
                     const int64_t triggerSample = blockStart + eventOffset;
-                    double stutterOffsetRatioOverride = -1.0;
-                    if (event.isMomentaryStutter
+                    double stutterOffsetRatioOverride = event.stutterOffsetRatioOverride;
+                    if (stutterOffsetRatioOverride < 0.0
+                        && event.isMomentaryStutter
                         && event.stripIndex >= 0
                         && event.stripIndex < MaxStrips)
                     {

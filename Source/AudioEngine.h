@@ -117,6 +117,7 @@ struct QuantisedTrigger
     double targetPPQ = 0.0;      // Exact PPQ grid value (calculated at schedule time)
     int stripIndex = -1;
     int column = 0;
+    double stutterOffsetRatioOverride = -1.0;
     int sampleSliceId = -1;
     int64_t sampleStartSample = -1;
     bool clearPendingOnFire = true;

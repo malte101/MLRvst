@@ -487,53 +487,82 @@ void handleGrainPageButtonPress(MlrVSTAudioProcessor& processor,
                                 int x)
 {
     const int cx = juce::jlimit(0, 15, x);
-    applyGrainPageButtonPressLive(targetStrip, controlRow, cx);
-
     switch (juce::jlimit(0, 5, controlRow))
     {
         case 0:
-            processor.notifyDirectSceneControlChange(stripIndex,
-                                                     ScenePerformanceControlTarget::GrainSize,
-                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
-                                                     0,
-                                                     grainSizeFromColumn(cx));
+            processor.applyLiveSceneControlTouch(stripIndex,
+                                                 ScenePerformanceControlTarget::GrainSize,
+                                                 MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                 0,
+                                                 grainSizeFromColumn(cx),
+                                                 cx,
+                                                 [&targetStrip, cx](MlrVSTAudioProcessor::StripControlWriteMode)
+                                                 {
+                                                     targetStrip.setGrainSizeMs(grainSizeFromColumn(cx));
+                                                 });
             break;
         case 1:
-            processor.notifyDirectSceneControlChange(stripIndex,
-                                                     ScenePerformanceControlTarget::GrainDensity,
-                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
-                                                     1,
-                                                     bipolarFromColumn(cx, 0.05f, 0.9f));
+            processor.applyLiveSceneControlTouch(stripIndex,
+                                                 ScenePerformanceControlTarget::GrainDensity,
+                                                 MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                 1,
+                                                 bipolarFromColumn(cx, 0.05f, 0.9f),
+                                                 cx,
+                                                 [&targetStrip, cx](MlrVSTAudioProcessor::StripControlWriteMode)
+                                                 {
+                                                     targetStrip.setGrainDensity(bipolarFromColumn(cx, 0.05f, 0.9f));
+                                                 });
             break;
         case 2:
-            processor.notifyDirectSceneControlChange(stripIndex,
-                                                     ScenePerformanceControlTarget::GrainPitch,
-                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
-                                                     2,
-                                                     bipolarFromColumn(cx, -24.0f, 24.0f));
+            processor.applyLiveSceneControlTouch(stripIndex,
+                                                 ScenePerformanceControlTarget::GrainPitch,
+                                                 MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                 2,
+                                                 bipolarFromColumn(cx, -24.0f, 24.0f),
+                                                 cx,
+                                                 [&targetStrip, cx](MlrVSTAudioProcessor::StripControlWriteMode)
+                                                 {
+                                                     targetStrip.setGrainPitch(bipolarFromColumn(cx, -24.0f, 24.0f));
+                                                 });
             break;
         case 3:
-            processor.notifyDirectSceneControlChange(stripIndex,
-                                                     ScenePerformanceControlTarget::GrainJitter,
-                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
-                                                     3,
-                                                     unitFromColumn(cx));
+            processor.applyLiveSceneControlTouch(stripIndex,
+                                                 ScenePerformanceControlTarget::GrainJitter,
+                                                 MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                 3,
+                                                 unitFromColumn(cx),
+                                                 cx,
+                                                 [&targetStrip, cx](MlrVSTAudioProcessor::StripControlWriteMode)
+                                                 {
+                                                     targetStrip.setGrainJitter(unitFromColumn(cx));
+                                                 });
             break;
         case 4:
-            processor.notifyDirectSceneControlChange(stripIndex,
-                                                     ScenePerformanceControlTarget::GrainRandomDepth,
-                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
-                                                     4,
-                                                     unitFromColumn(cx));
+            processor.applyLiveSceneControlTouch(stripIndex,
+                                                 ScenePerformanceControlTarget::GrainRandomDepth,
+                                                 MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                 4,
+                                                 unitFromColumn(cx),
+                                                 cx,
+                                                 [&targetStrip, cx](MlrVSTAudioProcessor::StripControlWriteMode)
+                                                 {
+                                                     targetStrip.setGrainRandomDepth(unitFromColumn(cx));
+                                                 });
             break;
         case 5:
-            processor.notifyDirectSceneControlChange(stripIndex,
-                                                     ScenePerformanceControlTarget::GrainEnvelope,
-                                                     MlrVSTAudioProcessor::ControlMode::GrainSize,
-                                                     5,
-                                                     unitFromColumn(cx));
+            processor.applyLiveSceneControlTouch(stripIndex,
+                                                 ScenePerformanceControlTarget::GrainEnvelope,
+                                                 MlrVSTAudioProcessor::ControlMode::GrainSize,
+                                                 5,
+                                                 unitFromColumn(cx),
+                                                 cx,
+                                                 [&targetStrip, cx](MlrVSTAudioProcessor::StripControlWriteMode)
+                                                 {
+                                                     targetStrip.setGrainEnvelope(unitFromColumn(cx));
+                                                 });
             break;
         default:
+            applyGrainPageButtonPressLive(targetStrip, controlRow, cx);
             break;
     }
 }

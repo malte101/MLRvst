@@ -14,6 +14,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_osc/juce_osc.h>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include "PerformanceTargets.h"
 #include "AudioEngine.h"
@@ -1094,6 +1095,14 @@ public:
     bool isActiveSceneAutomationOverridden(int stripIndex, ScenePerformanceControlTarget target) const;
     bool hasAnyActiveSceneAutomationOverrides() const;
     void reenableActiveSceneAutomation();
+    void applyLiveSceneControlTouch(int stripIndex,
+                                    ScenePerformanceControlTarget target,
+                                    ControlMode controlMode,
+                                    int controlRow,
+                                    float value,
+                                    int columnHint,
+                                    const std::function<void(StripControlWriteMode)>& applyLiveValue,
+                                    bool liveValueAlreadyApplied = false);
     void notifyDirectSceneControlChange(int stripIndex,
                                         ScenePerformanceControlTarget target,
                                         ControlMode controlMode,
@@ -1970,6 +1979,14 @@ private:
         Recorded,
         OverrodeAutomation
     };
+    ManualSceneControlHandling handleLiveSceneControlTouch(int stripIndex,
+                                                           ScenePerformanceControlTarget target,
+                                                           ControlMode controlMode,
+                                                           int controlRow,
+                                                           float value,
+                                                           int columnHint,
+                                                           const std::function<void(StripControlWriteMode)>& applyLiveValue,
+                                                           bool liveValueAlreadyApplied);
     ManualSceneControlHandling processManualSceneControlChange(int stripIndex,
                                                                ScenePerformanceControlTarget target,
                                                                ControlMode controlMode,
@@ -1996,6 +2013,9 @@ private:
                                              double currentBeat,
                                              double sceneStartBeat);
     void clearActiveSceneAutomationOverrides(bool restoreWrittenValues);
+    void clearActiveSceneAutomationOverrideForRecordedTarget(int sceneSlot,
+                                                             int stripIndex,
+                                                             ScenePerformanceControlTarget target);
     void pruneActiveSceneAutomationOverrides();
     void copyScenePerformanceClip(int sourceSceneSlot, int destSceneSlot);
     void handleIncomingMacroCc(const juce::MidiBuffer& midiMessages);
@@ -2643,6 +2663,8 @@ private:
     static constexpr int kSceneRecallBlendMaxChannels = 32;
     std::atomic<float> sceneGlobalStutterBaseAmount{0.0f};
     std::atomic<float> sceneTransitionStutterOverlayAmount{0.0f};
+    bool scenePlaybackBlockStutterPostRenderPending = false;
+    float scenePlaybackBlockStutterPostRenderAmount = 0.0f;
     std::atomic<int> sceneBoundaryTransitionType{static_cast<int>(SceneChainTransitionType::None)};
     std::atomic<int> sceneBoundaryTransitionOption{static_cast<int>(SceneChainTransitionOption::Default)};
     std::atomic<int> sceneBoundaryTransitionScope{static_cast<int>(SceneChainTransitionScope::All)};

@@ -9948,7 +9948,10 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
         }
 
         juce::Point<float> previousPoint;
+        juce::Point<float> firstPoint;
+        juce::Point<float> lastPoint;
         bool hasPreviousPoint = false;
+        bool hasFirstPoint = false;
         for (int eventIndex = 0; eventIndex < static_cast<int>(sceneEditorState.events.size()); ++eventIndex)
         {
             const auto& event = sceneEditorState.events[static_cast<size_t>(eventIndex)];
@@ -9957,6 +9960,11 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
 
             const auto marker = sceneControlMarkerBounds(globalLayout.laneBounds, event, lengthBeats);
             const auto point = marker.getCentre();
+            if (!hasFirstPoint)
+            {
+                firstPoint = point;
+                hasFirstPoint = true;
+            }
             if (hasPreviousPoint)
             {
                 drawSceneAutomationConnection(g,
@@ -9968,7 +9976,27 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                               1.2f);
             }
             previousPoint = point;
+            lastPoint = point;
             hasPreviousPoint = true;
+        }
+
+        if (hasFirstPoint)
+        {
+            const auto connectionColour = globalColour.withAlpha(0.4f);
+            const bool stepped = sceneDrawModeEnabled
+                || sceneAutomationTargetUsesSteppedSegments(ScenePerformanceControlTarget::Retrigger);
+            drawSceneAutomationConnection(g,
+                                          { globalLayout.laneBounds.getX(), firstPoint.y },
+                                          firstPoint,
+                                          connectionColour,
+                                          stepped,
+                                          1.2f);
+            drawSceneAutomationConnection(g,
+                                          lastPoint,
+                                          { globalLayout.laneBounds.getRight(), lastPoint.y },
+                                          connectionColour,
+                                          stepped,
+                                          1.2f);
         }
 
         for (int eventIndex = 0; eventIndex < static_cast<int>(sceneEditorState.events.size()); ++eventIndex)
@@ -10940,8 +10968,18 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
 
                 std::array<juce::Point<float>,
                            static_cast<size_t>(ScenePerformanceControlTarget::GrainShape) + 1> previousPoints{};
+                std::array<juce::Point<float>,
+                           static_cast<size_t>(ScenePerformanceControlTarget::GrainShape) + 1> firstPoints{};
+                std::array<juce::Point<float>,
+                           static_cast<size_t>(ScenePerformanceControlTarget::GrainShape) + 1> lastPoints{};
+                std::array<juce::Colour,
+                           static_cast<size_t>(ScenePerformanceControlTarget::GrainShape) + 1> connectionColours{};
+                std::array<bool,
+                           static_cast<size_t>(ScenePerformanceControlTarget::GrainShape) + 1> steppedConnections{};
                 std::array<bool,
                            static_cast<size_t>(ScenePerformanceControlTarget::GrainShape) + 1> hasPrevious{};
+                std::array<bool,
+                           static_cast<size_t>(ScenePerformanceControlTarget::GrainShape) + 1> hasFirst{};
 
                 for (int eventIndex = 0; eventIndex < static_cast<int>(sceneEditorState.events.size()); ++eventIndex)
                 {
@@ -10959,20 +10997,49 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                         0,
                         static_cast<int>(ScenePerformanceControlTarget::GrainShape),
                         static_cast<int>(event.controlTarget)));
+                    const auto connectionColour = laneOverrideActive
+                        ? kTextMuted.withAlpha(0.28f)
+                        : sceneAutomationColour(event).withAlpha(0.4f);
+                    const bool steppedConnection = sceneDrawModeEnabled
+                        || sceneAutomationTargetUsesSteppedSegments(event.controlTarget);
+                    if (!hasFirst[targetIndex])
+                    {
+                        firstPoints[targetIndex] = point;
+                        hasFirst[targetIndex] = true;
+                    }
                     if (hasPrevious[targetIndex])
                     {
                         drawSceneAutomationConnection(g,
                                                       previousPoints[targetIndex],
                                                       point,
-                                                      laneOverrideActive
-                                                          ? kTextMuted.withAlpha(0.28f)
-                                                          : sceneAutomationColour(event).withAlpha(0.4f),
-                                                      sceneDrawModeEnabled
-                                                          || sceneAutomationTargetUsesSteppedSegments(event.controlTarget),
+                                                      connectionColour,
+                                                      steppedConnection,
                                                       1.2f);
                     }
                     previousPoints[targetIndex] = point;
+                    lastPoints[targetIndex] = point;
+                    connectionColours[targetIndex] = connectionColour;
+                    steppedConnections[targetIndex] = steppedConnection;
                     hasPrevious[targetIndex] = true;
+                }
+
+                for (size_t targetIndex = 0; targetIndex < hasFirst.size(); ++targetIndex)
+                {
+                    if (!hasFirst[targetIndex])
+                        continue;
+
+                    drawSceneAutomationConnection(g,
+                                                  { laneBounds.getX(), firstPoints[targetIndex].y },
+                                                  firstPoints[targetIndex],
+                                                  connectionColours[targetIndex],
+                                                  steppedConnections[targetIndex],
+                                                  1.2f);
+                    drawSceneAutomationConnection(g,
+                                                  lastPoints[targetIndex],
+                                                  { laneBounds.getRight(), lastPoints[targetIndex].y },
+                                                  connectionColours[targetIndex],
+                                                  steppedConnections[targetIndex],
+                                                  1.2f);
                 }
 
                 for (int eventIndex = 0; eventIndex < static_cast<int>(sceneEditorState.events.size()); ++eventIndex)

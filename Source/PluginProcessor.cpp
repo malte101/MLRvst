@@ -720,6 +720,65 @@ bool buildSceneEventFromParameterChange(const juce::String& parameterID,
                             newValue >= 0.5f ? 1.0f : 0.0f);
 }
 
+bool buildDirectSceneControlProbeEvent(int stripIndex,
+                                       ScenePerformanceControlTarget target,
+                                       MlrVSTAudioProcessor::ControlMode controlMode,
+                                       int controlRow,
+                                       float value,
+                                       int columnHint,
+                                       ScenePerformanceEvent& outEvent)
+{
+    if (target == ScenePerformanceControlTarget::None)
+        return false;
+
+    outEvent = {};
+    outEvent.type = ScenePerformanceEventType::ControlPoint;
+    outEvent.stripIndex = (target == ScenePerformanceControlTarget::Retrigger && stripIndex < 0)
+        ? -1
+        : juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
+    outEvent.controlTarget = target;
+    outEvent.controlMode = static_cast<int>(controlMode);
+    outEvent.controlRow = controlRow;
+    outEvent.value = value;
+    outEvent.column = columnHint >= 0
+        ? juce::jlimit(0, MlrVSTAudioProcessor::MaxColumns - 1, columnHint)
+        : juce::jlimit(0,
+                       MlrVSTAudioProcessor::MaxColumns - 1,
+                       static_cast<int>(std::round(normalizeSceneControlValue(outEvent) * 15.0f)));
+    return true;
+}
+
+bool findHeldSceneAutomationEventAtClipBeat(const std::vector<ScenePerformanceEvent>& events,
+                                            int stripIndex,
+                                            ScenePerformanceControlTarget target,
+                                            double clipBeat,
+                                            ScenePerformanceEvent& outEvent)
+{
+    const ScenePerformanceEvent* lastEvent = nullptr;
+    const ScenePerformanceEvent* chosenEvent = nullptr;
+    for (const auto& event : events)
+    {
+        if (event.type != ScenePerformanceEventType::ControlPoint
+            || event.controlTarget != target
+            || event.stripIndex != stripIndex)
+        {
+            continue;
+        }
+
+        lastEvent = &event;
+        if (event.timeBeats <= clipBeat + 1.0e-6)
+            chosenEvent = &event;
+    }
+
+    if (chosenEvent == nullptr)
+        chosenEvent = lastEvent;
+    if (chosenEvent == nullptr)
+        return false;
+
+    outEvent = *chosenEvent;
+    return true;
+}
+
 int sanitizeStripPitchControlModeIndex(int storedIndex) noexcept
 {
     return juce::jlimit(0, 5, storedIndex);
@@ -9294,6 +9353,7 @@ void MlrVSTAudioProcessor::applyOwnedStripControlsFromParameters(int stripIndex,
 {
     const auto state = resolveOwnedStripControlStateFromParameters(stripIndex, strip);
     applyResolvedOwnedStripControlState(strip, state);
+    applyResolvedStripFilterState(strip, state);
     applyResolvedStripDelayState(strip, state);
 }
 
@@ -9310,6 +9370,85 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(int stripIndex,
                                                  float normalizedValue)
 {
     MacroTargetDispatcher::applyTargetValue(*this, stripIndex, strip, target, normalizedValue);
+
+    if (!momentaryStutterHoldActive
+        || momentaryStutterPlaybackActive.load(std::memory_order_acquire) == 0
+        || stripIndex < 0
+        || stripIndex >= MaxStrips)
+    {
+        return;
+    }
+
+    const auto idx = static_cast<size_t>(stripIndex);
+    auto& saved = momentaryStutterSavedState[idx];
+    if (!saved.valid || !momentaryStutterStripArmed[idx])
+        return;
+
+    switch (target)
+    {
+        case MacroTarget::Speed:
+            saved.playbackSpeed = strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Grain
+                ? strip.getPlaybackSpeed()
+                : strip.getPlayheadSpeedRatio();
+            break;
+        case MacroTarget::Pitch:
+            if (saved.stepMode)
+                saved.pitchSemitones = getPitchSemitonesForDisplay(strip);
+            else
+                saved.pitchShift = strip.getPitchShift();
+            break;
+        case MacroTarget::Cutoff:
+            saved.filterEnabled = strip.isFilterEnabled();
+            saved.filterFrequency = strip.getFilterFrequency();
+            if (saved.stepMode)
+            {
+                if (auto* stepSampler = strip.getStepSampler())
+                {
+                    saved.stepFilterEnabled = stepSampler->isFilterEnabled();
+                    saved.stepFilterFrequency = stepSampler->getFilterFrequency();
+                    saved.stepFilterType = stepSampler->getFilterType();
+                }
+            }
+            break;
+        case MacroTarget::Resonance:
+            saved.filterEnabled = strip.isFilterEnabled();
+            saved.filterResonance = strip.getFilterResonance();
+            if (saved.stepMode)
+            {
+                if (auto* stepSampler = strip.getStepSampler())
+                    saved.stepFilterResonance = stepSampler->getFilterResonance();
+            }
+            break;
+        case MacroTarget::None:
+        case MacroTarget::Volume:
+        case MacroTarget::Pan:
+        case MacroTarget::GrainSize:
+        case MacroTarget::GrainDensity:
+        case MacroTarget::GrainPitch:
+        case MacroTarget::GrainPitchJitter:
+        case MacroTarget::GrainSpread:
+        case MacroTarget::GrainJitter:
+        case MacroTarget::GrainRandom:
+        case MacroTarget::GrainArp:
+        case MacroTarget::GrainCloud:
+        case MacroTarget::GrainEmitter:
+        case MacroTarget::GrainEnvelope:
+        case MacroTarget::Retrigger:
+        case MacroTarget::GrainPositionJitter:
+        case MacroTarget::GrainShape:
+        case MacroTarget::FilterMorph:
+        case MacroTarget::FilterEnable:
+        case MacroTarget::SliceLength:
+        case MacroTarget::Scratch:
+        case MacroTarget::Rearrange:
+        case MacroTarget::DelayMix:
+        case MacroTarget::DelayTime:
+        case MacroTarget::DelayFeedback:
+        case MacroTarget::DelayLowCut:
+        case MacroTarget::DelayHighCut:
+        default:
+            break;
+    }
 }
 
 MlrVSTAudioProcessor::MacroState MlrVSTAudioProcessor::getMacroState() const
@@ -9349,22 +9488,28 @@ void MlrVSTAudioProcessor::setSelectedStripMacroValue(int macroIndex, float norm
     const bool hasSceneEvent = macroTargetWritesToSceneLane(target)
         && resolveScenePerformanceMacroEvent(stripIndex, target, normalizedValue, sceneEvent);
 
-    {
-        ScopedSceneAutosaveSuppression suppressSceneAutosave(*this);
-        beginSceneManualControlHandlingSuppression();
-        applyMacroTargetValue(stripIndex, *strip, target, normalizedValue);
-        endSceneManualControlHandlingSuppression();
-    }
-
     if (hasSceneEvent)
     {
-        notifyDirectSceneControlChange(sceneEvent.stripIndex,
-                                       sceneEvent.controlTarget,
-                                       static_cast<ControlMode>(sceneEvent.controlMode),
-                                       sceneEvent.controlRow,
-                                       sceneEvent.value,
-                                       sceneEvent.column);
+        applyLiveSceneControlTouch(sceneEvent.stripIndex,
+                                   sceneEvent.controlTarget,
+                                   static_cast<ControlMode>(sceneEvent.controlMode),
+                                   sceneEvent.controlRow,
+                                   sceneEvent.value,
+                                   sceneEvent.column,
+                                   [this, stripIndex, target, normalizedValue](StripControlWriteMode)
+                                   {
+                                       if (audioEngine == nullptr)
+                                           return;
+                                       if (auto* targetStrip = audioEngine->getStrip(stripIndex))
+                                           applyMacroTargetValue(stripIndex, *targetStrip, target, normalizedValue);
+                                   });
+        return;
     }
+
+    ScopedSceneAutosaveSuppression suppressSceneAutosave(*this);
+    beginSceneManualControlHandlingSuppression();
+    applyMacroTargetValue(stripIndex, *strip, target, normalizedValue);
+    endSceneManualControlHandlingSuppression();
 }
 
 void MlrVSTAudioProcessor::handleIncomingMacroCc(const juce::MidiBuffer& midiMessages)
@@ -12229,6 +12374,7 @@ void MlrVSTAudioProcessor::recordMacroSceneEvent(int stripIndex, MacroTarget tar
                                                 event.controlTarget,
                                                 event.value,
                                                 audioEngine->getTimelineBeat());
+    clearActiveSceneAutomationOverrideForRecordedTarget(sceneSlot, event.stripIndex, event.controlTarget);
 }
 
 namespace
@@ -12267,6 +12413,9 @@ void MlrVSTAudioProcessor::recordSceneGlobalStutterEvent(float normalizedValue, 
                                                 ScenePerformanceControlTarget::Retrigger,
                                                 juce::jlimit(0.0f, 1.0f, normalizedValue),
                                                 safeBeat);
+    clearActiveSceneAutomationOverrideForRecordedTarget(sceneSlot,
+                                                        -1,
+                                                        ScenePerformanceControlTarget::Retrigger);
 }
 
 void MlrVSTAudioProcessor::recordMomentaryStutterSceneDivision(double divisionBeats,
@@ -12297,6 +12446,135 @@ void MlrVSTAudioProcessor::recordMonomeControlSceneEvent(ControlMode mode,
                                                 event.controlTarget,
                                                 event.value,
                                                 audioEngine != nullptr ? audioEngine->getTimelineBeat() : 0.0);
+    clearActiveSceneAutomationOverrideForRecordedTarget(sceneSlot, event.stripIndex, event.controlTarget);
+}
+
+MlrVSTAudioProcessor::ManualSceneControlHandling
+MlrVSTAudioProcessor::handleLiveSceneControlTouch(int stripIndex,
+                                                  ScenePerformanceControlTarget target,
+                                                  ControlMode controlMode,
+                                                  int controlRow,
+                                                  float value,
+                                                  int columnHint,
+                                                  const std::function<void(StripControlWriteMode)>& applyLiveValue,
+                                                  bool liveValueAlreadyApplied)
+{
+    ScenePerformanceEvent probeEvent;
+    if (!buildDirectSceneControlProbeEvent(stripIndex,
+                                           target,
+                                           controlMode,
+                                           controlRow,
+                                           value,
+                                           columnHint,
+                                           probeEvent))
+    {
+        if (!liveValueAlreadyApplied && applyLiveValue)
+            applyLiveValue(StripControlWriteMode::NotifyHost);
+        return ManualSceneControlHandling::Ignored;
+    }
+
+    float liveValueBeforeTouch = 0.0f;
+    const bool shouldSeedTransition = !liveValueAlreadyApplied
+        && sceneControlSupportsTransitionSmoothing(target)
+        && getSceneControlCurrentValue(probeEvent.stripIndex, target, liveValueBeforeTouch);
+
+    auto applyLiveTouch = [this, &applyLiveValue](StripControlWriteMode writeMode)
+    {
+        if (!applyLiveValue)
+            return;
+
+        beginSceneManualControlHandlingSuppression();
+        applyLiveValue(writeMode);
+        endSceneManualControlHandlingSuppression();
+    };
+
+    auto seedTransitionIfNeeded = [this,
+                                   target,
+                                   &probeEvent,
+                                   shouldSeedTransition,
+                                   liveValueBeforeTouch]()
+    {
+        if (!shouldSeedTransition)
+            return;
+
+        seedSceneControlTransition(probeEvent.stripIndex,
+                                   target,
+                                   liveValueBeforeTouch,
+                                   probeEvent.value,
+                                   getSceneAutomationTransitionSeconds(target));
+    };
+
+    if (!isSceneModeEnabled() || audioEngine == nullptr)
+    {
+        if (!liveValueAlreadyApplied)
+        {
+            applyLiveTouch(StripControlWriteMode::NotifyHost);
+            seedTransitionIfNeeded();
+        }
+        return ManualSceneControlHandling::Ignored;
+    }
+
+    const int sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    if (scenePerformanceRecorder.isRecording())
+    {
+        if (!liveValueAlreadyApplied)
+        {
+            applyLiveTouch(StripControlWriteMode::NotifyHost);
+            seedTransitionIfNeeded();
+        }
+
+        scenePerformanceRecorder.recordControlEvent(sceneSlot,
+                                                    probeEvent.stripIndex,
+                                                    probeEvent.controlMode,
+                                                    probeEvent.controlRow,
+                                                    probeEvent.column,
+                                                    probeEvent.controlTarget,
+                                                    probeEvent.value,
+                                                    audioEngine->getTimelineBeat());
+        clearActiveSceneAutomationOverrideForRecordedTarget(sceneSlot,
+                                                            probeEvent.stripIndex,
+                                                            probeEvent.controlTarget);
+        return ManualSceneControlHandling::Recorded;
+    }
+
+    if (sceneClipHasAutomationTarget(sceneSlot, probeEvent.stripIndex, target))
+    {
+        const auto maskIndex = static_cast<size_t>(sceneAutomationMaskIndex(probeEvent.stripIndex, target));
+        activeSceneAutomationOverrideMasks[maskIndex].fetch_or(sceneAutomationTargetBit(target),
+                                                               std::memory_order_acq_rel);
+
+        if (liveValueAlreadyApplied)
+        {
+            // Reassert the touched live value after the override owner is active
+            // so GUI touches, macros, and Monome writes all land the same way.
+            beginSceneManualControlHandlingSuppression();
+            applyScenePerformanceEvent(probeEvent, StripControlWriteMode::CacheOnly);
+            endSceneManualControlHandlingSuppression();
+        }
+        else
+        {
+            applyLiveTouch(StripControlWriteMode::NotifyHost);
+            seedTransitionIfNeeded();
+        }
+
+        return ManualSceneControlHandling::OverrodeAutomation;
+    }
+
+    if (!liveValueAlreadyApplied)
+    {
+        applyLiveTouch(StripControlWriteMode::NotifyHost);
+        seedTransitionIfNeeded();
+    }
+
+    if (target == ScenePerformanceControlTarget::Volume
+        || target == ScenePerformanceControlTarget::Pan
+        || target == ScenePerformanceControlTarget::Speed)
+    {
+        syncActiveSceneClipSlotRuntimeStateFromEngine(true);
+    }
+
+    queueActiveSceneAutosave();
+    return ManualSceneControlHandling::PassedThrough;
 }
 
 MlrVSTAudioProcessor::ManualSceneControlHandling
@@ -12307,48 +12585,33 @@ MlrVSTAudioProcessor::processManualSceneControlChange(int stripIndex,
                                                       float value,
                                                       int columnHint)
 {
-    if (!isSceneModeEnabled() || audioEngine == nullptr || target == ScenePerformanceControlTarget::None)
-        return ManualSceneControlHandling::Ignored;
+    return handleLiveSceneControlTouch(stripIndex,
+                                       target,
+                                       controlMode,
+                                       controlRow,
+                                       value,
+                                       columnHint,
+                                       {},
+                                       true);
+}
 
-    const int sceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
-    const int eventStripIndex = (target == ScenePerformanceControlTarget::Retrigger && stripIndex < 0)
-        ? -1
-        : juce::jlimit(0, MaxStrips - 1, stripIndex);
-    ScenePerformanceEvent probeEvent;
-    probeEvent.type = ScenePerformanceEventType::ControlPoint;
-    probeEvent.stripIndex = eventStripIndex;
-    probeEvent.controlTarget = target;
-    probeEvent.controlMode = static_cast<int>(controlMode);
-    probeEvent.controlRow = controlRow;
-    probeEvent.value = value;
-    const int resolvedColumn = columnHint >= 0
-        ? juce::jlimit(0, MaxColumns - 1, columnHint)
-        : juce::jlimit(0,
-                       MaxColumns - 1,
-                       static_cast<int>(std::round(normalizeSceneControlValue(probeEvent) * 15.0f)));
-
-    if (scenePerformanceRecorder.isRecording())
-    {
-        scenePerformanceRecorder.recordControlEvent(sceneSlot,
-                                                    eventStripIndex,
-                                                    static_cast<int>(controlMode),
-                                                    controlRow,
-                                                    resolvedColumn,
-                                                    target,
-                                                    value,
-                                                    audioEngine->getTimelineBeat());
-        return ManualSceneControlHandling::Recorded;
-    }
-
-    if (sceneClipHasAutomationTarget(sceneSlot, eventStripIndex, target))
-    {
-        const auto maskIndex = static_cast<size_t>(sceneAutomationMaskIndex(eventStripIndex, target));
-        activeSceneAutomationOverrideMasks[maskIndex].fetch_or(sceneAutomationTargetBit(target),
-                                                               std::memory_order_acq_rel);
-        return ManualSceneControlHandling::OverrodeAutomation;
-    }
-
-    return ManualSceneControlHandling::PassedThrough;
+void MlrVSTAudioProcessor::applyLiveSceneControlTouch(int stripIndex,
+                                                      ScenePerformanceControlTarget target,
+                                                      ControlMode controlMode,
+                                                      int controlRow,
+                                                      float value,
+                                                      int columnHint,
+                                                      const std::function<void(StripControlWriteMode)>& applyLiveValue,
+                                                      bool liveValueAlreadyApplied)
+{
+    juce::ignoreUnused(handleLiveSceneControlTouch(stripIndex,
+                                                   target,
+                                                   controlMode,
+                                                   controlRow,
+                                                   value,
+                                                   columnHint,
+                                                   applyLiveValue,
+                                                   liveValueAlreadyApplied));
 }
 
 void MlrVSTAudioProcessor::notifyDirectSceneControlChange(int stripIndex,
@@ -12358,23 +12621,14 @@ void MlrVSTAudioProcessor::notifyDirectSceneControlChange(int stripIndex,
                                                           float value,
                                                           int columnHint)
 {
-    const auto handling = processManualSceneControlChange(stripIndex,
-                                                          target,
-                                                          controlMode,
-                                                          controlRow,
-                                                          value,
-                                                          columnHint);
-    if (handling == ManualSceneControlHandling::PassedThrough)
-    {
-        if (target == ScenePerformanceControlTarget::Volume
-            || target == ScenePerformanceControlTarget::Pan
-            || target == ScenePerformanceControlTarget::Speed)
-        {
-            syncActiveSceneClipSlotRuntimeStateFromEngine(true);
-        }
-
-        queueActiveSceneAutosave();
-    }
+    applyLiveSceneControlTouch(stripIndex,
+                               target,
+                               controlMode,
+                               controlRow,
+                               value,
+                               columnHint,
+                               {},
+                               true);
 }
 
 void MlrVSTAudioProcessor::applyScenePerformanceEvent(const ScenePerformanceEvent& event,
@@ -12613,26 +12867,15 @@ void MlrVSTAudioProcessor::applySceneHeldAutomationStateAtBeat(int sceneSlot,
                     continue;
                 }
 
-                const ScenePerformanceEvent* lastEvent = nullptr;
-                const ScenePerformanceEvent* chosenEvent = nullptr;
-                for (const auto& event : events)
+                ScenePerformanceEvent chosenEvent;
+                if (findHeldSceneAutomationEventAtClipBeat(events,
+                                                           targetStripIndex,
+                                                           target,
+                                                           clipBeat,
+                                                           chosenEvent))
                 {
-                    if (event.type != ScenePerformanceEventType::ControlPoint
-                        || event.controlTarget != target
-                        || event.stripIndex != targetStripIndex)
-                    {
-                        continue;
-                    }
-
-                    lastEvent = &event;
-                    if (event.timeBeats <= clipBeat + 1.0e-6)
-                        chosenEvent = &event;
+                    playbackScenePerformanceEvent(chosenEvent);
                 }
-
-                if (chosenEvent == nullptr)
-                    chosenEvent = lastEvent;
-                if (chosenEvent != nullptr)
-                    playbackScenePerformanceEvent(*chosenEvent);
             }
         }
     }
@@ -12645,6 +12888,7 @@ void MlrVSTAudioProcessor::processScenePerformancePlayback(const juce::AudioPlay
 {
     if (!isSceneModeEnabled() || audioEngine == nullptr)
     {
+        scenePlaybackBlockStutterPostRenderPending = false;
         lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
         lastScenePerformanceProcessSceneSlot = -1;
         lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
@@ -12658,6 +12902,7 @@ void MlrVSTAudioProcessor::processScenePerformancePlayback(const juce::AudioPlay
             || !activeSceneStartPpqValid
             || !std::isfinite(activeSceneStartPpq))
         {
+            scenePlaybackBlockStutterPostRenderPending = false;
             lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
             lastScenePerformanceProcessSceneSlot = sceneSlot;
             lastScenePerformanceProcessSceneStartBeat = activeSceneStartPpq;
@@ -12680,6 +12925,7 @@ void MlrVSTAudioProcessor::processScenePerformancePlayback(const juce::AudioPlay
 
     if (!scenePerformanceRecorder.hasEvents(sceneSlot))
     {
+        scenePlaybackBlockStutterPostRenderPending = false;
         lastScenePerformanceProcessBeat = blockEndBeat;
         lastScenePerformanceProcessSceneSlot = sceneSlot;
         lastScenePerformanceProcessSceneStartBeat = activeSceneStartPpq;
@@ -12701,6 +12947,10 @@ void MlrVSTAudioProcessor::processScenePerformancePlayback(const juce::AudioPlay
         applySceneHeldAutomationStateAtBeat(sceneSlot, blockStartBeat, activeSceneStartPpq);
 
     const double clipLengthBeats = juce::jmax(1.0, scenePerformanceRecorder.getClipLengthBeats(sceneSlot));
+    const float stutterAmountAtBlockStart = getGlobalSceneStutterAmount();
+    bool sawRetriggerEventThisBlock = false;
+    float retriggerRenderAmount = stutterAmountAtBlockStart;
+    float retriggerFinalAmount = stutterAmountAtBlockStart;
     const double beatDelta = blockEndBeat - fromBeat;
     if (beatDelta > 0.0 && beatDelta <= clipLengthBeats)
     {
@@ -12708,7 +12958,14 @@ void MlrVSTAudioProcessor::processScenePerformancePlayback(const juce::AudioPlay
                                                             activeSceneStartPpq,
                                                             fromBeat,
                                                             blockEndBeat,
-                                                            [this, blockStartBeat, blockStartSample, numSamples, samplesPerBeat]
+                                                            [this,
+                                                             blockStartBeat,
+                                                             blockStartSample,
+                                                             numSamples,
+                                                             samplesPerBeat,
+                                                             &sawRetriggerEventThisBlock,
+                                                             &retriggerRenderAmount,
+                                                             &retriggerFinalAmount]
                                                             (const ScenePerformanceEvent& event, double occurrenceBeat)
                                                             {
                                                                 if (event.stripIndex >= 0
@@ -12721,6 +12978,20 @@ void MlrVSTAudioProcessor::processScenePerformancePlayback(const juce::AudioPlay
                                                                     && isActiveSceneAutomationOverridden(event.stripIndex,
                                                                                                          event.controlTarget))
                                                                 {
+                                                                    return;
+                                                                }
+
+                                                                if (event.type == ScenePerformanceEventType::ControlPoint
+                                                                    && event.controlTarget
+                                                                        == ScenePerformanceControlTarget::Retrigger)
+                                                                {
+                                                                    sawRetriggerEventThisBlock = true;
+                                                                    const float clampedAmount = juce::jlimit(0.0f,
+                                                                                                              1.0f,
+                                                                                                              event.value);
+                                                                    if (clampedAmount > 1.0e-4f)
+                                                                        retriggerRenderAmount = clampedAmount;
+                                                                    retriggerFinalAmount = clampedAmount;
                                                                     return;
                                                                 }
 
@@ -12745,6 +13016,17 @@ void MlrVSTAudioProcessor::processScenePerformancePlayback(const juce::AudioPlay
 
                                                                 playbackScenePerformanceEvent(event);
                                                             });
+    }
+
+    if (sawRetriggerEventThisBlock)
+    {
+        setGlobalSceneStutterAmount(retriggerRenderAmount);
+        scenePlaybackBlockStutterPostRenderPending = true;
+        scenePlaybackBlockStutterPostRenderAmount = retriggerFinalAmount;
+    }
+    else
+    {
+        scenePlaybackBlockStutterPostRenderPending = false;
     }
 
     lastScenePerformanceProcessBeat = blockEndBeat;
@@ -15051,6 +15333,12 @@ void MlrVSTAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     if (!renderPendingPreparedSceneSwitch(buffer, midiMessages, posInfo, currentGlobalSample))
         renderActiveSceneAudio(buffer, midiMessages, posInfo, true, true);
 
+    if (scenePlaybackBlockStutterPostRenderPending)
+    {
+        setGlobalSceneStutterAmount(scenePlaybackBlockStutterPostRenderAmount);
+        scenePlaybackBlockStutterPostRenderPending = false;
+    }
+
     if (activeScenePlaybackHandle.active)
         refreshSceneStripLaunchHandlesFromEngine();
 
@@ -17212,6 +17500,19 @@ bool MlrVSTAudioProcessor::clearSceneStripAutomationAndMotion(int sceneSlot, int
     const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
     auto events = getScenePerformanceEventsSnapshot(safeSceneSlot);
     std::vector<ScenePerformanceControlTarget> clearedTargets;
+    std::vector<ScenePerformanceControlTarget> restoreTargets;
+
+    auto appendRestoreTarget = [&restoreTargets](ScenePerformanceControlTarget target)
+    {
+        if (target == ScenePerformanceControlTarget::None
+            || target == ScenePerformanceControlTarget::Retrigger)
+        {
+            return;
+        }
+
+        if (std::find(restoreTargets.begin(), restoreTargets.end(), target) == restoreTargets.end())
+            restoreTargets.push_back(target);
+    };
 
     events.erase(std::remove_if(events.begin(),
                                 events.end(),
@@ -17233,6 +17534,44 @@ bool MlrVSTAudioProcessor::clearSceneStripAutomationAndMotion(int sceneSlot, int
                                 }),
                  events.end());
 
+    appendRestoreTarget(ScenePerformanceControlTarget::Volume);
+    appendRestoreTarget(ScenePerformanceControlTarget::Pan);
+    appendRestoreTarget(stripUsesGrainSceneLanes(safeStripIndex)
+                            ? ScenePerformanceControlTarget::GrainPitch
+                            : ScenePerformanceControlTarget::Pitch);
+    appendRestoreTarget(ScenePerformanceControlTarget::Speed);
+    appendRestoreTarget(ScenePerformanceControlTarget::Swing);
+    appendRestoreTarget(ScenePerformanceControlTarget::FilterFrequency);
+    appendRestoreTarget(ScenePerformanceControlTarget::FilterResonance);
+    appendRestoreTarget(ScenePerformanceControlTarget::FilterEnabled);
+    appendRestoreTarget(ScenePerformanceControlTarget::FilterMorph);
+    appendRestoreTarget(ScenePerformanceControlTarget::SliceLength);
+    appendRestoreTarget(ScenePerformanceControlTarget::Scratch);
+    appendRestoreTarget(ScenePerformanceControlTarget::DelayMix);
+    appendRestoreTarget(ScenePerformanceControlTarget::DelayTime);
+    appendRestoreTarget(ScenePerformanceControlTarget::DelayFeedback);
+    appendRestoreTarget(ScenePerformanceControlTarget::DelayLowCut);
+    appendRestoreTarget(ScenePerformanceControlTarget::DelayHighCut);
+    appendRestoreTarget(ScenePerformanceControlTarget::DelayMode);
+    appendRestoreTarget(ScenePerformanceControlTarget::DelaySyncEnabled);
+    appendRestoreTarget(ScenePerformanceControlTarget::Rearrange);
+
+    if (stripUsesGrainSceneLanes(safeStripIndex))
+    {
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainSize);
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainDensity);
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainPitchJitter);
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainSpread);
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainJitter);
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainPositionJitter);
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainRandomDepth);
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainArp);
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainCloud);
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainEmitter);
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainEnvelope);
+        appendRestoreTarget(ScenePerformanceControlTarget::GrainShape);
+    }
+
     if (!clearedTargets.empty())
     {
         for (const auto target : clearedTargets)
@@ -17250,11 +17589,10 @@ bool MlrVSTAudioProcessor::clearSceneStripAutomationAndMotion(int sceneSlot, int
         std::sort(events.begin(), events.end());
         if (!replaceScenePerformanceClipEvents(safeSceneSlot, events))
             return false;
-
-        restoreSceneStripControlTargetsToStoredState(safeSceneSlot, safeStripIndex, clearedTargets);
     }
 
     clearSceneMotionStripState(safeSceneSlot, safeStripIndex);
+    restoreSceneStripControlTargetsToStoredState(safeSceneSlot, safeStripIndex, restoreTargets);
     clearPendingSceneTriggerRecord(safeStripIndex);
     updateMonomeLEDs();
     return true;
@@ -18057,36 +18395,23 @@ void MlrVSTAudioProcessor::clearActiveSceneAutomationOverrides(bool restoreWritt
                         continue;
 
                     const int targetStripIndex = (maskIndex == kSceneAutomationGlobalMaskIndex) ? -1 : maskIndex;
-                    const ScenePerformanceEvent* lastEvent = nullptr;
-                    const ScenePerformanceEvent* chosenEvent = nullptr;
-                    for (const auto& event : events)
-                    {
-                        if (event.type != ScenePerformanceEventType::ControlPoint
-                            || event.controlTarget != target
-                            || event.stripIndex != targetStripIndex)
-                        {
-                            continue;
-                        }
-
-                        lastEvent = &event;
-                        if (event.timeBeats <= clipBeat + 1.0e-6)
-                            chosenEvent = &event;
-                    }
-
-                    if (chosenEvent == nullptr)
-                        chosenEvent = lastEvent;
-                    if (chosenEvent != nullptr)
+                    ScenePerformanceEvent chosenEvent;
+                    if (findHeldSceneAutomationEventAtClipBeat(events,
+                                                               targetStripIndex,
+                                                               target,
+                                                               clipBeat,
+                                                               chosenEvent))
                     {
                         float liveValue = 0.0f;
                         const bool shouldSeedTransition = sceneControlSupportsTransitionSmoothing(target)
                             && getSceneControlCurrentValue(targetStripIndex, target, liveValue);
-                        applyScenePerformanceEvent(*chosenEvent, StripControlWriteMode::NotifyHost);
+                        applyScenePerformanceEvent(chosenEvent, StripControlWriteMode::NotifyHost);
                         if (shouldSeedTransition)
                         {
                             seedSceneControlTransition(targetStripIndex,
                                                        target,
                                                        liveValue,
-                                                       chosenEvent->value,
+                                                       chosenEvent.value,
                                                        getSceneAutomationTransitionSeconds(target));
                         }
                     }
@@ -18104,6 +18429,23 @@ void MlrVSTAudioProcessor::clearActiveSceneAutomationOverrides(bool restoreWritt
 
     for (auto& mask : activeSceneAutomationOverrideMasks)
         mask.store(0, std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::clearActiveSceneAutomationOverrideForRecordedTarget(int sceneSlot,
+                                                                               int stripIndex,
+                                                                               ScenePerformanceControlTarget target)
+{
+    if (target == ScenePerformanceControlTarget::None)
+        return;
+
+    const int safeRecordedSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const int safeActiveSceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
+    if (safeRecordedSceneSlot != safeActiveSceneSlot)
+        return;
+
+    auto& overrideMask = activeSceneAutomationOverrideMasks[static_cast<size_t>(
+        sceneAutomationMaskIndex(stripIndex, target))];
+    overrideMask.fetch_and(~sceneAutomationTargetBit(target), std::memory_order_acq_rel);
 }
 
 void MlrVSTAudioProcessor::reenableActiveSceneAutomation()
@@ -18150,25 +18492,6 @@ bool MlrVSTAudioProcessor::pasteSceneSlotFromClipboard(int sceneSlot)
                                                safeSceneSlot);
     if (!pasted)
         return false;
-
-    if (sceneSlotHasMotionState(sceneSlotClipboardSourceSlot))
-    {
-        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
-        {
-            scenePerformanceRecorder.setMotionStripState(
-                safeSceneSlot,
-                stripIndex,
-                scenePerformanceRecorder.getMotionStripState(sceneSlotClipboardSourceSlot, stripIndex));
-        }
-
-        if (safeSceneSlot == activeSceneSlot && isSceneModeEnabled())
-            applySceneMotionStateToEngine(safeSceneSlot);
-    }
-    else
-    {
-        for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
-            clearSceneMotionStripState(safeSceneSlot, stripIndex);
-    }
 
     if (pastingIntoActiveScene)
     {
@@ -18262,7 +18585,6 @@ bool MlrVSTAudioProcessor::clearSceneSlot(int sceneSlot)
         applyScenePerformanceStateData({}, -1);
 
     clearPendingActiveSceneAutosave();
-    saveSceneForMainPreset(mainPresetIndex, safeSceneSlot);
     focusSceneSlot(preservedFocusedSceneSlot);
     updateMonomeLEDs();
     return true;
@@ -22228,6 +22550,10 @@ void MlrVSTAudioProcessor::loadPersistentGlobalControls()
         }
     }
 
+    macroTargetAssignments[5].store(static_cast<int>(getDefaultMacroTarget(5)), std::memory_order_release);
+    macroTargetAssignments[6].store(static_cast<int>(getDefaultMacroTarget(6)), std::memory_order_release);
+    macroTargetAssignments[7].store(static_cast<int>(getDefaultMacroTarget(7)), std::memory_order_release);
+
     if (xml->hasAttribute("rootNoteMidi"))
     {
         globalRootNoteMidi.store(juce::jlimit(0, 127, xml->getIntAttribute("rootNoteMidi", 60)),
@@ -23044,10 +23370,15 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults(bool preserveLoaded
     lastScenePerformanceProcessBeat = std::numeric_limits<double>::quiet_NaN();
     lastScenePerformanceProcessSceneSlot = -1;
     lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
+    scenePlaybackBlockStutterPostRenderPending = false;
+    scenePlaybackBlockStutterPostRenderAmount = 0.0f;
     sceneCopySourceSlot = -1;
     sceneCopyMainPresetIndex = 0;
     scenePerformanceClipboardData.reset();
     sceneMainAutomationDisplayTargets.fill(ModernAudioEngine::ModTarget::None);
+    macroTargetAssignments[5].store(static_cast<int>(getDefaultMacroTarget(5)), std::memory_order_release);
+    macroTargetAssignments[6].store(static_cast<int>(getDefaultMacroTarget(6)), std::memory_order_release);
+    macroTargetAssignments[7].store(static_cast<int>(getDefaultMacroTarget(7)), std::memory_order_release);
 
     {
         const juce::ScopedLock lock(pendingLoopChangeLock);
