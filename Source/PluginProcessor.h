@@ -933,6 +933,7 @@ public:
     };
 
     struct PreparedSceneSwitchPayload;
+    struct PreparedSceneStripState;
 
     struct SceneSlotState
     {
@@ -1152,6 +1153,9 @@ public:
     void restoreSceneStripControlTargetsToStoredState(int sceneSlot,
                                                       int stripIndex,
                                                       const std::vector<ScenePerformanceControlTarget>& targets);
+    void restoreSceneStripControlTargetsToDefaultState(int sceneSlot,
+                                                       int stripIndex,
+                                                       const std::vector<ScenePerformanceControlTarget>& targets);
     void copySceneMotionStripState(int sceneSlot, int sourceStripIndex, int destStripIndex);
     void stepVisibleModLaneTarget(int stripIndex, int direction);
     void stepSceneModLaneTarget(int stripIndex, int direction);
@@ -1376,6 +1380,7 @@ private:
         int endColumn = MaxColumns;
         int markerColumn = -1;
         bool reverse = false;
+        float beatsPerLoopOverride = std::numeric_limits<float>::quiet_NaN();
         bool quantized = false;
         double targetPpq = 0.0;
         int quantizeDivision = 8;
@@ -1489,6 +1494,7 @@ private:
     std::atomic<bool> controlPageMomentary{true};
     std::atomic<int> swingDivisionSelection{1}; // 0=1/4,1=1/8,2=1/16,3=1/8T,4=1/2,5=1/32,6=1/16T
     std::atomic<int> innerLoopLengthSelection{0}; // 0=1,1=1/2,2=1/4,3=1/8,4=1/16
+    std::atomic<int> lastAppliedInnerLoopLengthSelection{0};
     std::atomic<int> gatePageMode{0};
     int lastAppliedStretchBackend = -1; // -1 = force initial sync on first process block
     int lastAppliedContinuousTraversal = -1;
@@ -1849,7 +1855,13 @@ private:
     void loadPersistentGlobalControls();
     int getQuantizeDivision() const;
     float getInnerLoopLengthFactor() const;
-    void queueLoopChange(int stripIndex, bool clearLoop, int startColumn, int endColumn, bool reverseDirection, int markerColumn = -1);
+    void queueLoopChange(int stripIndex,
+                         bool clearLoop,
+                         int startColumn,
+                         int endColumn,
+                         bool reverseDirection,
+                         int markerColumn = -1,
+                         float beatsPerLoopOverride = std::numeric_limits<float>::quiet_NaN());
     void recoverDeferredPpqAnchors(const juce::AudioPlayHead::PositionInfo& posInfo);
     void applyPendingLoopChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
     void applyPendingBarChanges(const juce::AudioPlayHead::PositionInfo& posInfo);
@@ -1998,6 +2010,10 @@ private:
     bool sceneClipHasAutomationTarget(int sceneSlot,
                                       int stripIndex,
                                       ScenePerformanceControlTarget target) const;
+    const PreparedSceneStripState* getStoredSceneStripStateForSlot(int sceneSlot,
+                                                                   int stripIndex,
+                                                                   PreparedSceneStripState& fallbackStripState) const;
+    bool stripUsesGrainSceneLanesForSceneSlot(int sceneSlot, int stripIndex) const;
     double getSceneAutomationTransitionSeconds() const;
     double getSceneAutomationTransitionSeconds(ScenePerformanceControlTarget target) const;
     bool shouldSmoothLiveSceneControlTarget(ScenePerformanceControlTarget target) const;
@@ -2009,6 +2025,9 @@ private:
     void beginSceneManualControlHandlingSuppression();
     void endSceneManualControlHandlingSuppression();
     bool isSceneManualControlHandlingSuppressed() const;
+    void refreshMomentaryStutterSavedStateFromCurrentStrip(int stripIndex,
+                                                           ScenePerformanceControlTarget target);
+    void rescaleActiveInnerLoopsForGlobalFactor(int previousChoice, int newChoice);
     void applySceneHeldAutomationStateAtBeat(int sceneSlot,
                                              double currentBeat,
                                              double sceneStartBeat);

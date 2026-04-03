@@ -77,6 +77,38 @@ void ensureStereoScratchBuffer(juce::AudioBuffer<float>& buffer, int requiredSam
         buffer.setSize(2, requiredSamples, false, false, true);
 }
 
+struct PanGainPair
+{
+    float left = 1.0f;
+    float right = 1.0f;
+};
+
+PanGainPair computeMonoPanGains(float pan) noexcept
+{
+    const float clampedPan = juce::jlimit(-1.0f, 1.0f, pan);
+    const float angle = (clampedPan + 1.0f) * 0.25f * juce::MathConstants<float>::pi;
+    return { std::cos(angle), std::sin(angle) };
+}
+
+PanGainPair computeStereoBalanceGains(float pan) noexcept
+{
+    const float clampedPan = juce::jlimit(-1.0f, 1.0f, pan);
+    const float attenuation = std::cos(std::abs(clampedPan) * 0.5f * juce::MathConstants<float>::pi);
+
+    if (clampedPan < 0.0f)
+        return { 1.0f, attenuation };
+    if (clampedPan > 0.0f)
+        return { attenuation, 1.0f };
+    return {};
+}
+
+void applyStereoBalance(float& leftSample, float& rightSample, float pan) noexcept
+{
+    const auto gains = computeStereoBalanceGains(pan);
+    leftSample *= gains.left;
+    rightSample *= gains.right;
+}
+
 float computeStereoBufferRms(const juce::AudioBuffer<float>& buffer, int startSample, int numSamples)
 {
     if (numSamples <= 0 || buffer.getNumChannels() < 2)
@@ -3961,14 +3993,7 @@ void EnhancedAudioStrip::clearSample()
     sourceSampleRate = currentSampleRate;
     pitchSourceVersion.fetch_add(1, std::memory_order_acq_rel);
     playbackPosition = 0.0;
-    playheadTraversalRatioAtLastCalc = -1.0;
-    playheadTraversalPhaseOffsetSlices = 0.0;
-    playheadTraversalSliceCountAtLastCalc = -1;
-    const float requestedTraversalRatio = playheadSpeedRatio.load(std::memory_order_acquire);
-    appliedPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
-    pendingPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
-    pendingPlayheadSpeedChange.store(0, std::memory_order_release);
-    pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
+    resetPlayheadTraversalSpeedStateFromRequestedRatio();
     triggerSample = 0;
     triggerColumn = 0;
     triggerOffsetRatio = 0.0;
@@ -6690,11 +6715,7 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             }
         }
         
-        // Calculate pan gains ONCE (not per channel)
-        const float pi = 3.14159265359f;
-        float panAngle = (currentPan + 1.0f) * 0.5f * pi * 0.5f;  // Map -1..1 to 0..pi/2
-        float leftGain = std::cos(panAngle);
-        float rightGain = std::sin(panAngle);
+        const auto monoPanGains = computeMonoPanGains(currentPan);
         
         // Read and sum all channels from source, then apply pan
         float leftSample = 0.0f;
@@ -6726,8 +6747,9 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             float grainR = 0.0f;
             renderGrainAtSample(grainL, grainR, grainCenter, effectiveSpeed, globalSampleStart + i);
 
-            leftSample = grainL * leftGain;
-            rightSample = grainR * rightGain;
+            leftSample = grainL;
+            rightSample = grainR;
+            applyStereoBalance(leftSample, rightSample, currentPan);
         }
         else if (playbackNumChannels == 1)
         {
@@ -6750,8 +6772,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 monoSample = (monoSample * overlapCurrentGain) + (overlapSample * overlapPreviousGain);
             }
             
-            leftSample = monoSample * leftGain;
-            rightSample = monoSample * rightGain;
+            leftSample = monoSample * monoPanGains.left;
+            rightSample = monoSample * monoPanGains.right;
         }
         else if (playbackNumChannels == 2)
         {
@@ -6781,8 +6803,9 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 rightSource = (rightSource * overlapCurrentGain) + (rightOverlap * overlapPreviousGain);
             }
             
-            leftSample = leftSource * leftGain;
-            rightSample = rightSource * rightGain;
+            leftSample = leftSource;
+            rightSample = rightSource;
+            applyStereoBalance(leftSample, rightSample, currentPan);
         }
         
         if (!soundTouchSwingActive
@@ -6803,13 +6826,14 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             if (playbackNumChannels == 1)
             {
                 const float monoOld = resampler.getSample(*playbackSourceBuffer, 0, oldReadPos, playbackSpeed);
-                oldLeft = monoOld * leftGain;
-                oldRight = monoOld * rightGain;
+                oldLeft = monoOld * monoPanGains.left;
+                oldRight = monoOld * monoPanGains.right;
             }
             else if (playbackNumChannels == 2)
             {
-                oldLeft = resampler.getSample(*playbackSourceBuffer, 0, oldReadPos, playbackSpeed) * leftGain;
-                oldRight = resampler.getSample(*playbackSourceBuffer, 1, oldReadPos, playbackSpeed) * rightGain;
+                oldLeft = resampler.getSample(*playbackSourceBuffer, 0, oldReadPos, playbackSpeed);
+                oldRight = resampler.getSample(*playbackSourceBuffer, 1, oldReadPos, playbackSpeed);
+                applyStereoBalance(oldLeft, oldRight, currentPan);
             }
 
             const float progress = 1.0f - (static_cast<float>(retriggerBlendSamplesRemaining)
@@ -7106,7 +7130,6 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
     const double samplesPerBeatLocal = hasPpq
         ? ((60.0 / tempo) * currentSampleRate)
         : 0.0;
-    const float pi = 3.14159265359f;
     if (useRealtimeSignalsmith)
     {
         for (int i = 0; i < numSamples; ++i)
@@ -7115,9 +7138,7 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
             float rightSample = output.getSample(1, startSample + i);
 
             const float currentPan = smoothedPan.getNextValue();
-            const float panAngle = (currentPan + 1.0f) * 0.5f * pi * 0.5f;
-            leftSample *= std::cos(panAngle);
-            rightSample *= std::sin(panAngle);
+            applyStereoBalance(leftSample, rightSample, currentPan);
             const float currentTrimGain = smoothedTrimGain.getNextValue();
             leftSample *= currentTrimGain;
             rightSample *= currentTrimGain;
@@ -7150,9 +7171,7 @@ void EnhancedAudioStrip::processExternalOutputBuffer(juce::AudioBuffer<float>& o
         float rightSample = output.getSample(1, startSample + i);
 
         const float currentPan = smoothedPan.getNextValue();
-        const float panAngle = (currentPan + 1.0f) * 0.5f * pi * 0.5f;
-        leftSample *= std::cos(panAngle);
-        rightSample *= std::sin(panAngle);
+        applyStereoBalance(leftSample, rightSample, currentPan);
         const float currentTrimGain = smoothedTrimGain.getNextValue();
         leftSample *= currentTrimGain;
         rightSample *= currentTrimGain;
@@ -7227,16 +7246,7 @@ void EnhancedAudioStrip::trigger(int column, double tempo, bool quantized)
     if (!wasPlaying)
         resetSignalsmithRealtimeAlignmentState();
 
-    playheadTraversalRatioAtLastCalc = -1.0;
-    playheadTraversalPhaseOffsetSlices = 0.0;
-    playheadTraversalSliceCountAtLastCalc = -1;
-    {
-        const float requestedTraversalRatio = playheadSpeedRatio.load(std::memory_order_acquire);
-        appliedPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
-        pendingPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
-        pendingPlayheadSpeedChange.store(0, std::memory_order_release);
-        pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
-    }
+    resetPlayheadTraversalSpeedStateFromRequestedRatio();
     
     triggerColumn = column;
     triggerSample = 0;  // Unknown global sample
@@ -7329,16 +7339,7 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
     if (!wasPlaying)
         resetSignalsmithRealtimeAlignmentState();
 
-    playheadTraversalRatioAtLastCalc = -1.0;
-    playheadTraversalPhaseOffsetSlices = 0.0;
-    playheadTraversalSliceCountAtLastCalc = -1;
-    {
-        const float requestedTraversalRatio = playheadSpeedRatio.load(std::memory_order_acquire);
-        appliedPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
-        pendingPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
-        pendingPlayheadSpeedChange.store(0, std::memory_order_release);
-        pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
-    }
+    resetPlayheadTraversalSpeedStateFromRequestedRatio();
     
     // Calculate loop length in samples
     int loopCols = loopEnd - loopStart;
@@ -7944,7 +7945,12 @@ void EnhancedAudioStrip::snapToTimeline(int64_t currentGlobalSample)
     
     // Calculate loop parameters
     double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
-    double loopLength = loopLengthSamples;
+    int loopCols = loopEnd - loopStart;
+    if (loopCols <= 0)
+        loopCols = ModernAudioEngine::MaxColumns;
+    double loopLength = (static_cast<double>(loopCols)
+                         / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
+    loopLengthSamples = loopLength;
     double triggerOffset = juce::jlimit(0.0, 0.999999, triggerOffsetRatio) * loopLength;
     
     // Calculate expected position based on time elapsed
@@ -8657,12 +8663,49 @@ void EnhancedAudioStrip::setLoop(int startColumn, int endColumn)
     loopStart = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, startColumn);
     loopEnd = juce::jlimit(loopStart + 1, ModernAudioEngine::MaxColumns, endColumn);
     loopEnabled = true;
+    if (sampleLength > 0.0)
+    {
+        const int loopCols = juce::jmax(1, loopEnd - loopStart);
+        loopLengthSamples = (static_cast<double>(loopCols)
+                             / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
+    }
+    else
+    {
+        loopLengthSamples = 0.0;
+    }
 }
 
 void EnhancedAudioStrip::setBeatsPerLoop(float beats)
 {
     const double hostPpqNow = lastObservedPpqValid ? lastObservedPPQ : std::numeric_limits<double>::quiet_NaN();
     setBeatsPerLoopAtPpq(beats, hostPpqNow);
+}
+
+float EnhancedAudioStrip::getInnerLoopBaseBeatsPerLoop() const
+{
+    if (innerLoopTempoOverrideActive.load(std::memory_order_acquire) != 0)
+        return innerLoopBaseBeatsPerLoop.load(std::memory_order_acquire);
+    return beatsPerLoop.load(std::memory_order_acquire);
+}
+
+void EnhancedAudioStrip::applyInnerLoopBeatsPerLoopOverride(float beats, double hostPpqNow)
+{
+    if (innerLoopTempoOverrideActive.load(std::memory_order_acquire) == 0)
+        innerLoopBaseBeatsPerLoop.store(beatsPerLoop.load(std::memory_order_acquire), std::memory_order_release);
+
+    innerLoopTempoOverrideActive.store(1, std::memory_order_release);
+    setBeatsPerLoopAtPpq(beats, hostPpqNow);
+}
+
+void EnhancedAudioStrip::restoreInnerLoopBaseBeatsPerLoop(double hostPpqNow)
+{
+    if (innerLoopTempoOverrideActive.load(std::memory_order_acquire) == 0)
+        return;
+
+    const float baseBeats = innerLoopBaseBeatsPerLoop.load(std::memory_order_acquire);
+    innerLoopTempoOverrideActive.store(0, std::memory_order_release);
+    innerLoopBaseBeatsPerLoop.store(-1.0f, std::memory_order_release);
+    setBeatsPerLoopAtPpq(baseBeats, hostPpqNow);
 }
 
 void EnhancedAudioStrip::setBeatsPerLoopAtPpq(float beats, double hostPpqNow)
@@ -8710,6 +8753,7 @@ void EnhancedAudioStrip::clearLoop()
     loopStart = 0;
     loopEnd = ModernAudioEngine::MaxColumns;
     reverse = false;
+    loopLengthSamples = juce::jmax(0.0, sampleLength);
 }
 
 void EnhancedAudioStrip::setPlaybackMarkerColumn(int column, int64_t currentGlobalSample)
@@ -8784,6 +8828,8 @@ void EnhancedAudioStrip::restorePresetPpqState(bool shouldPlay,
     const double beatsForLoop = (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0;
     if (beatsForLoop <= 0.0)
         return;
+
+    resetPlayheadTraversalSpeedStateFromRequestedRatio();
 
     // Restore timeline-relative anchor (offset from host PPQ), not absolute playback sample.
     ppqTimelineAnchored = true;
@@ -10610,6 +10656,57 @@ double EnhancedAudioStrip::getLoopPhaseNormalized() const
         posInLoop += loopLength;
 
     return juce::jlimit(0.0, 0.999999, posInLoop / loopLength);
+}
+
+double EnhancedAudioStrip::getEffectiveLoopDisplayLengthColumns() const
+{
+    const int rawLoopCols = juce::jmax(1, loopEnd - loopStart);
+    if (innerLoopTempoOverrideActive.load(std::memory_order_acquire) == 0)
+        return static_cast<double>(rawLoopCols);
+
+    float baseBeats = innerLoopBaseBeatsPerLoop.load(std::memory_order_acquire);
+    float currentBeats = beatsPerLoop.load(std::memory_order_acquire);
+    if (!(baseBeats > 0.0f))
+        baseBeats = (currentBeats > 0.0f) ? currentBeats : 4.0f;
+    if (!(currentBeats > 0.0f))
+        currentBeats = baseBeats;
+
+    return juce::jlimit(0.0,
+                        static_cast<double>(ModernAudioEngine::MaxColumns),
+                        static_cast<double>(rawLoopCols) * static_cast<double>(currentBeats)
+                            / static_cast<double>(juce::jmax(0.25f, baseBeats)));
+}
+
+double EnhancedAudioStrip::getEffectiveLoopDisplayStartColumn() const
+{
+    const double effectiveLength = getEffectiveLoopDisplayLengthColumns();
+    const double anchoredEnd = juce::jlimit(0.0,
+                                            static_cast<double>(ModernAudioEngine::MaxColumns),
+                                            static_cast<double>(loopEnd));
+
+    if (reverse || directionMode == DirectionMode::Reverse)
+        return juce::jlimit(0.0, anchoredEnd, anchoredEnd - effectiveLength);
+
+    return juce::jlimit(0.0,
+                        static_cast<double>(ModernAudioEngine::MaxColumns),
+                        static_cast<double>(loopStart));
+}
+
+double EnhancedAudioStrip::getEffectiveLoopDisplayEndColumn() const
+{
+    const double effectiveLength = getEffectiveLoopDisplayLengthColumns();
+    const double anchoredStart = juce::jlimit(0.0,
+                                              static_cast<double>(ModernAudioEngine::MaxColumns),
+                                              static_cast<double>(loopStart));
+
+    if (reverse || directionMode == DirectionMode::Reverse)
+        return juce::jlimit(0.0,
+                            static_cast<double>(ModernAudioEngine::MaxColumns),
+                            static_cast<double>(loopEnd));
+
+    return juce::jlimit(anchoredStart,
+                        static_cast<double>(ModernAudioEngine::MaxColumns),
+                        anchoredStart + effectiveLength);
 }
 
 int EnhancedAudioStrip::getCurrentColumn() const

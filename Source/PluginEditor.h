@@ -49,7 +49,7 @@ public:
                             float pitchSemitones,
                             float arpDepth,
                             float pitchJitterSemitones);
-    void setLoopPoints(int startCol, int endCol, int maxCols);
+    void setLoopPoints(double startCol, double endCol, int maxCols);
     void setSliceMarkers(const std::array<int, 16>& normalSlices,
                          const std::array<int, 16>& transientSlices,
                          int totalSamples,
@@ -65,8 +65,8 @@ public:
 private:
     std::vector<float> thumbnail;
     double playbackPosition = 0.0;
-    int loopStart = 0;
-    int loopEnd = 16;
+    double loopStart = 0.0;
+    double loopEnd = 16.0;
     int maxColumns = 16;
     bool hasAudio = false;
     juce::Colour waveformColor = juce::Colour(0xff8cb8ff);  // Brighter default blue

@@ -171,6 +171,13 @@ inline juce::String macroCutoffText(float normalized)
     return juce::String(static_cast<int>(std::round(hz))) + " Hz";
 }
 
+inline juce::String macroFrequencyText(float hz)
+{
+    if (hz >= 1000.0f)
+        return juce::String(hz / 1000.0f, 2) + " kHz";
+    return juce::String(static_cast<int>(std::round(hz))) + " Hz";
+}
+
 inline juce::String macroResonanceText(float normalized)
 {
     const float q = juce::jmap(juce::jlimit(0.0f, 1.0f, normalized), 0.0f, 1.0f, 0.1f, 10.0f);
@@ -189,6 +196,12 @@ inline juce::String macroPitchText(float normalized)
 {
     const float semitones = juce::jmap(juce::jlimit(0.0f, 1.0f, normalized), 0.0f, 1.0f, -24.0f, 24.0f);
     return juce::String(semitones, 1) + " st";
+}
+
+inline juce::String macroDelayTimeText(float normalized)
+{
+    const float beats = juce::jmap(juce::jlimit(0.0f, 1.0f, normalized), 0.0f, 1.0f, 0.25f, 4.0f);
+    return juce::String(beats, beats < 1.0f ? 2 : 2) + " beats";
 }
 
 inline int macroTargetToComboId(MlrVSTAudioProcessor::MacroTarget target)
@@ -283,12 +296,17 @@ inline juce::String macroValueText(MlrVSTAudioProcessor::MacroTarget target, flo
         case MlrVSTAudioProcessor::MacroTarget::Retrigger:
             return retriggerDivisionLabel(clamped);
         case MlrVSTAudioProcessor::MacroTarget::Rearrange:
-        case MlrVSTAudioProcessor::MacroTarget::DelayMix:
-        case MlrVSTAudioProcessor::MacroTarget::DelayTime:
-        case MlrVSTAudioProcessor::MacroTarget::DelayFeedback:
-        case MlrVSTAudioProcessor::MacroTarget::DelayLowCut:
-        case MlrVSTAudioProcessor::MacroTarget::DelayHighCut:
             return "Unassigned";
+        case MlrVSTAudioProcessor::MacroTarget::DelayMix:
+            return juce::String(static_cast<int>(std::round(clamped * 100.0f))) + "%";
+        case MlrVSTAudioProcessor::MacroTarget::DelayTime:
+            return macroDelayTimeText(clamped);
+        case MlrVSTAudioProcessor::MacroTarget::DelayFeedback:
+            return juce::String(static_cast<int>(std::round(juce::jmap(clamped, 0.0f, 1.0f, 0.0f, 97.0f)))) + "%";
+        case MlrVSTAudioProcessor::MacroTarget::DelayLowCut:
+            return macroFrequencyText(juce::jmap(clamped, 0.0f, 1.0f, 20.0f, 12000.0f));
+        case MlrVSTAudioProcessor::MacroTarget::DelayHighCut:
+            return macroFrequencyText(juce::jmap(clamped, 0.0f, 1.0f, 200.0f, 20000.0f));
         case MlrVSTAudioProcessor::MacroTarget::None:
         default:
             return "Unassigned";

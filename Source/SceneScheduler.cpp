@@ -981,15 +981,11 @@ bool SceneScheduler::persistSceneTimingForSlot(MlrVSTAudioProcessor& processor, 
     if (!processor.hasStoredSceneSlotState(mainPresetIndex, clampedSlot))
         return false;
 
-    const bool updated = PresetStore::updatePresetAuxState(
-        mainPresetIndex,
-        [&processor]()
-        {
-            return createSceneChainStateXml(processor, -1);
-        });
-    if (updated)
-        processor.presetRefreshToken.fetch_add(1, std::memory_order_acq_rel);
-    return updated;
+    juce::ignoreUnused(processor, clampedSlot, mainPresetIndex);
+
+    // Scene timing edits should remain runtime-only until the explicit preset save
+    // path serializes the current SceneChainState back into the preset XML.
+    return true;
 }
 
 int SceneScheduler::getSceneChainLength(const MlrVSTAudioProcessor& processor)

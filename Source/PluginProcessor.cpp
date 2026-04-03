@@ -445,6 +445,49 @@ float normalizeSceneControlValue(const ScenePerformanceEvent& event)
     }
 }
 
+float defaultSceneControlValue(ScenePerformanceControlTarget target) noexcept
+{
+    switch (target)
+    {
+        case ScenePerformanceControlTarget::Speed:               return 1.0f;
+        case ScenePerformanceControlTarget::Pitch:               return 0.0f;
+        case ScenePerformanceControlTarget::GrainPitch:          return 0.0f;
+        case ScenePerformanceControlTarget::Pan:                 return 0.0f;
+        case ScenePerformanceControlTarget::Volume:              return 1.0f;
+        case ScenePerformanceControlTarget::Swing:               return 0.0f;
+        case ScenePerformanceControlTarget::GrainSize:           return 1240.0f;
+        case ScenePerformanceControlTarget::GrainDensity:        return 0.05f;
+        case ScenePerformanceControlTarget::GrainPitchJitter:    return 0.0f;
+        case ScenePerformanceControlTarget::GrainSpread:         return 0.0f;
+        case ScenePerformanceControlTarget::GrainJitter:         return 0.0f;
+        case ScenePerformanceControlTarget::GrainPositionJitter: return 0.0f;
+        case ScenePerformanceControlTarget::GrainRandomDepth:    return 0.0f;
+        case ScenePerformanceControlTarget::GrainArp:            return 0.0f;
+        case ScenePerformanceControlTarget::GrainCloud:          return 0.0f;
+        case ScenePerformanceControlTarget::GrainEmitter:        return 0.0f;
+        case ScenePerformanceControlTarget::GrainEnvelope:       return 0.0f;
+        case ScenePerformanceControlTarget::GrainShape:          return 0.0f;
+        case ScenePerformanceControlTarget::FilterFrequency:     return 20000.0f;
+        case ScenePerformanceControlTarget::FilterResonance:     return 0.707f;
+        case ScenePerformanceControlTarget::FilterEnabled:       return 0.0f;
+        case ScenePerformanceControlTarget::FilterMorph:         return 0.0f;
+        case ScenePerformanceControlTarget::SliceLength:         return 1.0f;
+        case ScenePerformanceControlTarget::Scratch:             return 0.0f;
+        case ScenePerformanceControlTarget::DelayMix:            return 0.0f;
+        case ScenePerformanceControlTarget::DelayTime:           return 0.25f;
+        case ScenePerformanceControlTarget::DelayFeedback:       return 0.0f;
+        case ScenePerformanceControlTarget::DelayLowCut:         return 20.0f;
+        case ScenePerformanceControlTarget::DelayHighCut:        return 20000.0f;
+        case ScenePerformanceControlTarget::DelayMode:           return 0.0f;
+        case ScenePerformanceControlTarget::DelaySyncEnabled:    return 0.0f;
+        case ScenePerformanceControlTarget::Retrigger:           return 0.0f;
+        case ScenePerformanceControlTarget::Rearrange:           return 0.0f;
+        case ScenePerformanceControlTarget::None:
+        default:
+            return 0.0f;
+    }
+}
+
 MlrVSTAudioProcessor::ControlMode sceneControlModeForTarget(ScenePerformanceControlTarget target) noexcept
 {
     using ControlMode = MlrVSTAudioProcessor::ControlMode;
@@ -594,6 +637,94 @@ bool sceneControlSupportsTransitionSmoothing(ScenePerformanceControlTarget targe
                      target) != kSceneTransitionSeedTargets.end();
 }
 
+bool sceneAutomationTargetHasEditorLane(ScenePerformanceControlTarget target) noexcept
+{
+    switch (target)
+    {
+        case ScenePerformanceControlTarget::Volume:
+        case ScenePerformanceControlTarget::Pan:
+        case ScenePerformanceControlTarget::Pitch:
+        case ScenePerformanceControlTarget::FilterFrequency:
+        case ScenePerformanceControlTarget::FilterResonance:
+        case ScenePerformanceControlTarget::FilterMorph:
+        case ScenePerformanceControlTarget::Speed:
+        case ScenePerformanceControlTarget::Retrigger:
+        case ScenePerformanceControlTarget::SliceLength:
+        case ScenePerformanceControlTarget::Scratch:
+        case ScenePerformanceControlTarget::DelayMix:
+        case ScenePerformanceControlTarget::DelayTime:
+        case ScenePerformanceControlTarget::DelayFeedback:
+        case ScenePerformanceControlTarget::GrainPitch:
+        case ScenePerformanceControlTarget::GrainSize:
+        case ScenePerformanceControlTarget::GrainDensity:
+        case ScenePerformanceControlTarget::GrainPitchJitter:
+        case ScenePerformanceControlTarget::GrainSpread:
+        case ScenePerformanceControlTarget::GrainJitter:
+        case ScenePerformanceControlTarget::GrainPositionJitter:
+        case ScenePerformanceControlTarget::GrainRandomDepth:
+        case ScenePerformanceControlTarget::GrainArp:
+        case ScenePerformanceControlTarget::GrainCloud:
+        case ScenePerformanceControlTarget::GrainEmitter:
+        case ScenePerformanceControlTarget::GrainEnvelope:
+        case ScenePerformanceControlTarget::GrainShape:
+            return true;
+        case ScenePerformanceControlTarget::None:
+        case ScenePerformanceControlTarget::Swing:
+        case ScenePerformanceControlTarget::FilterEnabled:
+        case ScenePerformanceControlTarget::DelayLowCut:
+        case ScenePerformanceControlTarget::DelayHighCut:
+        case ScenePerformanceControlTarget::DelayMode:
+        case ScenePerformanceControlTarget::DelaySyncEnabled:
+        case ScenePerformanceControlTarget::Rearrange:
+        default:
+            return false;
+    }
+}
+
+std::vector<ModernAudioEngine::ModTarget> buildVisibleModTargetsForSceneLaneMode(bool grainStrip)
+{
+    std::vector<ModernAudioEngine::ModTarget> targets{
+        ModernAudioEngine::ModTarget::Volume,
+        ModernAudioEngine::ModTarget::Pan,
+        grainStrip ? ModernAudioEngine::ModTarget::GrainPitch
+                   : ModernAudioEngine::ModTarget::Pitch,
+        ModernAudioEngine::ModTarget::Cutoff,
+        ModernAudioEngine::ModTarget::Resonance,
+        ModernAudioEngine::ModTarget::FilterMorph,
+        ModernAudioEngine::ModTarget::Speed,
+        ModernAudioEngine::ModTarget::Retrigger,
+        ModernAudioEngine::ModTarget::SliceLength,
+        ModernAudioEngine::ModTarget::Scratch,
+        ModernAudioEngine::ModTarget::DelayMix,
+        ModernAudioEngine::ModTarget::DelayTime,
+        ModernAudioEngine::ModTarget::DelayFeedback
+    };
+
+    if (grainStrip)
+    {
+        targets.push_back(ModernAudioEngine::ModTarget::GrainSize);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainDensity);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainPitchJitter);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainSpread);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainJitter);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainPositionJitter);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainRandom);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainArp);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainCloud);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainEmitter);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainEnvelope);
+        targets.push_back(ModernAudioEngine::ModTarget::GrainShape);
+    }
+
+    return targets;
+}
+
+float innerLoopLengthFactorForChoice(int choice) noexcept
+{
+    static constexpr std::array<float, 5> kFactors { 1.0f, 0.5f, 0.25f, 0.125f, 0.0625f };
+    return kFactors[static_cast<size_t>(juce::jlimit(0, 4, choice))];
+}
+
 bool parseStripIndexForPrefix(const juce::String& parameterID,
                               const char* prefix,
                               int& stripIndexOut) noexcept
@@ -663,11 +794,6 @@ bool buildSceneEventFromParameterChange(const juce::String& parameterID,
                             MlrVSTAudioProcessor::ControlMode::Normal,
                             0,
                             juce::jlimit(0.02f, 1.0f, newValue))
-        || assignStripEvent("stripFilterEnabled",
-                            ScenePerformanceControlTarget::FilterEnabled,
-                            MlrVSTAudioProcessor::ControlMode::Filter,
-                            3,
-                            newValue >= 0.5f ? 1.0f : 0.0f)
         || assignStripEvent("stripFilterFrequency",
                             ScenePerformanceControlTarget::FilterFrequency,
                             MlrVSTAudioProcessor::ControlMode::Filter,
@@ -697,27 +823,7 @@ bool buildSceneEventFromParameterChange(const juce::String& parameterID,
                             ScenePerformanceControlTarget::DelayFeedback,
                             MlrVSTAudioProcessor::ControlMode::Delay,
                             2,
-                            juce::jlimit(0.0f, 0.97f, newValue))
-        || assignStripEvent("stripDelayLowCut",
-                            ScenePerformanceControlTarget::DelayLowCut,
-                            MlrVSTAudioProcessor::ControlMode::Delay,
-                            3,
-                            juce::jlimit(20.0f, 12000.0f, newValue))
-        || assignStripEvent("stripDelayHighCut",
-                            ScenePerformanceControlTarget::DelayHighCut,
-                            MlrVSTAudioProcessor::ControlMode::Delay,
-                            4,
-                            juce::jlimit(200.0f, 20000.0f, newValue))
-        || assignStripEvent("stripDelayMode",
-                            ScenePerformanceControlTarget::DelayMode,
-                            MlrVSTAudioProcessor::ControlMode::Delay,
-                            5,
-                            static_cast<float>(juce::jlimit(0, 2, static_cast<int>(std::round(newValue)))))
-        || assignStripEvent("stripDelaySync",
-                            ScenePerformanceControlTarget::DelaySyncEnabled,
-                            MlrVSTAudioProcessor::ControlMode::Delay,
-                            5,
-                            newValue >= 0.5f ? 1.0f : 0.0f);
+                            juce::jlimit(0.0f, 0.97f, newValue));
 }
 
 bool buildDirectSceneControlProbeEvent(int stripIndex,
@@ -6850,6 +6956,7 @@ void MlrVSTAudioProcessor::applySceneClipSlotRuntimeState(int mainPresetIndex, i
     const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
     const int safeMainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex);
     const auto& runtimeState = sceneClipSlotRuntimeStates[static_cast<size_t>(safeSceneSlot)];
+    const bool hasStoredSceneState = hasStoredSceneSlotState(safeMainPresetIndex, safeSceneSlot);
     if (!runtimeState.hasLiveStripControls
         || !runtimeState.liveStripControlsDirty
         || runtimeState.mainPresetIndex != safeMainPresetIndex)
@@ -6862,7 +6969,14 @@ void MlrVSTAudioProcessor::applySceneClipSlotRuntimeState(int mainPresetIndex, i
         const auto& stripState = runtimeState.stripControls[static_cast<size_t>(stripIndex)];
         setStripVolumeControlValue(stripIndex, stripState.volume, StripControlWriteMode::CacheOnly);
         setStripPanControlValue(stripIndex, stripState.pan, StripControlWriteMode::CacheOnly);
-        setStripSpeedControlValue(stripIndex, stripState.speed, StripControlWriteMode::CacheOnly);
+
+        // Stored scene payloads are the canonical source of strip speed on recall.
+        // The runtime slot cache is useful for empty scenes and unsaved live state,
+        // but speed is much more likely to be dirtied by transient scene/stutter
+        // handoffs. Reapplying that cached speed over a stored scene can produce
+        // the brief "double speed then snap back" glitch on scene changes.
+        if (!hasStoredSceneState)
+            setStripSpeedControlValue(stripIndex, stripState.speed, StripControlWriteMode::CacheOnly);
     }
 }
 
@@ -7012,6 +7126,8 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
                                        ? juce::jlimit(0, 4, static_cast<int>(innerLoopLengthParam->load(std::memory_order_acquire)))
                                        : 0,
                                    std::memory_order_release);
+    lastAppliedInnerLoopLengthSelection.store(innerLoopLengthSelection.load(std::memory_order_acquire),
+                                              std::memory_order_release);
     grainQualityParam = parameters.getRawParameterValue("quality");
     pitchSmoothingParam = parameters.getRawParameterValue("pitchSmoothing");
     inputMonitorParam = parameters.getRawParameterValue("inputMonitor");
@@ -7066,6 +7182,17 @@ void MlrVSTAudioProcessor::cacheParameterPointers()
 
 void MlrVSTAudioProcessor::parameterChanged(const juce::String& parameterID, float newValue)
 {
+    if (parameterID == "innerLoopLength")
+    {
+        const int newSelection = juce::jlimit(0, 4, static_cast<int>(std::round(newValue)));
+        const int previousSelection = lastAppliedInnerLoopLengthSelection.exchange(newSelection,
+                                                                                   std::memory_order_acq_rel);
+        innerLoopLengthSelection.store(newSelection, std::memory_order_release);
+
+        if (previousSelection != newSelection)
+            rescaleActiveInnerLoopsForGlobalFactor(previousSelection, newSelection);
+    }
+
     if (parameterID == "limiterThreshold")
     {
         if (auto* param = parameters.getParameter("limiterThreshold"))
@@ -7638,8 +7765,6 @@ bool MlrVSTAudioProcessor::macroTargetWritesToSceneLane(MacroTarget target)
         case MacroTarget::DelayMix:
         case MacroTarget::DelayTime:
         case MacroTarget::DelayFeedback:
-        case MacroTarget::DelayLowCut:
-        case MacroTarget::DelayHighCut:
         case MacroTarget::GrainSize:
         case MacroTarget::GrainDensity:
         case MacroTarget::GrainPitch:
@@ -7655,6 +7780,8 @@ bool MlrVSTAudioProcessor::macroTargetWritesToSceneLane(MacroTarget target)
         case MacroTarget::GrainShape:
             return true;
         case MacroTarget::FilterEnable:
+        case MacroTarget::DelayLowCut:
+        case MacroTarget::DelayHighCut:
         case MacroTarget::Rearrange:
         case MacroTarget::None:
         default:
@@ -9371,57 +9498,34 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(int stripIndex,
 {
     MacroTargetDispatcher::applyTargetValue(*this, stripIndex, strip, target, normalizedValue);
 
-    if (!momentaryStutterHoldActive
-        || momentaryStutterPlaybackActive.load(std::memory_order_acquire) == 0
-        || stripIndex < 0
-        || stripIndex >= MaxStrips)
+    switch (sanitizeMacroPerformanceTarget(target))
     {
-        return;
-    }
-
-    const auto idx = static_cast<size_t>(stripIndex);
-    auto& saved = momentaryStutterSavedState[idx];
-    if (!saved.valid || !momentaryStutterStripArmed[idx])
-        return;
-
-    switch (target)
-    {
+        case MacroTarget::Pan:
+            refreshMomentaryStutterSavedStateFromCurrentStrip(stripIndex, ScenePerformanceControlTarget::Pan);
+            break;
         case MacroTarget::Speed:
-            saved.playbackSpeed = strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Grain
-                ? strip.getPlaybackSpeed()
-                : strip.getPlayheadSpeedRatio();
+            refreshMomentaryStutterSavedStateFromCurrentStrip(stripIndex, ScenePerformanceControlTarget::Speed);
             break;
         case MacroTarget::Pitch:
-            if (saved.stepMode)
-                saved.pitchSemitones = getPitchSemitonesForDisplay(strip);
-            else
-                saved.pitchShift = strip.getPitchShift();
+            refreshMomentaryStutterSavedStateFromCurrentStrip(stripIndex, ScenePerformanceControlTarget::Pitch);
             break;
         case MacroTarget::Cutoff:
-            saved.filterEnabled = strip.isFilterEnabled();
-            saved.filterFrequency = strip.getFilterFrequency();
-            if (saved.stepMode)
-            {
-                if (auto* stepSampler = strip.getStepSampler())
-                {
-                    saved.stepFilterEnabled = stepSampler->isFilterEnabled();
-                    saved.stepFilterFrequency = stepSampler->getFilterFrequency();
-                    saved.stepFilterType = stepSampler->getFilterType();
-                }
-            }
+            refreshMomentaryStutterSavedStateFromCurrentStrip(stripIndex, ScenePerformanceControlTarget::FilterFrequency);
             break;
         case MacroTarget::Resonance:
-            saved.filterEnabled = strip.isFilterEnabled();
-            saved.filterResonance = strip.getFilterResonance();
-            if (saved.stepMode)
-            {
-                if (auto* stepSampler = strip.getStepSampler())
-                    saved.stepFilterResonance = stepSampler->getFilterResonance();
-            }
+            refreshMomentaryStutterSavedStateFromCurrentStrip(stripIndex, ScenePerformanceControlTarget::FilterResonance);
+            break;
+        case MacroTarget::FilterMorph:
+            refreshMomentaryStutterSavedStateFromCurrentStrip(stripIndex, ScenePerformanceControlTarget::FilterMorph);
+            break;
+        case MacroTarget::FilterEnable:
+            refreshMomentaryStutterSavedStateFromCurrentStrip(stripIndex, ScenePerformanceControlTarget::FilterEnabled);
+            break;
+        case MacroTarget::SliceLength:
+            refreshMomentaryStutterSavedStateFromCurrentStrip(stripIndex, ScenePerformanceControlTarget::SliceLength);
             break;
         case MacroTarget::None:
         case MacroTarget::Volume:
-        case MacroTarget::Pan:
         case MacroTarget::GrainSize:
         case MacroTarget::GrainDensity:
         case MacroTarget::GrainPitch:
@@ -9436,9 +9540,6 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(int stripIndex,
         case MacroTarget::Retrigger:
         case MacroTarget::GrainPositionJitter:
         case MacroTarget::GrainShape:
-        case MacroTarget::FilterMorph:
-        case MacroTarget::FilterEnable:
-        case MacroTarget::SliceLength:
         case MacroTarget::Scratch:
         case MacroTarget::Rearrange:
         case MacroTarget::DelayMix:
@@ -9446,6 +9547,109 @@ void MlrVSTAudioProcessor::applyMacroTargetValue(int stripIndex,
         case MacroTarget::DelayFeedback:
         case MacroTarget::DelayLowCut:
         case MacroTarget::DelayHighCut:
+        default:
+            break;
+    }
+}
+
+void MlrVSTAudioProcessor::refreshMomentaryStutterSavedStateFromCurrentStrip(int stripIndex,
+                                                                             ScenePerformanceControlTarget target)
+{
+    if (!momentaryStutterHoldActive
+        || momentaryStutterPlaybackActive.load(std::memory_order_acquire) == 0
+        || audioEngine == nullptr
+        || stripIndex < 0
+        || stripIndex >= MaxStrips)
+    {
+        return;
+    }
+
+    const auto idx = static_cast<size_t>(stripIndex);
+    auto& saved = momentaryStutterSavedState[idx];
+    if (!saved.valid || !momentaryStutterStripArmed[idx])
+        return;
+
+    auto* strip = audioEngine->getStrip(stripIndex);
+    if (strip == nullptr)
+        return;
+
+    auto* stepSampler = saved.stepMode ? strip->getStepSampler() : nullptr;
+
+    switch (target)
+    {
+        case ScenePerformanceControlTarget::Pan:
+            saved.pan = (saved.stepMode && stepSampler != nullptr) ? stepSampler->getPan() : strip->getPan();
+            break;
+        case ScenePerformanceControlTarget::Speed:
+            saved.playbackSpeed = strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain
+                ? strip->getPlaybackSpeed()
+                : strip->getPlayheadSpeedRatio();
+            break;
+        case ScenePerformanceControlTarget::Pitch:
+        case ScenePerformanceControlTarget::GrainPitch:
+            if (saved.stepMode)
+                saved.pitchSemitones = getPitchSemitonesForDisplay(*strip);
+            else
+                saved.pitchShift = strip->getPitchShift();
+            break;
+        case ScenePerformanceControlTarget::SliceLength:
+            saved.loopSliceLength = strip->getLoopSliceLength();
+            break;
+        case ScenePerformanceControlTarget::FilterEnabled:
+            saved.filterEnabled = strip->isFilterEnabled();
+            if (saved.stepMode && stepSampler != nullptr)
+                saved.stepFilterEnabled = stepSampler->isFilterEnabled();
+            break;
+        case ScenePerformanceControlTarget::FilterFrequency:
+            saved.filterEnabled = strip->isFilterEnabled();
+            saved.filterFrequency = strip->getFilterFrequency();
+            if (saved.stepMode && stepSampler != nullptr)
+            {
+                saved.stepFilterEnabled = stepSampler->isFilterEnabled();
+                saved.stepFilterFrequency = stepSampler->getFilterFrequency();
+                saved.stepFilterType = stepSampler->getFilterType();
+            }
+            break;
+        case ScenePerformanceControlTarget::FilterResonance:
+            saved.filterEnabled = strip->isFilterEnabled();
+            saved.filterResonance = strip->getFilterResonance();
+            if (saved.stepMode && stepSampler != nullptr)
+                saved.stepFilterResonance = stepSampler->getFilterResonance();
+            break;
+        case ScenePerformanceControlTarget::FilterMorph:
+            saved.filterEnabled = strip->isFilterEnabled();
+            saved.filterMorph = strip->getFilterMorph();
+            if (saved.stepMode && stepSampler != nullptr)
+            {
+                saved.stepFilterEnabled = stepSampler->isFilterEnabled();
+                saved.stepFilterType = stepSampler->getFilterType();
+            }
+            break;
+        case ScenePerformanceControlTarget::None:
+        case ScenePerformanceControlTarget::Volume:
+        case ScenePerformanceControlTarget::Swing:
+        case ScenePerformanceControlTarget::GrainSize:
+        case ScenePerformanceControlTarget::GrainDensity:
+        case ScenePerformanceControlTarget::GrainPitchJitter:
+        case ScenePerformanceControlTarget::GrainSpread:
+        case ScenePerformanceControlTarget::GrainJitter:
+        case ScenePerformanceControlTarget::GrainPositionJitter:
+        case ScenePerformanceControlTarget::GrainRandomDepth:
+        case ScenePerformanceControlTarget::GrainArp:
+        case ScenePerformanceControlTarget::GrainCloud:
+        case ScenePerformanceControlTarget::GrainEmitter:
+        case ScenePerformanceControlTarget::GrainEnvelope:
+        case ScenePerformanceControlTarget::GrainShape:
+        case ScenePerformanceControlTarget::DelayMix:
+        case ScenePerformanceControlTarget::DelayTime:
+        case ScenePerformanceControlTarget::DelayFeedback:
+        case ScenePerformanceControlTarget::DelayLowCut:
+        case ScenePerformanceControlTarget::DelayHighCut:
+        case ScenePerformanceControlTarget::DelayMode:
+        case ScenePerformanceControlTarget::DelaySyncEnabled:
+        case ScenePerformanceControlTarget::Retrigger:
+        case ScenePerformanceControlTarget::Scratch:
+        case ScenePerformanceControlTarget::Rearrange:
         default:
             break;
     }
@@ -11331,6 +11535,8 @@ void MlrVSTAudioProcessor::setInnerLoopLengthSelection(int choiceIndex)
 
     if (auto* param = parameters.getParameter("innerLoopLength"))
         param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(clamped)));
+    else
+        lastAppliedInnerLoopLengthSelection.store(clamped, std::memory_order_release);
 }
 
 void MlrVSTAudioProcessor::syncTransientDetectionSettingsFromParameters(bool refreshSlicesNow)
@@ -12059,32 +12265,10 @@ bool MlrVSTAudioProcessor::resolveScenePerformanceControlEvent(ControlMode mode,
                     outEvent.value = 0.97f * juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f);
                     return true;
                 case 3:
-                {
-                    const juce::NormalisableRange<float> range(20.0f, 12000.0f, 1.0f, 0.25f);
-                    outEvent.controlTarget = ScenePerformanceControlTarget::DelayLowCut;
-                    outEvent.value = range.convertFrom0to1(juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f));
-                    return true;
-                }
+                    return false;
                 case 4:
-                {
-                    const juce::NormalisableRange<float> range(200.0f, 20000.0f, 1.0f, 0.3f);
-                    outEvent.controlTarget = ScenePerformanceControlTarget::DelayHighCut;
-                    outEvent.value = range.convertFrom0to1(juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f));
-                    return true;
-                }
+                    return false;
                 case 5:
-                    if (safeColumn <= 2)
-                    {
-                        outEvent.controlTarget = ScenePerformanceControlTarget::DelayMode;
-                        outEvent.value = static_cast<float>(safeColumn);
-                        return true;
-                    }
-                    if (safeColumn >= 12)
-                    {
-                        outEvent.controlTarget = ScenePerformanceControlTarget::DelaySyncEnabled;
-                        outEvent.value = safeColumn >= 14 ? 1.0f : 0.0f;
-                        return true;
-                    }
                     return false;
                 default:
                     return false;
@@ -12232,18 +12416,8 @@ bool MlrVSTAudioProcessor::resolveScenePerformanceMacroEvent(int stripIndex,
             return true;
 
         case MacroTarget::DelayLowCut:
-            outEvent.controlMode = static_cast<int>(ControlMode::Delay);
-            outEvent.controlRow = 3;
-            outEvent.controlTarget = ScenePerformanceControlTarget::DelayLowCut;
-            outEvent.value = denormalizeMacroLinearValue(clamped, 20.0f, 12000.0f);
-            return true;
-
         case MacroTarget::DelayHighCut:
-            outEvent.controlMode = static_cast<int>(ControlMode::Delay);
-            outEvent.controlRow = 4;
-            outEvent.controlTarget = ScenePerformanceControlTarget::DelayHighCut;
-            outEvent.value = denormalizeMacroLinearValue(clamped, 200.0f, 20000.0f);
-            return true;
+            return false;
 
         case MacroTarget::GrainSize:
             outEvent.controlMode = static_cast<int>(ControlMode::GrainSize);
@@ -12504,6 +12678,23 @@ MlrVSTAudioProcessor::handleLiveSceneControlTouch(int stripIndex,
                                    getSceneAutomationTransitionSeconds(target));
     };
 
+    auto refreshStutterBaseline = [this, &probeEvent]()
+    {
+        refreshMomentaryStutterSavedStateFromCurrentStrip(probeEvent.stripIndex, probeEvent.controlTarget);
+    };
+
+    if (!sceneAutomationTargetHasEditorLane(probeEvent.controlTarget))
+    {
+        if (!liveValueAlreadyApplied)
+        {
+            applyLiveTouch(StripControlWriteMode::NotifyHost);
+            seedTransitionIfNeeded();
+        }
+
+        refreshStutterBaseline();
+        return ManualSceneControlHandling::Ignored;
+    }
+
     if (!isSceneModeEnabled() || audioEngine == nullptr)
     {
         if (!liveValueAlreadyApplied)
@@ -12511,6 +12702,13 @@ MlrVSTAudioProcessor::handleLiveSceneControlTouch(int stripIndex,
             applyLiveTouch(StripControlWriteMode::NotifyHost);
             seedTransitionIfNeeded();
         }
+        else
+        {
+            refreshStutterBaseline();
+        }
+
+        if (!liveValueAlreadyApplied)
+            refreshStutterBaseline();
         return ManualSceneControlHandling::Ignored;
     }
 
@@ -12522,6 +12720,13 @@ MlrVSTAudioProcessor::handleLiveSceneControlTouch(int stripIndex,
             applyLiveTouch(StripControlWriteMode::NotifyHost);
             seedTransitionIfNeeded();
         }
+        else
+        {
+            refreshStutterBaseline();
+        }
+
+        if (!liveValueAlreadyApplied)
+            refreshStutterBaseline();
 
         scenePerformanceRecorder.recordControlEvent(sceneSlot,
                                                     probeEvent.stripIndex,
@@ -12550,11 +12755,13 @@ MlrVSTAudioProcessor::handleLiveSceneControlTouch(int stripIndex,
             beginSceneManualControlHandlingSuppression();
             applyScenePerformanceEvent(probeEvent, StripControlWriteMode::CacheOnly);
             endSceneManualControlHandlingSuppression();
+            refreshStutterBaseline();
         }
         else
         {
             applyLiveTouch(StripControlWriteMode::NotifyHost);
             seedTransitionIfNeeded();
+            refreshStutterBaseline();
         }
 
         return ManualSceneControlHandling::OverrodeAutomation;
@@ -12564,6 +12771,11 @@ MlrVSTAudioProcessor::handleLiveSceneControlTouch(int stripIndex,
     {
         applyLiveTouch(StripControlWriteMode::NotifyHost);
         seedTransitionIfNeeded();
+        refreshStutterBaseline();
+    }
+    else
+    {
+        refreshStutterBaseline();
     }
 
     if (target == ScenePerformanceControlTarget::Volume
@@ -12923,18 +13135,25 @@ void MlrVSTAudioProcessor::processScenePerformancePlayback(const juce::AudioPlay
 
     scenePerformanceRecorder.updateRecording(blockEndBeat);
 
+    const bool sceneChanged = sceneSlot != lastScenePerformanceProcessSceneSlot
+        || !std::isfinite(lastScenePerformanceProcessSceneStartBeat)
+        || std::abs(lastScenePerformanceProcessSceneStartBeat - activeSceneStartPpq) > 1.0e-9;
+    const bool sceneHasGlobalRetriggerLane =
+        sceneClipHasAutomationTarget(sceneSlot, -1, ScenePerformanceControlTarget::Retrigger);
+
     if (!scenePerformanceRecorder.hasEvents(sceneSlot))
     {
         scenePlaybackBlockStutterPostRenderPending = false;
+        if (sceneChanged)
+        {
+            scenePlaybackBlockStutterPostRenderAmount = 0.0f;
+            setGlobalSceneStutterAmount(0.0f);
+        }
         lastScenePerformanceProcessBeat = blockEndBeat;
         lastScenePerformanceProcessSceneSlot = sceneSlot;
         lastScenePerformanceProcessSceneStartBeat = activeSceneStartPpq;
         return;
     }
-
-    const bool sceneChanged = sceneSlot != lastScenePerformanceProcessSceneSlot
-        || !std::isfinite(lastScenePerformanceProcessSceneStartBeat)
-        || std::abs(lastScenePerformanceProcessSceneStartBeat - activeSceneStartPpq) > 1.0e-9;
 
     double fromBeat = sceneChanged ? juce::jmax(blockStartBeat, activeSceneStartPpq) : lastScenePerformanceProcessBeat;
     if (!std::isfinite(fromBeat))
@@ -12944,7 +13163,13 @@ void MlrVSTAudioProcessor::processScenePerformancePlayback(const juce::AudioPlay
         fromBeat = blockStartBeat;
 
     if (sceneChanged)
+    {
+        scenePlaybackBlockStutterPostRenderPending = false;
+        scenePlaybackBlockStutterPostRenderAmount = 0.0f;
+        if (!sceneHasGlobalRetriggerLane)
+            setGlobalSceneStutterAmount(0.0f);
         applySceneHeldAutomationStateAtBeat(sceneSlot, blockStartBeat, activeSceneStartPpq);
+    }
 
     const double clipLengthBeats = juce::jmax(1.0, scenePerformanceRecorder.getClipLengthBeats(sceneSlot));
     const float stutterAmountAtBlockStart = getGlobalSceneStutterAmount();
@@ -15369,8 +15594,7 @@ void MlrVSTAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
         appendControlPagesToState(state);
         appendFlipStatesToState(state);
         appendLoopPitchStateToState(state);
-        appendSceneModeStateToState(state);
-        
+
         if (!state.isValid())
             return;
             
@@ -15406,7 +15630,6 @@ void MlrVSTAudioProcessor::setStateInformation(const void* data, int sizeInBytes
             loadControlPagesFromState(state);
             loadFlipStatesFromState(state);
             loadLoopPitchStateFromState(state);
-            loadSceneModeStateFromState(state);
             loadPersistentGlobalControls();
             persistentGlobalControlsApplied = true;
             pendingPersistentGlobalControlsRestore.store(1, std::memory_order_release);
@@ -17536,7 +17759,7 @@ bool MlrVSTAudioProcessor::clearSceneStripAutomationAndMotion(int sceneSlot, int
 
     appendRestoreTarget(ScenePerformanceControlTarget::Volume);
     appendRestoreTarget(ScenePerformanceControlTarget::Pan);
-    appendRestoreTarget(stripUsesGrainSceneLanes(safeStripIndex)
+    appendRestoreTarget(stripUsesGrainSceneLanesForSceneSlot(safeSceneSlot, safeStripIndex)
                             ? ScenePerformanceControlTarget::GrainPitch
                             : ScenePerformanceControlTarget::Pitch);
     appendRestoreTarget(ScenePerformanceControlTarget::Speed);
@@ -17556,7 +17779,7 @@ bool MlrVSTAudioProcessor::clearSceneStripAutomationAndMotion(int sceneSlot, int
     appendRestoreTarget(ScenePerformanceControlTarget::DelaySyncEnabled);
     appendRestoreTarget(ScenePerformanceControlTarget::Rearrange);
 
-    if (stripUsesGrainSceneLanes(safeStripIndex))
+    if (stripUsesGrainSceneLanesForSceneSlot(safeSceneSlot, safeStripIndex))
     {
         appendRestoreTarget(ScenePerformanceControlTarget::GrainSize);
         appendRestoreTarget(ScenePerformanceControlTarget::GrainDensity);
@@ -17574,16 +17797,15 @@ bool MlrVSTAudioProcessor::clearSceneStripAutomationAndMotion(int sceneSlot, int
 
     if (!clearedTargets.empty())
     {
-        for (const auto target : clearedTargets)
+        for (const auto target : restoreTargets)
         {
-            float storedValue = 0.0f;
-            if (!getStoredSceneControlValue(safeSceneSlot, safeStripIndex, target, storedValue)
-                && !getSceneControlCurrentValue(safeStripIndex, target, storedValue))
-            {
+            if (!sceneAutomationTargetHasEditorLane(target))
                 continue;
-            }
 
-            events.push_back(makeSceneControlPointEvent(safeStripIndex, target, 0.0, storedValue));
+            events.push_back(makeSceneControlPointEvent(safeStripIndex,
+                                                        target,
+                                                        0.0,
+                                                        defaultSceneControlValue(target)));
         }
 
         std::sort(events.begin(), events.end());
@@ -17592,7 +17814,7 @@ bool MlrVSTAudioProcessor::clearSceneStripAutomationAndMotion(int sceneSlot, int
     }
 
     clearSceneMotionStripState(safeSceneSlot, safeStripIndex);
-    restoreSceneStripControlTargetsToStoredState(safeSceneSlot, safeStripIndex, restoreTargets);
+    restoreSceneStripControlTargetsToDefaultState(safeSceneSlot, safeStripIndex, restoreTargets);
     clearPendingSceneTriggerRecord(safeStripIndex);
     updateMonomeLEDs();
     return true;
@@ -17666,6 +17888,42 @@ std::vector<ScenePerformanceEvent> MlrVSTAudioProcessor::getScenePerformanceEven
     return scenePerformanceRecorder.getEventsSnapshot(sceneSlot);
 }
 
+const MlrVSTAudioProcessor::PreparedSceneStripState* MlrVSTAudioProcessor::getStoredSceneStripStateForSlot(
+    int sceneSlot,
+    int stripIndex,
+    PreparedSceneStripState& fallbackStripState) const
+{
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+
+    int mainPresetIndex = getActiveMainPresetIndexForScenes();
+    if (safeSceneSlot == juce::jlimit(0, SceneSlots - 1, activeSceneSlot))
+        mainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, activeSceneMainPresetIndex);
+
+    if (const auto* storedSceneState = getStoredSceneSlotState(mainPresetIndex, safeSceneSlot))
+    {
+        if (storedSceneState->preparedSwitchPayloadTemplate != nullptr)
+        {
+            const auto& candidate =
+                storedSceneState->preparedSwitchPayloadTemplate->stripStates[static_cast<size_t>(safeStripIndex)];
+            if (candidate.present)
+                return &candidate;
+        }
+    }
+
+    return &fallbackStripState;
+}
+
+bool MlrVSTAudioProcessor::stripUsesGrainSceneLanesForSceneSlot(int sceneSlot, int stripIndex) const
+{
+    PreparedSceneStripState fallbackStripState;
+    const auto* storedStripState = getStoredSceneStripStateForSlot(sceneSlot, stripIndex, fallbackStripState);
+    if (storedStripState != nullptr && storedStripState->present)
+        return storedStripState->playMode == EnhancedAudioStrip::PlayMode::Grain;
+
+    return stripUsesGrainSceneLanes(stripIndex);
+}
+
 bool MlrVSTAudioProcessor::getStoredSceneControlValue(int sceneSlot,
                                                       int stripIndex,
                                                       ScenePerformanceControlTarget target,
@@ -17679,22 +17937,9 @@ bool MlrVSTAudioProcessor::getStoredSceneControlValue(int sceneSlot,
 
     const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
     const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
-    int mainPresetIndex = getActiveMainPresetIndexForScenes();
-    if (safeSceneSlot == juce::jlimit(0, SceneSlots - 1, activeSceneSlot))
-        mainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, activeSceneMainPresetIndex);
-
     PreparedSceneStripState fallbackStripState;
-    const PreparedSceneStripState* storedStripState = &fallbackStripState;
-    if (const auto* storedSceneState = getStoredSceneSlotState(mainPresetIndex, safeSceneSlot))
-    {
-        if (storedSceneState->preparedSwitchPayloadTemplate != nullptr)
-        {
-            const auto& candidate =
-                storedSceneState->preparedSwitchPayloadTemplate->stripStates[static_cast<size_t>(safeStripIndex)];
-            if (candidate.present)
-                storedStripState = &candidate;
-        }
-    }
+    const PreparedSceneStripState* storedStripState =
+        getStoredSceneStripStateForSlot(safeSceneSlot, safeStripIndex, fallbackStripState);
 
     auto ownedControls = storedStripState->parameterState.ownedControls;
     if (!storedStripState->present && audioEngine != nullptr)
@@ -18777,7 +19022,7 @@ void MlrVSTAudioProcessor::setSceneModPageMode(SceneModPageMode mode)
 
         for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
         {
-            const auto targets = getVisibleModTargetsForStrip(stripIndex);
+            const auto targets = getSceneVisibleModTargetsForStrip(stripIndex);
             ModernAudioEngine::ModTarget resolvedTarget = ModernAudioEngine::ModTarget::None;
             const auto liveTarget = audioEngine != nullptr
                 ? sanitizeModPerformanceTarget(audioEngine->getModTarget(stripIndex))
@@ -19150,6 +19395,14 @@ void MlrVSTAudioProcessor::restoreSceneStripControlTargetsToStoredState(
     int stripIndex,
     const std::vector<ScenePerformanceControlTarget>& targets)
 {
+    restoreSceneStripControlTargetsToDefaultState(sceneSlot, stripIndex, targets);
+}
+
+void MlrVSTAudioProcessor::restoreSceneStripControlTargetsToDefaultState(
+    int sceneSlot,
+    int stripIndex,
+    const std::vector<ScenePerformanceControlTarget>& targets)
+{
     if (targets.empty()
         || !isSceneModeEnabled()
         || audioEngine == nullptr)
@@ -19166,26 +19419,8 @@ void MlrVSTAudioProcessor::restoreSceneStripControlTargetsToStoredState(
     if (strip == nullptr)
         return;
 
-    int mainPresetIndex = getActiveMainPresetIndexForScenes();
-    if (safeSceneSlot == juce::jlimit(0, SceneSlots - 1, activeSceneSlot))
-        mainPresetIndex = juce::jlimit(0, MaxPresetSlots - 1, activeSceneMainPresetIndex);
-
-    PreparedSceneStripState fallbackStripState;
-    const PreparedSceneStripState* storedStripState = &fallbackStripState;
-    if (const auto* storedSceneState = getStoredSceneSlotState(mainPresetIndex, safeSceneSlot))
-    {
-        if (storedSceneState->preparedSwitchPayloadTemplate != nullptr)
-        {
-            const auto& candidate =
-                storedSceneState->preparedSwitchPayloadTemplate->stripStates[static_cast<size_t>(safeStripIndex)];
-            if (candidate.present)
-                storedStripState = &candidate;
-        }
-    }
-
-    auto ownedControls = storedStripState->parameterState.ownedControls;
-    if (!storedStripState->present)
-        ownedControls.usesGrainPlaybackSpeed = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain);
+    const ResolvedOwnedStripControlState defaultOwnedControls;
+    const bool usesGrainPlaybackSpeed = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain);
 
     bool restoreVolume = false;
     bool restorePan = false;
@@ -19309,122 +19544,122 @@ void MlrVSTAudioProcessor::restoreSceneStripControlTargetsToStoredState(
     }
 
     if (restoreVolume)
-        setStripVolumeControlValue(safeStripIndex, ownedControls.volume, StripControlWriteMode::CacheOnly);
+        setStripVolumeControlValue(safeStripIndex, defaultOwnedControls.volume, StripControlWriteMode::CacheOnly);
     if (restorePan)
-        setStripPanControlValue(safeStripIndex, ownedControls.pan, StripControlWriteMode::CacheOnly);
+        setStripPanControlValue(safeStripIndex, defaultOwnedControls.pan, StripControlWriteMode::CacheOnly);
     if (restoreSpeed)
     {
-        const float storedSpeedControl = ownedControls.usesGrainPlaybackSpeed
-            ? PlayheadSpeedQuantizer::grainControlValueFromPlaybackSpeed(ownedControls.playbackSpeed)
-            : ownedControls.playheadSpeedRatio;
-        setStripSpeedControlValue(safeStripIndex, storedSpeedControl, StripControlWriteMode::CacheOnly);
+        const float defaultSpeedControl = usesGrainPlaybackSpeed
+            ? PlayheadSpeedQuantizer::grainControlValueFromPlaybackSpeed(defaultOwnedControls.playbackSpeed)
+            : defaultOwnedControls.playheadSpeedRatio;
+        setStripSpeedControlValue(safeStripIndex, defaultSpeedControl, StripControlWriteMode::CacheOnly);
     }
 
     if (restorePitch)
     {
         writeStripFloatParameter("stripPitch" + juce::String(safeStripIndex),
-                                 storedStripState->parameterState.pitchSemitones,
+                                 0.0f,
                                  stripPitchParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
-        applyPitchControlToStrip(safeStripIndex, *strip, storedStripState->parameterState.pitchSemitones);
+        applyPitchControlToStrip(safeStripIndex, *strip, 0.0f);
     }
 
     if (restoreFilter)
     {
         writeStripBoolParameter("stripFilterEnabled" + juce::String(safeStripIndex),
-                                ownedControls.filterEnabled,
+                                defaultOwnedControls.filterEnabled,
                                 stripFilterEnabledParams[static_cast<size_t>(safeStripIndex)],
                                 StripControlWriteMode::CacheOnly);
         writeStripFloatParameter("stripFilterFrequency" + juce::String(safeStripIndex),
-                                 ownedControls.filterFrequency,
+                                 defaultOwnedControls.filterFrequency,
                                  stripFilterFrequencyParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
         writeStripFloatParameter("stripFilterResonance" + juce::String(safeStripIndex),
-                                 ownedControls.filterResonance,
+                                 defaultOwnedControls.filterResonance,
                                  stripFilterResonanceParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
         writeStripFloatParameter("stripFilterMorph" + juce::String(safeStripIndex),
-                                 ownedControls.filterMorph,
+                                 defaultOwnedControls.filterMorph,
                                  stripFilterMorphParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
         writeStripFloatParameter("stripFilterAlgorithm" + juce::String(safeStripIndex),
-                                 static_cast<float>(static_cast<int>(ownedControls.filterAlgorithm)),
+                                 static_cast<float>(static_cast<int>(defaultOwnedControls.filterAlgorithm)),
                                  stripFilterAlgorithmParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
-        applyResolvedStripFilterState(*strip, ownedControls);
+        applyResolvedStripFilterState(*strip, defaultOwnedControls);
     }
 
     if (restoreDelay)
     {
         writeStripFloatParameter("stripDelayMix" + juce::String(safeStripIndex),
-                                 ownedControls.delayMix,
+                                 defaultOwnedControls.delayMix,
                                  stripDelayMixParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
         writeStripFloatParameter("stripDelayTime" + juce::String(safeStripIndex),
-                                 ownedControls.delayTime,
+                                 defaultOwnedControls.delayTime,
                                  stripDelayTimeParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
         writeStripBoolParameter("stripDelaySync" + juce::String(safeStripIndex),
-                                ownedControls.delaySyncEnabled,
+                                defaultOwnedControls.delaySyncEnabled,
                                 stripDelaySyncParams[static_cast<size_t>(safeStripIndex)],
                                 StripControlWriteMode::CacheOnly);
         writeStripFloatParameter("stripDelayFeedback" + juce::String(safeStripIndex),
-                                 ownedControls.delayFeedback,
+                                 defaultOwnedControls.delayFeedback,
                                  stripDelayFeedbackParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
         writeStripFloatParameter("stripDelayLowCut" + juce::String(safeStripIndex),
-                                 ownedControls.delayLowCutHz,
+                                 defaultOwnedControls.delayLowCutHz,
                                  stripDelayLowCutParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
         writeStripFloatParameter("stripDelayHighCut" + juce::String(safeStripIndex),
-                                 ownedControls.delayHighCutHz,
+                                 defaultOwnedControls.delayHighCutHz,
                                  stripDelayHighCutParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
         writeStripFloatParameter("stripDelayMode" + juce::String(safeStripIndex),
-                                 static_cast<float>(static_cast<int>(ownedControls.delayMode)),
+                                 static_cast<float>(static_cast<int>(defaultOwnedControls.delayMode)),
                                  stripDelayModeParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
-        applyResolvedStripDelayState(*strip, ownedControls);
+        applyResolvedStripDelayState(*strip, defaultOwnedControls);
     }
 
     if (restoreSwing)
-        strip->setSwingAmount(storedStripState->swingAmount);
+        strip->setSwingAmount(0.0f);
     if (restoreSliceLength)
     {
         writeStripFloatParameter("stripSliceLength" + juce::String(safeStripIndex),
-                                 storedStripState->parameterState.sliceLength,
+                                 1.0f,
                                  stripSliceLengthParams[static_cast<size_t>(safeStripIndex)],
                                  StripControlWriteMode::CacheOnly);
-        strip->setLoopSliceLength(storedStripState->parameterState.sliceLength);
+        strip->setLoopSliceLength(1.0f);
     }
     if (restoreScratch)
-        strip->setScratchAmount(storedStripState->scratchAmount);
+        strip->setScratchAmount(0.0f);
     if (restoreGrainSize)
-        strip->setGrainSizeMs(storedStripState->grainSizeMs);
+        strip->setGrainSizeMs(1240.0f);
     if (restoreGrainDensity)
-        strip->setGrainDensity(storedStripState->grainDensity);
+        strip->setGrainDensity(0.05f);
     if (restoreGrainPitch)
-        strip->setGrainPitch(storedStripState->grainPitch);
+        strip->setGrainPitch(0.0f);
     if (restoreGrainPitchJitter)
-        strip->setGrainPitchJitter(storedStripState->grainPitchJitter);
+        strip->setGrainPitchJitter(0.0f);
     if (restoreGrainSpread)
-        strip->setGrainSpread(storedStripState->grainSpread);
+        strip->setGrainSpread(0.0f);
     if (restoreGrainJitter)
-        strip->setGrainJitter(storedStripState->grainJitter);
+        strip->setGrainJitter(0.0f);
     if (restoreGrainPositionJitter)
-        strip->setGrainPositionJitter(storedStripState->grainPositionJitter);
+        strip->setGrainPositionJitter(0.0f);
     if (restoreGrainRandomDepth)
-        strip->setGrainRandomDepth(storedStripState->grainRandomDepth);
+        strip->setGrainRandomDepth(0.0f);
     if (restoreGrainArp)
-        strip->setGrainArpDepth(storedStripState->grainArpDepth);
+        strip->setGrainArpDepth(0.0f);
     if (restoreGrainCloud)
-        strip->setGrainCloudDepth(storedStripState->grainCloudDepth);
+        strip->setGrainCloudDepth(0.0f);
     if (restoreGrainEmitter)
-        strip->setGrainEmitterDepth(storedStripState->grainEmitterDepth);
+        strip->setGrainEmitterDepth(0.0f);
     if (restoreGrainEnvelope)
-        strip->setGrainEnvelope(storedStripState->grainEnvelope);
+        strip->setGrainEnvelope(0.0f);
     if (restoreGrainShape)
-        strip->setGrainShape(storedStripState->grainShape);
+        strip->setGrainShape(0.0f);
     if (clearRearrange)
         strip->clearTraversalRearrange();
 
@@ -19465,46 +19700,13 @@ bool MlrVSTAudioProcessor::stripUsesGrainSceneLanes(int stripIndex) const
 
 std::vector<ModernAudioEngine::ModTarget> MlrVSTAudioProcessor::getVisibleModTargetsForStrip(int stripIndex) const
 {
-    const bool grainStrip = stripUsesGrainSceneLanes(stripIndex);
-    std::vector<ModernAudioEngine::ModTarget> targets{
-        ModernAudioEngine::ModTarget::Volume,
-        ModernAudioEngine::ModTarget::Pan,
-        grainStrip ? ModernAudioEngine::ModTarget::GrainPitch
-                   : ModernAudioEngine::ModTarget::Pitch,
-        ModernAudioEngine::ModTarget::Cutoff,
-        ModernAudioEngine::ModTarget::Resonance,
-        ModernAudioEngine::ModTarget::FilterMorph,
-        ModernAudioEngine::ModTarget::Speed,
-        ModernAudioEngine::ModTarget::Retrigger,
-        ModernAudioEngine::ModTarget::SliceLength,
-        ModernAudioEngine::ModTarget::Scratch,
-        ModernAudioEngine::ModTarget::DelayMix,
-        ModernAudioEngine::ModTarget::DelayTime,
-        ModernAudioEngine::ModTarget::DelayFeedback
-    };
-
-    if (grainStrip)
-    {
-        targets.push_back(ModernAudioEngine::ModTarget::GrainSize);
-        targets.push_back(ModernAudioEngine::ModTarget::GrainDensity);
-        targets.push_back(ModernAudioEngine::ModTarget::GrainPitchJitter);
-        targets.push_back(ModernAudioEngine::ModTarget::GrainSpread);
-        targets.push_back(ModernAudioEngine::ModTarget::GrainJitter);
-        targets.push_back(ModernAudioEngine::ModTarget::GrainPositionJitter);
-        targets.push_back(ModernAudioEngine::ModTarget::GrainRandom);
-        targets.push_back(ModernAudioEngine::ModTarget::GrainArp);
-        targets.push_back(ModernAudioEngine::ModTarget::GrainCloud);
-        targets.push_back(ModernAudioEngine::ModTarget::GrainEmitter);
-        targets.push_back(ModernAudioEngine::ModTarget::GrainEnvelope);
-        targets.push_back(ModernAudioEngine::ModTarget::GrainShape);
-    }
-
-    return targets;
+    return buildVisibleModTargetsForSceneLaneMode(stripUsesGrainSceneLanes(stripIndex));
 }
 
 std::vector<ModernAudioEngine::ModTarget> MlrVSTAudioProcessor::getSceneVisibleModTargetsForStrip(int stripIndex) const
 {
-    return getVisibleModTargetsForStrip(stripIndex);
+    return buildVisibleModTargetsForSceneLaneMode(
+        stripUsesGrainSceneLanesForSceneSlot(getFocusedSceneSlot(), stripIndex));
 }
 
 ModernAudioEngine::ModTarget MlrVSTAudioProcessor::getSceneMainAutomationDisplayTargetForStrip(int stripIndex) const
@@ -19513,7 +19715,7 @@ ModernAudioEngine::ModTarget MlrVSTAudioProcessor::getSceneMainAutomationDisplay
         return ModernAudioEngine::ModTarget::None;
 
     const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
-    const auto targets = getVisibleModTargetsForStrip(safeStripIndex);
+    const auto targets = getSceneVisibleModTargetsForStrip(safeStripIndex);
     if (targets.empty())
         return ModernAudioEngine::ModTarget::None;
 
@@ -19546,7 +19748,7 @@ void MlrVSTAudioProcessor::setSceneMainAutomationDisplayTargetForStrip(int strip
                                                                        ModernAudioEngine::ModTarget target)
 {
     const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
-    const auto targets = getVisibleModTargetsForStrip(safeStripIndex);
+    const auto targets = getSceneVisibleModTargetsForStrip(safeStripIndex);
     const auto safeTarget = sanitizeModPerformanceTarget(target);
 
     auto matchesTarget = [](ModernAudioEngine::ModTarget lhs, ModernAudioEngine::ModTarget rhs)
@@ -19645,7 +19847,10 @@ void MlrVSTAudioProcessor::stepVisibleModLaneTarget(int stripIndex, int directio
         return;
 
     const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
-    const auto targets = getVisibleModTargetsForStrip(safeStripIndex);
+    const bool sceneMainModActive = isSceneModeEnabled() && getSceneModPageMode() == SceneModPageMode::MainModulation;
+    const auto targets = sceneMainModActive
+        ? getSceneVisibleModTargetsForStrip(safeStripIndex)
+        : getVisibleModTargetsForStrip(safeStripIndex);
     if (targets.empty())
         return;
 
@@ -19659,7 +19864,7 @@ void MlrVSTAudioProcessor::stepVisibleModLaneTarget(int stripIndex, int directio
     const int activeSlot = juce::jlimit(0,
                                         ModernAudioEngine::NumModSequencers - 1,
                                         audioEngine->getModSequencerSlot(safeStripIndex));
-    const auto activeTarget = (isSceneModeEnabled() && getSceneModPageMode() == SceneModPageMode::MainModulation)
+    const auto activeTarget = sceneMainModActive
         ? getSceneMainAutomationDisplayTargetForStrip(safeStripIndex)
         : sanitizeModPerformanceTarget(audioEngine->getModTargetForSlot(safeStripIndex, activeSlot));
 
@@ -19679,7 +19884,7 @@ void MlrVSTAudioProcessor::stepVisibleModLaneTarget(int stripIndex, int directio
         : (safeDirection > 0 ? 0 : targetCount - 1);
     const auto nextTarget = sanitizeModPerformanceTarget(targets[static_cast<size_t>(nextIndex)]);
 
-    if (isSceneModeEnabled() && getSceneModPageMode() == SceneModPageMode::MainModulation)
+    if (sceneMainModActive)
     {
         setSceneMainAutomationDisplayTargetForStrip(safeStripIndex, nextTarget);
         requestSceneControlRefreshAsync();
@@ -19944,14 +20149,103 @@ void MlrVSTAudioProcessor::performSceneLoad(int mainPresetIndex,
                                      recallContinuityBrokenOut);
 }
 
-float MlrVSTAudioProcessor::getInnerLoopLengthFactor() const
+void MlrVSTAudioProcessor::rescaleActiveInnerLoopsForGlobalFactor(int previousChoice, int newChoice)
 {
-    const int choice = innerLoopLengthSelection.load(std::memory_order_acquire);
-    static constexpr std::array<float, 5> kFactors { 1.0f, 0.5f, 0.25f, 0.125f, 0.0625f };
-    return kFactors[static_cast<size_t>(choice)];
+    if (audioEngine == nullptr)
+        return;
+
+    const float previousFactor = innerLoopLengthFactorForChoice(previousChoice);
+    const float nextFactor = innerLoopLengthFactorForChoice(newChoice);
+    if (!(previousFactor > 0.0f) || std::abs(previousFactor - nextFactor) <= 1.0e-6f)
+        return;
+
+    for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
+    {
+        auto* strip = audioEngine->getStrip(stripIndex);
+        if (strip == nullptr)
+            continue;
+
+        const auto playMode = strip->getPlayMode();
+        if (playMode == EnhancedAudioStrip::PlayMode::Step
+            || playMode == EnhancedAudioStrip::PlayMode::Sample)
+        {
+            continue;
+        }
+
+        const int loopStart = juce::jlimit(0, MaxColumns - 1, strip->getLoopStart());
+        const int loopEnd = juce::jlimit(loopStart + 1, MaxColumns, strip->getLoopEnd());
+        const int currentLength = juce::jmax(1, loopEnd - loopStart);
+        if (currentLength >= MaxColumns)
+            continue;
+
+        const int nextLength = juce::jlimit(
+            1,
+            MaxColumns,
+            static_cast<int>(std::round(static_cast<double>(currentLength)
+                                        * static_cast<double>(nextFactor)
+                                        / static_cast<double>(previousFactor))));
+        const float currentFullBeats = [&]()
+        {
+            const float beats = strip->getBeatsPerLoop();
+            return (beats > 0.0f) ? beats : 4.0f;
+        }();
+        const float desiredFullBeats = juce::jmax(
+            0.25f,
+            static_cast<float>(
+                static_cast<double>(currentFullBeats)
+                * static_cast<double>(currentLength)
+                * static_cast<double>(nextFactor)
+                / (static_cast<double>(previousFactor) * static_cast<double>(nextLength))));
+        float baseFullBeats = strip->getInnerLoopBaseBeatsPerLoop();
+        if (!(baseFullBeats > 0.0f))
+            baseFullBeats = 4.0f;
+        const bool needsTempoOverride = strip->hasInnerLoopTempoOverride()
+            || std::abs(static_cast<double>(desiredFullBeats) - static_cast<double>(baseFullBeats)) > 1.0e-6;
+
+        const bool reverse = strip->isReverse()
+            || strip->getDirectionMode() == EnhancedAudioStrip::DirectionMode::Reverse;
+
+        int nextStart = loopStart;
+        int nextEnd = loopEnd;
+        if (reverse)
+        {
+            nextEnd = loopEnd;
+            nextStart = juce::jmax(0, nextEnd - nextLength);
+        }
+        else
+        {
+            nextStart = loopStart;
+            nextEnd = juce::jmin(MaxColumns, nextStart + nextLength);
+        }
+
+        nextStart = juce::jlimit(0, MaxColumns - 1, nextStart);
+        nextEnd = juce::jlimit(nextStart + 1, MaxColumns, nextEnd);
+        queueLoopChange(stripIndex,
+                        false,
+                        nextStart,
+                        nextEnd,
+                        reverse,
+                        -1,
+                        needsTempoOverride ? desiredFullBeats
+                                           : std::numeric_limits<float>::quiet_NaN());
+    }
 }
 
-void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int startColumn, int endColumn, bool reverseDirection, int markerColumn)
+float MlrVSTAudioProcessor::getInnerLoopLengthFactor() const
+{
+    const int choice = innerLoopLengthParam != nullptr
+        ? juce::jlimit(0, 4, static_cast<int>(std::round(innerLoopLengthParam->load(std::memory_order_acquire))))
+        : innerLoopLengthSelection.load(std::memory_order_acquire);
+    return innerLoopLengthFactorForChoice(choice);
+}
+
+void MlrVSTAudioProcessor::queueLoopChange(int stripIndex,
+                                           bool clearLoop,
+                                           int startColumn,
+                                           int endColumn,
+                                           bool reverseDirection,
+                                           int markerColumn,
+                                           float beatsPerLoopOverride)
 {
     if (!audioEngine || stripIndex < 0 || stripIndex >= MaxStrips)
         return;
@@ -19966,6 +20260,11 @@ void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int s
 
     if (!useQuantize)
     {
+        double currentPpq = audioEngine->getTimelineBeat();
+        getCurrentHostPpq(currentPpq);
+        if (!std::isfinite(currentPpq))
+            currentPpq = audioEngine->getTimelineBeat();
+
         {
             const juce::ScopedLock lock(pendingLoopChangeLock);
             pendingLoopChanges[static_cast<size_t>(stripIndex)].active = false;
@@ -19975,6 +20274,7 @@ void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int s
         if (clearLoop)
         {
             strip->clearLoop();
+            strip->restoreInnerLoopBaseBeatsPerLoop(currentPpq);
             strip->setReverse(false);
             strip->setDirectionMode(EnhancedAudioStrip::DirectionMode::Normal);
             if (markerColumn >= 0)
@@ -19986,6 +20286,10 @@ void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int s
         else
         {
             strip->setLoop(startColumn, endColumn);
+            if (std::isfinite(beatsPerLoopOverride) && beatsPerLoopOverride > 0.0f)
+                strip->applyInnerLoopBeatsPerLoopOverride(beatsPerLoopOverride, currentPpq);
+            else
+                strip->restoreInnerLoopBaseBeatsPerLoop(currentPpq);
             strip->setDirectionMode(reverseDirection
                 ? EnhancedAudioStrip::DirectionMode::Reverse
                 : EnhancedAudioStrip::DirectionMode::Normal);
@@ -20019,6 +20323,7 @@ void MlrVSTAudioProcessor::queueLoopChange(int stripIndex, bool clearLoop, int s
     pending.endColumn = juce::jlimit(pending.startColumn + 1, MaxColumns, endColumn);
     pending.markerColumn = juce::jlimit(-1, MaxColumns - 1, markerColumn);
     pending.reverse = reverseDirection;
+    pending.beatsPerLoopOverride = beatsPerLoopOverride;
     pending.quantized = true;
     pending.targetPpq = targetPpq;
     pending.quantizeDivision = quantizeDivision;
@@ -20102,18 +20407,19 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
         if (!strip)
             continue;
 
+        const double applyPpq = (change.quantized && std::isfinite(change.targetPpq))
+            ? change.targetPpq
+            : currentPpq;
         bool triggeredAtColumn = false;
         if (change.clear)
         {
             strip->clearLoop();
+            strip->restoreInnerLoopBaseBeatsPerLoop(applyPpq);
             strip->setReverse(false);
             strip->setDirectionMode(EnhancedAudioStrip::DirectionMode::Normal);
             if (change.markerColumn >= 0 && std::isfinite(currentPpq) && currentTempo > 0.0)
             {
                 juce::AudioPlayHead::PositionInfo retriggerPosInfo;
-                const double applyPpq = (change.quantized && std::isfinite(change.targetPpq))
-                    ? change.targetPpq
-                    : currentPpq;
                 retriggerPosInfo.setPpqPosition(applyPpq);
                 retriggerPosInfo.setBpm(currentTempo);
                 strip->triggerAtSample(change.markerColumn, currentTempo, currentGlobalSample, retriggerPosInfo);
@@ -20127,6 +20433,10 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
         else
         {
             strip->setLoop(change.startColumn, change.endColumn);
+            if (std::isfinite(change.beatsPerLoopOverride) && change.beatsPerLoopOverride > 0.0f)
+                strip->applyInnerLoopBeatsPerLoopOverride(change.beatsPerLoopOverride, applyPpq);
+            else
+                strip->restoreInnerLoopBaseBeatsPerLoop(applyPpq);
             strip->setDirectionMode(change.reverse
                 ? EnhancedAudioStrip::DirectionMode::Reverse
                 : EnhancedAudioStrip::DirectionMode::Normal);
@@ -20135,11 +20445,11 @@ void MlrVSTAudioProcessor::applyPendingLoopChanges(const juce::AudioPlayHead::Po
         if (change.quantized && !triggeredAtColumn)
         {
             // Deterministic PPQ realign after loop-geometry change.
-            const double applyPpq = std::isfinite(currentPpq)
+            const double realignPpq = std::isfinite(currentPpq)
                 ? currentPpq
                 : (std::isfinite(change.targetPpq) ? change.targetPpq : audioEngine->getTimelineBeat());
-            strip->realignToPpqAnchor(applyPpq, currentGlobalSample);
-            strip->setBeatsPerLoopAtPpq(strip->getBeatsPerLoop(), applyPpq);
+            strip->realignToPpqAnchor(realignPpq, currentGlobalSample);
+            strip->setBeatsPerLoopAtPpq(strip->getBeatsPerLoop(), realignPpq);
         }
         else
         {
@@ -22580,6 +22890,8 @@ void MlrVSTAudioProcessor::loadPersistentGlobalControls()
                                        ? juce::jlimit(0, 4, static_cast<int>(innerLoopLengthParam->load(std::memory_order_acquire)))
                                        : 0,
                                    std::memory_order_release);
+    lastAppliedInnerLoopLengthSelection.store(innerLoopLengthSelection.load(std::memory_order_acquire),
+                                              std::memory_order_release);
     anyRestored = restoreChoiceParam("quality", "quality", 0, 3) || anyRestored;
     anyRestored = restoreFloatParam("pitchSmoothing", "pitchSmoothing", 0.0, 1.0) || anyRestored;
     anyRestored = restoreFloatParam("inputMonitor", "inputMonitor", 0.0, 1.0) || anyRestored;

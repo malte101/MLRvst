@@ -10,7 +10,7 @@ namespace
 constexpr double kDefaultSceneClipLengthBeats = 4.0;
 constexpr double kMaxSceneClipLengthBeats = 4096.0;
 constexpr int kScenePerformanceDataMagic = 0x53435031; // SCP1
-constexpr int kScenePerformanceDataVersion = 2;
+constexpr int kScenePerformanceDataVersion = 3;
 constexpr double kSceneEventReplaceEpsilonBeats = 1.0 / 1024.0;
 constexpr double kSceneControlThinBeatWindowBeats = 1.0 / 64.0;
 constexpr float kSceneContinuousControlThinValueThreshold = 0.015f;
@@ -275,7 +275,7 @@ void writeClip(juce::MemoryOutputStream& out,
         : kDefaultSceneClipLengthBeats;
     out.writeInt(sceneSlot);
     out.writeDouble(serializedLength);
-    out.writeInt(static_cast<int>(clip.version));
+    out.writeInt(kScenePerformanceDataVersion);
     out.writeInt(static_cast<int>(clip.events.size()));
     for (const auto& event : clip.events)
     {
@@ -290,6 +290,7 @@ void writeClip(juce::MemoryOutputStream& out,
         out.writeFloat(event.value);
         out.writeDouble(event.timeBeats);
         out.writeByte(static_cast<char>(event.isNoteOn ? 1 : 0));
+        out.writeByte(static_cast<char>(event.drawStepped ? 1 : 0));
     }
 
     out.writeByte(static_cast<char>(clip.hasMotionState ? 1 : 0));
@@ -1088,7 +1089,7 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
     int version = 0;
     if (!readIntChecked(version))
         return false;
-    if (version != 1 && version != kScenePerformanceDataVersion)
+    if (version < 1 || version > kScenePerformanceDataVersion)
         return false;
 
     int rawClipCount = 0;
@@ -1135,6 +1136,7 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
             char rawType = 0;
             char rawTarget = 0;
             char rawNoteOn = 0;
+            char rawDrawStepped = 0;
             if (!readByteChecked(rawType)
                 || !readIntChecked(event.stripIndex)
                 || !readIntChecked(event.column)
@@ -1149,7 +1151,8 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
             {
                 return false;
             }
-
+            if (version >= 3 && !readByteChecked(rawDrawStepped))
+                return false;
             event.type = static_cast<ScenePerformanceEventType>(
                 juce::jlimit(0, 1, static_cast<int>(rawType)));
             event.controlTarget = static_cast<ScenePerformanceControlTarget>(
@@ -1157,6 +1160,7 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
                              static_cast<int>(ScenePerformanceControlTarget::GrainShape),
                              static_cast<int>(rawTarget)));
             event.isNoteOn = rawNoteOn != 0;
+            event.drawStepped = version >= 3 && rawDrawStepped != 0;
             if (clip != nullptr)
             {
                 if (event.type == ScenePerformanceEventType::ControlPoint

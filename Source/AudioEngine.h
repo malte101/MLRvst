@@ -415,6 +415,8 @@ public:
     bool reverse = false;
     
     std::atomic<float> beatsPerLoop{-1.0f};  // -1 = auto-detect, otherwise manual override
+    std::atomic<float> innerLoopBaseBeatsPerLoop{-1.0f};
+    std::atomic<int> innerLoopTempoOverrideActive{0};
     int recordingBars = 2;  // Unified per-strip bars for capture + loaded sample mapping (1..8)
     
     std::atomic<float> volume{1.0f};
@@ -603,6 +605,10 @@ public:
     void setBeatsPerLoop(float beats);  // Manual override: how many beats is this loop?
     void setBeatsPerLoopAtPpq(float beats, double hostPpqNow);
     float getBeatsPerLoop() const { return beatsPerLoop.load(); }
+    bool hasInnerLoopTempoOverride() const { return innerLoopTempoOverrideActive.load(std::memory_order_acquire) != 0; }
+    float getInnerLoopBaseBeatsPerLoop() const;
+    void applyInnerLoopBeatsPerLoopOverride(float beats, double hostPpqNow);
+    void restoreInnerLoopBaseBeatsPerLoop(double hostPpqNow);
     
     // Recording length per strip
     void setRecordingBars(int bars)
@@ -624,18 +630,24 @@ public:
     void setPan(float panValue); // -1.0 (left) to 1.0 (right)
     float getPan() const { return pan.load(); }
     void seedPanTransition(float fromValue, float toValue, double rampSeconds);
+    void resetPlayheadTraversalSpeedStateFromRequestedRatio() noexcept
+    {
+        playheadTraversalRatioAtLastCalc = -1.0;
+        playheadTraversalPhaseOffsetSlices = 0.0;
+        playheadTraversalSliceCountAtLastCalc = -1;
+        const float requestedTraversalRatio = playheadSpeedRatio.load(std::memory_order_acquire);
+        appliedPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
+        pendingPlayheadSpeedRatio.store(requestedTraversalRatio, std::memory_order_release);
+        pendingPlayheadSpeedChange.store(0, std::memory_order_release);
+        pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
+    }
     void setPlayheadSpeedRatio(float ratio)
     {
         const float clamped = juce::jlimit(0.125f, 8.0f, ratio);
         playheadSpeedRatio.store(clamped, std::memory_order_release);
 
         if (playMode != PlayMode::Loop || !playing.load(std::memory_order_acquire))
-        {
-            appliedPlayheadSpeedRatio.store(clamped, std::memory_order_release);
-            pendingPlayheadSpeedRatio.store(clamped, std::memory_order_release);
-            pendingPlayheadSpeedChange.store(0, std::memory_order_release);
-            pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
-        }
+            resetPlayheadTraversalSpeedStateFromRequestedRatio();
     }
     float getPlayheadSpeedRatio() const { return playheadSpeedRatio.load(std::memory_order_acquire); }
     void setContinuousPlayheadTraversal(bool enabled)
@@ -643,13 +655,7 @@ public:
         const int next = enabled ? 1 : 0;
         const int previous = continuousPlayheadTraversal.exchange(next, std::memory_order_acq_rel);
         if (previous != next)
-        {
-            playheadTraversalRatioAtLastCalc = -1.0;
-            playheadTraversalPhaseOffsetSlices = 0.0;
-            playheadTraversalSliceCountAtLastCalc = -1;
-            pendingPlayheadSpeedChange.store(0, std::memory_order_release);
-            pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
-        }
+            resetPlayheadTraversalSpeedStateFromRequestedRatio();
     }
     bool usesContinuousPlayheadTraversal() const
     {
@@ -937,14 +943,7 @@ public:
     { 
         PlayMode oldMode = playMode;
         playMode = mode;
-        playheadTraversalRatioAtLastCalc = -1.0;
-        playheadTraversalPhaseOffsetSlices = 0.0;
-        playheadTraversalSliceCountAtLastCalc = -1;
-        const float requestedSpeedRatio = playheadSpeedRatio.load(std::memory_order_acquire);
-        appliedPlayheadSpeedRatio.store(requestedSpeedRatio, std::memory_order_release);
-        pendingPlayheadSpeedRatio.store(requestedSpeedRatio, std::memory_order_release);
-        pendingPlayheadSpeedChange.store(0, std::memory_order_release);
-        pendingPlayheadSpeedBaseSlice.store(-1, std::memory_order_release);
+        resetPlayheadTraversalSpeedStateFromRequestedRatio();
 
         // Switching INTO step mode while transport is already running must
         // immediately arm step playback; waiting for a new transport edge
@@ -1104,6 +1103,9 @@ public:
     int getGroup() const { return groupId; }
     
     // LED feedback
+    double getEffectiveLoopDisplayLengthColumns() const;
+    double getEffectiveLoopDisplayStartColumn() const;
+    double getEffectiveLoopDisplayEndColumn() const;
     int getCurrentColumn() const;
     int getStutterEntryColumn() const;
     double getStutterEntryOffsetRatio() const;

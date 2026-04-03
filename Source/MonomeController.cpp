@@ -395,7 +395,11 @@ ScenePerformanceControlTarget activeSceneMainAutomationTarget(const MlrVSTAudioP
 {
     const int safeStripIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
     const auto activeTarget = processor.getSceneMainAutomationDisplayTargetForStrip(safeStripIndex);
-    return sceneControlTargetForModTarget(processor.stripUsesGrainSceneLanes(safeStripIndex), activeTarget);
+    const auto sceneTargets = processor.getSceneVisibleModTargetsForStrip(safeStripIndex);
+    const bool grainMode = std::find(sceneTargets.begin(),
+                                     sceneTargets.end(),
+                                     ModernAudioEngine::ModTarget::GrainPitch) != sceneTargets.end();
+    return sceneControlTargetForModTarget(grainMode, activeTarget);
 }
 
 int sceneMainAutomationDisplayPage(const MlrVSTAudioProcessor& processor,
@@ -2080,6 +2084,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     const int secondButton = juce::jlimit(0, MaxColumns - 1, x);
                     int start = juce::jmin(firstButton, secondButton);
                     int end = juce::jmax(firstButton, secondButton) + 1;
+                    const int originalLength = juce::jmax(1, end - start);
 
                     // Detect reverse: first button > second button
                     const bool shouldReverse = (firstButton > secondButton);
@@ -2089,7 +2094,6 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     const float loopLengthFactor = juce::jlimit(0.0625f, 1.0f, getInnerLoopLengthFactor());
                     if (loopLengthFactor < 0.999f)
                     {
-                        const int originalLength = juce::jmax(1, end - start);
                         const int scaledLength = juce::jmax(1, static_cast<int>(
                             std::floor(static_cast<double>(originalLength) * static_cast<double>(loopLengthFactor))));
 
@@ -2107,8 +2111,33 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                         start = juce::jlimit(0, MaxColumns - 1, start);
                         end = juce::jlimit(start + 1, MaxColumns, end);
                     }
-                    
-                    queueLoopChange(stripIndex, false, start, end, shouldReverse);
+
+                    const int appliedLength = juce::jmax(1, end - start);
+                    const double desiredScaledLength = static_cast<double>(originalLength)
+                        * static_cast<double>(loopLengthFactor);
+                    float beatsPerLoopOverride = std::numeric_limits<float>::quiet_NaN();
+                    if (strip->hasInnerLoopTempoOverride()
+                        || std::abs(desiredScaledLength - static_cast<double>(appliedLength)) > 1.0e-6)
+                    {
+                        float baseBeatsPerLoop = strip->getInnerLoopBaseBeatsPerLoop();
+                        if (!(baseBeatsPerLoop > 0.0f))
+                            baseBeatsPerLoop = 4.0f;
+
+                        beatsPerLoopOverride = juce::jmax(
+                            0.25f,
+                            static_cast<float>(
+                                static_cast<double>(baseBeatsPerLoop)
+                                * desiredScaledLength
+                                / static_cast<double>(appliedLength)));
+                    }
+
+                    queueLoopChange(stripIndex,
+                                    false,
+                                    start,
+                                    end,
+                                    shouldReverse,
+                                    -1,
+                                    beatsPerLoopOverride);
                     
                     DBG("Inner loop set: " << start << "-" << end << 
                         (shouldReverse ? " (REVERSE)" : " (NORMAL)"));

@@ -54,6 +54,8 @@ public:
         ampEnvelope.setSampleRate(newSampleRate);
         ampEnvelope.reset();
         updateAmpEnvelopeParameters();
+        smoothedVolume.reset(newSampleRate, 0.05);
+        smoothedVolume.setCurrentAndTargetValue(volume);
         
         // Prepare filter
         juce::dsp::ProcessSpec spec;
@@ -263,6 +265,7 @@ public:
     {
         // Volume 0.0 to 1.0
         this->volume = juce::jlimit(0.0f, 1.0f, vol);
+        smoothedVolume.setTargetValue(this->volume);
     }
 
     void setTrimGain(float gain)
@@ -382,26 +385,31 @@ public:
             filter.process(context);
         }
         
-        // Apply volume and pan, then add to output
-        for (int channel = 0; channel < output.getNumChannels() && channel < 2; ++channel)
+        // Apply smoothed volume and pan, then add to output.
+        const int outputChannels = juce::jmin(output.getNumChannels(), tempBuffer.getNumChannels(), 2);
+        for (int sample = 0; sample < numSamples; ++sample)
         {
-            // Calculate pan gains
+            const float currentVolume = smoothedVolume.getNextValue();
+            const float baseGain = currentVolume * trimGain;
             float leftGain = 1.0f;
             float rightGain = 1.0f;
-            
-            if (channel == 0)  // Left
+
+            if (pan > 0.0f)
+                leftGain = 1.0f - pan;
+            else if (pan < 0.0f)
+                rightGain = 1.0f + pan;
+
+            if (outputChannels > 0)
             {
-                leftGain = pan <= 0.0f ? 1.0f : (1.0f - pan);
+                const float sampleValue = tempBuffer.getSample(0, sample) * baseGain * leftGain;
+                output.addSample(0, startSample + sample, sampleValue);
             }
-            else if (channel == 1)  // Right
+
+            if (outputChannels > 1)
             {
-                rightGain = pan >= 0.0f ? 1.0f : (1.0f + pan);
+                const float sampleValue = tempBuffer.getSample(1, sample) * baseGain * rightGain;
+                output.addSample(1, startSample + sample, sampleValue);
             }
-            
-            float gain = volume * trimGain * (channel == 0 ? leftGain : rightGain);
-            
-            // Add to output buffer
-            output.addFrom(channel, startSample, tempBuffer, channel, 0, numSamples, gain);
         }
     }
     
@@ -425,6 +433,7 @@ private:
     
     // Volume and pan (connected to strip controls)
     float volume = 1.0f;
+    juce::SmoothedValue<float> smoothedVolume{1.0f};
     float trimGain = 1.0f;
     float pan = 0.0f;
     int rootMidi = 60;

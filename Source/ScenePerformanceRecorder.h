@@ -67,6 +67,7 @@ struct ScenePerformanceEvent
     bool isNoteOn = true;
     ScenePerformanceEventType type = ScenePerformanceEventType::Trigger;
     ScenePerformanceControlTarget controlTarget = ScenePerformanceControlTarget::None;
+    bool drawStepped = false;
 
     bool operator<(const ScenePerformanceEvent& other) const { return timeBeats < other.timeBeats; }
 };
@@ -109,7 +110,7 @@ struct ScenePerformanceMotionStripState
 struct ScenePerformanceClip
 {
     double lengthBeats = 4.0;
-    uint32_t version = 2;
+    uint32_t version = 3;
     std::vector<ScenePerformanceEvent> events;
     bool hasMotionState = false;
     std::array<ScenePerformanceMotionStripState, ModernAudioEngine::MaxStrips> motionStrips{};

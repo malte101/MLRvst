@@ -274,9 +274,11 @@ bool MlrVSTAudioProcessor::deleteStoredSceneSlotState(int mainPresetIndex, int s
 
 bool MlrVSTAudioProcessor::persistStoredSceneSlotStatesToMainPreset(int mainPresetIndex)
 {
-    return PresetStore::updatePresetAuxState(juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex),
-                                             [this]()
-                                             {
-                                                 return createSceneChainStateXml(-1);
-                                             });
+    juce::ignoreUnused(mainPresetIndex);
+
+    // Scene capture/copy/delete should remain runtime-only until the user performs
+    // an explicit preset save. The preset save path serializes scene state through
+    // createSceneChainStateXml(-1), so background scene autosave must not rewrite
+    // preset files on its own.
+    return true;
 }

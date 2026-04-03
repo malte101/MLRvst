@@ -2070,8 +2070,6 @@ bool applyPresetXml(const juce::XmlElement& presetXml,
         }
     }
 
-    const bool presetDeclaresSceneState = preset->getChildByName("SceneChainState") != nullptr;
-
     if (applyAuxStateXml)
         applyAuxStateXml(*preset);
 
@@ -2084,8 +2082,7 @@ bool applyPresetXml(const juce::XmlElement& presetXml,
         else
         {
             juce::MemoryBlock scenePerformanceData;
-            if (readEmbeddedScenePerformanceData(*preset, scenePerformanceData)
-                || (presetDeclaresSceneState && loadScenePerformanceDataForPreset(presetIndexHint, scenePerformanceData)))
+            if (readEmbeddedScenePerformanceData(*preset, scenePerformanceData))
                 applyScenePerformanceData(scenePerformanceData);
             else
                 applyScenePerformanceData({});

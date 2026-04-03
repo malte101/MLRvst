@@ -1031,8 +1031,12 @@ void WaveformDisplay::paint(juce::Graphics& g)
     // Draw loop points with matching waveform color
     if (maxColumns > 0)
     {
-        const float loopStartNorm = juce::jlimit(0.0f, 1.0f, loopStart / static_cast<float>(juce::jmax(1, maxColumns)));
-        const float loopEndNorm = juce::jlimit(0.0f, 1.0f, loopEnd / static_cast<float>(juce::jmax(1, maxColumns)));
+        const float loopStartNorm = juce::jlimit(0.0f,
+                                                 1.0f,
+                                                 static_cast<float>(loopStart / static_cast<double>(juce::jmax(1, maxColumns))));
+        const float loopEndNorm = juce::jlimit(0.0f,
+                                               1.0f,
+                                               static_cast<float>(loopEnd / static_cast<double>(juce::jmax(1, maxColumns))));
         auto loopStartX = normToX(loopStartNorm);
         auto loopEndX = normToX(loopEndNorm);
         auto rectWidth = loopEndX - loopStartX;
@@ -1434,7 +1438,7 @@ void WaveformDisplay::setGrainHudOverlay(bool enabled,
     repaint();
 }
 
-void WaveformDisplay::setLoopPoints(int startCol, int endCol, int cols)
+void WaveformDisplay::setLoopPoints(double startCol, double endCol, int cols)
 {
     loopStart = startCol;
     loopEnd = endCol;
@@ -4784,7 +4788,9 @@ void StripControl::updateFromEngine()
         if (buffer && buffer->getNumSamples() > 0)
         {
             waveform.setAudioBuffer(*buffer, strip->getSourceSampleRate());
-            waveform.setLoopPoints(strip->getLoopStart(), strip->getLoopEnd(), 16);
+            const double displayLoopStart = strip->getEffectiveLoopDisplayStartColumn();
+            const double displayLoopEnd = strip->getEffectiveLoopDisplayEndColumn();
+            waveform.setLoopPoints(displayLoopStart, displayLoopEnd, 16);
             waveform.setSliceMarkers(strip->getSliceStartSamples(false),
                                      strip->getSliceStartSamples(true),
                                      buffer->getNumSamples(),
@@ -4792,17 +4798,29 @@ void StripControl::updateFromEngine()
             
             if (strip->isPlaying() || strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
             {
-                double playbackPos = strip->getPlaybackPosition();
-                double numSamples = static_cast<double>(buffer->getNumSamples());
-                
-                // Safety check to prevent division by zero or NaN
-                if (numSamples > 0 && std::isfinite(playbackPos))
+                if (strip->hasInnerLoopTempoOverride())
                 {
-                    double wrappedPos = std::fmod(playbackPos, numSamples);
-                    if (wrappedPos < 0.0)
-                        wrappedPos += numSamples;
-                    double normalized = wrappedPos / numSamples;
+                    const double phase = juce::jlimit(0.0, 0.999999, strip->getLoopPhaseNormalized());
+                    const double displayLoopLength = juce::jmax(0.0, displayLoopEnd - displayLoopStart);
+                    const double normalized = juce::jlimit(0.0,
+                                                           1.0,
+                                                           (displayLoopStart + (displayLoopLength * phase)) / 16.0);
                     waveform.setPlaybackPosition(normalized);
+                }
+                else
+                {
+                    double playbackPos = strip->getPlaybackPosition();
+                    double numSamples = static_cast<double>(buffer->getNumSamples());
+                    
+                    // Safety check to prevent division by zero or NaN
+                    if (numSamples > 0 && std::isfinite(playbackPos))
+                    {
+                        double wrappedPos = std::fmod(playbackPos, numSamples);
+                        if (wrappedPos < 0.0)
+                            wrappedPos += numSamples;
+                        double normalized = wrappedPos / numSamples;
+                        waveform.setPlaybackPosition(normalized);
+                    }
                 }
             }
 

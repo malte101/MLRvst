@@ -483,6 +483,11 @@ bool sceneAutomationTargetUsesSteppedSegments(ScenePerformanceControlTarget targ
     }
 }
 
+bool sceneAutomationEventUsesSteppedSegments(const ScenePerformanceEvent& event)
+{
+    return event.drawStepped || sceneAutomationTargetUsesSteppedSegments(event.controlTarget);
+}
+
 void drawSceneAutomationConnection(juce::Graphics& g,
                                    juce::Point<float> start,
                                    juce::Point<float> end,
@@ -829,13 +834,44 @@ int scenePrimaryModSlotForLane(MlrVSTAudioProcessor& processor, int stripIndex, 
     return -1;
 }
 
+int scenePreferredModEditorSlotForLane(MlrVSTAudioProcessor& processor, int stripIndex, int laneIndex)
+{
+    auto* engine = processor.getAudioEngine();
+    if (engine == nullptr)
+        return -1;
+
+    const int safeStripIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
+    const int safeLaneIndex = juce::jlimit(0, kSceneAutomationLaneCount - 1, laneIndex);
+    const int primarySlot = scenePrimaryModSlotForLane(processor, safeStripIndex, safeLaneIndex);
+    if (primarySlot >= 0)
+        return primarySlot;
+
+    const auto desiredTarget = sceneDisplayedModTargetForLane(processor, safeStripIndex, safeLaneIndex);
+    if (desiredTarget == ModernAudioEngine::ModTarget::None)
+        return -1;
+
+    const int activeSlot = juce::jlimit(0,
+                                        ModernAudioEngine::NumModSequencers - 1,
+                                        engine->getModSequencerSlot(safeStripIndex));
+    if (engine->getModTargetForSlot(safeStripIndex, activeSlot) == ModernAudioEngine::ModTarget::None)
+        return activeSlot;
+
+    for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+    {
+        if (engine->getModTargetForSlot(safeStripIndex, slot) == ModernAudioEngine::ModTarget::None)
+            return slot;
+    }
+
+    return activeSlot;
+}
+
 SceneLaneModUiState sceneLaneModUiState(MlrVSTAudioProcessor& processor,
                                         int stripIndex,
                                         int laneIndex,
                                         juce::Rectangle<float> laneBounds)
 {
     SceneLaneModUiState state;
-    state.slot = scenePrimaryModSlotForLane(processor, stripIndex, laneIndex);
+    state.slot = scenePreferredModEditorSlotForLane(processor, stripIndex, laneIndex);
     if (state.slot < 0 || laneBounds.isEmpty())
         return state;
 
@@ -1573,7 +1609,9 @@ bool sceneCurrentEffectiveNormalizedValue(MlrVSTAudioProcessor& processor,
             switch (target)
             {
                 case ScenePerformanceControlTarget::Speed:
-                    value = strip->getPlaybackSpeed();
+                    value = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
+                        ? strip->getPlaybackSpeed()
+                        : strip->getPlayheadSpeedRatio();
                     break;
                 case ScenePerformanceControlTarget::Pitch:
                     value = (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
@@ -1854,7 +1892,8 @@ float sceneDefaultNormalizedValueForLane(int laneIndex)
 ScenePerformanceEvent makeDefaultSceneControlEventForLane(int stripIndex,
                                                           int laneIndex,
                                                           double timeBeats,
-                                                          float normalizedValue)
+                                                          float normalizedValue,
+                                                          bool drawStepped = false)
 {
     ScenePerformanceEvent event;
     event.type = ScenePerformanceEventType::ControlPoint;
@@ -1866,6 +1905,7 @@ ScenePerformanceEvent makeDefaultSceneControlEventForLane(int stripIndex,
     event.controlMode = static_cast<int>(sceneControlModeForTarget(event.controlTarget));
 
     event.value = denormalizeSceneAutomationValue(event, normalizedValue);
+    event.drawStepped = drawStepped;
     return event;
 }
 
@@ -1905,6 +1945,7 @@ void appendSceneStripStoredDefaultAutomationStartPoints(MlrVSTAudioProcessor& pr
                                                         int stripIndex,
                                                         std::vector<ScenePerformanceEvent>& events)
 {
+    juce::ignoreUnused(sceneSlot);
     const int safeStripIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
 
     for (int lane = 0; lane < kSceneAutomationLaneCount; ++lane)
@@ -1915,9 +1956,6 @@ void appendSceneStripStoredDefaultAutomationStartPoints(MlrVSTAudioProcessor& pr
         float normalizedValue = sceneAutomationLaneIsBipolar(lane)
             ? 0.5f
             : sceneDefaultNormalizedValueForLane(lane);
-        const auto target = sceneAutomationLaneTarget(lane);
-        if (processor.getStoredSceneControlNormalizedValue(sceneSlot, safeStripIndex, target, normalizedValue))
-            normalizedValue = juce::jlimit(0.0f, 1.0f, normalizedValue);
 
         events.push_back(makeDefaultSceneControlEventForLane(safeStripIndex,
                                                              lane,
@@ -6368,10 +6406,12 @@ bool SceneControlPanel::applySceneDrawPoint(int stripIndex, int laneIndex, doubl
     const double lengthBeats = getSceneTimelineLengthBeats(sceneSlot);
     const int safeLaneIndex = juce::jlimit(0, kSceneAutomationLaneCount - 1, laneIndex);
     const int safeStripIndex = sceneResolveAutomationStripIndex(stripIndex, safeLaneIndex);
+    const bool drawStepped = sceneDrawModeEnabled;
     auto drawnEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
                                                           safeLaneIndex,
                                                           snapSceneBeatToGrid(timeBeats, lengthBeats),
-                                                          normalizedValue);
+                                                          normalizedValue,
+                                                          drawStepped);
 
     auto events = sceneEditorState.events;
     const int safeDivision = juce::jlimit(1, 64, sceneGridDivision);
@@ -6441,7 +6481,8 @@ bool SceneControlPanel::applySceneDrawCurveSegment(int stripIndex,
         auto drawnEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
                                                               safeLaneIndex,
                                                               clampedEndBeat,
-                                                              endValue);
+                                                              endValue,
+                                                              false);
 
         events.erase(std::remove_if(events.begin(),
                                     events.end(),
@@ -6549,7 +6590,8 @@ bool SceneControlPanel::applySceneDrawCurveSegment(int stripIndex,
             auto drawnEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
                                                                   safeLaneIndex,
                                                                   beat,
-                                                                  normalized);
+                                                                  normalized,
+                                                                  true);
             events.push_back(drawnEvent);
             drawnEvents.push_back(drawnEvent);
         }
@@ -6583,7 +6625,8 @@ bool SceneControlPanel::applySceneDrawCurveSegment(int stripIndex,
             auto drawnEvent = makeDefaultSceneControlEventForLane(safeStripIndex,
                                                                   safeLaneIndex,
                                                                   clampedBeat,
-                                                                  normalized);
+                                                                  normalized,
+                                                                  false);
             events.push_back(drawnEvent);
             drawnEvents.push_back(drawnEvent);
         }
@@ -7427,30 +7470,11 @@ bool SceneControlPanel::isLegacyModEditorAvailableForLane(int stripIndex, int la
 
 int SceneControlPanel::preferredLegacyModEditorSlotForLane(int stripIndex, int laneIndex) const
 {
-    auto* engine = processor.getAudioEngine();
-    if (engine == nullptr || stripIndex < 0 || stripIndex >= getVisibleSceneStripCount())
+    if (stripIndex < 0 || stripIndex >= getVisibleSceneStripCount())
         return -1;
 
     auto& mutableProcessor = const_cast<MlrVSTAudioProcessor&>(processor);
-    const int safeStripIndex = juce::jlimit(0, getVisibleSceneStripCount() - 1, stripIndex);
-    const int safeLaneIndex = juce::jlimit(0, kSceneAutomationLaneCount - 1, laneIndex);
-    const int primarySlot = scenePrimaryModSlotForLane(mutableProcessor, safeStripIndex, safeLaneIndex);
-    if (primarySlot >= 0)
-        return primarySlot;
-
-    const int activeSlot = juce::jlimit(0,
-                                        ModernAudioEngine::NumModSequencers - 1,
-                                        engine->getModSequencerSlot(safeStripIndex));
-    if (engine->getModTargetForSlot(safeStripIndex, activeSlot) == ModernAudioEngine::ModTarget::None)
-        return activeSlot;
-
-    for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
-    {
-        if (engine->getModTargetForSlot(safeStripIndex, slot) == ModernAudioEngine::ModTarget::None)
-            return slot;
-    }
-
-    return activeSlot;
+    return scenePreferredModEditorSlotForLane(mutableProcessor, stripIndex, laneIndex);
 }
 
 void SceneControlPanel::openLegacyModEditorForMainMod()
@@ -9950,6 +9974,8 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
         juce::Point<float> previousPoint;
         juce::Point<float> firstPoint;
         juce::Point<float> lastPoint;
+        bool firstPointStepped = false;
+        bool lastPointStepped = false;
         bool hasPreviousPoint = false;
         bool hasFirstPoint = false;
         for (int eventIndex = 0; eventIndex < static_cast<int>(sceneEditorState.events.size()); ++eventIndex)
@@ -9963,6 +9989,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
             if (!hasFirstPoint)
             {
                 firstPoint = point;
+                firstPointStepped = sceneAutomationEventUsesSteppedSegments(event);
                 hasFirstPoint = true;
             }
             if (hasPreviousPoint)
@@ -9971,31 +9998,29 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                               previousPoint,
                                               point,
                                               globalColour.withAlpha(0.4f),
-                                              sceneDrawModeEnabled
-                                                  || sceneAutomationTargetUsesSteppedSegments(event.controlTarget),
+                                              sceneAutomationEventUsesSteppedSegments(event),
                                               1.2f);
             }
             previousPoint = point;
             lastPoint = point;
+            lastPointStepped = sceneAutomationEventUsesSteppedSegments(event);
             hasPreviousPoint = true;
         }
 
         if (hasFirstPoint)
         {
             const auto connectionColour = globalColour.withAlpha(0.4f);
-            const bool stepped = sceneDrawModeEnabled
-                || sceneAutomationTargetUsesSteppedSegments(ScenePerformanceControlTarget::Retrigger);
             drawSceneAutomationConnection(g,
                                           { globalLayout.laneBounds.getX(), firstPoint.y },
                                           firstPoint,
                                           connectionColour,
-                                          stepped,
+                                          firstPointStepped,
                                           1.2f);
             drawSceneAutomationConnection(g,
                                           lastPoint,
                                           { globalLayout.laneBounds.getRight(), lastPoint.y },
                                           connectionColour,
-                                          stepped,
+                                          lastPointStepped,
                                           1.2f);
         }
 
@@ -10977,6 +11002,8 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                 std::array<bool,
                            static_cast<size_t>(ScenePerformanceControlTarget::GrainShape) + 1> steppedConnections{};
                 std::array<bool,
+                           static_cast<size_t>(ScenePerformanceControlTarget::GrainShape) + 1> firstSteppedConnections{};
+                std::array<bool,
                            static_cast<size_t>(ScenePerformanceControlTarget::GrainShape) + 1> hasPrevious{};
                 std::array<bool,
                            static_cast<size_t>(ScenePerformanceControlTarget::GrainShape) + 1> hasFirst{};
@@ -11000,11 +11027,11 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                     const auto connectionColour = laneOverrideActive
                         ? kTextMuted.withAlpha(0.28f)
                         : sceneAutomationColour(event).withAlpha(0.4f);
-                    const bool steppedConnection = sceneDrawModeEnabled
-                        || sceneAutomationTargetUsesSteppedSegments(event.controlTarget);
+                    const bool steppedConnection = sceneAutomationEventUsesSteppedSegments(event);
                     if (!hasFirst[targetIndex])
                     {
                         firstPoints[targetIndex] = point;
+                        firstSteppedConnections[targetIndex] = steppedConnection;
                         hasFirst[targetIndex] = true;
                     }
                     if (hasPrevious[targetIndex])
@@ -11032,7 +11059,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                                   { laneBounds.getX(), firstPoints[targetIndex].y },
                                                   firstPoints[targetIndex],
                                                   connectionColours[targetIndex],
-                                                  steppedConnections[targetIndex],
+                                                  firstSteppedConnections[targetIndex],
                                                   1.2f);
                     drawSceneAutomationConnection(g,
                                                   lastPoints[targetIndex],
@@ -12053,7 +12080,8 @@ void SceneControlPanel::handleSceneTimelineMouseDoubleClick(const juce::MouseEve
                 -1,
                 globalLane,
                 snapSceneBeatToGrid(sceneTimeBeatsForX(globalLayout.laneBounds, e.position.x, lengthBeats), lengthBeats),
-                normalizedY);
+                normalizedY,
+                sceneDrawModeEnabled);
             auto events = sceneEditorState.events;
             events.push_back(event);
             applyEditedSceneEvents(std::move(events), -1, &event);
@@ -12190,7 +12218,8 @@ void SceneControlPanel::handleSceneTimelineMouseDoubleClick(const juce::MouseEve
                     visibleStrip,
                     lane,
                     snapSceneBeatToGrid(sceneTimeBeatsForX(laneBounds, e.position.x, lengthBeats), lengthBeats),
-                    normalizedY);
+                    normalizedY,
+                    sceneDrawModeEnabled);
                 auto events = sceneEditorState.events;
                 events.push_back(event);
                 applyEditedSceneEvents(std::move(events), -1, &event);
