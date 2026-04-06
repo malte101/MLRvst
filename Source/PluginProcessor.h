@@ -227,10 +227,13 @@ public:
     ModernAudioEngine* getAudioEngine() { return audioEngine.get(); }
     const ModernAudioEngine* getAudioEngine() const { return audioEngine.get(); }
     MonomeConnection& getMonomeConnection() { return monomeConnection; }
+    void requestMonomeLedRefreshAsync();
+    void handleUserStripPlayModeChange(int stripIndex);
     
     bool loadSampleToStrip(int stripIndex, const juce::File& file);
     bool loadSampleToStripPreservingPlaybackState(int stripIndex, const juce::File& file);
     bool loadSampleToSampleModeStrip(int stripIndex, const juce::File& file);
+    bool ensureSampleModeAudioAvailableForStrip(int stripIndex);
     SampleModeEngine* getSampleModeEngine(int stripIndex, bool createIfMissing = true);
     bool hasSampleModeAudio(int stripIndex) const;
     bool isStripScenePlaybackAvailable(int stripIndex) const;
@@ -487,7 +490,8 @@ public:
                                            StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
     void setStripFilterFrequencyControlValue(int stripIndex,
                                              float frequency,
-                                             StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
+                                             StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost,
+                                             bool fastResponse = false);
     void setStripFilterResonanceControlValue(int stripIndex,
                                              float resonance,
                                              StripControlWriteMode writeMode = StripControlWriteMode::NotifyHost);
@@ -1791,6 +1795,7 @@ private:
     void updateLoopStripLoadProgress(int stripIndex, int requestId, float progress, const juce::String& statusText);
     void resetLoopStripLoadProgress(int stripIndex);
     float getStoredStripPitchSemitones(int stripIndex) const;
+    void reapplyStripStateForCurrentPlayMode(int stripIndex);
     void applyStoredPitchControlToStrip(int stripIndex);
     void applyLoopStripPitchSemitones(int stripIndex, float semitones);
     void normalizeLoopPitchMasterRoles();
@@ -1960,10 +1965,15 @@ private:
                                  double eventBeat,
                                  int sampleSliceId,
                                  int64_t sampleStartSample,
-                                 bool noteOn = true);
+                                 bool noteOn = true,
+                                 bool scratchGesture = false);
     void clearPendingSceneTriggerRecord(int stripIndex);
-    void rememberPendingSceneTriggerRecord(int stripIndex, int column, double eventBeat);
+    void rememberPendingSceneTriggerRecord(int stripIndex,
+                                           int column,
+                                           double eventBeat,
+                                           bool scratchGesture);
     void cancelPendingSceneTriggerRecord(int stripIndex);
+    void downgradePendingSceneScratchTriggerRecord(int stripIndex);
     void captureSceneTriggerRelease(int stripIndex, int columnHint);
     void recordMonomeControlSceneEvent(ControlMode mode,
                                        int targetStripIndex,
@@ -2402,6 +2412,7 @@ private:
         float volume = 1.0f;
         float pan = 0.0f;
         float speed = 1.0f;
+        EnhancedAudioStrip::PlayMode playMode = EnhancedAudioStrip::PlayMode::Loop;
     };
     struct SceneClipSlotRuntimeState
     {
@@ -2544,6 +2555,7 @@ private:
     struct PendingSceneTriggerRecord
     {
         bool active = false;
+        bool scratchGesture = false;
         int sceneSlot = -1;
         int column = -1;
         double eventBeat = std::numeric_limits<double>::quiet_NaN();

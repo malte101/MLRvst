@@ -856,6 +856,7 @@ public:
         return filterEnabled.load(std::memory_order_acquire) != 0;
     }
     void setFilterFrequency(float freq);
+    void setFilterFrequencyMonomeFast(float freq);
     float getFilterFrequency() const { return filterFrequency.load(); }
     float getDisplayedFilterFrequency() const { return displayedFilterFrequency.load(std::memory_order_acquire); }
     void seedFilterFrequencyTransition(float fromValue, float toValue, double rampSeconds);
@@ -970,6 +971,10 @@ public:
             // is empty, bootstrap step mode from that content.
             if (!stepSampler.getHasAudio() && sampleBuffer.getNumSamples() > 0)
                 stepSampler.loadSampleFromBuffer(sampleBuffer, sourceSampleRate);
+
+            // Step mode should enter at neutral sample pitch until the
+            // processor reapplies the current pitch control for this strip.
+            stepSampler.setSpeed(1.0f);
 
             if (lastHostPlayingState)
                 playing = true;

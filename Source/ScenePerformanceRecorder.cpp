@@ -10,7 +10,7 @@ namespace
 constexpr double kDefaultSceneClipLengthBeats = 4.0;
 constexpr double kMaxSceneClipLengthBeats = 4096.0;
 constexpr int kScenePerformanceDataMagic = 0x53435031; // SCP1
-constexpr int kScenePerformanceDataVersion = 3;
+constexpr int kScenePerformanceDataVersion = 4;
 constexpr double kSceneEventReplaceEpsilonBeats = 1.0 / 1024.0;
 constexpr double kSceneControlThinBeatWindowBeats = 1.0 / 64.0;
 constexpr float kSceneContinuousControlThinValueThreshold = 0.015f;
@@ -291,6 +291,7 @@ void writeClip(juce::MemoryOutputStream& out,
         out.writeDouble(event.timeBeats);
         out.writeByte(static_cast<char>(event.isNoteOn ? 1 : 0));
         out.writeByte(static_cast<char>(event.drawStepped ? 1 : 0));
+        out.writeByte(static_cast<char>(event.scratchGesture ? 1 : 0));
     }
 
     out.writeByte(static_cast<char>(clip.hasMotionState ? 1 : 0));
@@ -639,7 +640,8 @@ void ScenePerformanceRecorder::recordTriggerEvent(int sceneSlot,
                                                   bool noteOn,
                                                   double currentBeat,
                                                   int sampleSliceId,
-                                                  int64_t sampleStartSample)
+                                                  int64_t sampleStartSample,
+                                                  bool scratchGesture)
 {
     if (!recording.load(std::memory_order_acquire))
         return;
@@ -678,6 +680,7 @@ void ScenePerformanceRecorder::recordTriggerEvent(int sceneSlot,
     event.sampleSliceId = sampleSliceId;
     event.sampleStartSample = sampleStartSample;
     event.isNoteOn = noteOn;
+    event.scratchGesture = scratchGesture;
     event.type = ScenePerformanceEventType::Trigger;
     event.timeBeats = wrappedBeat;
     insertEventSorted(clip, event);
@@ -1137,6 +1140,7 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
             char rawTarget = 0;
             char rawNoteOn = 0;
             char rawDrawStepped = 0;
+            char rawScratchGesture = 0;
             if (!readByteChecked(rawType)
                 || !readIntChecked(event.stripIndex)
                 || !readIntChecked(event.column)
@@ -1153,6 +1157,8 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
             }
             if (version >= 3 && !readByteChecked(rawDrawStepped))
                 return false;
+            if (version >= 4 && !readByteChecked(rawScratchGesture))
+                return false;
             event.type = static_cast<ScenePerformanceEventType>(
                 juce::jlimit(0, 1, static_cast<int>(rawType)));
             event.controlTarget = static_cast<ScenePerformanceControlTarget>(
@@ -1161,6 +1167,7 @@ bool ScenePerformanceRecorder::applyData(const juce::MemoryBlock& data, int scen
                              static_cast<int>(rawTarget)));
             event.isNoteOn = rawNoteOn != 0;
             event.drawStepped = version >= 3 && rawDrawStepped != 0;
+            event.scratchGesture = version >= 4 && rawScratchGesture != 0;
             if (clip != nullptr)
             {
                 if (event.type == ScenePerformanceEventType::ControlPoint

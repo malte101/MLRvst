@@ -65,6 +65,7 @@ struct ScenePerformanceEvent
     float value = 0.0f;
     double timeBeats = 0.0;
     bool isNoteOn = true;
+    bool scratchGesture = false;
     ScenePerformanceEventType type = ScenePerformanceEventType::Trigger;
     ScenePerformanceControlTarget controlTarget = ScenePerformanceControlTarget::None;
     bool drawStepped = false;
@@ -145,7 +146,8 @@ public:
                             bool noteOn,
                             double currentBeat,
                             int sampleSliceId,
-                            int64_t sampleStartSample);
+                            int64_t sampleStartSample,
+                            bool scratchGesture = false);
     bool cancelTriggerEvent(int sceneSlot,
                             int stripIndex,
                             int column,

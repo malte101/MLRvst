@@ -104,4 +104,38 @@ inline float grainControlValueFromPlaybackSpeed(float playbackSpeed)
         return clamped;
     return 1.0f + ((clamped - 1.0f) * 7.0f);
 }
+
+inline float grainPlaybackSpeedFromMonomeColumn(int column)
+{
+    const int clamped = std::clamp(column, 0, 15);
+    if (clamped <= 8)
+        return static_cast<float>(clamped) / 8.0f;
+
+    return 1.0f + (static_cast<float>(clamped - 8) / 7.0f);
+}
+
+inline int monomeColumnFromGrainPlaybackSpeed(float playbackSpeed)
+{
+    const float clamped = std::clamp(playbackSpeed, 0.0f, 2.0f);
+    if (clamped <= 1.0f)
+        return std::clamp(static_cast<int>(std::round(clamped * 8.0f)), 0, 8);
+
+    return std::clamp(8 + static_cast<int>(std::round((clamped - 1.0f) * 7.0f)), 8, 15);
+}
+
+inline float monomeSpeedControlValueFromColumn(int column, bool grainMode)
+{
+    if (grainMode)
+        return grainControlValueFromPlaybackSpeed(grainPlaybackSpeedFromMonomeColumn(column));
+
+    return ratioFromColumn(column);
+}
+
+inline int monomeColumnFromSpeedControlValue(float speedControlValue, bool grainMode)
+{
+    if (grainMode)
+        return monomeColumnFromGrainPlaybackSpeed(grainPlaybackSpeedFromControl(speedControlValue));
+
+    return nearestSpeedIndex(speedControlValue);
+}
 }

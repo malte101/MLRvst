@@ -144,9 +144,9 @@ int findNearestStepDecayColumn(float valueMs)
     return juce::jlimit(0, 15, static_cast<int>(std::round(t * 15.0f)));
 }
 
-int findNearestSpeedColumn(float speed)
+int findNearestSpeedColumn(float speedControlValue, bool grainMode)
 {
-    return PlayheadSpeedQuantizer::nearestSpeedIndex(speed);
+    return PlayheadSpeedQuantizer::monomeColumnFromSpeedControlValue(speedControlValue, grainMode);
 }
 
 int findNearestPitchColumn(int semitones)
@@ -274,9 +274,11 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
     {
         case speedMode:
         {
-            const float speedRatio = PlayheadSpeedQuantizer::ratioFromColumn(juce::jlimit(0, 15, x));
+            const bool grainMode = (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Grain);
+            const float speedControlValue =
+                PlayheadSpeedQuantizer::monomeSpeedControlValueFromColumn(juce::jlimit(0, 15, x), grainMode);
             processor.setStripSpeedControlValue(stripIndex,
-                                                speedRatio,
+                                                speedControlValue,
                                                 MlrVSTAudioProcessor::StripControlWriteMode::NotifyHost);
             break;
         }
@@ -347,8 +349,11 @@ void renderRow(const EnhancedAudioStrip& strip,
     {
         case speedMode:
         {
-            const float speed = PlayheadSpeedQuantizer::quantizeRatio(strip.getPlayheadSpeedRatio());
-            const int activeCol = findNearestSpeedColumn(speed);
+            const bool grainMode = (strip.getPlayMode() == EnhancedAudioStrip::PlayMode::Grain);
+            const float speedControlValue = grainMode
+                ? PlayheadSpeedQuantizer::grainControlValueFromPlaybackSpeed(strip.getPlaybackSpeed())
+                : PlayheadSpeedQuantizer::quantizeRatio(strip.getPlayheadSpeedRatio());
+            const int activeCol = findNearestSpeedColumn(speedControlValue, grainMode);
 
             for (int x = 0; x < 16; ++x)
             {

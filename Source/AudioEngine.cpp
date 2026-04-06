@@ -433,14 +433,23 @@ float Resampler::getSample(const juce::AudioBuffer<float>& buffer,
 {
     (void)speed;
     const int numSamples = buffer.getNumSamples();
-    if (numSamples == 0 || channel >= buffer.getNumChannels())
+    if (numSamples <= 0 || channel < 0 || channel >= buffer.getNumChannels())
         return 0.0f;
     
     const float* data = buffer.getReadPointer(channel);
+    if (numSamples == 1)
+        return data[0];
+
+    if (!std::isfinite(position))
+        return 0.0f;
     
-    // Clamp position
-    while (position < 0) position += numSamples;
-    while (position >= numSamples) position -= numSamples;
+    // Wrap position safely. Non-finite positions can arise transiently from
+    // scratch/grain gesture math; return silence instead of indexing invalid memory.
+    position = std::fmod(position, static_cast<double>(numSamples));
+    if (!std::isfinite(position))
+        return 0.0f;
+    if (position < 0.0)
+        position += static_cast<double>(numSamples);
     
     int index = (int)position;
     float frac = (float)(position - index);
@@ -2219,14 +2228,28 @@ double EnhancedAudioStrip::getWrappedSamplePosition(double samplePos, double loo
     if (sampleLength <= 0.0)
         return 0.0;
 
+    const double playbackFallback = playbackPosition.load(std::memory_order_acquire);
+    const double clampedPlaybackFallback = std::isfinite(playbackFallback)
+        ? juce::jlimit(0.0, juce::jmax(0.0, sampleLength - 1.0), playbackFallback)
+        : 0.0;
+    const double safeLoopStart = std::isfinite(loopStartSamples)
+        ? loopStartSamples
+        : clampedPlaybackFallback;
+    if (!std::isfinite(samplePos))
+        return clampedPlaybackFallback;
+
     if (playMode == PlayMode::OneShot)
         return juce::jlimit(0.0, juce::jmax(0.0, sampleLength - 1.0), samplePos);
 
-    const double loopLengthSafe = juce::jmax(1.0, loopLengthSamplesArg);
-    double posInLoop = std::fmod(samplePos - loopStartSamples, loopLengthSafe);
+    const double loopLengthSafe = (std::isfinite(loopLengthSamplesArg) && loopLengthSamplesArg > 0.0)
+        ? loopLengthSamplesArg
+        : 1.0;
+    double posInLoop = std::fmod(samplePos - safeLoopStart, loopLengthSafe);
+    if (!std::isfinite(posInLoop))
+        return clampedPlaybackFallback;
     if (posInLoop < 0.0)
         posInLoop += loopLengthSafe;
-    return loopStartSamples + posInLoop;
+    return safeLoopStart + posInLoop;
 }
 
 double EnhancedAudioStrip::snapToNearestZeroCrossing(double targetPos, int radiusSamples) const
@@ -2358,9 +2381,14 @@ void EnhancedAudioStrip::setGrainCenterTarget(double targetSamplePos, bool propo
     const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
     const double loopLength = juce::jmax(1.0, (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength);
 
-    const double currentCenter = grainCenterSmoother.getCurrentValue();
+    const double playbackFallback = juce::jlimit(0.0,
+                                                 juce::jmax(0.0, sampleLength - 1.0),
+                                                 playbackPosition.load(std::memory_order_acquire));
+    const double currentCenterRaw = grainCenterSmoother.getCurrentValue();
+    const double currentCenter = std::isfinite(currentCenterRaw) ? currentCenterRaw : playbackFallback;
+    const double targetCenter = std::isfinite(targetSamplePos) ? targetSamplePos : currentCenter;
     const double wrappedCurrent = getWrappedSamplePosition(currentCenter, loopStartSamples, loopLength);
-    const double wrappedTarget = getWrappedSamplePosition(targetSamplePos, loopStartSamples, loopLength);
+    const double wrappedTarget = getWrappedSamplePosition(targetCenter, loopStartSamples, loopLength);
 
     double delta = wrappedTarget - wrappedCurrent;
     if (delta > (loopLength * 0.5))
@@ -2403,11 +2431,17 @@ void EnhancedAudioStrip::updateGrainAnchorFromHeld()
         return;
     }
 
-    int newestIdx = 0;
+    // In 3-finger grain grips, the third held button should modulate grip/size
+    // without stealing the two-button scratch anchor pair.
+    const bool hasDedicatedSizeControl = (grainGesture.heldCount >= 3 && grainGesture.sizeControlX >= 0);
+    int newestIdx = -1;
     int secondNewestIdx = -1;
-    for (int i = 1; i < grainGesture.heldCount; ++i)
+    for (int i = 0; i < grainGesture.heldCount; ++i)
     {
-        if (grainGesture.heldOrder[i] > grainGesture.heldOrder[newestIdx])
+        if (hasDedicatedSizeControl && grainGesture.heldX[i] == grainGesture.sizeControlX)
+            continue;
+
+        if (newestIdx < 0 || grainGesture.heldOrder[i] > grainGesture.heldOrder[newestIdx])
         {
             secondNewestIdx = newestIdx;
             newestIdx = i;
@@ -2416,6 +2450,12 @@ void EnhancedAudioStrip::updateGrainAnchorFromHeld()
         {
             secondNewestIdx = i;
         }
+    }
+
+    if (newestIdx < 0)
+    {
+        newestIdx = 0;
+        secondNewestIdx = (grainGesture.heldCount > 1) ? 1 : -1;
     }
 
     grainGesture.anchorX = grainGesture.heldX[newestIdx];
@@ -2512,11 +2552,13 @@ void EnhancedAudioStrip::updateGrainGestureOnPress(int column, int64_t globalSam
     const float grainScratch = scratchAmount.load(std::memory_order_acquire);
     grainGesture.centerRampMs = static_cast<float>(grainScratchSecondsFromAmount(grainScratch) * 1000.0);
 
+    const bool threeButtonGrip = (grainGesture.heldCount == 3);
+    grainGesture.sizeControlX = threeButtonGrip ? column : -1;
     updateGrainAnchorFromHeld();
     grainGesture.freeze = true;
     grainGesture.returningToTimeline = false;
 
-    if (grainGesture.heldCount == 3)
+    if (threeButtonGrip)
     {
         if (!grainParamsSnapshotValid)
         {
@@ -2524,12 +2566,10 @@ void EnhancedAudioStrip::updateGrainGestureOnPress(int column, int64_t globalSam
             grainParamsSnapshotValid = true;
             grainThreeButtonSnapshotActive = true;
         }
-        grainGesture.sizeControlX = column;
         updateGrainSizeFromGrip();
     }
     else
     {
-        grainGesture.sizeControlX = -1;
         int loopCols = loopEnd - loopStart;
         if (loopCols <= 0)
             loopCols = ModernAudioEngine::MaxColumns;
@@ -3753,7 +3793,18 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         windowSumR += std::abs(ampR);
         windowEnergy += 0.5f * ((ampL * ampL) + (ampR * ampR));
 
+        if (!std::isfinite(voice.readPos) || !std::isfinite(voice.step))
+        {
+            voice.active = false;
+            continue;
+        }
+
         const double sourceReadPos = mapGrainReadPosition(voice.readPos);
+        if (!std::isfinite(sourceReadPos))
+        {
+            voice.active = false;
+            continue;
+        }
         float l = grainResampler.getSample(*grainSourceBuffer, 0, sourceReadPos, 1.0);
         float r = (grainSourceBuffer->getNumChannels() > 1)
             ? grainResampler.getSample(*grainSourceBuffer, 1, sourceReadPos, 1.0)
@@ -3762,11 +3813,9 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
         outL += l * ampL;
         outR += r * ampR;
 
-        voice.readPos += voice.step;
-        if (voice.readPos >= sampleLength)
-            voice.readPos -= sampleLength;
-        else if (voice.readPos < 0.0)
-            voice.readPos += sampleLength;
+        voice.readPos = getWrappedSamplePosition(voice.readPos + voice.step,
+                                                 loopStartSamples,
+                                                 loopLengthSamplesLocal);
         ++voice.ageSamples;
     }
 
@@ -4805,8 +4854,15 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
 
         if ((patternActive && activePattern >= 0) || directionMode == DirectionMode::RandomSlice)
         {
-            const double sliceLength = loopLength / 16.0;
-            const double beatPos = (rawPositionInLoop / loopLength) * beatsForLoop;
+            if (!std::isfinite(rawPositionInLoop))
+                return 0.0;
+
+            const double loopLengthSafe = juce::jmax(1.0, loopLength);
+            const double beatsForLoopSafe = juce::jmax(0.25, beatsForLoop);
+            const double sliceLength = loopLengthSafe / 16.0;
+            const double beatPos = (rawPositionInLoop / loopLengthSafe) * beatsForLoopSafe;
+            if (!std::isfinite(beatPos))
+                return 0.0;
             const double qBase = juce::jmax(1.0 / 32.0, quantizeBeats);
             const std::array<double, 5> quantChoices {
                 qBase * 0.5,
@@ -4941,16 +4997,16 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                                          * ((randomSliceSpeedStart * u) + (0.5 * speedDelta * u * u));
 
             const double windowLength = sliceLength * juce::jmax(1, randomSliceWindowLengthSlices);
-            double windowPos = integratedBeats * (loopLength / beatsForLoop);
+            double windowPos = integratedBeats * (loopLengthSafe / beatsForLoopSafe);
             windowPos = std::fmod(windowPos, windowLength);
             if (windowPos < 0.0)
                 windowPos += windowLength;
 
             const double windowStart = static_cast<double>(randomSliceWindowStartSlice) * sliceLength;
             double outPos = windowStart + windowPos;
-            outPos = std::fmod(outPos, loopLength);
+            outPos = std::fmod(outPos, loopLengthSafe);
             if (outPos < 0.0)
-                outPos += loopLength;
+                outPos += loopLengthSafe;
             return outPos;
         }
 
@@ -6539,10 +6595,30 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 }
                 
             }
+            if (!std::isfinite(positionInLoop))
+            {
+                const double playbackFallbackRaw = playbackPosition.load(std::memory_order_acquire);
+                const double playbackFallback = std::isfinite(playbackFallbackRaw)
+                    ? playbackFallbackRaw
+                    : loopStartSamples;
+                positionInLoop = std::fmod(playbackFallback - loopStartSamples, loopLength);
+                if (!std::isfinite(positionInLoop))
+                    positionInLoop = 0.0;
+                if (positionInLoop < 0.0)
+                    positionInLoop += loopLength;
+            }
+
             const double timelineSamplePosition = loopStartSamples + positionInLoop;
             samplePosition = (playMode == PlayMode::Grain)
                 ? timelineSamplePosition
                 : (playbackSourceLoopStartSamples + (positionInLoop * playbackSourcePositionScale));
+            if (!std::isfinite(samplePosition))
+            {
+                samplePosition = (playMode == PlayMode::Grain)
+                    ? timelineSamplePosition
+                    : wrapPlaybackSourcePosition(playbackSourceLoopStartSamples
+                                                 + (positionInLoop * playbackSourcePositionScale));
+            }
 
             const bool hasLoopSegmentState = resolveLoopSegmentState(
                 positionInLoop, activeLoopSegmentIndex, activeLoopSegmentPhase);
@@ -6723,11 +6799,28 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
 
         if (playMode == PlayMode::Grain)
         {
-            grainCenterSmoother.setTargetValue(grainGesture.targetCenterSample);
+            const double playbackFallbackRaw = playbackPosition.load(std::memory_order_acquire);
+            const double playbackFallback = std::isfinite(playbackFallbackRaw)
+                ? playbackFallbackRaw
+                : loopStartSamples;
+            const double safeSamplePosition = std::isfinite(samplePosition)
+                ? samplePosition
+                : playbackFallback;
+            const double safeTargetCenter = std::isfinite(grainGesture.targetCenterSample)
+                ? grainGesture.targetCenterSample
+                : safeSamplePosition;
+            grainGesture.targetCenterSample = safeTargetCenter;
+            grainCenterSmoother.setTargetValue(safeTargetCenter);
             grainFreezeBlendSmoother.setTargetValue(grainGesture.freeze ? 1.0f : 0.0f);
             const float freezeBlend = grainFreezeBlendSmoother.getNextValue();
-            const double frozenCenter = grainCenterSmoother.getNextValue();
-            const double grainCenterRaw = samplePosition + ((frozenCenter - samplePosition) * static_cast<double>(freezeBlend));
+            double frozenCenter = grainCenterSmoother.getNextValue();
+            if (!std::isfinite(frozenCenter))
+            {
+                grainCenterSmoother.setCurrentAndTargetValue(safeSamplePosition);
+                frozenCenter = safeSamplePosition;
+            }
+            const double grainCenterRaw = safeSamplePosition
+                + ((frozenCenter - safeSamplePosition) * static_cast<double>(freezeBlend));
             const double grainCenter = getWrappedSamplePosition(grainCenterRaw, loopStartSamples, loopLength);
             grainGesture.centerSampleSmoothed = grainCenter;
             playbackPosition = grainCenter;
@@ -7062,13 +7155,6 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
     if (signalsmithPitchCacheActive)
         signalsmithPitchCacheActiveBaseSemitones = signalsmithPitchCacheBaseSemitones;
 
-    if (!playing.load(std::memory_order_acquire) && signalsmithRealtimeAlignmentDelaySamples > 0)
-    {
-        signalsmithRealtimeAlignmentTailSamplesRemaining = juce::jmax(
-            signalsmithRealtimeAlignmentTailSamplesRemaining,
-            signalsmithRealtimeAlignmentDelaySamples);
-    }
-
     publishDisplayedControlState();
 
     publishSignalsmithLoopDebugSnapshot(renderedSamples,
@@ -7340,6 +7426,25 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         resetSignalsmithRealtimeAlignmentState();
 
     resetPlayheadTraversalSpeedStateFromRequestedRatio();
+
+    const float scratchAmountNow = scratchAmount.load(std::memory_order_acquire);
+    const bool comboPatternTouch = (playMode == PlayMode::Loop)
+        && (scratchAmountNow > 0.0f)
+        && patternActive
+        && (patternHoldCountRequired >= 3)
+        && (heldButtons.size() >= static_cast<size_t>(patternHoldCountRequired))
+        && heldButtons.count(juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, column)) > 0
+        && (wasPlaying || buttonHeld || scrubActive || tapeStopActive || scratchGestureActive);
+    if (comboPatternTouch)
+    {
+        // Once a 3-button loop combo is active, additional combo presses should
+        // only reseed the combo pattern and must not hard-retrigger playback.
+        randomSliceLastBucket = -1;
+        randomSliceRepeatsRemaining = 0;
+        randomSliceNextTriggerBeat = -1.0;
+        stopAfterFade = false;
+        return;
+    }
     
     // Calculate loop length in samples
     int loopCols = loopEnd - loopStart;
@@ -7657,6 +7762,7 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
 void EnhancedAudioStrip::onButtonPress(int column, int64_t globalSample)
 {
     juce::ScopedLock lock(bufferLock);
+    column = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, column);
 
     if (playMode == PlayMode::Grain)
     {
@@ -7734,6 +7840,7 @@ void EnhancedAudioStrip::onButtonPress(int column, int64_t globalSample)
 void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
 {
     juce::ScopedLock lock(bufferLock);
+    column = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, column);
 
     if (playMode == PlayMode::Grain)
     {
@@ -7940,9 +8047,6 @@ void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
 
 void EnhancedAudioStrip::snapToTimeline(int64_t currentGlobalSample)
 {
-    // Calculate where the strip SHOULD be based on original trigger point
-    int64_t samplesElapsedSinceTrigger = currentGlobalSample - triggerSample;
-    
     // Calculate loop parameters
     double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
     int loopCols = loopEnd - loopStart;
@@ -7950,23 +8054,86 @@ void EnhancedAudioStrip::snapToTimeline(int64_t currentGlobalSample)
         loopCols = ModernAudioEngine::MaxColumns;
     double loopLength = (static_cast<double>(loopCols)
                          / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
+    loopLength = juce::jmax(1.0, loopLength);
     loopLengthSamples = loopLength;
-    double triggerOffset = juce::jlimit(0.0, 0.999999, triggerOffsetRatio) * loopLength;
-    
-    // Calculate expected position based on time elapsed
-    double currentSpeedValue = smoothedSpeed.getNextValue();
-    double expectedAdvance = samplesElapsedSinceTrigger * currentSpeedValue;
-    double expectedPosInLoop = std::fmod(triggerOffset + expectedAdvance, loopLength);
-    
-    // Handle wrapping
-    if (expectedPosInLoop < 0) expectedPosInLoop += loopLength;
-    
+
+    const float manualBeats = beatsPerLoop.load(std::memory_order_acquire);
+    const double beatsForLoop = juce::jmax(0.25, (manualBeats >= 0.0f) ? static_cast<double>(manualBeats) : 4.0);
+    const bool restorePpqAnchor = scratchSavedPpqTimelineAnchored || ppqTimelineAnchored;
+    const double restorePpqOffsetRaw = scratchSavedPpqTimelineAnchored
+        ? scratchSavedPpqTimelineOffsetBeats
+        : ppqTimelineOffsetBeats;
+    const double restorePpqOffset = std::isfinite(restorePpqOffsetRaw) ? restorePpqOffsetRaw : 0.0;
+
+    double estimatedHostPpq = std::numeric_limits<double>::quiet_NaN();
+    if (lastObservedPpqValid && lastObservedTempo > 0.0 && currentSampleRate > 0.0)
+    {
+        const double samplesPerBeat = (60.0 / lastObservedTempo) * currentSampleRate;
+        estimatedHostPpq = lastObservedPPQ
+            + (static_cast<double>(currentGlobalSample - lastObservedGlobalSample) / samplesPerBeat);
+    }
+
+    double expectedPosInLoop = std::numeric_limits<double>::quiet_NaN();
+    if (restorePpqAnchor && std::isfinite(estimatedHostPpq))
+    {
+        double beatInLoop = std::fmod(estimatedHostPpq + restorePpqOffset, beatsForLoop);
+        if (beatInLoop < 0.0)
+            beatInLoop += beatsForLoop;
+        expectedPosInLoop = (beatInLoop / beatsForLoop) * loopLength;
+    }
+    else
+    {
+        const int64_t samplesElapsedSinceTrigger = currentGlobalSample - triggerSample;
+        const double triggerOffset = juce::jlimit(0.0, 0.999999, triggerOffsetRatio) * loopLength;
+        double currentSpeedValue = smoothedSpeed.getNextValue();
+        if (!std::isfinite(currentSpeedValue))
+            currentSpeedValue = static_cast<double>(playbackSpeed.load(std::memory_order_acquire));
+        expectedPosInLoop = std::fmod(triggerOffset + (samplesElapsedSinceTrigger * currentSpeedValue), loopLength);
+    }
+
+    if (!std::isfinite(expectedPosInLoop))
+    {
+        const double playbackFallbackRaw = playbackPosition.load(std::memory_order_acquire);
+        const double playbackFallback = std::isfinite(playbackFallbackRaw) ? playbackFallbackRaw : loopStartSamples;
+        expectedPosInLoop = std::fmod(playbackFallback - loopStartSamples, loopLength);
+    }
+
+    if (!std::isfinite(expectedPosInLoop))
+        expectedPosInLoop = 0.0;
+    if (expectedPosInLoop < 0.0)
+        expectedPosInLoop += loopLength;
+
     double expectedPosition = loopStartSamples + expectedPosInLoop;
-    
-    // SNAP back to expected timeline position
+    if (!std::isfinite(expectedPosition))
+        expectedPosition = loopStartSamples;
+
+    // SNAP back to a valid timeline position and refresh trigger anchors so
+    // combo-pattern releases cannot strand playback in a stale silent state.
     playbackPosition = expectedPosition;
-    
+    heldPosition = expectedPosition;
+    targetPosition = expectedPosition;
+    targetSampleTime = currentGlobalSample;
+    scratchStartPosition = expectedPosition;
+    scratchStartTime = currentGlobalSample;
+    scratchDuration = 0;
+
+    ppqTimelineAnchored = restorePpqAnchor;
+    ppqTimelineOffsetBeats = restorePpqOffset;
+    triggerSample = currentGlobalSample;
+    triggerOffsetRatio = juce::jlimit(0.0, 0.999999, expectedPosInLoop / loopLength);
+    if (ppqTimelineAnchored && std::isfinite(estimatedHostPpq))
+    {
+        triggerPpqPosition = estimatedHostPpq;
+        lastTriggerPPQ = estimatedHostPpq;
+    }
+    else
+    {
+        triggerPpqPosition = -1.0;
+    }
+
     // Exit scratch mode - return to normal playback
+    stopAfterFade = false;
+    playing = (sampleLength > 0.0);
     scrubActive = false;
     tapeStopActive = false;
     scratchGestureActive = false;
@@ -7974,9 +8141,11 @@ void EnhancedAudioStrip::snapToTimeline(int64_t currentGlobalSample)
     reverseScratchPpqRetarget = false;
     reverseScratchUseRateBlend = false;
     scratchTravelDistance = 0.0;
+    resetScratchComboState();
     const float restoreSpeed = static_cast<float>(playbackSpeed.load(std::memory_order_acquire));
     smoothedSpeed.setCurrentAndTargetValue(restoreSpeed);
     rateSmoother.setCurrentAndTargetValue(1.0);
+    crossfader.startFade(true, 32);
     
     DBG("Snapped to timeline position (expected: " << expectedPosInLoop << " samples into loop)");
 }
@@ -8028,9 +8197,14 @@ void EnhancedAudioStrip::reverseScratchToTimeline(int64_t currentGlobalSample)
 
     bool usedPpqPrediction = false;
     double futureTimelinePosition = predictFutureTimeline(reverseDuration, usedPpqPrediction);
-    const double currentPos = playbackPosition.load();
+    const double currentPosRaw = playbackPosition.load(std::memory_order_acquire);
+    const double currentPos = std::isfinite(currentPosRaw) ? currentPosRaw : loopStartSamples;
+    if (!std::isfinite(futureTimelinePosition))
+        futureTimelinePosition = currentPos;
     // Always use shortest wrapped path to the release target.
     double distance = computeScratchTravelDistance(currentPos, futureTimelinePosition);
+    if (!std::isfinite(distance))
+        distance = 0.0;
 
     const int64_t reverseTargetTime = currentGlobalSample + reverseDuration;
     const float displaySpeedNow = displaySpeedAtomic.load(std::memory_order_acquire);
@@ -8042,7 +8216,10 @@ void EnhancedAudioStrip::reverseScratchToTimeline(int64_t currentGlobalSample)
 
     targetPosition = futureTimelinePosition;
     targetSampleTime = reverseTargetTime;
+    stopAfterFade = false;
+    playing = (sampleLength > 0.0);
     scrubActive = true;
+    scratchGestureActive = true;
     isReverseScratch = true;
     reverseScratchPpqRetarget = false;
     reverseScratchUseRateBlend = true;
@@ -8067,6 +8244,9 @@ void EnhancedAudioStrip::reverseScratchToTimeline(int64_t currentGlobalSample)
 
 double EnhancedAudioStrip::computeScratchTravelDistance(double startPosSamples, double endPosSamples) const
 {
+    if (!std::isfinite(startPosSamples) || !std::isfinite(endPosSamples))
+        return 0.0;
+
     // One-shot is non-wrapping; use direct distance.
     if (playMode == PlayMode::OneShot)
         return endPosSamples - startPosSamples;
@@ -8077,12 +8257,14 @@ double EnhancedAudioStrip::computeScratchTravelDistance(double startPosSamples, 
 
     const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
     const double loopLength = (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
-    if (loopLength <= 0.0)
+    if (!std::isfinite(loopStartSamples) || !std::isfinite(loopLength) || loopLength <= 0.0)
         return endPosSamples - startPosSamples;
 
     auto wrapToLoop = [loopLength](double value) -> double
     {
         double wrapped = std::fmod(value, loopLength);
+        if (!std::isfinite(wrapped))
+            return 0.0;
         if (wrapped < 0.0)
             wrapped += loopLength;
         return wrapped;

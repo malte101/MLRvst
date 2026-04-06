@@ -531,6 +531,22 @@ bool sceneStripSupportsScenePlayback(const MlrVSTAudioProcessor& processor, int 
     return processor.isStripScenePlaybackAvailable(stripIndex);
 }
 
+juce::String sceneStripPlaybackUnavailableReason(const MlrVSTAudioProcessor& processor, int stripIndex)
+{
+    auto* engine = processor.getAudioEngine();
+    if (engine == nullptr)
+        return "Scene playback unavailable";
+
+    auto* strip = engine->getStrip(juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex));
+    if (strip == nullptr)
+        return "Scene playback unavailable";
+
+    if (strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
+        return "Load Flip audio to use scene playback";
+
+    return "Scene playback unavailable";
+}
+
 bool sceneAutomationLaneVisible(const MlrVSTAudioProcessor& processor, int stripIndex, int laneIndex)
 {
     const auto& lane = sceneAutomationLaneDefinition(laneIndex);
@@ -10140,7 +10156,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                        ? (juce::String(triggerCount) + " trig  •  "
                           + juce::String(controlCount) + " ctrl  •  " + sceneLengthLabel
                           + (layout.compactOverview ? "  •  click edit" : ""))
-                       : "Sample mode not available in scene playback",
+                       : sceneStripPlaybackUnavailableReason(processor, visibleStrip),
                    summaryBounds.toNearestInt(),
                    juce::Justification::centredRight);
 
@@ -10812,7 +10828,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
             g.drawRoundedRectangle(layout.triggerTimelineBounds.reduced(0.8f), 4.0f, 1.0f);
             g.setColour(kTextPrimary.withAlpha(0.92f));
             g.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
-            g.drawText("Sample mode not available in scene playback",
+            g.drawText(sceneStripPlaybackUnavailableReason(processor, visibleStrip),
                        layout.triggerTimelineBounds.toNearestInt().reduced(12, 10),
                        juce::Justification::centred,
                        true);
@@ -10831,7 +10847,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
             g.setFont(juce::Font(juce::FontOptions(9.0f)));
             g.drawText(stripHasEvents
                            ? "Existing scene events on this strip are ignored in scene mode"
-                           : "Switch the strip out of sample mode to use scene playback",
+                           : sceneStripPlaybackUnavailableReason(processor, visibleStrip),
                        layout.automationHeaderBounds.toNearestInt(),
                        juce::Justification::centredRight);
         }

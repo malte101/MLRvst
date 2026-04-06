@@ -63,6 +63,12 @@ int sceneLengthCountFromButton(int x)
     return kSceneLengthButtonValues[static_cast<size_t>(x - kSceneLengthFirstColumn)];
 }
 
+int scratchSceneColumnFromAmount(float amount) noexcept
+{
+    const float clamped = juce::jlimit(0.0f, 100.0f, amount);
+    return juce::jlimit(0, 15, static_cast<int>(std::lround((clamped / 100.0f) * 15.0f)));
+}
+
 float quantizeMonomeRearrangeValue(float value01)
 {
     return juce::jlimit(0.0f, 1.0f,
@@ -677,6 +683,12 @@ void MlrVSTAudioProcessor::setMomentaryScratchHold(bool shouldEnable)
 
             // Original momentary scratch profile.
             strip->setScratchAmount(15.0f);
+            notifyDirectSceneControlChange(i,
+                                           ScenePerformanceControlTarget::Scratch,
+                                           ControlMode::Normal,
+                                           1,
+                                           15.0f,
+                                           scratchSceneColumnFromAmount(15.0f));
 
             if (momentaryScratchWasStepMode[idx])
                 strip->setDirectionMode(EnhancedAudioStrip::DirectionMode::Random);
@@ -685,6 +697,12 @@ void MlrVSTAudioProcessor::setMomentaryScratchHold(bool shouldEnable)
         {
             const int64_t nowSample = audioEngine->getGlobalSampleCount();
             strip->setScratchAmount(momentaryScratchSavedAmount[idx]);
+            notifyDirectSceneControlChange(i,
+                                           ScenePerformanceControlTarget::Scratch,
+                                           ControlMode::Normal,
+                                           1,
+                                           momentaryScratchSavedAmount[idx],
+                                           scratchSceneColumnFromAmount(momentaryScratchSavedAmount[idx]));
 
             if (momentaryScratchWasStepMode[idx])
                 strip->setDirectionMode(momentaryScratchSavedDirection[idx]);
@@ -2112,32 +2130,13 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                         end = juce::jlimit(start + 1, MaxColumns, end);
                     }
 
-                    const int appliedLength = juce::jmax(1, end - start);
-                    const double desiredScaledLength = static_cast<double>(originalLength)
-                        * static_cast<double>(loopLengthFactor);
-                    float beatsPerLoopOverride = std::numeric_limits<float>::quiet_NaN();
-                    if (strip->hasInnerLoopTempoOverride()
-                        || std::abs(desiredScaledLength - static_cast<double>(appliedLength)) > 1.0e-6)
-                    {
-                        float baseBeatsPerLoop = strip->getInnerLoopBaseBeatsPerLoop();
-                        if (!(baseBeatsPerLoop > 0.0f))
-                            baseBeatsPerLoop = 4.0f;
-
-                        beatsPerLoopOverride = juce::jmax(
-                            0.25f,
-                            static_cast<float>(
-                                static_cast<double>(baseBeatsPerLoop)
-                                * desiredScaledLength
-                                / static_cast<double>(appliedLength)));
-                    }
-
                     queueLoopChange(stripIndex,
                                     false,
                                     start,
                                     end,
                                     shouldReverse,
                                     -1,
-                                    beatsPerLoopOverride);
+                                    std::numeric_limits<float>::quiet_NaN());
                     
                     DBG("Inner loop set: " << start << "-" << end << 
                         (shouldReverse ? " (REVERSE)" : " (NORMAL)"));
@@ -2235,7 +2234,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                                                              {
                                                                  setStripFilterFrequencyControlValue(stripIndex,
                                                                                                 frequency,
-                                                                                                writeMode);
+                                                                                                writeMode,
+                                                                                                true);
                                                              });
                             }
                             else if (filterSubPage == FilterSubPage::Resonance)
@@ -2506,10 +2506,30 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 auto* strip = audioEngine->getStrip(stripIndex);
                 if (strip)
                 {
+                    const bool scratchGestureRelease = strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample
+                        && strip->getScratchAmount() > kScratchZeroEpsilon
+                        && ((strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
+                            ? (strip->getGrainHeldCount() > 0)
+                            : strip->isButtonHeld(x));
+                    const bool releaseBeforeQuantizedTrigger = scratchGestureRelease
+                        && audioEngine->hasPendingTrigger(stripIndex);
+                    if (releaseBeforeQuantizedTrigger)
+                        downgradePendingSceneScratchTriggerRecord(stripIndex);
+
                     if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample)
                     {
                         int64_t globalSample = audioEngine->getGlobalSampleCount();
                         strip->onButtonRelease(x, globalSample);
+                        if (scratchGestureRelease && !releaseBeforeQuantizedTrigger)
+                        {
+                            recordSceneTriggerEvent(stripIndex,
+                                                    x,
+                                                    audioEngine->getTimelineBeat(),
+                                                    -1,
+                                                    -1,
+                                                    false,
+                                                    true);
+                        }
                     }
                     else
                     {
@@ -3441,7 +3461,8 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         // Skip empty strips ONLY in Normal mode (not in control modes)
         // In control modes, we always want to show the control LEDs even on empty strips
         bool hasContent = strip->hasAudio();
-        if (strip->playMode == EnhancedAudioStrip::PlayMode::Step)
+        const auto playMode = strip->getPlayMode();
+        if (playMode == EnhancedAudioStrip::PlayMode::Step)
         {
             // In step mode, check if stepSampler has audio
             hasContent = strip->stepSampler.getHasAudio();
@@ -3647,7 +3668,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         else // Normal - playhead or step sequencer
         {
             // Check if this strip is in step mode
-            if (strip->playMode == EnhancedAudioStrip::PlayMode::Step)
+            if (playMode == EnhancedAudioStrip::PlayMode::Step)
             {
                 // STEP SEQUENCER MODE - show step pattern
                 const auto visiblePattern = strip->getVisibleStepPattern();
@@ -3679,7 +3700,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                     }
                 }
             }
-            else if (strip->playMode == EnhancedAudioStrip::PlayMode::Sample)
+            else if (playMode == EnhancedAudioStrip::PlayMode::Sample)
             {
                 for (int x = 0; x < 16; ++x)
                     newLedState[x][y] = 0;
@@ -3751,7 +3772,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                     }
                 }
             }
-            else if (strip->playMode == EnhancedAudioStrip::PlayMode::Grain)
+            else if (playMode == EnhancedAudioStrip::PlayMode::Grain)
             {
                 const int anchor = strip->getGrainAnchorColumn();
                 const int secondary = strip->getGrainSecondaryColumn();

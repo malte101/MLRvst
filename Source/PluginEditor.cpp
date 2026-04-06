@@ -2069,31 +2069,31 @@ void StripControl::setupComponents()
         if (!processor.getAudioEngine()) return;
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
         {
-            int modeId = playModeBox.getSelectedId() - 1;
-            const auto playMode = static_cast<EnhancedAudioStrip::PlayMode>(modeId);
-            strip->setPlayMode(playMode);
-            
-            // Switch between waveform and step display
-            const bool isStepMode = (playMode == EnhancedAudioStrip::PlayMode::Step);
-            const bool isSampleMode = (playMode == EnhancedAudioStrip::PlayMode::Sample);
-            showingStepDisplay = isStepMode;
-            showingSampleMode = isSampleMode;
+            const int selectedId = playModeBox.getSelectedId();
+            if (selectedId <= 0)
+                return;
 
-            if (isSampleMode)
-                sampleModeComponent.setEngine(processor.getSampleModeEngine(stripIndex, true));
-            else
-                sampleModeComponent.setEngine(processor.getSampleModeEngine(stripIndex, false));
-            
-            waveform.setVisible(!isStepMode && !isSampleMode);
-            stepDisplay.setVisible(isStepMode);
-            sampleModeComponent.setVisible(isSampleMode);
-            patternLengthBox.setVisible(isStepMode);
-            updateGrainOverlayVisibility();
-            
-            // Don't manually start - let process() auto-start when DAW plays
-            // This respects the host transport state (paused or playing)
-            
-            resized();  // Re-layout components
+            const int modeId = selectedId - 1;
+            if (modeId < static_cast<int>(EnhancedAudioStrip::PlayMode::OneShot)
+                || modeId > static_cast<int>(EnhancedAudioStrip::PlayMode::Sample))
+            {
+                return;
+            }
+
+            strip->setPlayMode(static_cast<EnhancedAudioStrip::PlayMode>(modeId));
+            processor.handleUserStripPlayModeChange(stripIndex);
+
+            // Defer the heavier UI relayout until after the combo popup closes
+            // so the mode switch applies reliably on the first selection.
+            auto safeThis = juce::Component::SafePointer<StripControl>(this);
+            juce::MessageManager::callAsync([safeThis]()
+            {
+                if (safeThis == nullptr)
+                    return;
+
+                safeThis->refreshModeDependentUiState(true);
+                safeThis->updateFromEngine();
+            });
             
             DBG("Strip " << stripIndex << " mode changed to " << modeId);
         }
@@ -2215,6 +2215,7 @@ void StripControl::setupComponents()
                 processor.setStripSpeedControlValue(stripIndex,
                                                     static_cast<float>(speedSlider.getValue()),
                                                     MlrVSTAudioProcessor::StripControlWriteMode::CacheOnly);
+                processor.requestMonomeLedRefreshAsync();
             }
             else
             {
@@ -2227,6 +2228,7 @@ void StripControl::setupComponents()
                 processor.setStripSpeedControlValue(stripIndex,
                                                     quantizedRatio,
                                                     MlrVSTAudioProcessor::StripControlWriteMode::CacheOnly);
+                processor.requestMonomeLedRefreshAsync();
             }
         }
     };
@@ -2623,11 +2625,28 @@ void StripControl::setupComponents()
     patternLengthBox.setTooltip("Step pattern length");
     patternLengthBox.onChange = [this]()
     {
-        const int bars = juce::jmax(1, patternLengthBox.getSelectedId());
+        const int selectedId = patternLengthBox.getSelectedId();
+        if (selectedId <= 0)
+            return;
+
+        const int bars = juce::jmax(1, selectedId);
         const int steps = juce::jlimit(1, 64, bars * 16);
         if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
             strip->setStepPatternBars(bars);
         stepLengthReadoutBox.setValue(steps, juce::dontSendNotification);
+
+        if (processor.isSceneModeEnabled())
+            processor.queueActiveSceneAutosave();
+        processor.requestMonomeLedRefreshAsync();
+
+        auto safeThis = juce::Component::SafePointer<StripControl>(this);
+        juce::MessageManager::callAsync([safeThis]()
+        {
+            if (safeThis == nullptr)
+                return;
+
+            safeThis->updateFromEngine();
+        });
     };
     addAndMakeVisible(patternLengthBox);
 
@@ -2654,6 +2673,19 @@ void StripControl::setupComponents()
             patternLengthBox.setSelectedId(0, juce::dontSendNotification);
             patternLengthBox.setText(juce::String(clampedSteps), juce::dontSendNotification);
         }
+
+        if (processor.isSceneModeEnabled())
+            processor.queueActiveSceneAutosave();
+        processor.requestMonomeLedRefreshAsync();
+
+        auto safeThis = juce::Component::SafePointer<StripControl>(this);
+        juce::MessageManager::callAsync([safeThis]()
+        {
+            if (safeThis == nullptr)
+                return;
+
+            safeThis->updateFromEngine();
+        });
     };
     addAndMakeVisible(stepLengthReadoutBox);
 
@@ -3132,6 +3164,16 @@ void StripControl::updateGrainOverlayVisibility()
     grainEnvelopeLabel.setVisible(showShapePage);
     grainShapeLabel.setVisible(showShapePage);
     updateGrainTabButtons();
+}
+
+void StripControl::refreshModeDependentUiState(bool relayout)
+{
+    updateGrainOverlayVisibility();
+
+    if (relayout)
+        resized();
+
+    repaint();
 }
 
 void StripControl::updateGrainTabButtons()
@@ -4731,19 +4773,7 @@ void StripControl::updateFromEngine()
         || showingSampleMode != isSampleMode
         || grainOverlayVisible != isGrainMode)
     {
-        showingStepDisplay = isStepMode;
-        showingSampleMode = isSampleMode;
-        if (isSampleMode)
-            sampleModeComponent.setEngine(processor.getSampleModeEngine(stripIndex, true));
-        else
-            sampleModeComponent.setEngine(processor.getSampleModeEngine(stripIndex, false));
-        waveform.setVisible(!isStepMode && !isSampleMode);
-        stepDisplay.setVisible(isStepMode);
-        sampleModeComponent.setVisible(isSampleMode);
-        patternLengthBox.setVisible(isStepMode);
-        stepLengthReadoutBox.setVisible(isStepMode);
-        updateGrainOverlayVisibility();
-        resized();
+        refreshModeDependentUiState(true);
     }
     
     // Update step display if in step mode
@@ -6161,11 +6191,12 @@ void MonomeGridDisplay::updateFromEngine()
         auto* strip = processor.getAudioEngine()->getStrip(stripIndex);
         if (strip)
         {
+            const auto playMode = strip->getPlayMode();
             // Check if this strip is in Step mode AND control mode is not active
             // When control mode is active (level, pan, sample select, etc.), hide step display
             bool controlModeActive = (processor.getCurrentControlMode() != MlrVSTAudioProcessor::ControlMode::Normal);
             
-            if (strip->playMode == EnhancedAudioStrip::PlayMode::Step && !controlModeActive)
+            if (playMode == EnhancedAudioStrip::PlayMode::Step && !controlModeActive)
             {
                 DBG("Strip " << stripIndex << " in Step mode - updating row " << monomeRow);
                 
@@ -6208,7 +6239,7 @@ void MonomeGridDisplay::updateFromEngine()
                     << ledState[2][monomeRow] << " " 
                     << ledState[3][monomeRow]);
             }
-            else if (strip->playMode == EnhancedAudioStrip::PlayMode::Sample && !controlModeActive)
+            else if (playMode == EnhancedAudioStrip::PlayMode::Sample && !controlModeActive)
             {
                 if (auto* sampleEngine = processor.getSampleModeEngine(stripIndex, false))
                 {
@@ -6260,7 +6291,7 @@ void MonomeGridDisplay::updateFromEngine()
                         ledState[x][monomeRow] = 0;
                 }
             }
-            else if (strip->playMode != EnhancedAudioStrip::PlayMode::Step && !controlModeActive)
+            else if (playMode != EnhancedAudioStrip::PlayMode::Step && !controlModeActive)
             {
                 // Normal playback mode (Loop/OneShot) - show LED states from strip
                 // When control mode is active, PluginProcessor handles ALL LED display
@@ -6281,7 +6312,7 @@ void MonomeGridDisplay::updateFromEngine()
         if (engine)
         {
             auto* strip0 = engine->getStrip(0);
-            bool strip0IsStep = (strip0 && strip0->playMode == EnhancedAudioStrip::PlayMode::Step);
+            bool strip0IsStep = (strip0 && strip0->getPlayMode() == EnhancedAudioStrip::PlayMode::Step);
             
             // Only show pattern recorder if strip 0 is not in step mode
             if (!strip0IsStep)

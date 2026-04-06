@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 
 # Set C and C++ compilers (JUCE needs both)
-project(mlrVST VERSION 2.0.1 LANGUAGES C CXX)
+project(mlrVST VERSION 2.0.2 LANGUAGES C CXX)
 
 # C++ Standard
 set(CMAKE_CXX_STANDARD 17)

@@ -373,11 +373,49 @@ void EnhancedAudioStrip::processFilterSample(float& left, float& right, float fr
     right = safetyClip0dB(right);
 }
 
+constexpr double kDefaultFilterFrequencyRampSeconds = 0.04;
+constexpr double kMonomeFilterFrequencyRampSeconds = 0.012;
+
 void EnhancedAudioStrip::setFilterFrequency(float freq)
 {
     const float clamped = juce::jlimit(20.0f, 20000.0f, freq);
+    const float currentSmoothed = smoothedFilterFrequency.getCurrentValue();
     filterFrequency.store(clamped, std::memory_order_release);
-    smoothedFilterFrequency.setTargetValue(clamped);
+
+    if (currentSampleRate > 0.0)
+    {
+        smoothedFilterFrequency.reset(currentSampleRate, kDefaultFilterFrequencyRampSeconds);
+        smoothedFilterFrequency.setCurrentAndTargetValue(currentSmoothed);
+        smoothedFilterFrequency.setTargetValue(clamped);
+    }
+    else
+    {
+        smoothedFilterFrequency.setCurrentAndTargetValue(clamped);
+        displayedFilterFrequency.store(clamped, std::memory_order_release);
+    }
+
+    if (!isFilterEnabled())
+        setFilterEnabled(true);
+}
+
+void EnhancedAudioStrip::setFilterFrequencyMonomeFast(float freq)
+{
+    const float clamped = juce::jlimit(20.0f, 20000.0f, freq);
+    const float currentSmoothed = smoothedFilterFrequency.getCurrentValue();
+    filterFrequency.store(clamped, std::memory_order_release);
+
+    if (currentSampleRate > 0.0)
+    {
+        smoothedFilterFrequency.reset(currentSampleRate, kMonomeFilterFrequencyRampSeconds);
+        smoothedFilterFrequency.setCurrentAndTargetValue(currentSmoothed);
+        smoothedFilterFrequency.setTargetValue(clamped);
+    }
+    else
+    {
+        smoothedFilterFrequency.setCurrentAndTargetValue(clamped);
+        displayedFilterFrequency.store(clamped, std::memory_order_release);
+    }
+
     if (!isFilterEnabled())
         setFilterEnabled(true);
 }

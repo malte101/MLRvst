@@ -94,7 +94,7 @@ void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][16], 
         // Filter frequency visualization (log scale: 20Hz - 20kHz)
         float freq = isStepMode && stepSampler
                    ? stepSampler->getFilterFrequency()
-                   : strip.getDisplayedFilterFrequency();
+                   : strip.getFilterFrequency();
 
         float t = std::log(freq / 20.0f) / std::log(1000.0f);
         t = juce::jlimit(0.0f, 1.0f, t);
