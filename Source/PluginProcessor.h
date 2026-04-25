@@ -18,12 +18,14 @@
 #include <limits>
 #include "PerformanceTargets.h"
 #include "AudioEngine.h"
+#include "GestureCoordinator.h"
 #include "SampleMode.h"
 #include "ScenePerformanceRecorder.h"
 #include "StripControlState.h"
 
 class MacroTargetDispatcher;
 class SceneScheduler;
+class GlobalSettingsStore;
 
 //==============================================================================
 /**
@@ -217,6 +219,10 @@ public:
     void queuePersistentGlobalControlsSave();
     void queueActiveSceneAutosave();
     void queueActiveSceneAutosave(uint32_t additionalDelayMs);
+    GestureCoordinator& getGestureCoordinator() noexcept { return *gestureCoordinator; }
+    const GestureCoordinator& getGestureCoordinator() const noexcept { return *gestureCoordinator; }
+    bool getLiveMonomeGestureComboSelection(GestureComboKind& kind, int& buttonCount, int& comboIndex) const;
+    void flushPersistentGlobalControlsNow();
 
     //==============================================================================
     void getStateInformation(juce::MemoryBlock& destData) override;
@@ -848,7 +854,7 @@ public:
     {
         ScenePlaybackOwner owner = ScenePlaybackOwner::Manual;
         ScenePlaybackOwner outgoingOwner = ScenePlaybackOwner::Manual;
-        SceneRecallMode recallMode = SceneRecallMode::QuantizeGrid;
+        SceneRecallMode recallMode = SceneRecallMode::Manual;
         bool sequenceDriven = false;
         bool surfaceQuantizedLaunch = false;
         bool useSceneDurationTiming = false;
@@ -1145,6 +1151,8 @@ public:
     void setSceneEditorStripAutomationExpanded(int stripIndex, bool expanded);
     void setSceneEditorStripHeightExpanded(int stripIndex, bool expanded);
     void setSceneEditorStripAutomationExpandedAll(bool expanded);
+    void requestSceneEditorStripFocus(int stripIndex, bool collapseOthers);
+    bool consumePendingSceneEditorStripFocus(int& stripIndex, bool& collapseOthers);
     bool stripUsesGrainSceneLanes(int stripIndex) const;
     std::vector<ModernAudioEngine::ModTarget> getVisibleModTargetsForStrip(int stripIndex) const;
     std::vector<ModernAudioEngine::ModTarget> getSceneVisibleModTargetsForStrip(int stripIndex) const;
@@ -1221,6 +1229,7 @@ private:
             Launch,
             SceneLaunch,
             PresetGrid,
+            Scene,
             StepEdit,
             Gate,
             Filter,
@@ -1706,6 +1715,7 @@ private:
         StopRecording
     };
     bool handleMonomeSceneRecorderButtonPress(uint32_t nowMs);
+    bool beginMonomeSceneGestureRecording();
     void processPendingMonomeSceneRecorderTapActions(uint32_t nowMs);
     void clearPendingMonomeSceneRecorderTap();
     void requestSceneRecorderActionQuantized(SceneRecorderAction action);
@@ -1720,6 +1730,48 @@ private:
     void stopScenePerformanceRecordingNow(bool updateLeds = true);
     void updateMonomeLEDs();
     void updateMonomeArcRings();
+    bool isSceneMainAutomationMonomePageActive() const;
+    ScenePerformanceControlTarget getActiveSceneMainAutomationTargetForMonome(int stripIndex) const;
+    bool isSceneAutomationTargetBipolarForMonome(ScenePerformanceControlTarget target) const;
+    int getSceneMainAutomationDisplayPageForMonome(int sceneSlot, double currentBeat) const;
+    bool getSceneMainAutomationPlaybackStepForMonome(int sceneSlot,
+                                                     int displayPage,
+                                                     double currentBeat,
+                                                     int& stepOut) const;
+    bool getSceneMainAutomationColumnValueForMonome(const std::vector<ScenePerformanceEvent>& events,
+                                                    int sceneSlot,
+                                                    int stripIndex,
+                                                    ScenePerformanceControlTarget target,
+                                                    int column,
+                                                    double currentBeat,
+                                                    double lengthBeats,
+                                                    float& normalizedOut) const;
+    bool writeSceneMainAutomationColumnFromMonome(int stripIndex,
+                                                  int column,
+                                                  float normalizedValue,
+                                                  double currentBeat);
+    bool handleMonomeControlPageStripPress(const MonomeLayoutState& layout,
+                                           EnhancedAudioStrip& strip,
+                                           int stripIndex,
+                                           int row,
+                                           int column,
+                                           bool scenePageActive);
+    bool renderMonomeControlPageStripRow(const MonomeLayoutState& layout,
+                                         EnhancedAudioStrip& strip,
+                                         int stripIndex,
+                                         int row,
+                                         int newLedState[MaxGridWidth][MaxGridHeight],
+                                         bool scenePageActive,
+                                         bool fastBlinkOn,
+                                         bool slowBlinkOn,
+                                         double beatNow);
+    void renderMonomePlaybackStripRow(EnhancedAudioStrip& strip,
+                                      int stripIndex,
+                                      int row,
+                                      int newLedState[MaxGridWidth][MaxGridHeight],
+                                      bool isGroupMuted,
+                                      bool fastBlinkOn,
+                                      bool slowBlinkOn);
     void renderSampleModeStrip(int stripIndex,
                                juce::AudioBuffer<float>& output,
                                int startSample,
@@ -1852,12 +1904,7 @@ private:
     void loadControlPagesFromState(const juce::ValueTree& state);
     void appendControlPagesToState(juce::ValueTree& state) const;
     void stripPersistentGlobalControlsFromState(juce::ValueTree& state) const;
-    void loadPersistentDefaultPaths();
-    void savePersistentDefaultPaths() const;
     void resetCurrentBrowserDirectoriesToDefaultPaths(bool persist);
-    void loadPersistentControlPages();
-    void savePersistentControlPages() const;
-    void loadPersistentGlobalControls();
     int getQuantizeDivision() const;
     float getInnerLoopLengthFactor() const;
     void queueLoopChange(int stripIndex,
@@ -2458,7 +2505,9 @@ public:
     {
         return sceneBoundaryTransitionFromStep.load(std::memory_order_acquire);
     }
-private:
+  private:
+    friend class GlobalSettingsStore;
+    std::unique_ptr<GestureCoordinator> gestureCoordinator;
 
     // Row 0, col 8: global momentary scratch modifier.
     bool momentaryScratchHoldActive = false;
@@ -2538,6 +2587,7 @@ private:
     MonomeSceneRecorderTapAction monomeSceneRecorderPendingAction = MonomeSceneRecorderTapAction::None;
     bool monomeSceneRecorderHeld = false;
     bool monomeSceneRecorderHoldClearTriggered = false;
+    bool monomeSceneRecorderGestureRecordConsumed = false;
     uint32_t monomeSceneRecorderPressStartMs = 0;
     uint32_t monomeSceneRecorderClearBurstUntilMs = 0;
     struct PendingSceneRecorderAction
@@ -2612,6 +2662,8 @@ private:
     std::array<ModernAudioEngine::ModTarget, MaxStrips> sceneMainAutomationDisplayTargets{};
     std::array<bool, MaxStrips> sceneEditorStripAutomationExpanded{};
     std::array<bool, MaxStrips> sceneEditorStripHeightExpanded{};
+    std::atomic<int> pendingSceneEditorFocusStrip{-1};
+    std::atomic<int> pendingSceneEditorFocusCollapseOthers{0};
     std::array<bool, SceneSlots> scenePadHeld{};
     std::array<bool, SceneSlots> scenePadHoldDeleteTriggered{};
     std::array<bool, SceneSlots> scenePadLaunchConsumed{};

@@ -813,10 +813,13 @@ private:
 /**
  * GlobalControlPanel - Master controls
  */
+class GlobalGestureEditorOverlay;
+
 class GlobalControlPanel : public juce::Component
 {
 public:
     GlobalControlPanel(MlrVSTAudioProcessor& p);
+    ~GlobalControlPanel() override;
     
     void paint(juce::Graphics& g) override;
     void resized() override;
@@ -876,6 +879,8 @@ private:
     juce::ComboBox transientSpacingBox;
     juce::Label transientSpacingLabel;
     juce::ToggleButton tooltipsToggle;
+    juce::TextButton gestureEditorButton;
+    std::unique_ptr<GlobalGestureEditorOverlay> gestureEditorOverlay;
     
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterVolumeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> limiterEnabledAttachment;
@@ -1762,6 +1767,9 @@ private:
     void updateSceneViewportFollow();
     void updateSceneTimelineContentSize();
     void updateSceneEditorState(double beat);
+    void applySceneStripFocusState(int stripIndex, bool collapseOthers);
+    juce::Rectangle<float> getSceneStripCardBounds(int stripIndex) const;
+    void ensureSceneStripVisible(int stripIndex);
     void applySceneTransitionSmartTuning(int stepIndex,
                                          MlrVSTAudioProcessor::SceneChainTransitionType type,
                                          MlrVSTAudioProcessor::SceneChainTransitionOption option,
@@ -1775,7 +1783,8 @@ private:
                                          MlrVSTAudioProcessor::SceneChainTransitionOption option,
                                          float intensity,
                                          float lengthBeats,
-                                         bool subtractFromSceneLength);
+                                         bool subtractFromSceneLength,
+                                         MlrVSTAudioProcessor::SceneChainTransitionContour contour);
     void rebuildSceneTransitionEndSampleChoices();
     int preferredLegacyModEditorSlotForLane(int stripIndex, int laneIndex) const;
     bool shouldShowSceneMotionTargetSelectors(int stripIndex) const;

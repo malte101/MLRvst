@@ -45,6 +45,21 @@ constexpr std::array<int, 7> kScaleMinor{{0, 2, 3, 5, 7, 8, 10}};
 constexpr std::array<int, 7> kScaleDorian{{0, 2, 3, 5, 7, 9, 10}};
 constexpr std::array<int, 5> kScalePentMinor{{0, 3, 5, 7, 10}};
 
+int gestureProfileStorageIndex(GestureProfileId profileId, int laneIndex, int stepIndex) noexcept
+{
+    const int profile = juce::jlimit(0, kGestureProfileCount - 1, static_cast<int>(profileId));
+    const int lane = juce::jlimit(0, kGestureProfileLaneCount - 1, laneIndex);
+    const int step = juce::jlimit(0, kGestureProfileSteps - 1, stepIndex);
+    return ((profile * kGestureProfileLaneCount) + lane) * kGestureProfileSteps + step;
+}
+
+float sanitizeGestureProfileValue(float value) noexcept
+{
+    if (!std::isfinite(value))
+        return 0.0f;
+    return juce::jlimit(-1.0f, 1.0f, value);
+}
+
 float pitchSmoothingSecondsForAlgorithm(EnhancedAudioStrip::PitchShiftAlgorithm algorithm) noexcept
 {
     switch (algorithm)
@@ -126,6 +141,17 @@ float computeStereoBufferRms(const juce::AudioBuffer<float>& buffer, int startSa
 
     return static_cast<float>(std::sqrt(sumSquares / static_cast<double>(numSamples * 2)));
 }
+
+float sanitizeOutputSample(float sample, float limit) noexcept
+{
+    if (!std::isfinite(sample))
+        return 0.0f;
+
+    return juce::jlimit(-limit, limit, sample);
+}
+
+constexpr float kRenderedOutputSafetyClamp = 8.0f;
+constexpr float kOutputContinuitySafetyClamp = 4.0f;
 
 double grainScratchSecondsFromAmount(float amountPercent)
 {
@@ -382,6 +408,370 @@ float sampleStepSubdivisionValue(float startValue,
     return juce::jlimit(0.0f, 1.0f, start + ((end - start) * t));
 }
 
+constexpr int kStutterGestureFirstColumn = 9;
+
+float sanitizeGestureComboValue(float value) noexcept
+{
+    if (!std::isfinite(value))
+        return 0.0f;
+    return juce::jlimit(-1.0f, 1.0f, value);
+}
+
+int gestureComboColumnSpan(GestureComboKind kind) noexcept
+{
+    return (kind == GestureComboKind::Stutter) ? 7 : 16;
+}
+
+int gestureComboLaneCountInternal(GestureComboKind kind) noexcept
+{
+    return (kind == GestureComboKind::Stutter) ? kStutterGestureComboLaneCount
+                                               : kScratchGestureComboLaneCount;
+}
+
+int combinationCount(int span, int count) noexcept
+{
+    if (count <= 0 || count > 3 || span <= 0)
+        return 0;
+
+    if (count == 1)
+        return span;
+    if (count == 2)
+        return (span * (span - 1)) / 2;
+    return (span * (span - 1) * (span - 2)) / 6;
+}
+
+int rankColumnsWithinSpan(int span, int count, const std::array<int, 3>& columns) noexcept
+{
+    if (count <= 0 || count > 3)
+        return -1;
+
+    int rank = 0;
+    if (count == 1)
+    {
+        for (int a = 0; a < span; ++a, ++rank)
+            if (a == columns[0])
+                return rank;
+        return -1;
+    }
+
+    if (count == 2)
+    {
+        for (int a = 0; a < span; ++a)
+        {
+            for (int b = a + 1; b < span; ++b, ++rank)
+            {
+                if (a == columns[0] && b == columns[1])
+                    return rank;
+            }
+        }
+        return -1;
+    }
+
+    for (int a = 0; a < span; ++a)
+    {
+        for (int b = a + 1; b < span; ++b)
+        {
+            for (int c = b + 1; c < span; ++c, ++rank)
+            {
+                if (a == columns[0] && b == columns[1] && c == columns[2])
+                    return rank;
+            }
+        }
+    }
+
+    return -1;
+}
+
+bool unrankColumnsWithinSpan(int span, int count, int rank, std::array<int, 3>& outColumns) noexcept
+{
+    if (count <= 0 || count > 3 || rank < 0)
+        return false;
+
+    int current = 0;
+    if (count == 1)
+    {
+        for (int a = 0; a < span; ++a, ++current)
+        {
+            if (current == rank)
+            {
+                outColumns = { a, -1, -1 };
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (count == 2)
+    {
+        for (int a = 0; a < span; ++a)
+        {
+            for (int b = a + 1; b < span; ++b, ++current)
+            {
+                if (current == rank)
+                {
+                    outColumns = { a, b, -1 };
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    for (int a = 0; a < span; ++a)
+    {
+        for (int b = a + 1; b < span; ++b)
+        {
+            for (int c = b + 1; c < span; ++c, ++current)
+            {
+                if (current == rank)
+                {
+                    outColumns = { a, b, c };
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+int gestureComboStorageIndex(GestureComboKind kind, int comboFlatIndex, int laneIndex, int stepIndex) noexcept
+{
+    const int combo = juce::jlimit(0, getGestureComboTotalCount(kind) - 1, comboFlatIndex);
+    const int lane = juce::jlimit(0, gestureComboLaneCountInternal(kind) - 1, laneIndex);
+    const int step = juce::jlimit(0, kGestureProfileSteps - 1, stepIndex);
+    return ((combo * gestureComboLaneCountInternal(kind)) + lane) * kGestureProfileSteps + step;
+}
+
+}
+
+int getGestureComboLaneCount(GestureComboKind kind) noexcept
+{
+    return gestureComboLaneCountInternal(kind);
+}
+
+int getGestureComboTotalCount(GestureComboKind kind) noexcept
+{
+    return (kind == GestureComboKind::Stutter) ? kStutterGestureComboCount
+                                               : kScratchGestureComboCount;
+}
+
+int getGestureComboCountForButtonCount(GestureComboKind kind, int buttonCount) noexcept
+{
+    return combinationCount(gestureComboColumnSpan(kind), juce::jlimit(1, 3, buttonCount));
+}
+
+int getGestureComboFlatOffsetForButtonCount(GestureComboKind kind, int buttonCount) noexcept
+{
+    const int safeCount = juce::jlimit(1, 3, buttonCount);
+    int offset = 0;
+    for (int count = 1; count < safeCount; ++count)
+        offset += getGestureComboCountForButtonCount(kind, count);
+    return offset;
+}
+
+bool getGestureComboColumns(GestureComboKind kind,
+                            int buttonCount,
+                            int comboIndex,
+                            std::array<int, 3>& outColumns) noexcept
+{
+    std::array<int, 3> normalized{ -1, -1, -1 };
+    if (!unrankColumnsWithinSpan(gestureComboColumnSpan(kind),
+                                 juce::jlimit(1, 3, buttonCount),
+                                 comboIndex,
+                                 normalized))
+        return false;
+
+    outColumns = normalized;
+    if (kind == GestureComboKind::Stutter)
+    {
+        for (int i = 0; i < juce::jlimit(1, 3, buttonCount); ++i)
+            outColumns[static_cast<size_t>(i)] += kStutterGestureFirstColumn;
+    }
+    return true;
+}
+
+bool getGestureComboColumnsFromFlatIndex(GestureComboKind kind,
+                                         int flatIndex,
+                                         int& outButtonCount,
+                                         std::array<int, 3>& outColumns) noexcept
+{
+    const int total = getGestureComboTotalCount(kind);
+    if (flatIndex < 0 || flatIndex >= total)
+        return false;
+
+    int remaining = flatIndex;
+    for (int count = 1; count <= 3; ++count)
+    {
+        const int countTotal = getGestureComboCountForButtonCount(kind, count);
+        if (remaining < countTotal)
+        {
+            outButtonCount = count;
+            return getGestureComboColumns(kind, count, remaining, outColumns);
+        }
+        remaining -= countTotal;
+    }
+
+    return false;
+}
+
+int getGestureComboFlatIndexFromColumns(GestureComboKind kind,
+                                        int buttonCount,
+                                        const std::array<int, 3>& columns) noexcept
+{
+    const int safeCount = juce::jlimit(1, 3, buttonCount);
+    std::array<int, 3> normalized{ -1, -1, -1 };
+    for (int i = 0; i < safeCount; ++i)
+    {
+        const int column = columns[static_cast<size_t>(i)];
+        normalized[static_cast<size_t>(i)] = (kind == GestureComboKind::Stutter)
+            ? (column - kStutterGestureFirstColumn)
+            : column;
+    }
+    std::sort(normalized.begin(), normalized.begin() + safeCount);
+
+    const int span = gestureComboColumnSpan(kind);
+    for (int i = 0; i < safeCount; ++i)
+    {
+        if (normalized[static_cast<size_t>(i)] < 0 || normalized[static_cast<size_t>(i)] >= span)
+            return -1;
+        if (i > 0 && normalized[static_cast<size_t>(i)] == normalized[static_cast<size_t>(i - 1)])
+            return -1;
+    }
+
+    const int rank = rankColumnsWithinSpan(span, safeCount, normalized);
+    if (rank < 0)
+        return -1;
+    return getGestureComboFlatOffsetForButtonCount(kind, safeCount) + rank;
+}
+
+int getStutterGestureComboFlatIndexFromMask(uint8_t mask) noexcept
+{
+    std::array<int, 3> columns{ -1, -1, -1 };
+    int count = 0;
+    for (int bit = 0; bit < 7; ++bit)
+    {
+        if ((mask & static_cast<uint8_t>(1u << static_cast<unsigned int>(bit))) == 0)
+            continue;
+        if (count >= 3)
+            return -1;
+        columns[static_cast<size_t>(count++)] = kStutterGestureFirstColumn + bit;
+    }
+
+    if (count <= 0)
+        return -1;
+    return getGestureComboFlatIndexFromColumns(GestureComboKind::Stutter, count, columns);
+}
+
+float GestureComboProfileStore::getStepValue(GestureComboKind kind,
+                                             int comboFlatIndex,
+                                             int laneIndex,
+                                             int stepIndex) const noexcept
+{
+    if (kind == GestureComboKind::Stutter)
+    {
+        return stutterValues[static_cast<size_t>(gestureComboStorageIndex(kind, comboFlatIndex, laneIndex, stepIndex))]
+            .load(std::memory_order_acquire);
+    }
+
+    return scratchValues[static_cast<size_t>(gestureComboStorageIndex(kind, comboFlatIndex, laneIndex, stepIndex))]
+        .load(std::memory_order_acquire);
+}
+
+void GestureComboProfileStore::setStepValue(GestureComboKind kind,
+                                            int comboFlatIndex,
+                                            int laneIndex,
+                                            int stepIndex,
+                                            float value) noexcept
+{
+    const float sanitized = sanitizeGestureComboValue(value);
+    if (kind == GestureComboKind::Stutter)
+    {
+        stutterValues[static_cast<size_t>(gestureComboStorageIndex(kind, comboFlatIndex, laneIndex, stepIndex))]
+            .store(sanitized, std::memory_order_release);
+        return;
+    }
+
+    scratchValues[static_cast<size_t>(gestureComboStorageIndex(kind, comboFlatIndex, laneIndex, stepIndex))]
+        .store(sanitized, std::memory_order_release);
+}
+
+GestureComboProfileState GestureComboProfileStore::getState(GestureComboKind kind, int comboFlatIndex) const noexcept
+{
+    GestureComboProfileState state;
+    const int laneCount = getGestureComboLaneCount(kind);
+    for (int lane = 0; lane < laneCount; ++lane)
+    {
+        for (int step = 0; step < kGestureProfileSteps; ++step)
+            state.lanes[static_cast<size_t>(lane)][static_cast<size_t>(step)] =
+                getStepValue(kind, comboFlatIndex, lane, step);
+    }
+    return state;
+}
+
+float GestureComboProfileStore::sampleLane(GestureComboKind kind,
+                                           int comboFlatIndex,
+                                           int laneIndex,
+                                           float phase) const noexcept
+{
+    if (comboFlatIndex < 0)
+        return 0.0f;
+
+    const float wrappedPhase = static_cast<float>(std::isfinite(phase)
+        ? std::fmod(static_cast<double>(phase), 1.0)
+        : 0.0);
+    const float normalizedPhase = wrappedPhase < 0.0f ? wrappedPhase + 1.0f : wrappedPhase;
+    const float scaled = normalizedPhase * static_cast<float>(kGestureProfileSteps);
+    const int baseIndex = juce::jlimit(0, kGestureProfileSteps - 1, static_cast<int>(std::floor(scaled)));
+    const float frac = juce::jlimit(0.0f, 1.0f, scaled - static_cast<float>(baseIndex));
+    const int nextIndex = (baseIndex + 1) % kGestureProfileSteps;
+    const float start = getStepValue(kind, comboFlatIndex, laneIndex, baseIndex);
+    const float end = getStepValue(kind, comboFlatIndex, laneIndex, nextIndex);
+    return sanitizeGestureComboValue(juce::jmap(frac, start, end));
+}
+
+void GestureComboProfileStore::clearCombo(GestureComboKind kind, int comboFlatIndex) noexcept
+{
+    const int laneCount = getGestureComboLaneCount(kind);
+    for (int lane = 0; lane < laneCount; ++lane)
+        for (int step = 0; step < kGestureProfileSteps; ++step)
+            setStepValue(kind, comboFlatIndex, lane, step, 0.0f);
+}
+
+void GestureComboProfileStore::clearButtonCount(GestureComboKind kind, int buttonCount) noexcept
+{
+    const int safeCount = juce::jlimit(1, 3, buttonCount);
+    const int offset = getGestureComboFlatOffsetForButtonCount(kind, safeCount);
+    const int count = getGestureComboCountForButtonCount(kind, safeCount);
+    for (int combo = 0; combo < count; ++combo)
+        clearCombo(kind, offset + combo);
+}
+
+void GestureComboProfileStore::clearAllCombos(GestureComboKind kind) noexcept
+{
+    for (int combo = 0; combo < getGestureComboTotalCount(kind); ++combo)
+        clearCombo(kind, combo);
+}
+
+void GestureComboProfileStore::clearAll() noexcept
+{
+    clearAllCombos(GestureComboKind::Stutter);
+    clearAllCombos(GestureComboKind::Scratch);
+}
+
+bool GestureComboProfileStore::comboHasAnyValue(GestureComboKind kind, int comboFlatIndex) const noexcept
+{
+    const int laneCount = getGestureComboLaneCount(kind);
+    for (int lane = 0; lane < laneCount; ++lane)
+    {
+        for (int step = 0; step < kGestureProfileSteps; ++step)
+        {
+            if (std::abs(getStepValue(kind, comboFlatIndex, lane, step)) > 1.0e-6f)
+                return true;
+        }
+    }
+
+    return false;
 }
 
 float ModernAudioEngine::quantizePitchSemitonesToScale(float semitoneDelta, PitchScale scale)
@@ -2352,6 +2742,7 @@ void EnhancedAudioStrip::resetGrainState()
     grainBloomPhase = 0.0;
     grainBloomAmount = 0.0f;
     updateGrainHeldLedState();
+    refreshGrainGestureComboCache();
     grainSizeMsAtomic.store(grainParams.sizeMs, std::memory_order_release);
     grainDensityAtomic.store(grainParams.density, std::memory_order_release);
     grainPitchAtomic.store(grainParams.pitchSemitones, std::memory_order_release);
@@ -2420,6 +2811,57 @@ void EnhancedAudioStrip::updateGrainHeldLedState()
     grainLedSecondary.store(grainGesture.secondaryX, std::memory_order_release);
     grainLedSizeControl.store(grainGesture.sizeControlX, std::memory_order_release);
     grainLedFreeze.store(grainGesture.freeze, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::refreshScratchGestureComboCache() noexcept
+{
+    int comboFlatIndex = -1;
+    int buttonCount = 0;
+
+    if (patternActive && patternHoldCountRequired >= 3 && activePattern >= 0)
+    {
+        buttonCount = 3;
+        comboFlatIndex = getGestureComboFlatOffsetForButtonCount(GestureComboKind::Scratch, 3)
+            + juce::jlimit(0, getGestureComboCountForButtonCount(GestureComboKind::Scratch, 3) - 1, activePattern);
+    }
+    else if (!heldButtons.empty())
+    {
+        std::array<int, 3> columns{ -1, -1, -1 };
+        for (int held : heldButtons)
+        {
+            if (buttonCount >= 3)
+                break;
+            columns[static_cast<size_t>(buttonCount++)] = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, held);
+        }
+        if (buttonCount > 0)
+            comboFlatIndex = getGestureComboFlatIndexFromColumns(GestureComboKind::Scratch, buttonCount, columns);
+    }
+    else if (buttonHeld && heldButton >= 0)
+    {
+        buttonCount = 1;
+        comboFlatIndex = getGestureComboFlatIndexFromColumns(
+            GestureComboKind::Scratch, 1, { juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, heldButton), -1, -1 });
+    }
+
+    scratchGestureComboButtonCount.store(buttonCount, std::memory_order_release);
+    scratchGestureComboFlatIndex.store(comboFlatIndex, std::memory_order_release);
+}
+
+void EnhancedAudioStrip::refreshGrainGestureComboCache() noexcept
+{
+    const int buttonCount = juce::jlimit(0, 3, grainGesture.heldCount);
+    int comboFlatIndex = -1;
+    if (buttonCount > 0)
+    {
+        std::array<int, 3> columns{ -1, -1, -1 };
+        for (int i = 0; i < buttonCount; ++i)
+            columns[static_cast<size_t>(i)] = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, grainGesture.heldX[i]);
+        std::sort(columns.begin(), columns.begin() + buttonCount);
+        comboFlatIndex = getGestureComboFlatIndexFromColumns(GestureComboKind::Scratch, buttonCount, columns);
+    }
+
+    grainGestureComboButtonCount.store(buttonCount, std::memory_order_release);
+    grainGestureComboFlatIndex.store(comboFlatIndex, std::memory_order_release);
 }
 
 void EnhancedAudioStrip::updateGrainAnchorFromHeld()
@@ -2555,6 +2997,7 @@ void EnhancedAudioStrip::updateGrainGestureOnPress(int column, int64_t globalSam
     const bool threeButtonGrip = (grainGesture.heldCount == 3);
     grainGesture.sizeControlX = threeButtonGrip ? column : -1;
     updateGrainAnchorFromHeld();
+    refreshGrainGestureComboCache();
     grainGesture.freeze = true;
     grainGesture.returningToTimeline = false;
 
@@ -2757,6 +3200,7 @@ void EnhancedAudioStrip::updateGrainGestureOnRelease(int column, int64_t globalS
     }
     grainGesture.heldCount = juce::jmax(0, grainGesture.heldCount - 1);
     grainGesture.anyHeld = (grainGesture.heldCount > 0);
+    refreshGrainGestureComboCache();
 
     if (wasThreeButton && grainGesture.heldCount < 3)
         restoreSnapshotIfNeeded();
@@ -3197,12 +3641,16 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
     float sceneTri = 0.0f;
     int sceneStepIndex = 0;
     double sceneCenterSample = centerSamplePos;
+    float scratchProfilePhase = static_cast<float>(std::fmod(beatNow / ((heldCount >= 3) ? 2.0 : 1.0), 1.0));
+    if (scratchProfilePhase < 0.0f)
+        scratchProfilePhase += 1.0f;
     if (sceneMix > 0.001f && heldCount > 0)
     {
         const double stepBeats = (heldCount >= 3) ? (1.0 / 24.0) : ((heldCount == 2) ? (1.0 / 16.0) : (1.0 / 8.0));
         const double scenePhase = beatNow / stepBeats;
         const double sceneStepBase = std::floor(scenePhase);
         const double sceneStepFrac = scenePhase - sceneStepBase;
+        scratchProfilePhase = juce::jlimit(0.0f, 1.0f, static_cast<float>(sceneStepFrac));
         sceneStepIndex = static_cast<int>(sceneStepBase);
         scenePulse = std::pow(static_cast<float>(1.0 - sceneStepFrac), (heldCount >= 2) ? 2.8f : 2.0f);
         sceneTri = 1.0f - std::abs((2.0f * static_cast<float>(sceneStepFrac)) - 1.0f);
@@ -3437,6 +3885,51 @@ void EnhancedAudioStrip::renderGrainAtSample(float& outL, float& outR, double ce
             const double posMacro = (static_cast<double>(twoBarSweep) + (0.45 * static_cast<double>(barSweep))) * posRangeSamples;
             sceneCenterSample = getWrappedSamplePosition(sceneCenterSample + posMacro, loopStartSamples, loopLengthSamplesLocal);
         }
+    }
+
+    if (heldCount > 0 && gestureComboProfileStore != nullptr)
+    {
+        const int scratchComboFlatIndex = grainGestureComboFlatIndex.load(std::memory_order_acquire);
+        const float motionLane = gestureComboProfileStore->sampleLane(
+            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Motion), scratchProfilePhase);
+        const float pitchLane = gestureComboProfileStore->sampleLane(
+            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Pitch), scratchProfilePhase);
+        const float sceneLane = gestureComboProfileStore->sampleLane(
+            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::SceneMix), scratchProfilePhase);
+        const float sizeLane = gestureComboProfileStore->sampleLane(
+            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Size), scratchProfilePhase);
+        const float densityLane = gestureComboProfileStore->sampleLane(
+            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Density), scratchProfilePhase);
+        const float spreadLane = gestureComboProfileStore->sampleLane(
+            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Spread), scratchProfilePhase);
+        const float positionLane = gestureComboProfileStore->sampleLane(
+            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Position), scratchProfilePhase);
+        const float gestureDrive = juce::jlimit(0.18f, 1.0f,
+            ((sceneMix > 0.001f) ? sceneMix : 0.32f) + (0.16f * static_cast<float>(heldCount - 1)));
+
+        sceneMix = juce::jlimit(0.0f, 1.0f, sceneMix + (sceneLane * 0.22f * gestureDrive));
+        if (heldCount >= 2)
+            sceneMix = juce::jlimit(0.0f, 1.0f, sceneMix + (motionLane * 0.12f * gestureDrive));
+
+        effectiveSizeMs = juce::jlimit(kGrainMinSizeMs,
+                                       kGrainMaxSizeMs,
+                                       effectiveSizeMs * std::pow(2.0f, sizeLane * 0.85f * gestureDrive));
+        effectiveDensity = juce::jlimit(kGrainMinDensity,
+                                        0.9f,
+                                        effectiveDensity + (densityLane * 0.18f * gestureDrive));
+        effectiveSpread = juce::jlimit(0.0f,
+                                       1.0f,
+                                       effectiveSpread + (spreadLane * 0.26f * gestureDrive));
+        scenePitchOffset += pitchLane * (8.0f + (6.0f * gestureDrive));
+        jitterAmount = juce::jlimit(0.0f, 1.0f,
+                                    jitterAmount + (std::abs(motionLane) * 0.10f * gestureDrive));
+
+        const double positionRangeSamples = loopLengthSamplesLocal
+            * (0.01 + (0.12 * static_cast<double>(gestureDrive)));
+        sceneCenterSample = getWrappedSamplePosition(
+            sceneCenterSample + (static_cast<double>(positionLane) * positionRangeSamples),
+            loopStartSamples,
+            loopLengthSamplesLocal);
     }
 
     // Short grains need a denser floor to avoid audible holes/clicks between grains.
@@ -4527,6 +5020,10 @@ void EnhancedAudioStrip::resetScratchComboState()
     heldButton = -1;
     buttonPressTime = 0;
     scratchArrived = false;
+    scratchGestureComboButtonCount.store(0, std::memory_order_release);
+    scratchGestureComboFlatIndex.store(-1, std::memory_order_release);
+    grainGestureComboButtonCount.store(0, std::memory_order_release);
+    grainGestureComboFlatIndex.store(-1, std::memory_order_release);
 }
 
 void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output, 
@@ -4958,6 +5455,52 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                     const int durMult = 1 + ((signature[static_cast<size_t>((eventIndex + 3) & 3)] + comboSpan + sigA) % 4);
                     const double durationCandidate = randomSliceTriggerQuantBeats * static_cast<double>(durMult);
                     randomSliceStutterDurationBeats = juce::jlimit(qBase * 0.5, 4.0, durationCandidate);
+
+                    if (gestureComboProfileStore != nullptr)
+                    {
+                        const int scratchComboFlatIndex = getGestureComboFlatOffsetForButtonCount(GestureComboKind::Scratch, 3)
+                            + juce::jlimit(0, getGestureComboCountForButtonCount(GestureComboKind::Scratch, 3) - 1, patternId);
+                        const float eventPhase = static_cast<float>(std::fmod(
+                            static_cast<double>(eventIndex),
+                            static_cast<double>(kGestureProfileSteps)) / static_cast<double>(kGestureProfileSteps));
+                        const float motionLane = gestureComboProfileStore->sampleLane(
+                            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Motion), eventPhase);
+                        const float motionEndLane = gestureComboProfileStore->sampleLane(
+                            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::MotionEnd), eventPhase);
+                        const float positionLane = gestureComboProfileStore->sampleLane(
+                            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Position), eventPhase);
+                        const float windowLane = gestureComboProfileStore->sampleLane(
+                            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Window), eventPhase);
+                        const float divisionLane = gestureComboProfileStore->sampleLane(
+                            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Division), eventPhase);
+                        const float durationLane = gestureComboProfileStore->sampleLane(
+                            GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Duration), eventPhase);
+
+                        randomSliceTriggerQuantBeats = juce::jlimit(
+                            1.0 / 32.0,
+                            4.0,
+                            randomSliceTriggerQuantBeats * std::pow(2.0, -static_cast<double>(divisionLane) * 1.35));
+                        const int startOffset = juce::jlimit(-6, 6, static_cast<int>(std::lround(positionLane * 5.0f)));
+                        randomSliceWindowStartSlice = (randomSliceWindowStartSlice + startOffset) % 16;
+                        if (randomSliceWindowStartSlice < 0)
+                            randomSliceWindowStartSlice += 16;
+                        randomSliceWindowLengthSlices = juce::jlimit(
+                            1,
+                            8,
+                            randomSliceWindowLengthSlices + juce::jlimit(-3, 3, static_cast<int>(std::lround(windowLane * 2.5f))));
+                        randomSliceSpeedStart = juce::jlimit(
+                            -8.0,
+                            8.0,
+                            randomSliceSpeedStart * std::pow(2.0, static_cast<double>(motionLane) * 1.1));
+                        randomSliceSpeedEnd = juce::jlimit(
+                            -8.0,
+                            8.0,
+                            randomSliceSpeedEnd * std::pow(2.0, static_cast<double>(motionEndLane) * 1.1));
+                        randomSliceStutterDurationBeats = juce::jlimit(
+                            qBase * 0.5,
+                            4.0,
+                            randomSliceStutterDurationBeats * std::pow(2.0, static_cast<double>(durationLane)));
+                    }
                 }
                 else
                 {
@@ -6167,6 +6710,9 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
         double scratchRate = 1.0;
         bool scratchHasExplicitPosition = false;
         double scratchExplicitPosition = playbackPosition.load();
+        const int scratchGestureHoldCount = patternActive
+            ? juce::jmax(patternHoldCountRequired, static_cast<int>(heldButtons.size()))
+            : juce::jmax(buttonHeld ? 1 : 0, static_cast<int>(heldButtons.size()));
         // RHYTHMIC PATTERN EXECUTION (3-button hold)
         if (stripScratch > 0.0f && scrubActive)
         // CLOCK-LOCKED SCRATCHING: Use smoothed rate instead of fixed speed
@@ -6288,6 +6834,20 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 scratchExplicitPosition = scratchStartPosition + (totalDistance * travelledNorm);
                 scratchHasExplicitPosition = true;
             }
+
+            if (scratchGestureHoldCount > 0 && gestureComboProfileStore != nullptr)
+            {
+                const int scratchComboFlatIndex = scratchGestureComboFlatIndex.load(std::memory_order_acquire);
+                const float scratchPhase = juce::jlimit(0.0f, 1.0f, static_cast<float>(progress));
+                const float motionLane = gestureComboProfileStore->sampleLane(
+                    GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Motion), scratchPhase);
+                const float pitchLane = gestureComboProfileStore->sampleLane(
+                    GestureComboKind::Scratch, scratchComboFlatIndex, static_cast<int>(ScratchGestureLane::Pitch), scratchPhase);
+                const double gestureRateRatio = std::pow(2.0,
+                    (static_cast<double>(motionLane) * (patternActive ? 0.95 : 0.75))
+                        + (static_cast<double>(pitchLane) * 0.55));
+                scratchRate *= gestureRateRatio;
+            }
             
             // Check if we've reached the target time - hard-lock to avoid drift
             if (currentGlobalSample >= targetSampleTime)
@@ -6295,54 +6855,61 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
                 // Check if this is a reverse scratch (returning to timeline)
                 if (isReverseScratch)
                 {
-                    // Reverse return complete. Land on the precomputed future
-                    // timeline target (computed at release time), then re-lock
-                    // PPQ offset from that exact landed target.
-                    ppqTimelineAnchored = scratchSavedPpqTimelineAnchored;
-                    ppqTimelineOffsetBeats = scratchSavedPpqTimelineOffsetBeats;
-                    if (ppqTimelineAnchored && positionInfo.getPpqPosition().hasValue() && tempo > 0.0)
+                    if (playMode == PlayMode::Loop)
                     {
-                        float anchoredManualBeats = beatsPerLoop.load();
-                        const double anchoredBeatsForLoop = (anchoredManualBeats >= 0.0f) ? static_cast<double>(anchoredManualBeats) : 4.0;
-                        const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
-                        const double ppqAtSample = *positionInfo.getPpqPosition()
-                                                 + (static_cast<double>(i) / samplesPerBeat);
-
-                        playbackPosition = targetPosition;
-
-                        double targetInLoop = std::fmod(targetPosition - loopStartSamples, loopLength);
-                        if (targetInLoop < 0.0)
-                            targetInLoop += loopLength;
-                        const double beatInLoop = (targetInLoop / juce::jmax(1.0, loopLength)) * anchoredBeatsForLoop;
-                        ppqTimelineOffsetBeats = std::fmod(beatInLoop - ppqAtSample, anchoredBeatsForLoop);
-                        if (ppqTimelineOffsetBeats < 0.0)
-                            ppqTimelineOffsetBeats += anchoredBeatsForLoop;
-
-                        // Re-lock trigger references so sample/fallback paths
-                        // remain continuous immediately after release.
-                        triggerSample = currentGlobalSample;
-                        triggerPpqPosition = ppqAtSample;
-                        triggerOffsetRatio = juce::jlimit(0.0, 0.999999,
-                            (targetPosition - loopStartSamples) / juce::jmax(1.0, loopLength));
+                        snapToTimeline(currentGlobalSample);
                     }
                     else
                     {
-                        playbackPosition = targetPosition;
-                    }
+                        // Reverse return complete. Land on the precomputed future
+                        // timeline target (computed at release time), then re-lock
+                        // PPQ offset from that exact landed target.
+                        ppqTimelineAnchored = scratchSavedPpqTimelineAnchored;
+                        ppqTimelineOffsetBeats = scratchSavedPpqTimelineOffsetBeats;
+                        if (ppqTimelineAnchored && positionInfo.getPpqPosition().hasValue() && tempo > 0.0)
+                        {
+                            float anchoredManualBeats = beatsPerLoop.load();
+                            const double anchoredBeatsForLoop = (anchoredManualBeats >= 0.0f) ? static_cast<double>(anchoredManualBeats) : 4.0;
+                            const double samplesPerBeat = (60.0 / tempo) * currentSampleRate;
+                            const double ppqAtSample = *positionInfo.getPpqPosition()
+                                                     + (static_cast<double>(i) / samplesPerBeat);
 
-                    // Exit scratch mode.
-                    scrubActive = false;
-                    isReverseScratch = false;
-                    reverseScratchPpqRetarget = false;
-                    reverseScratchUseRateBlend = false;
-                    tapeStopActive = false;
-                    scratchGestureActive = false;
-                    scratchTravelDistance = 0.0;
-                    const float restoreSpeed = static_cast<float>(playbackSpeed.load(std::memory_order_acquire));
-                    smoothedSpeed.setCurrentAndTargetValue(restoreSpeed);
-                    rateSmoother.setCurrentAndTargetValue(1.0);
+                            playbackPosition = targetPosition;
+
+                            double targetInLoop = std::fmod(targetPosition - loopStartSamples, loopLength);
+                            if (targetInLoop < 0.0)
+                                targetInLoop += loopLength;
+                            const double beatInLoop = (targetInLoop / juce::jmax(1.0, loopLength)) * anchoredBeatsForLoop;
+                            ppqTimelineOffsetBeats = std::fmod(beatInLoop - ppqAtSample, anchoredBeatsForLoop);
+                            if (ppqTimelineOffsetBeats < 0.0)
+                                ppqTimelineOffsetBeats += anchoredBeatsForLoop;
+
+                            // Re-lock trigger references so sample/fallback paths
+                            // remain continuous immediately after release.
+                            triggerSample = currentGlobalSample;
+                            triggerPpqPosition = ppqAtSample;
+                            triggerOffsetRatio = juce::jlimit(0.0, 0.999999,
+                                (targetPosition - loopStartSamples) / juce::jmax(1.0, loopLength));
+                        }
+                        else
+                        {
+                            playbackPosition = targetPosition;
+                        }
+
+                        // Exit scratch mode.
+                        scrubActive = false;
+                        isReverseScratch = false;
+                        reverseScratchPpqRetarget = false;
+                        reverseScratchUseRateBlend = false;
+                        tapeStopActive = false;
+                        scratchGestureActive = false;
+                        scratchTravelDistance = 0.0;
+                        const float restoreSpeed = static_cast<float>(playbackSpeed.load(std::memory_order_acquire));
+                        smoothedSpeed.setCurrentAndTargetValue(restoreSpeed);
+                        rateSmoother.setCurrentAndTargetValue(1.0);
+                        crossfader.startFade(true, 32);
+                    }
                     scratchRate = 1.0;
-                    crossfader.startFade(true, 32);
                 }
                 else
                 {
@@ -7058,8 +7625,8 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
 
         processDelaySample(outL, outR, tempo);
 
-        if (!std::isfinite(outL)) outL = 0.0f;
-        if (!std::isfinite(outR)) outR = 0.0f;
+        outL = sanitizeOutputSample(outL, kRenderedOutputSafetyClamp);
+        outR = sanitizeOutputSample(outR, kRenderedOutputSafetyClamp);
 
         renderOutputBuffer->addSample(0, renderOutputStartSample + i, outL);
         renderOutputBuffer->addSample(1, renderOutputStartSample + i, outR);
@@ -7808,6 +8375,7 @@ void EnhancedAudioStrip::onButtonPress(int column, int64_t globalSample)
         {
             activatePatternMode(3, trioPattern, "3-button");
         }
+        refreshScratchGestureComboCache();
         return;
     }
 
@@ -7819,6 +8387,7 @@ void EnhancedAudioStrip::onButtonPress(int column, int64_t globalSample)
         activePattern = -1;
         patternHoldCountRequired = 3;
     }
+    refreshScratchGestureComboCache();
     
     // Normal single/double button behavior
     buttonHeld = true;
@@ -7856,6 +8425,7 @@ void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
     // Remove from held buttons set
     heldButtons.erase(column);
     heldButtonOrder.erase(std::remove(heldButtonOrder.begin(), heldButtonOrder.end(), column), heldButtonOrder.end());
+    refreshScratchGestureComboCache();
     
     // If pattern was active and we now have fewer held buttons than required,
     // deactivate and return to timeline.
@@ -7872,6 +8442,7 @@ void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
         // Clear all button state
         buttonHeld = false;
         heldButton = -1;
+        refreshScratchGestureComboCache();
         return;
     }
     
@@ -7890,6 +8461,7 @@ void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
         buttonHeld = false;
         heldButton = -1;
         scratchArrived = false;
+        refreshScratchGestureComboCache();
         return;
     }
     
@@ -7937,6 +8509,7 @@ void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
                 crossfader.startFade(true, 64);
 
                 DBG("Button " << column << " released -> retarget to held button " << fallbackColumn);
+                refreshScratchGestureComboCache();
                 return;
             }
         }
@@ -7952,6 +8525,7 @@ void EnhancedAudioStrip::onButtonRelease(int column, int64_t globalSample)
         buttonHeld = false;
         heldButton = -1;
         scratchArrived = false;
+        refreshScratchGestureComboCache();
         return;
     }
     
@@ -8111,6 +8685,7 @@ void EnhancedAudioStrip::snapToTimeline(int64_t currentGlobalSample)
     // combo-pattern releases cannot strand playback in a stale silent state.
     playbackPosition = expectedPosition;
     heldPosition = expectedPosition;
+    stopLoopPosition = expectedPosition;
     targetPosition = expectedPosition;
     targetSampleTime = currentGlobalSample;
     scratchStartPosition = expectedPosition;
@@ -8142,9 +8717,21 @@ void EnhancedAudioStrip::snapToTimeline(int64_t currentGlobalSample)
     reverseScratchUseRateBlend = false;
     scratchTravelDistance = 0.0;
     resetScratchComboState();
+    momentaryPhaseGuardValid = false;
+    triggerOutputSampleFader.reset();
+    stoppedOutputSampleFader.reset();
+    pitchCacheOutputBlendActive = false;
+    pitchCacheOutputBlendSamplesRemaining = 0;
+    pitchCacheOutputBlendTotalSamples = 0;
+    pitchCacheOutputBlendStartL = 0.0f;
+    pitchCacheOutputBlendStartR = 0.0f;
+    lastOutputSampleL = 0.0f;
+    lastOutputSampleR = 0.0f;
+    clearRecentOutputTailLocked();
     const float restoreSpeed = static_cast<float>(playbackSpeed.load(std::memory_order_acquire));
     smoothedSpeed.setCurrentAndTargetValue(restoreSpeed);
     rateSmoother.setCurrentAndTargetValue(1.0);
+    displaySpeedAtomic.store(juce::jlimit(0.0f, 8.0f, std::abs(restoreSpeed)), std::memory_order_release);
     crossfader.startFade(true, 32);
     
     DBG("Snapped to timeline position (expected: " << expectedPosInLoop << " samples into loop)");
@@ -9135,6 +9722,47 @@ void EnhancedAudioStrip::seedPanTransition(float fromValue, float toValue, doubl
     smoothedPan.setTargetValue(target);
 }
 
+void EnhancedAudioStrip::setGestureProfiles(const std::array<GestureProfileState, kGestureProfileCount>& profiles)
+{
+    for (int profile = 0; profile < kGestureProfileCount; ++profile)
+    {
+        for (int lane = 0; lane < kGestureProfileLaneCount; ++lane)
+        {
+            for (int step = 0; step < kGestureProfileSteps; ++step)
+            {
+                gestureProfileValues[static_cast<size_t>(gestureProfileStorageIndex(
+                    static_cast<GestureProfileId>(profile), lane, step))]
+                    .store(sanitizeGestureProfileValue(
+                        profiles[static_cast<size_t>(profile)].lanes[static_cast<size_t>(lane)][static_cast<size_t>(step)]),
+                        std::memory_order_release);
+            }
+        }
+    }
+}
+
+void EnhancedAudioStrip::setGestureComboProfileStore(const std::shared_ptr<GestureComboProfileStore>& store)
+{
+    gestureComboProfileStore = store;
+}
+
+float EnhancedAudioStrip::sampleGestureProfileLane(GestureProfileId profileId, int laneIndex, float phase) const
+{
+    const int safeLane = juce::jlimit(0, kGestureProfileLaneCount - 1, laneIndex);
+    const float wrappedPhase = static_cast<float>(std::isfinite(phase)
+        ? std::fmod(static_cast<double>(phase), 1.0)
+        : 0.0);
+    const float normalizedPhase = wrappedPhase < 0.0f ? wrappedPhase + 1.0f : wrappedPhase;
+    const float scaled = normalizedPhase * static_cast<float>(kGestureProfileSteps);
+    const int baseIndex = juce::jlimit(0, kGestureProfileSteps - 1, static_cast<int>(std::floor(scaled)));
+    const float frac = juce::jlimit(0.0f, 1.0f, scaled - static_cast<float>(baseIndex));
+    const int nextIndex = (baseIndex + 1) % kGestureProfileSteps;
+    const float start = gestureProfileValues[static_cast<size_t>(gestureProfileStorageIndex(profileId, safeLane, baseIndex))]
+        .load(std::memory_order_acquire);
+    const float end = gestureProfileValues[static_cast<size_t>(gestureProfileStorageIndex(profileId, safeLane, nextIndex))]
+        .load(std::memory_order_acquire);
+    return sanitizeGestureProfileValue(juce::jmap(frac, start, end));
+}
+
 void EnhancedAudioStrip::setPlaybackSpeed(float speed)
 {
     speed = juce::jlimit(0.0f, 8.0f, speed);
@@ -9747,6 +10375,8 @@ void EnhancedAudioStrip::clearRecentOutputTailLocked()
 
 void EnhancedAudioStrip::rememberRenderedOutputSampleLocked(float left, float right)
 {
+    left = sanitizeOutputSample(left, kOutputContinuitySafetyClamp);
+    right = sanitizeOutputSample(right, kOutputContinuitySafetyClamp);
     lastOutputSampleL = left;
     lastOutputSampleR = right;
 
@@ -9774,23 +10404,19 @@ void EnhancedAudioStrip::captureRenderedOutputTailFromBufferLocked(const juce::A
     const int tailStart = safeStart + safeLength - tailLength;
     const int rightChannel = juce::jmin(1, buffer.getNumChannels() - 1);
 
-    lastOutputSampleL = buffer.getSample(0, safeStart + safeLength - 1);
-    lastOutputSampleR = buffer.getSample(rightChannel, safeStart + safeLength - 1);
+    lastOutputSampleL = sanitizeOutputSample(buffer.getSample(0, safeStart + safeLength - 1),
+                                             kOutputContinuitySafetyClamp);
+    lastOutputSampleR = sanitizeOutputSample(buffer.getSample(rightChannel, safeStart + safeLength - 1),
+                                             kOutputContinuitySafetyClamp);
 
-    std::copy_n(buffer.getReadPointer(0, tailStart),
-                tailLength,
-                recentOutputTailL.begin());
-    if (rightChannel == 0)
+    const auto* leftTail = buffer.getReadPointer(0, tailStart);
+    const auto* rightTail = buffer.getReadPointer(rightChannel, tailStart);
+    for (int i = 0; i < tailLength; ++i)
     {
-        std::copy_n(recentOutputTailL.begin(),
-                    tailLength,
-                    recentOutputTailR.begin());
-    }
-    else
-    {
-        std::copy_n(buffer.getReadPointer(rightChannel, tailStart),
-                    tailLength,
-                    recentOutputTailR.begin());
+        recentOutputTailL[static_cast<size_t>(i)] = sanitizeOutputSample(leftTail[i], kOutputContinuitySafetyClamp);
+        recentOutputTailR[static_cast<size_t>(i)] = sanitizeOutputSample(
+            (rightChannel == 0) ? leftTail[i] : rightTail[i],
+            kOutputContinuitySafetyClamp);
     }
     recentOutputTailLength = tailLength;
     recentOutputTailWritePos = tailLength % kTriggerOutputBlendTailMaxSamples;
@@ -9803,8 +10429,10 @@ void EnhancedAudioStrip::armSampleFaderFromRecentTailLocked(SampleFader& fader,
 {
     fader.reset();
     const bool useContinuityState = continuityState != nullptr && continuityState->valid;
-    fader.startL = useContinuityState ? continuityState->lastSampleL : lastOutputSampleL;
-    fader.startR = useContinuityState ? continuityState->lastSampleR : lastOutputSampleR;
+    fader.startL = sanitizeOutputSample(useContinuityState ? continuityState->lastSampleL : lastOutputSampleL,
+                                        kOutputContinuitySafetyClamp);
+    fader.startR = sanitizeOutputSample(useContinuityState ? continuityState->lastSampleR : lastOutputSampleR,
+                                        kOutputContinuitySafetyClamp);
     fader.trigger(juce::jmax(1, fadeSamples));
 
     if (useContinuityState)
@@ -9812,8 +10440,12 @@ void EnhancedAudioStrip::armSampleFaderFromRecentTailLocked(SampleFader& fader,
         const int copyCount = juce::jmin(continuityState->tailLength, kTriggerOutputBlendTailMaxSamples);
         for (int i = 0; i < copyCount; ++i)
         {
-            fader.tailL[static_cast<size_t>(i)] = continuityState->tailL[static_cast<size_t>(i)];
-            fader.tailR[static_cast<size_t>(i)] = continuityState->tailR[static_cast<size_t>(i)];
+            fader.tailL[static_cast<size_t>(i)] = sanitizeOutputSample(
+                continuityState->tailL[static_cast<size_t>(i)],
+                kOutputContinuitySafetyClamp);
+            fader.tailR[static_cast<size_t>(i)] = sanitizeOutputSample(
+                continuityState->tailR[static_cast<size_t>(i)],
+                kOutputContinuitySafetyClamp);
         }
         fader.tailLength = copyCount;
         return;
@@ -9828,8 +10460,12 @@ void EnhancedAudioStrip::armSampleFaderFromRecentTailLocked(SampleFader& fader,
     for (int i = 0; i < copyCount; ++i)
     {
         const int sourceIndex = (startIndex + i) % kTriggerOutputBlendTailMaxSamples;
-        fader.tailL[static_cast<size_t>(i)] = recentOutputTailL[static_cast<size_t>(sourceIndex)];
-        fader.tailR[static_cast<size_t>(i)] = recentOutputTailR[static_cast<size_t>(sourceIndex)];
+        fader.tailL[static_cast<size_t>(i)] = sanitizeOutputSample(
+            recentOutputTailL[static_cast<size_t>(sourceIndex)],
+            kOutputContinuitySafetyClamp);
+        fader.tailR[static_cast<size_t>(i)] = sanitizeOutputSample(
+            recentOutputTailR[static_cast<size_t>(sourceIndex)],
+            kOutputContinuitySafetyClamp);
     }
     fader.tailLength = copyCount;
 }
@@ -13581,6 +14217,25 @@ void ModernAudioEngine::setMomentaryStutterActive(bool enabled)
     momentaryStutterActive.store(enabled ? 1 : 0, std::memory_order_release);
     if (!enabled)
         setMomentaryStutterRetriggerFadeMs(0.7f);
+}
+
+void ModernAudioEngine::setGestureProfiles(const std::array<GestureProfileState, kGestureProfileCount>& profiles)
+{
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        if (auto* strip = getStrip(i))
+            strip->setGestureProfiles(profiles);
+    }
+}
+
+void ModernAudioEngine::setGestureComboProfileStore(const std::shared_ptr<GestureComboProfileStore>& store)
+{
+    gestureComboProfileStore = store;
+    for (int i = 0; i < MaxStrips; ++i)
+    {
+        if (auto* strip = getStrip(i))
+            strip->setGestureComboProfileStore(store);
+    }
 }
 
 void ModernAudioEngine::setMomentaryStutterDivision(double beats)

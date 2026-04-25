@@ -1,6 +1,6 @@
 {
   "Name": "mlrVST",
-  "Version": "2.0.0",
+  "Version": "2.0.2",
   "Factory Info": {
     "Vendor": "mlrVST",
     "URL": "",
@@ -17,7 +17,7 @@
       "Category": "Audio Module Class",
       "Name": "mlrVST",
       "Vendor": "mlrVST",
-      "Version": "2.0.0",
+      "Version": "2.0.2",
       "SDKVersion": "VST 3.8.0",
       "Sub Categories": [
         "Fx",
@@ -33,7 +33,7 @@
       "Category": "Component Controller Class",
       "Name": "mlrVST",
       "Vendor": "mlrVST",
-      "Version": "2.0.0",
+      "Version": "2.0.2",
       "SDKVersion": "VST 3.8.0",
       "Sub Categories": [
         "Fx",

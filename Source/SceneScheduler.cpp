@@ -64,18 +64,14 @@ double scenePreloadLookaheadBeats(double currentTempo)
 
 SceneLengthMode sanitizeSceneLengthMode(int rawMode)
 {
-    return static_cast<SceneLengthMode>(juce::jlimit(
-        0,
-        static_cast<int>(SceneLengthMode::AnchorStrip),
-        rawMode));
+    juce::ignoreUnused(rawMode);
+    return SceneLengthMode::ManualBars;
 }
 
 SceneRecallMode sanitizeSceneRecallMode(int rawMode)
 {
-    return static_cast<SceneRecallMode>(juce::jlimit(
-        0,
-        static_cast<int>(SceneRecallMode::Manual),
-        rawMode));
+    juce::ignoreUnused(rawMode);
+    return SceneRecallMode::Manual;
 }
 
 void clearSceneChainStep(SceneChainStep& step)
@@ -407,7 +403,7 @@ juce::String sceneChainTransitionSummaryLabel(SceneChainTransitionType type)
         case SceneChainTransitionType::Drop:       return "Drop";
         case SceneChainTransitionType::MuteTail:   return "Mute";
         case SceneChainTransitionType::Break:      return "Break";
-        case SceneChainTransitionType::Return:     return "Return";
+        case SceneChainTransitionType::Return:     return "Back";
         case SceneChainTransitionType::None:
         default:
             return {};
@@ -586,8 +582,14 @@ void SceneScheduler::markSceneChainTransitionEdited(MlrVSTAudioProcessor& proces
         {
             const auto updatedOption = sanitizeSceneChainTransitionOption(
                 processor.sceneChainState.steps[static_cast<size_t>(safeEditedStep)].transitionOption);
+            const auto updatedScope = sanitizeSceneChainTransitionScope(
+                processor.sceneChainState.steps[static_cast<size_t>(safeEditedStep)].transitionScope);
+            const auto updatedContour = sanitizeSceneChainTransitionContour(
+                processor.sceneChainState.steps[static_cast<size_t>(safeEditedStep)].transitionContour);
             processor.sceneBoundaryTransitionType.store(static_cast<int>(updatedType), std::memory_order_release);
             processor.sceneBoundaryTransitionOption.store(static_cast<int>(updatedOption), std::memory_order_release);
+            processor.sceneBoundaryTransitionScope.store(static_cast<int>(updatedScope), std::memory_order_release);
+            processor.sceneBoundaryTransitionContour.store(static_cast<int>(updatedContour), std::memory_order_release);
             processor.sceneBoundaryTransitionLengthBeats.store(
                 sanitizeSceneChainTransitionLengthBeats(
                     processor.sceneChainState.steps[static_cast<size_t>(safeEditedStep)].transitionLengthBeats),
@@ -749,7 +751,7 @@ int SceneScheduler::getSceneRecallModeIndex(const MlrVSTAudioProcessor& processo
 {
     const int rawMode = processor.sceneRecallModeParam != nullptr
         ? static_cast<int>(processor.sceneRecallModeParam->load(std::memory_order_acquire))
-        : static_cast<int>(SceneRecallMode::QuantizeGrid);
+        : static_cast<int>(SceneRecallMode::Manual);
     return static_cast<int>(sanitizeSceneRecallMode(rawMode));
 }
 
@@ -3063,6 +3065,13 @@ void SceneScheduler::processPendingSceneApply(MlrVSTAudioProcessor& processor)
                                                                                   chainLength - 1,
                                                                                   outgoingStepIndex))].transitionToNext)
             : SceneChainTransitionType::None;
+    const auto outgoingTransitionCondition =
+        (processor.sceneSequenceActive && outgoingStepIndex >= 0 && chainLength > 0)
+            ? sanitizeSceneChainTransitionCondition(
+                  processor.sceneChainState.steps[static_cast<size_t>(juce::jlimit(0,
+                                                                                  chainLength - 1,
+                                                                                  outgoingStepIndex))].transitionCondition)
+            : SceneChainTransitionCondition::Always;
     const bool effectiveSequenceDriven = queuedSequenceDriven;
     const bool preserveSceneSequence = effectiveSequenceDriven && processor.sceneSequenceActive && chainLength >= 2;
     int effectiveSequenceStep = effectiveSequenceDriven ? queuedSequenceStep : -1;
@@ -3229,14 +3238,29 @@ void SceneScheduler::processPendingSceneApply(MlrVSTAudioProcessor& processor)
         }
     }
 
-    if (effectiveSequenceDriven
+    const bool returnRouteLoopbackHandoff = effectiveSequenceDriven
+        && processor.sceneChainState.loopEnabled
+        && effectiveSequenceStep >= 0
+        && outgoingStepIndex >= 0
+        && effectiveSequenceStep <= outgoingStepIndex;
+    const double returnRouteConditionPpq = queuedTimingValid
+        ? queuedTargetPpq
+        : (hasHostSync ? hostPpqSnapshot : std::numeric_limits<double>::quiet_NaN());
+    const bool shouldArmReturnRoute = effectiveSequenceDriven
         && outgoingTransitionType == SceneChainTransitionType::Return
         && outgoingStepIndex >= 0
-        && effectiveSequenceStep >= 0)
+        && effectiveSequenceStep >= 0
+        && sceneChainTransitionConditionAllows(outgoingTransitionCondition,
+                                               outgoingStepIndex,
+                                               effectiveSequenceStep,
+                                               returnRouteConditionPpq,
+                                               returnRouteLoopbackHandoff);
+
+    if (shouldArmReturnRoute)
     {
         processor.armSceneChainReturnOverride(outgoingStepIndex, effectiveSequenceStep);
     }
-    else if (!effectiveSequenceDriven)
+    else if (!effectiveSequenceDriven || outgoingTransitionType == SceneChainTransitionType::Return)
     {
         processor.clearSceneChainReturnOverride();
     }

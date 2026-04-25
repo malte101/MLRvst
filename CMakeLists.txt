@@ -221,6 +221,32 @@ target_sources(mlrVST
         Source/AudioEngine.h
         Source/MacroTargetDispatcher.cpp
         Source/MacroTargetDispatcher.h
+        Source/GestureCoordinator.cpp
+        Source/GestureCoordinator.h
+        Source/GlobalSettingsStore.cpp
+        Source/GlobalSettingsStore.h
+        Source/PluginProcessorGlobalControls.cpp
+        Source/PluginProcessorBrowserPaths.cpp
+        Source/PluginProcessorLoopPitch.cpp
+        Source/PluginProcessorPreparedScene.cpp
+        Source/PluginProcessorPresetState.cpp
+        Source/PluginProcessorSampleMode.cpp
+        Source/PluginProcessorSceneAutomation.cpp
+        Source/PluginProcessorSceneClipData.cpp
+        Source/PluginProcessorSceneConfig.cpp
+        Source/PluginProcessorSceneControl.cpp
+        Source/PluginProcessorSceneMode.cpp
+        Source/PluginProcessorSceneMotion.cpp
+        Source/PluginProcessorSceneAutosave.cpp
+        Source/PluginProcessorMacro.cpp
+        Source/PluginProcessorMonomeControls.cpp
+        Source/PluginProcessorMonomePattern.cpp
+        Source/PluginProcessorParameterChange.cpp
+        Source/PluginProcessorScenePerformance.cpp
+        Source/PluginProcessorSceneRender.cpp
+        Source/PluginProcessorSceneBoundaryTransition.cpp
+        Source/PluginProcessorSceneState.cpp
+        Source/PluginProcessorSceneSwitch.cpp
         Source/SceneScheduler.cpp
         Source/SceneScheduler.h
         Source/ScenePerformanceRecorder.cpp
@@ -237,6 +263,8 @@ target_sources(mlrVST
         Source/SampleMode.cpp
         Source/SampleMode.h
         Source/MonomeController.cpp
+        Source/MonomePageHandlers.cpp
+        Source/MonomePageRenderers.cpp
         Source/ArcController.cpp
         Source/MonomeFilterActions.cpp
         Source/MonomeFilterActions.h

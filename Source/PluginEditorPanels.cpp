@@ -2,6 +2,7 @@
 #include "PluginEditorPanelUtils.h"
 #include "PluginEditorStyle.h"
 #include "mlrvst_build_info.h"
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -2509,7 +2510,7 @@ juce::String sceneChainTransitionTypeLabel(MlrVSTAudioProcessor::SceneChainTrans
         case TransitionType::Drop:       return "Drop";
         case TransitionType::MuteTail:   return "Mute";
         case TransitionType::Break:      return "Break";
-        case TransitionType::Return:     return "Return";
+        case TransitionType::Return:     return "Return Route";
         case TransitionType::None:
         default:
             return "None";
@@ -2545,7 +2546,7 @@ juce::String sceneChainTransitionTypeSummary(MlrVSTAudioProcessor::SceneChainTra
         case TransitionType::Drop:       return "drop + fade";
         case TransitionType::MuteTail:   return "tail cut";
         case TransitionType::Break:      return "hard break";
-        case TransitionType::Return:     return "auto-return";
+        case TransitionType::Return:     return "route-only: visit next, then return here";
         case TransitionType::None:
         default:
             return "straight switch";
@@ -2811,7 +2812,7 @@ SceneTransitionTuningProfile sceneTransitionTypeTuningProfile(MlrVSTAudioProcess
 
     switch (type)
     {
-        case TransitionType::Fill:       return { 1.0f, 0.78f, 0.62f, 0.48f, 0.34f, false };
+        case TransitionType::Fill:       return { 1.0f, 0.82f, 0.72f, 0.56f, 0.52f, false };
         case TransitionType::Stutter:    return { 0.5f, 0.84f, 0.18f, 0.24f, 1.00f, true };
         case TransitionType::FilterRise: return { 2.0f, 0.80f, 0.18f, 1.00f, 0.12f, false };
         case TransitionType::Drop:       return { 1.0f, 0.86f, 0.34f, 0.76f, 0.58f, true };
@@ -3047,7 +3048,7 @@ juce::String sceneChainTransitionChipLabel(MlrVSTAudioProcessor::SceneChainTrans
         case TransitionType::Drop:       return "Drop";
         case TransitionType::MuteTail:   return "Mute";
         case TransitionType::Break:      return "Break";
-        case TransitionType::Return:     return "Back";
+        case TransitionType::Return:     return "Route";
         case TransitionType::None:
         default:
             return "None";
@@ -3706,7 +3707,7 @@ juce::String sceneTransitionEndSampleEditorContext(MlrVSTAudioProcessor& process
         ? (stepIndex + 1)
         : (processor.isSceneChainLoopEnabled() ? processor.getSceneChainLoopStartStep() : -1);
 
-    juce::String label = loopbackStep ? "Loopback clamp" : "Fill bubble";
+    juce::String label = loopbackStep ? "Loopback clamp" : "Connector chip";
     label << "  Step " << juce::String(stepIndex + 1);
     if (fromSceneSlot >= 0)
         label << "  S" << juce::String(fromSceneSlot + 1);
@@ -4192,7 +4193,7 @@ void SceneTransitionEndSampleEditorPanel::refreshFromProcessor()
 {
     if (pinnedStepIndex < 0 || pinnedStepIndex >= processor.getSceneChainLength())
     {
-        contextLabel.setText("Pick a fill bubble to edit its end sample.", juce::dontSendNotification);
+        contextLabel.setText("Pick a fill chip to edit its end sample.", juce::dontSendNotification);
         currentSampleLabel.setText("Picked: None", juce::dontSendNotification);
         currentSampleLabel.setTooltip({});
         folderLabel.setText("Folder: not set", juce::dontSendNotification);
@@ -4494,7 +4495,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     hintLabel.setFont(juce::Font(juce::FontOptions(10.2f)));
     hintLabel.setColour(juce::Label::textColourId, kTextMuted);
     hintLabel.setJustificationType(juce::Justification::centredLeft);
-    hintLabel.setTooltip("Scene buttons focus and launch scenes. Playback controls decide when the next scene starts. The chain rail sets order, repeats, and fill bubbles between scenes.");
+    hintLabel.setTooltip("Scene buttons focus and launch scenes. Playback controls decide when the next scene starts. The chain rail sets order, repeats, and fill/route chips between scenes.");
     addAndMakeVisible(hintLabel);
 
     sceneModeToggle.setButtonText("Scene Mode");
@@ -4515,16 +4516,17 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(scenePlaybackSectionLabel);
     scenePlaybackSectionLabel.setVisible(false);
 
-    configureSectionLabel(sceneFillSectionLabel, "FILL");
+    configureSectionLabel(sceneFillSectionLabel, "FILL / ROUTE");
     addAndMakeVisible(sceneFillSectionLabel);
     sceneFillSectionLabel.setVisible(false);
 
-    sceneChangeModeLabel.setText("Next", juce::dontSendNotification);
+    sceneChangeModeLabel.setText("Next Manual", juce::dontSendNotification);
     sceneChangeModeLabel.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
     sceneChangeModeLabel.setColour(juce::Label::textColourId, kTextMuted);
     sceneChangeModeLabel.setJustificationType(juce::Justification::centredLeft);
-    sceneChangeModeLabel.setTooltip("Choose when the chain should move to the next scene.");
+    sceneChangeModeLabel.setTooltip("Scene advance is fixed to Manual.");
     addAndMakeVisible(sceneChangeModeLabel);
+    sceneChangeModeLabel.setVisible(false);
 
     sceneChangeModeBox.addItem("Grid", static_cast<int>(MlrVSTAudioProcessor::SceneRecallMode::QuantizeGrid) + 1);
     sceneChangeModeBox.addItem("Pattern", static_cast<int>(MlrVSTAudioProcessor::SceneRecallMode::PatternEnd) + 1);
@@ -4542,6 +4544,8 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     };
     addAndMakeVisible(sceneChangeModeBox);
     styleSceneCombo(sceneChangeModeBox);
+    sceneChangeModeBox.setVisible(false);
+    sceneChangeModeBox.setEnabled(false);
 
     configureHeaderLabel(sceneSlotHeaderLabel, "Current");
     addAndMakeVisible(sceneSlotHeaderLabel);
@@ -4689,8 +4693,8 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(sceneDuplicateLengthButton);
     styleSceneUtilityButton(sceneDuplicateLengthButton);
 
-    configureHeaderLabel(sceneLengthHeaderLabel, "Length");
-    configureHeaderLabel(sceneBarsHeaderLabel, "Repeats");
+    configureHeaderLabel(sceneLengthHeaderLabel, "Length Bars");
+    configureHeaderLabel(sceneBarsHeaderLabel, "Bars");
     configureHeaderLabel(sceneAnchorHeaderLabel, "Ends On");
     configureHeaderLabel(sceneTransitionHeaderLabel, "Type");
     configureHeaderLabel(sceneTransitionOptionsHeaderLabel, "Style");
@@ -4704,8 +4708,10 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     configureHeaderLabel(sceneTransitionConditionHeaderLabel, "When");
     configureHeaderLabel(sceneTransitionEndSampleHeaderLabel, "End");
     addAndMakeVisible(sceneLengthHeaderLabel);
+    sceneLengthHeaderLabel.setVisible(false);
     addAndMakeVisible(sceneBarsHeaderLabel);
     addAndMakeVisible(sceneAnchorHeaderLabel);
+    sceneAnchorHeaderLabel.setVisible(false);
     addAndMakeVisible(sceneTransitionHeaderLabel);
     addAndMakeVisible(sceneTransitionOptionsHeaderLabel);
     addAndMakeVisible(sceneTransitionLengthHeaderLabel);
@@ -4774,10 +4780,12 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
         };
         addAndMakeVisible(lengthModeBox);
         styleSceneCombo(lengthModeBox);
+        lengthModeBox.setVisible(false);
+        lengthModeBox.setEnabled(false);
 
         for (int bars = 1; bars <= MlrVSTAudioProcessor::MaxSceneManualBars; ++bars)
             manualBarsBox.addItem(juce::String(bars), bars);
-        manualBarsBox.setTooltip("How many times the chosen scene length should repeat. In Bars mode, this is the number of bars.");
+        manualBarsBox.setTooltip("Number of bars the focused scene runs before it is eligible to end.");
         manualBarsBox.onChange = [this, sceneSlot]()
         {
             const int selectedId = sceneManualBarsBoxes[static_cast<size_t>(sceneSlot)].getSelectedId();
@@ -4806,6 +4814,8 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
         };
         addAndMakeVisible(anchorStripBox);
         styleSceneCombo(anchorStripBox);
+        anchorStripBox.setVisible(false);
+        anchorStripBox.setEnabled(false);
     }
 
     sceneTransitionTypeBox.addItem("None", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionType::None) + 1);
@@ -4815,8 +4825,8 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     sceneTransitionTypeBox.addItem("Drop", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionType::Drop) + 1);
     sceneTransitionTypeBox.addItem("Mute", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionType::MuteTail) + 1);
     sceneTransitionTypeBox.addItem("Break", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionType::Break) + 1);
-    sceneTransitionTypeBox.addItem("Return", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionType::Return) + 1);
-    sceneTransitionTypeBox.setTooltip("Outgoing connector for the selected chain step. Edit this live while the chain is playing to change the next handoff without stopping the cycle.");
+    sceneTransitionTypeBox.addItem("Return Route", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionType::Return) + 1);
+    sceneTransitionTypeBox.setTooltip("Outgoing connector for the selected chain step. Fill types add audio FX; Return Route is routing-only and sends the chain back here after visiting the next scene.");
     sceneTransitionTypeBox.onChange = [this]()
     {
         const int focusedStep = getFocusedSceneChainStep();
@@ -4935,7 +4945,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     sceneTransitionScopeBox.addItem("Steps", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionScope::Steps) + 1);
     sceneTransitionScopeBox.addItem("Grains", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionScope::Grains) + 1);
     sceneTransitionScopeBox.addItem("Flip", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionScope::Flip) + 1);
-    sceneTransitionScopeBox.setTooltip("Choose which kinds of strips the focused Chain Fill should touch.");
+    sceneTransitionScopeBox.setTooltip("Choose which kinds of strips the focused Chain Fill should touch. Return Route does not use audio scope.");
     sceneTransitionScopeBox.onChange = [this]()
     {
         const int focusedStep = getFocusedSceneChainStep();
@@ -4956,7 +4966,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     sceneTransitionContourBox.addItem("Burst", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionContour::BurstEnd) + 1);
     sceneTransitionContourBox.addItem("Duck/Lift", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionContour::DuckThenLift) + 1);
     sceneTransitionContourBox.addItem("Late Hit", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionContour::LateHit) + 1);
-    sceneTransitionContourBox.setTooltip("Shape how the fill blooms over time without changing the core Chain Fill type.");
+    sceneTransitionContourBox.setTooltip("Shape how the fill blooms over time without changing the core Chain Fill type. Return Route has no fill contour.");
     sceneTransitionContourBox.onChange = [this]()
     {
         const int focusedStep = getFocusedSceneChainStep();
@@ -4977,7 +4987,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     sceneTransitionConditionBox.addItem("25%", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionCondition::Chance25) + 1);
     sceneTransitionConditionBox.addItem("Loop", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionCondition::LoopOnly) + 1);
     sceneTransitionConditionBox.addItem("Forward", static_cast<int>(MlrVSTAudioProcessor::SceneChainTransitionCondition::ForwardOnly) + 1);
-    sceneTransitionConditionBox.setTooltip("Decide when the focused Chain Fill is allowed to fire.");
+    sceneTransitionConditionBox.setTooltip("Decide when the focused Chain Fill or Return Route is allowed to fire.");
     sceneTransitionConditionBox.onChange = [this]()
     {
         const int focusedStep = getFocusedSceneChainStep();
@@ -5167,11 +5177,12 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
                                                                            MlrVSTAudioProcessor::SceneChainTransitionOption option,
                                                                            float intensity,
                                                                            float lengthBeats,
-                                                                           bool subtractFromSceneLength)
+                                                                           bool subtractFromSceneLength,
+                                                                           MlrVSTAudioProcessor::SceneChainTransitionContour contour)
     {
         button.setButtonText(text);
         button.setTooltip(tooltip);
-        button.onClick = [this, type, option, intensity, lengthBeats, subtractFromSceneLength]()
+        button.onClick = [this, type, option, intensity, lengthBeats, subtractFromSceneLength, contour]()
         {
             const int focusedStep = getFocusedSceneChainStep();
             if (focusedStep < 0)
@@ -5182,7 +5193,8 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
                                             option,
                                             intensity,
                                             lengthBeats,
-                                            subtractFromSceneLength);
+                                            subtractFromSceneLength,
+                                            contour);
         };
         styleSceneUtilityButton(button);
     };
@@ -5194,7 +5206,8 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
                                    MlrVSTAudioProcessor::SceneChainTransitionOption::Tight,
                                    0.82f,
                                    0.5f,
-                                   true);
+                                   true,
+                                   MlrVSTAudioProcessor::SceneChainTransitionContour::BurstEnd);
     configureTransitionQuickAction(sceneTransitionLiftButton,
                                    "Lift",
                                    "Quick Chain Fill: rising filter sweep with a longer musical lift into the next scene.",
@@ -5202,7 +5215,8 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
                                    MlrVSTAudioProcessor::SceneChainTransitionOption::Sweep,
                                    0.80f,
                                    2.0f,
-                                   false);
+                                   false,
+                                   MlrVSTAudioProcessor::SceneChainTransitionContour::Ramp);
     configureTransitionQuickAction(sceneTransitionEchoButton,
                                    "Echo",
                                    "Quick Chain Fill: delay-led handoff with a little movement and tail.",
@@ -5210,7 +5224,8 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
                                    MlrVSTAudioProcessor::SceneChainTransitionOption::Echo,
                                    0.76f,
                                    1.0f,
-                                   false);
+                                   false,
+                                   MlrVSTAudioProcessor::SceneChainTransitionContour::DuckThenLift);
     configureTransitionQuickAction(sceneTransitionDropButton,
                                    "Drop",
                                    "Quick Chain Fill: short drop into the next scene with stronger cut and gate.",
@@ -5218,7 +5233,8 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
                                    MlrVSTAudioProcessor::SceneChainTransitionOption::Gate,
                                    0.86f,
                                    1.0f,
-                                   true);
+                                   true,
+                                   MlrVSTAudioProcessor::SceneChainTransitionContour::LateHit);
 
     addAndMakeVisible(sceneChainCanvas);
 
@@ -5677,13 +5693,9 @@ void SceneControlPanel::paint(juce::Graphics& g)
     unionVisibleBounds(playbackBounds, scenePlaybackSectionLabel);
     unionVisibleBounds(playbackBounds, sceneChainPlayButton);
     unionVisibleBounds(playbackBounds, sceneChangeModeLabel);
-    unionVisibleBounds(playbackBounds, sceneChangeModeBox);
     unionVisibleBounds(playbackBounds, sceneLengthHeaderLabel);
-    unionVisibleBounds(playbackBounds, sceneLengthModeBoxes[static_cast<size_t>(juce::jlimit(0, MlrVSTAudioProcessor::SceneSlots - 1, getFocusedSceneSlot()))]);
     unionVisibleBounds(playbackBounds, sceneBarsHeaderLabel);
     unionVisibleBounds(playbackBounds, sceneManualBarsBoxes[static_cast<size_t>(juce::jlimit(0, MlrVSTAudioProcessor::SceneSlots - 1, getFocusedSceneSlot()))]);
-    unionVisibleBounds(playbackBounds, sceneAnchorHeaderLabel);
-    unionVisibleBounds(playbackBounds, sceneAnchorStripBoxes[static_cast<size_t>(juce::jlimit(0, MlrVSTAudioProcessor::SceneSlots - 1, getFocusedSceneSlot()))]);
     drawInsetSection(playbackBounds, kAccent);
 
     juce::Rectangle<int> actionBounds;
@@ -5833,10 +5845,12 @@ void SceneControlPanel::applySceneTransitionQuickAction(int stepIndex,
                                                         MlrVSTAudioProcessor::SceneChainTransitionOption option,
                                                         float intensity,
                                                         float lengthBeats,
-                                                        bool subtractFromSceneLength)
+                                                        bool subtractFromSceneLength,
+                                                        MlrVSTAudioProcessor::SceneChainTransitionContour contour)
 {
     sceneTransitionSmartLinkEnabled = true;
     sceneTransitionSmartLinkButton.setToggleState(true, juce::dontSendNotification);
+    processor.setSceneChainStepTransitionContour(stepIndex, contour);
     applySceneTransitionSmartTuning(stepIndex,
                                     type,
                                     option,
@@ -6347,6 +6361,105 @@ void SceneControlPanel::updateSceneTimelineContentSize()
 
     if (sceneFollowPlayheadEnabled)
         updateSceneViewportFollow();
+}
+
+void SceneControlPanel::applySceneStripFocusState(int stripIndex, bool collapseOthers)
+{
+    const int visibleStripCount = getVisibleSceneStripCount();
+    if (visibleStripCount <= 0)
+        return;
+
+    const int safeStripIndex = juce::jlimit(0, visibleStripCount - 1, stripIndex);
+    sceneEditorState.selectedStripIndex = safeStripIndex;
+
+    for (int visibleStrip = 0; visibleStrip < visibleStripCount; ++visibleStrip)
+    {
+        const auto stripArrayIndex = static_cast<size_t>(visibleStrip);
+        const bool shouldExpandStrip = (visibleStrip == safeStripIndex);
+        const bool nextHeightExpanded = collapseOthers
+            ? shouldExpandStrip
+            : (shouldExpandStrip || stripHeightExpanded[stripArrayIndex]);
+        const bool nextAutomationExpanded = collapseOthers
+            ? shouldExpandStrip
+            : (shouldExpandStrip || stripAutomationExpanded[stripArrayIndex]);
+
+        if (stripHeightExpanded[stripArrayIndex] != nextHeightExpanded)
+        {
+            stripHeightExpanded[stripArrayIndex] = nextHeightExpanded;
+            processor.setSceneEditorStripHeightExpanded(visibleStrip, nextHeightExpanded);
+        }
+
+        if (stripAutomationExpanded[stripArrayIndex] != nextAutomationExpanded)
+        {
+            stripAutomationExpanded[stripArrayIndex] = nextAutomationExpanded;
+            processor.setSceneEditorStripAutomationExpanded(visibleStrip, nextAutomationExpanded);
+        }
+    }
+}
+
+juce::Rectangle<float> SceneControlPanel::getSceneStripCardBounds(int stripIndex) const
+{
+    const int visibleStripCount = getVisibleSceneStripCount();
+    if (stripIndex < 0 || stripIndex >= visibleStripCount)
+        return {};
+
+    float y = sceneGlobalLaneSectionHeight(sceneGlobalLaneExpanded);
+    for (int visibleStrip = 0; visibleStrip < stripIndex; ++visibleStrip)
+    {
+        y += sceneStripCardHeight(processor,
+                                  visibleStrip,
+                                  stripAutomationExpanded[static_cast<size_t>(visibleStrip)],
+                                  stripHeightExpanded[static_cast<size_t>(visibleStrip)])
+            + kSceneCardGap;
+    }
+
+    const int contentWidth = juce::jmax(sceneTimelineCanvas.getWidth(),
+                                        juce::jmax(220,
+                                                   sceneViewport.getWidth() - sceneViewport.getScrollBarThickness()));
+    const float cardHeight = sceneStripCardHeight(processor,
+                                                  stripIndex,
+                                                  stripAutomationExpanded[static_cast<size_t>(stripIndex)],
+                                                  stripHeightExpanded[static_cast<size_t>(stripIndex)]);
+    return { 0.0f, y, static_cast<float>(contentWidth), cardHeight };
+}
+
+void SceneControlPanel::ensureSceneStripVisible(int stripIndex)
+{
+    const int visibleStripCount = getVisibleSceneStripCount();
+    if (visibleStripCount <= 0)
+        return;
+
+    const int safeStripIndex = juce::jlimit(0, visibleStripCount - 1, stripIndex);
+    const auto cardBounds = getSceneStripCardBounds(safeStripIndex);
+    if (cardBounds.isEmpty())
+        return;
+
+    const int viewportHeight = sceneViewport.getHeight();
+    if (viewportHeight <= 0)
+        return;
+
+    const int currentY = sceneViewport.getViewPositionY();
+    const int margin = juce::jmax(18, viewportHeight / 12);
+    const int minVisibleY = currentY + margin;
+    const int maxVisibleY = currentY + viewportHeight - margin;
+    const int cardTop = static_cast<int>(std::floor(cardBounds.getY()));
+    const int cardBottom = static_cast<int>(std::ceil(cardBounds.getBottom()));
+
+    if (cardTop >= minVisibleY && cardBottom <= maxVisibleY)
+        return;
+
+    const int maxY = juce::jmax(0, sceneTimelineCanvas.getHeight() - viewportHeight);
+    int targetY = currentY;
+
+    if ((cardBottom - cardTop) >= (viewportHeight - (margin * 2)))
+        targetY = cardTop - margin;
+    else if (cardTop < minVisibleY)
+        targetY = cardTop - margin;
+    else
+        targetY = cardBottom - viewportHeight + margin;
+
+    sceneViewport.setViewPosition(sceneViewport.getViewPositionX(),
+                                  juce::jlimit(0, maxY, targetY));
 }
 
 double SceneControlPanel::getSceneTimelineLengthBeats(int sceneSlot) const
@@ -6946,46 +7059,26 @@ void SceneControlPanel::resized()
     auto timingRow = sceneActionRow;
     const int labelGap = 5;
     const int transportWidth = compactButtonWidthForText("STOP", 64, 74);
-    const int advanceLabelWidth = 34;
-    const int advanceWidth = comboWidthForTexts({"Grid", "Pattern", "Scene", "Manual"},
-                                                66,
-                                                juce::jmax(70, timingRow.getWidth() / 8));
-    const int lengthLabelWidth = 44;
-    const int lengthWidth = comboWidthForTexts({"Longest Strip", "Pattern End", "Bars", "Anchor Strip"},
-                                               80,
-                                               juce::jmax(84, timingRow.getWidth() / 6));
-    const int countLabelWidth = 52;
+    const int countLabelWidth = 30;
     const int countWidth = comboWidthForTexts({juce::String(MlrVSTAudioProcessor::MaxSceneManualBars)},
                                               44,
                                               juce::jmax(52, timingRow.getWidth() / 9));
-    const int anchorLabelWidth = 48;
-    const int anchorWidth = comboWidthForTexts({juce::String("S") + juce::String(MlrVSTAudioProcessor::MaxStrips)},
-                                               42,
-                                               juce::jmax(44, timingRow.getWidth() / 10));
     sceneChainPlayButton.setBounds(timingRow.removeFromLeft(transportWidth));
     timingRow.removeFromLeft(labelGap + 3);
-    sceneChangeModeLabel.setBounds(timingRow.removeFromLeft(advanceLabelWidth));
-    timingRow.removeFromLeft(labelGap);
-    sceneChangeModeBox.setBounds(timingRow.removeFromLeft(advanceWidth));
-    timingRow.removeFromLeft(labelGap + 1);
-    sceneLengthHeaderLabel.setBounds(timingRow.removeFromLeft(lengthLabelWidth));
-    timingRow.removeFromLeft(labelGap);
+    sceneChangeModeLabel.setBounds({});
+    sceneLengthHeaderLabel.setBounds({});
     const int focusedSceneSlot = getFocusedSceneSlot();
+    sceneChangeModeBox.setBounds({});
+    sceneAnchorHeaderLabel.setBounds({});
     for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
     {
         sceneLengthModeBoxes[static_cast<size_t>(sceneSlot)].setBounds({});
         sceneManualBarsBoxes[static_cast<size_t>(sceneSlot)].setBounds({});
         sceneAnchorStripBoxes[static_cast<size_t>(sceneSlot)].setBounds({});
     }
-    sceneLengthModeBoxes[static_cast<size_t>(focusedSceneSlot)].setBounds(timingRow.removeFromLeft(lengthWidth));
-    timingRow.removeFromLeft(labelGap);
     sceneBarsHeaderLabel.setBounds(timingRow.removeFromLeft(countLabelWidth));
     timingRow.removeFromLeft(labelGap);
     sceneManualBarsBoxes[static_cast<size_t>(focusedSceneSlot)].setBounds(timingRow.removeFromLeft(countWidth));
-    timingRow.removeFromLeft(labelGap);
-    sceneAnchorHeaderLabel.setBounds(timingRow.removeFromLeft(anchorLabelWidth));
-    timingRow.removeFromLeft(labelGap);
-    sceneAnchorStripBoxes[static_cast<size_t>(focusedSceneSlot)].setBounds(timingRow.removeFromLeft(anchorWidth));
     sceneTimingLayoutFocusedSlot = focusedSceneSlot;
 
     settingsBounds.removeFromTop(sectionGap);
@@ -7656,10 +7749,12 @@ void SceneControlPanel::refreshFromProcessor()
         stripHeightExpanded[static_cast<size_t>(stripIndex)] =
             processor.getSceneEditorStripHeightExpanded(stripIndex);
     }
+    int pendingFocusStrip = -1;
+    bool pendingFocusCollapseOthers = false;
+    const bool hasPendingSceneStripFocus = processor.consumePendingSceneEditorStripFocus(pendingFocusStrip,
+                                                                                         pendingFocusCollapseOthers);
 
     sceneModeToggle.setToggleState(processor.isSceneModeEnabled(), juce::dontSendNotification);
-    sceneChangeModeBox.setSelectedId(static_cast<int>(processor.getSceneRecallMode()) + 1,
-                                     juce::dontSendNotification);
     sceneGridToggleButton.setToggleState(sceneGridEnabled, juce::dontSendNotification);
     sceneGridDivisionBox.setSelectedId(sceneGridDivision, juce::dontSendNotification);
     sceneGridDivisionBox.setEnabled(sceneGridEnabled);
@@ -7680,11 +7775,11 @@ void SceneControlPanel::refreshFromProcessor()
     const bool sceneSlotClipboardReady = processor.hasSceneSlotClipboard();
     const int sceneSlotClipboardSourceSlot = processor.getSceneSlotClipboardSourceSlot();
     juce::String chainHint = chainLength > 0
-        ? juce::String("Scenes live up top, playback rules sit underneath, and the rail shapes order plus fills.")
+        ? juce::String("Scenes live up top, bar count sits underneath, and the rail shapes order plus fills.")
         : juce::String("Scenes live up top. Click an empty rail slot to add the focused scene.");
     if (chainLength > 0)
         chainHint << "  " << processor.getSceneSequenceSummaryText() << ".";
-    juce::String chainHintTooltip = "Scene buttons focus and launch scenes. Playback controls decide when the chain moves next. Click a chain step to focus it without launching, drag steps to reorder, wheel steps to change repeats, and use connector bubbles or the loop clamp to shape Chain Fills. Drag a bubble horizontally for Lead and vertically for Blend. Plain wheel changes Style, Shift-wheel changes Lead, Cmd/Ctrl-wheel changes Blend, Alt-wheel changes Type, Shift+Cmd/Ctrl-wheel changes Scope, Shift+Alt-wheel changes Contour, Cmd/Ctrl+Alt-wheel changes When, and double-click toggles Shorten Scene vs Ride Over End. Chains auto-loop.";
+    juce::String chainHintTooltip = "Scene buttons focus and launch scenes. Scene advance is fixed to Manual and scene length is fixed to Bars. Click a chain step to focus it without launching, drag steps to reorder, wheel steps to change repeats, and use connector chips or the loop clamp to shape Chain Fills and Return Routes. Fill chips render audio FX; Return Route visits the next scene and then routes back to this step. Drag a fill horizontally for Lead and vertically for Blend. Plain wheel changes Style, Shift-wheel changes Lead, Cmd/Ctrl-wheel changes Blend, Alt-wheel changes Type, Shift+Cmd/Ctrl-wheel changes Scope, Shift+Alt-wheel changes Contour, Cmd/Ctrl+Alt-wheel changes When, and double-click toggles Shorten Scene vs Ride Over End. On Return Route, plain wheel changes When and Alt-wheel changes Type. Chains auto-loop.";
     if (chainLength > 0)
         chainHintTooltip = processor.getSceneSequenceSummaryText() + ".  " + chainHintTooltip;
     hintLabel.setText(chainHint, juce::dontSendNotification);
@@ -7720,7 +7815,6 @@ void SceneControlPanel::refreshFromProcessor()
     sceneChainPlayButton.setColour(juce::TextButton::textColourOnId, juce::Colour(0xff10150f));
     sceneChainClearButton.setEnabled(processor.isSceneModeEnabled());
     const int focusedLengthCount = processor.getSceneLengthCount(focusedSceneSlot);
-    const auto focusedLengthMode = processor.getSceneLengthMode(focusedSceneSlot);
     const int focusedStep = getFocusedSceneChainStep() >= 0
         ? getFocusedSceneChainStep()
         : (sceneEndSampleEditorVisible ? sceneEndSampleEditorStep : -1);
@@ -7736,8 +7830,8 @@ void SceneControlPanel::refreshFromProcessor()
     }
     sceneSlotHeaderLabel.setText("Edit S" + juce::String(focusedSceneSlot + 1), juce::dontSendNotification);
     sceneSlotHeaderLabel.setColour(juce::Label::textColourId, sceneSlotUiColour(processor, focusedSceneSlot).brighter(0.12f));
-    sceneSlotHeaderLabel.setTooltip("The scene whose Length and Count settings are shown below.");
-    sceneAnchorHeaderLabel.setVisible(focusedLengthMode == MlrVSTAudioProcessor::SceneLengthMode::AnchorStrip);
+    sceneSlotHeaderLabel.setTooltip("The scene whose bar count setting is shown below.");
+    sceneAnchorHeaderLabel.setVisible(false);
 
     sceneInsertBeforeButton.setTooltip("Shift later scenes right and capture before scene S"
                                        + juce::String(getFocusedSceneSlot() + 1) + ".");
@@ -7778,19 +7872,6 @@ void SceneControlPanel::refreshFromProcessor()
     if (sceneTimingLayoutFocusedStep != focusedStep)
         resized();
 
-    sceneTransitionTypeBox.setEnabled(hasFocusedStep);
-    sceneTransitionOptionsBox.setEnabled(hasFocusedStep);
-    sceneTransitionScopeBox.setEnabled(hasFocusedStep);
-    sceneTransitionContourBox.setEnabled(hasFocusedStep);
-    sceneTransitionConditionBox.setEnabled(hasFocusedStep);
-    sceneTransitionLengthBox.setEnabled(hasFocusedStep);
-    sceneTransitionMixSlider.setEnabled(hasFocusedStep);
-    sceneTransitionDelaySlider.setEnabled(hasFocusedStep);
-    sceneTransitionFilterSlider.setEnabled(hasFocusedStep);
-    sceneTransitionChopSlider.setEnabled(hasFocusedStep);
-    sceneTransitionSubtractButton.setEnabled(hasFocusedStep);
-    sceneTransitionEndSampleBox.setEnabled(hasFocusedStep);
-    sceneTransitionEndSampleFolderButton.setEnabled(hasFocusedStep);
     sceneTransitionTypeBox.setSelectedId(hasFocusedStep
                                              ? (static_cast<int>(processor.getSceneChainStepTransitionType(focusedStep)) + 1)
                                              : 0,
@@ -7855,6 +7936,22 @@ void SceneControlPanel::refreshFromProcessor()
     const auto focusedTransitionEndSample = hasFocusedStep
         ? processor.getSceneChainStepTransitionEndSampleFile(focusedStep)
         : juce::File();
+    const bool focusedTransitionRoutesBack =
+        focusedTransitionType == MlrVSTAudioProcessor::SceneChainTransitionType::Return;
+    const bool focusedTransitionHasFillControls = hasFocusedStep && !focusedTransitionRoutesBack;
+    sceneTransitionTypeBox.setEnabled(hasFocusedStep);
+    sceneTransitionOptionsBox.setEnabled(focusedTransitionHasFillControls);
+    sceneTransitionScopeBox.setEnabled(focusedTransitionHasFillControls);
+    sceneTransitionContourBox.setEnabled(focusedTransitionHasFillControls);
+    sceneTransitionConditionBox.setEnabled(hasFocusedStep);
+    sceneTransitionLengthBox.setEnabled(focusedTransitionHasFillControls);
+    sceneTransitionMixSlider.setEnabled(focusedTransitionHasFillControls);
+    sceneTransitionDelaySlider.setEnabled(focusedTransitionHasFillControls);
+    sceneTransitionFilterSlider.setEnabled(focusedTransitionHasFillControls);
+    sceneTransitionChopSlider.setEnabled(focusedTransitionHasFillControls);
+    sceneTransitionSubtractButton.setEnabled(focusedTransitionHasFillControls);
+    sceneTransitionEndSampleBox.setEnabled(focusedTransitionHasFillControls);
+    sceneTransitionEndSampleFolderButton.setEnabled(focusedTransitionHasFillControls);
     const auto endSampleDirectory = processor.getSceneTransitionEndSampleDirectory();
     const auto transitionColour = hasFocusedStep
         ? sceneChainTransitionColour(focusedTransitionType)
@@ -7867,10 +7964,10 @@ void SceneControlPanel::refreshFromProcessor()
             : juce::Colours::white.withAlpha(0.34f));
         slider.setValue(hasFocusedStep ? value : 0.0f, juce::dontSendNotification);
     };
-    tintTransitionSlider(sceneTransitionMixSlider, focusedTransitionIntensity);
-    tintTransitionSlider(sceneTransitionDelaySlider, focusedTransitionDelay);
-    tintTransitionSlider(sceneTransitionFilterSlider, focusedTransitionFilter);
-    tintTransitionSlider(sceneTransitionChopSlider, focusedTransitionChop);
+    tintTransitionSlider(sceneTransitionMixSlider, focusedTransitionRoutesBack ? 0.0f : focusedTransitionIntensity);
+    tintTransitionSlider(sceneTransitionDelaySlider, focusedTransitionRoutesBack ? 0.0f : focusedTransitionDelay);
+    tintTransitionSlider(sceneTransitionFilterSlider, focusedTransitionRoutesBack ? 0.0f : focusedTransitionFilter);
+    tintTransitionSlider(sceneTransitionChopSlider, focusedTransitionRoutesBack ? 0.0f : focusedTransitionChop);
     sceneTransitionSubtractButton.setToggleState(focusedTransitionSubtractsFromSceneLength, juce::dontSendNotification);
     sceneTransitionSubtractButton.setButtonText(
         sceneTransitionSubtractButtonLabel(focusedTransitionSubtractsFromSceneLength));
@@ -7926,7 +8023,7 @@ void SceneControlPanel::refreshFromProcessor()
     }
     sceneTransitionSummaryLabel.setVisible(true);
     sceneTransitionMetaLabel.setVisible(true);
-    sceneTransitionSmartLinkButton.setEnabled(hasFocusedStep);
+    sceneTransitionSmartLinkButton.setEnabled(focusedTransitionHasFillControls);
     sceneTransitionSmartLinkButton.setToggleState(sceneTransitionSmartLinkEnabled, juce::dontSendNotification);
     sceneTransitionSmartLinkButton.setButtonText(sceneTransitionSmartLinkEnabled ? "Linked" : "Manual");
     sceneTransitionHeaderLabel.setColour(juce::Label::textColourId,
@@ -7973,14 +8070,14 @@ void SceneControlPanel::refreshFromProcessor()
                                                    juce::Colour(0xff111111));
     sceneTransitionSmartLinkButton.setColour(juce::TextButton::buttonColourId,
                                              hasFocusedStep
-                                                 ? (sceneTransitionSmartLinkEnabled
+                                                 ? (sceneTransitionSmartLinkEnabled && focusedTransitionHasFillControls
                                                         ? transitionColour.withAlpha(0.88f)
                                                         : juce::Colour(0xff454b52))
                                                  : juce::Colour(0xff3a4046));
     sceneTransitionSmartLinkButton.setColour(juce::TextButton::buttonOnColourId,
                                              transitionColour.brighter(0.18f));
     sceneTransitionSmartLinkButton.setColour(juce::TextButton::textColourOffId,
-                                             sceneTransitionSmartLinkEnabled && hasFocusedStep
+                                             sceneTransitionSmartLinkEnabled && focusedTransitionHasFillControls
                                                  ? juce::Colour(0xff111111)
                                                  : kTextPrimary);
     sceneTransitionSmartLinkButton.setColour(juce::TextButton::textColourOnId,
@@ -8029,40 +8126,61 @@ void SceneControlPanel::refreshFromProcessor()
             : (!focusedTransitionEndSample.existsAsFile()
                    ? juce::String("(Missing) ") + focusedTransitionEndSample.getFileName()
                    : focusedTransitionEndSample.getFileName());
-        sceneTransitionSummaryLabel.setText(sceneChainTransitionTypeLabel(focusedTransitionType)
-                                                + " / "
-                                                + sceneChainTransitionOptionLabel(focusedTransitionOption)
-                                                + " • "
-                                                + sceneTransitionFocusSummary(focusedTransitionDelay,
-                                                                             focusedTransitionFilter,
-                                                                             focusedTransitionChop)
-                                                + " • "
-                                                + sceneChainTransitionScopeLabel(focusedTransitionScope),
-                                            juce::dontSendNotification);
-    sceneTransitionMetaLabel.setText(formatSceneTransitionLengthBeats(focusedTransitionLength)
-                                             + " • "
-                                             + sceneTransitionEnergySummary(focusedTransitionIntensity)
-                                             + " • "
-                                             + sceneChainTransitionContourLabel(focusedTransitionContour)
-                                             + " • "
-                                             + sceneChainTransitionConditionLabel(focusedTransitionCondition)
-                                             + " • "
-                                             + juce::String("D")
-                                             + juce::String(juce::roundToInt(focusedTransitionDelay * 100.0f))
-                                             + " F"
-                                             + juce::String(juce::roundToInt(focusedTransitionFilter * 100.0f))
-                                             + " G"
-                                             + juce::String(juce::roundToInt(focusedTransitionChop * 100.0f))
-                                             + " • "
-                                             + juce::String(focusedTransitionSubtractsFromSceneLength ? "Shorten" : "Ride")
-                                             + " • Picked "
-                                             + focusedEndSampleLabel,
-                                         juce::dontSendNotification);
         const int currentSceneSlot = processor.getSceneChainStepSceneSlot(focusedStep);
         const bool loopbackStep = processor.isSceneChainLoopEnabled() && focusedStep == (chainLength - 1);
         const int nextStep = (focusedStep + 1 < chainLength)
             ? (focusedStep + 1)
             : (processor.isSceneChainLoopEnabled() ? processor.getSceneChainLoopStartStep() : -1);
+        juce::String routeDestinationLabel = "next";
+        if (nextStep >= 0 && nextStep < chainLength)
+            routeDestinationLabel = "S" + juce::String(processor.getSceneChainStepSceneSlot(nextStep) + 1);
+
+        if (focusedTransitionRoutesBack)
+        {
+            sceneTransitionSummaryLabel.setText("Return Route / no fill FX • visit "
+                                                    + routeDestinationLabel
+                                                    + ", then back here",
+                                                juce::dontSendNotification);
+            sceneTransitionMetaLabel.setText("Routing only • "
+                                                 + sceneChainTransitionConditionLabel(focusedTransitionCondition)
+                                                 + " • after "
+                                                 + routeDestinationLabel
+                                                 + ", chain returns to step "
+                                                 + juce::String(focusedStep + 1),
+                                             juce::dontSendNotification);
+        }
+        else
+        {
+            sceneTransitionSummaryLabel.setText(sceneChainTransitionTypeLabel(focusedTransitionType)
+                                                    + " / "
+                                                    + sceneChainTransitionOptionLabel(focusedTransitionOption)
+                                                    + " • "
+                                                    + sceneTransitionFocusSummary(focusedTransitionDelay,
+                                                                                 focusedTransitionFilter,
+                                                                                 focusedTransitionChop)
+                                                    + " • "
+                                                    + sceneChainTransitionScopeLabel(focusedTransitionScope),
+                                                juce::dontSendNotification);
+            sceneTransitionMetaLabel.setText(formatSceneTransitionLengthBeats(focusedTransitionLength)
+                                                 + " • "
+                                                 + sceneTransitionEnergySummary(focusedTransitionIntensity)
+                                                 + " • "
+                                                 + sceneChainTransitionContourLabel(focusedTransitionContour)
+                                                 + " • "
+                                                 + sceneChainTransitionConditionLabel(focusedTransitionCondition)
+                                                 + " • "
+                                                 + juce::String("D")
+                                                 + juce::String(juce::roundToInt(focusedTransitionDelay * 100.0f))
+                                                 + " F"
+                                                 + juce::String(juce::roundToInt(focusedTransitionFilter * 100.0f))
+                                                 + " G"
+                                                 + juce::String(juce::roundToInt(focusedTransitionChop * 100.0f))
+                                                 + " • "
+                                                 + juce::String(focusedTransitionSubtractsFromSceneLength ? "Shorten" : "Ride")
+                                                 + " • Picked "
+                                                 + focusedEndSampleLabel,
+                                             juce::dontSendNotification);
+        }
         juce::String transitionTooltip = loopbackStep
             ? (juce::String("Focused loopback clamp • step ") + juce::String(focusedStep + 1))
             : (juce::String("Focused connector • step ") + juce::String(focusedStep + 1));
@@ -8072,45 +8190,77 @@ void SceneControlPanel::refreshFromProcessor()
             transitionTooltip << " -> S" << juce::String(processor.getSceneChainStepSceneSlot(nextStep) + 1);
         else
             transitionTooltip << " -> stop";
-        transitionTooltip << " • " << sceneChainTransitionTypeSummary(focusedTransitionType)
-                          << " • " << sceneChainTransitionOptionSummary(focusedTransitionOption)
-                          << " • Scope: " << sceneChainTransitionScopeSummary(focusedTransitionScope)
-                          << " • Contour: " << sceneChainTransitionContourSummary(focusedTransitionContour)
-                          << " • Condition: " << sceneChainTransitionConditionSummary(focusedTransitionCondition)
-                          << " • " << sceneTransitionParameterSummary(focusedTransitionLength,
-                                                                      focusedTransitionScope,
-                                                                      focusedTransitionContour,
-                                                                      focusedTransitionCondition,
-                                                                      focusedTransitionIntensity,
-                                                                      focusedTransitionDelay,
-                                                                      focusedTransitionFilter,
-                                                                      focusedTransitionChop)
-                          << " • End sample: " << focusedEndSampleLabel
-                          << " • Type, Style, Lead, and Blend retune the fill shape together"
-                          << " • Drag X: Lead | Drag Y: Blend | Wheel: Style | Shift-wheel: Lead | Cmd/Ctrl-wheel: Blend | Alt-wheel: Type | Shift+Cmd/Ctrl-wheel: Scope | Shift+Alt-wheel: Contour | Cmd/Ctrl+Alt-wheel: When | Double-click: timing mode"
-                          << " • " << sceneTransitionTimingModeSummary(focusedTransitionSubtractsFromSceneLength);
+        transitionTooltip << " • " << sceneChainTransitionTypeSummary(focusedTransitionType);
+        if (focusedTransitionRoutesBack)
+        {
+            transitionTooltip << " • Return Route is not an audio fill; it queues "
+                              << routeDestinationLabel
+                              << ", then sends the chain back to this step after that scene completes"
+                              << " • Condition: "
+                              << sceneChainTransitionConditionSummary(focusedTransitionCondition)
+                              << " • Cmd/Ctrl+Alt-wheel changes When | Alt-wheel changes Type";
+        }
+        else
+        {
+            transitionTooltip << " • " << sceneChainTransitionOptionSummary(focusedTransitionOption)
+                              << " • Scope: " << sceneChainTransitionScopeSummary(focusedTransitionScope)
+                              << " • Contour: " << sceneChainTransitionContourSummary(focusedTransitionContour)
+                              << " • Condition: " << sceneChainTransitionConditionSummary(focusedTransitionCondition)
+                              << " • " << sceneTransitionParameterSummary(focusedTransitionLength,
+                                                                          focusedTransitionScope,
+                                                                          focusedTransitionContour,
+                                                                          focusedTransitionCondition,
+                                                                          focusedTransitionIntensity,
+                                                                          focusedTransitionDelay,
+                                                                          focusedTransitionFilter,
+                                                                          focusedTransitionChop)
+                              << " • End sample: " << focusedEndSampleLabel
+                              << " • Type, Style, Lead, and Blend retune the fill shape together"
+                              << " • Drag X: Lead | Drag Y: Blend | Wheel: Style | Shift-wheel: Lead | Cmd/Ctrl-wheel: Blend | Alt-wheel: Type | Shift+Cmd/Ctrl-wheel: Scope | Shift+Alt-wheel: Contour | Cmd/Ctrl+Alt-wheel: When | Double-click: timing mode"
+                              << " • " << sceneTransitionTimingModeSummary(focusedTransitionSubtractsFromSceneLength);
+        }
         sceneTransitionSummaryLabel.setTooltip(transitionTooltip);
         sceneTransitionMetaLabel.setTooltip(transitionTooltip);
-        sceneTransitionTypeBox.setTooltip("Fill type for the focused connector bubble or loopback clamp. Changing Type also retunes the Echo, Tone, and Gate balance.");
-        sceneTransitionOptionsBox.setTooltip("Transition style for the focused fill bubble. Style steers the same Chain Fill toward tighter, wider, echo-led, sweep-led, or gate-led behaviour.");
-        sceneTransitionScopeBox.setTooltip("Scope decides which strip types the focused Chain Fill will touch: all strips, loop-style strips, steps, grains, or flip/sample strips.");
-        sceneTransitionContourBox.setTooltip("Contour shapes how the fill evolves across its lead time: smooth, ramped, burst-ending, duck-then-lift, or late-hit.");
-        sceneTransitionConditionBox.setTooltip("Condition decides when this Chain Fill is allowed to fire: every time, probabilistically, loop-only, or forward-only.");
-        sceneTransitionLengthBox.setTooltip("Lead-in length for the focused fill bubble. Longer leads lean more into Echo and Tone; shorter leads stay punchier.");
-        sceneTransitionMixSlider.setTooltip("Primary Chain Fill macro. Blend retunes Echo, Tone, and Gate together around the current Type, Style, and Lead.");
-        sceneTransitionDelaySlider.setTooltip("Delay amount used by the focused fill bubble.");
-        sceneTransitionFilterSlider.setTooltip("Filter sweep amount used by the focused fill bubble.");
-        sceneTransitionChopSlider.setTooltip("Gate/stutter amount used by the focused fill bubble.");
-        sceneTransitionEndSampleBox.setTooltip("Quick pick for the sample that fires on the next bar. Open Edit for audition and shaping.");
-        sceneTransitionEndSampleFolderButton.setTooltip(sceneEndSampleEditorVisible
-                                                            ? "Close the fill-end sample editor."
-                                                            : "Open the fill-end sample editor for audition, browsing, and playback shaping.");
-        sceneTransitionSubtractButton.setTooltip(focusedTransitionSubtractsFromSceneLength
-                                                     ? "On: the fill lead time is subtracted from the outgoing scene duration."
-                                                     : "Off: the fill rides over the scene end without shortening the scene duration.");
-        sceneTransitionSmartLinkButton.setTooltip(sceneTransitionSmartLinkEnabled
-                                                      ? "Linked is on. Blend, Type, Style, and Lead all keep the Chain Fill musically balanced. Touch Echo, Tone, or Gate to break out into manual editing."
-                                                      : "Manual editing is on. Turn Linked back on to let Blend, Type, Style, and Lead retune the focused Chain Fill.");
+        if (focusedTransitionRoutesBack)
+        {
+            sceneTransitionTypeBox.setTooltip("Return Route is routing-only: play the next scene, then route the chain back to this step. Choose another Type for audible fill FX.");
+            sceneTransitionOptionsBox.setTooltip("Return Route has no Style because it does not render audio FX.");
+            sceneTransitionScopeBox.setTooltip("Return Route has no audio scope.");
+            sceneTransitionContourBox.setTooltip("Return Route has no fill contour.");
+            sceneTransitionConditionBox.setTooltip("Condition decides when this Return Route is allowed to queue the bounce back.");
+            sceneTransitionLengthBox.setTooltip("Return Route has no lead time.");
+            sceneTransitionMixSlider.setTooltip("Return Route has no fill Blend.");
+            sceneTransitionDelaySlider.setTooltip("Return Route has no delay FX.");
+            sceneTransitionFilterSlider.setTooltip("Return Route has no filter FX.");
+            sceneTransitionChopSlider.setTooltip("Return Route has no gate/stutter FX.");
+            sceneTransitionEndSampleBox.setTooltip("Return Route does not trigger end samples.");
+            sceneTransitionEndSampleFolderButton.setTooltip("Return Route does not use the fill-end sample editor.");
+            sceneTransitionSubtractButton.setTooltip("Return Route does not use Shorten/Ride timing.");
+            sceneTransitionSmartLinkButton.setTooltip("Linked tuning applies to audible Chain Fills, not Return Route.");
+        }
+        else
+        {
+            sceneTransitionTypeBox.setTooltip("Fill type for the focused connector bubble or loopback clamp. Return Route is routing-only; the other types render audible fills.");
+            sceneTransitionOptionsBox.setTooltip("Transition style for the focused fill bubble. Style steers the same Chain Fill toward tighter, wider, echo-led, sweep-led, or gate-led behaviour.");
+            sceneTransitionScopeBox.setTooltip("Scope decides which strip types the focused Chain Fill will touch: all strips, loop-style strips, steps, grains, or flip/sample strips.");
+            sceneTransitionContourBox.setTooltip("Contour shapes how the fill evolves across its lead time: smooth, ramped, burst-ending, duck-then-lift, or late-hit.");
+            sceneTransitionConditionBox.setTooltip("Condition decides when this Chain Fill is allowed to fire: every time, probabilistically, loop-only, or forward-only.");
+            sceneTransitionLengthBox.setTooltip("Lead-in length for the focused fill bubble. Longer leads lean more into Echo and Tone; shorter leads stay punchier.");
+            sceneTransitionMixSlider.setTooltip("Primary Chain Fill macro. Blend retunes Echo, Tone, and Gate together around the current Type, Style, and Lead.");
+            sceneTransitionDelaySlider.setTooltip("Delay amount used by the focused fill bubble.");
+            sceneTransitionFilterSlider.setTooltip("Filter sweep amount used by the focused fill bubble.");
+            sceneTransitionChopSlider.setTooltip("Gate/stutter amount used by the focused fill bubble.");
+            sceneTransitionEndSampleBox.setTooltip("Quick pick for the sample that fires on the next bar. Open Edit for audition and shaping.");
+            sceneTransitionEndSampleFolderButton.setTooltip(sceneEndSampleEditorVisible
+                                                                ? "Close the fill-end sample editor."
+                                                                : "Open the fill-end sample editor for audition, browsing, and playback shaping.");
+            sceneTransitionSubtractButton.setTooltip(focusedTransitionSubtractsFromSceneLength
+                                                         ? "On: the fill lead time is subtracted from the outgoing scene duration."
+                                                         : "Off: the fill rides over the scene end without shortening the scene duration.");
+            sceneTransitionSmartLinkButton.setTooltip(sceneTransitionSmartLinkEnabled
+                                                          ? "Linked is on. Blend, Type, Style, and Lead all keep the Chain Fill musically balanced. Touch Echo, Tone, or Gate to break out into manual editing."
+                                                          : "Manual editing is on. Turn Linked back on to let Blend, Type, Style, and Lead retune the focused Chain Fill.");
+        }
         sceneTransitionPunchButton.setTooltip("Punch preset: tight stutter with a short lead and stronger gate.");
         sceneTransitionLiftButton.setTooltip("Lift preset: longer rising sweep into the next scene.");
         sceneTransitionEchoButton.setTooltip("Echo preset: delay-led Chain Fill with a softer handoff.");
@@ -8118,16 +8268,16 @@ void SceneControlPanel::refreshFromProcessor()
     }
     else
     {
-        sceneTransitionSummaryLabel.setText("No fill bubble", juce::dontSendNotification);
-        sceneTransitionMetaLabel.setText("Click a connector chip or the loop clamp to edit the current Chain Fill",
+        sceneTransitionSummaryLabel.setText("No connector chip", juce::dontSendNotification);
+        sceneTransitionMetaLabel.setText("Click a connector chip or the loop clamp to edit the current Chain Fill or Return Route",
                                          juce::dontSendNotification);
-        sceneTransitionSummaryLabel.setTooltip("The fill editor follows the focused connector bubble or loopback clamp.");
-        sceneTransitionMetaLabel.setTooltip("Select a connector chip or loop clamp, then shape the fill here.");
-        sceneTransitionTypeBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
+        sceneTransitionSummaryLabel.setTooltip("The fill/route editor follows the focused connector chip or loopback clamp.");
+        sceneTransitionMetaLabel.setTooltip("Select a connector chip or loop clamp, then shape the fill or route here.");
+        sceneTransitionTypeBox.setTooltip("Select a connector chip or loop clamp to edit fills and routes.");
         sceneTransitionOptionsBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
         sceneTransitionScopeBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
         sceneTransitionContourBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
-        sceneTransitionConditionBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
+        sceneTransitionConditionBox.setTooltip("Select a connector chip or loop clamp to edit fill or route conditions.");
         sceneTransitionLengthBox.setTooltip("Select a connector chip or loop clamp to edit fills.");
         sceneTransitionMixSlider.setTooltip("Select a connector chip or loop clamp to edit fills.");
         sceneTransitionDelaySlider.setTooltip("Select a connector chip or loop clamp to edit fills.");
@@ -8179,10 +8329,11 @@ void SceneControlPanel::refreshFromProcessor()
         sceneLengthModeBoxes[idx].setSelectedId(static_cast<int>(lengthMode) + 1, juce::dontSendNotification);
         sceneManualBarsBoxes[idx].setSelectedId(countValue, juce::dontSendNotification);
         sceneAnchorStripBoxes[idx].setSelectedId(anchorStrip + 1, juce::dontSendNotification);
-        sceneLengthModeBoxes[idx].setVisible(isSelectedScene);
+        sceneLengthModeBoxes[idx].setVisible(false);
+        sceneLengthModeBoxes[idx].setEnabled(false);
         sceneManualBarsBoxes[idx].setVisible(isSelectedScene);
-        sceneAnchorStripBoxes[idx].setVisible(isSelectedScene && lengthMode == MlrVSTAudioProcessor::SceneLengthMode::AnchorStrip);
-        sceneAnchorStripBoxes[idx].setEnabled(lengthMode == MlrVSTAudioProcessor::SceneLengthMode::AnchorStrip);
+        sceneAnchorStripBoxes[idx].setVisible(false);
+        sceneAnchorStripBoxes[idx].setEnabled(false);
         juce::String slotText = "S" + juce::String(sceneSlot + 1);
         if (isActiveScene)
             slotText << " LIVE";
@@ -8242,13 +8393,13 @@ void SceneControlPanel::refreshFromProcessor()
                                          ? " | This scene has saved content."
                                          : " | Empty scenes stay grey until you save into them.")
                                   + " | Click manually launches this scene on the global trigger grid and takes over from chain playback."
-                                  + " | This button also focuses the scene for Copy, Paste, Clear, Length, and Count editing."
+                                  + " | This button also focuses the scene for Copy, Paste, Clear, and Bars editing."
                                   + " | Drag this scene into the chain rail below to add it to playback order."
                                   + " | The chain rail below also supports drag-reorder."
                                   + " | Use the scene Copy/Paste buttons above for duplication.");
-        sceneLengthModeBoxes[idx].setTooltip(resolvedTooltip + " | Length mode");
-        sceneManualBarsBoxes[idx].setTooltip(resolvedTooltip + " | Length count");
-        sceneAnchorStripBoxes[idx].setTooltip(resolvedTooltip + " | Anchor strip");
+        sceneLengthModeBoxes[idx].setTooltip(resolvedTooltip + " | Length fixed to Bars");
+        sceneManualBarsBoxes[idx].setTooltip(resolvedTooltip + " | Bars");
+        sceneAnchorStripBoxes[idx].setTooltip(resolvedTooltip + " | Anchor strip ignored while length stays in Bars");
     }
 
     const bool hasEngine = (processor.getAudioEngine() != nullptr);
@@ -8302,7 +8453,11 @@ void SceneControlPanel::refreshFromProcessor()
         ? processor.getAudioEngine()->getCurrentBeat()
         : 0.0;
     updateSceneEditorState(beat);
+    if (hasPendingSceneStripFocus)
+        applySceneStripFocusState(pendingFocusStrip, pendingFocusCollapseOthers);
     updateSceneTimelineContentSize();
+    if (hasPendingSceneStripFocus)
+        ensureSceneStripVisible(pendingFocusStrip);
     updateSceneViewportFollow();
     sceneChainCanvas.repaint();
     sceneTimelineCanvas.repaint();
@@ -8807,7 +8962,8 @@ void SceneControlPanel::handleSceneChainMouseDoubleClick(const juce::MouseEvent&
         return;
 
     const auto transitionType = processor.getSceneChainStepTransitionType(hitTransition);
-    if (transitionType == MlrVSTAudioProcessor::SceneChainTransitionType::None)
+    if (transitionType == MlrVSTAudioProcessor::SceneChainTransitionType::None
+        || transitionType == MlrVSTAudioProcessor::SceneChainTransitionType::Return)
         return;
 
     selectedSceneChainStep = hitTransition;
@@ -8843,6 +8999,12 @@ void SceneControlPanel::handleSceneChainMouseDrag(const juce::MouseEvent& e)
                                                 1.0f,
                                                 sceneChainDragTransitionStartIntensity + (deltaY / 90.0f));
         const auto currentType = processor.getSceneChainStepTransitionType(hitTransition);
+        if (currentType == MlrVSTAudioProcessor::SceneChainTransitionType::Return)
+        {
+            sceneChainCanvas.repaint();
+            return;
+        }
+
         const auto currentOption = processor.getSceneChainStepTransitionOption(hitTransition);
         const bool subtractFromSceneLength =
             processor.getSceneChainStepTransitionSubtractsFromSceneLength(hitTransition);
@@ -9061,6 +9223,47 @@ void SceneControlPanel::handleSceneChainMouseWheel(const juce::MouseEvent& e, co
         const bool linkedType = currentType != MlrVSTAudioProcessor::SceneChainTransitionType::None
             && currentType != MlrVSTAudioProcessor::SceneChainTransitionType::Return;
         const bool canUseLinkedRetune = sceneTransitionSmartLinkEnabled && linkedType;
+
+        if (currentType == MlrVSTAudioProcessor::SceneChainTransitionType::Return)
+        {
+            if (commandOrCtrlDown && altDown)
+            {
+                const auto newCondition = increase
+                    ? nextSceneChainTransitionCondition(currentCondition)
+                    : previousSceneChainTransitionCondition(currentCondition);
+                if (newCondition != currentCondition)
+                {
+                    processor.setSceneChainStepTransitionCondition(hitTransition, newCondition);
+                    refreshFromProcessor();
+                }
+                return;
+            }
+
+            if (altDown)
+            {
+                auto nextType = increase
+                    ? nextSceneChainTransitionType(currentType)
+                    : previousSceneChainTransitionType(currentType);
+                processor.setSceneChainStepTransitionType(hitTransition, nextType);
+                refreshFromProcessor();
+                return;
+            }
+
+            if (!shiftDown)
+            {
+                const auto newCondition = increase
+                    ? nextSceneChainTransitionCondition(currentCondition)
+                    : previousSceneChainTransitionCondition(currentCondition);
+                if (newCondition != currentCondition)
+                {
+                    processor.setSceneChainStepTransitionCondition(hitTransition, newCondition);
+                    refreshFromProcessor();
+                }
+                return;
+            }
+
+            return;
+        }
 
         if (shiftDown && commandOrCtrlDown)
         {
@@ -13461,6 +13664,674 @@ void MacroControlPanel::refreshFromProcessor()
 // GlobalControlPanel Implementation
 //==============================================================================
 
+namespace
+{
+const char* gestureLaneName(GestureComboKind kind, int laneIndex) noexcept
+{
+    static constexpr std::array<const char*, kStutterGestureComboLaneCount> kStutterNames{
+        "Speed", "Pitch", "Pan", "Cutoff", "Resonance", "Morph", "Division", "Slice"
+    };
+    static constexpr std::array<const char*, kScratchGestureComboLaneCount> kScratchNames{
+        "Motion", "Pitch", "Scene", "Size", "Density", "Spread", "Position", "Window", "Division", "Duration", "Motion End"
+    };
+
+    if (kind == GestureComboKind::Stutter)
+    {
+        const int safeLane = juce::jlimit(0, kStutterGestureComboLaneCount - 1, laneIndex);
+        return kStutterNames[static_cast<size_t>(safeLane)];
+    }
+
+    const int safeLane = juce::jlimit(0, kScratchGestureComboLaneCount - 1, laneIndex);
+    return kScratchNames[static_cast<size_t>(safeLane)];
+}
+
+juce::String gestureComboDisplayLabel(GestureComboKind kind, int buttonCount, int comboIndex)
+{
+    std::array<int, 3> columns{ -1, -1, -1 };
+    if (!getGestureComboColumns(kind, buttonCount, comboIndex, columns))
+        return "Unavailable";
+
+    juce::String label = (kind == GestureComboKind::Stutter) ? "Top " : "Row ";
+    for (int i = 0; i < buttonCount; ++i)
+    {
+        if (i > 0)
+            label << " + ";
+        label << columns[static_cast<size_t>(i)];
+    }
+    return label;
+}
+} // namespace
+
+class GlobalGestureEditorOverlay : public juce::Component,
+                                   private juce::ListBoxModel
+{
+public:
+    GlobalGestureEditorOverlay(MlrVSTAudioProcessor& p, std::function<void()> closeFn)
+        : processor(p), onClose(std::move(closeFn))
+    {
+        titleLabel.setText("GESTURE EDITOR", juce::dontSendNotification);
+        titleLabel.setFont(juce::Font(juce::FontOptions(13.0f, juce::Font::bold)));
+        titleLabel.setColour(juce::Label::textColourId, kTextPrimary);
+        titleLabel.setJustificationType(juce::Justification::centredLeft);
+        addAndMakeVisible(titleLabel);
+
+        profileLabel.setColour(juce::Label::textColourId, kAccent.brighter(0.08f));
+        profileLabel.setJustificationType(juce::Justification::centredLeft);
+        profileLabel.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+        addAndMakeVisible(profileLabel);
+
+        hintLabel.setText("Pick a combo on the left, drag to draw, and double-click a lane to flatten it. The center line is neutral.", juce::dontSendNotification);
+        hintLabel.setColour(juce::Label::textColourId, kTextMuted);
+        hintLabel.setJustificationType(juce::Justification::centredLeft);
+        hintLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
+        addAndMakeVisible(hintLabel);
+
+        searchBox.setTextToShowWhenEmpty("Filter combos", kTextMuted.withAlpha(0.75f));
+        searchBox.setColour(juce::TextEditor::backgroundColourId, kSurfaceDark.withAlpha(0.92f));
+        searchBox.setColour(juce::TextEditor::outlineColourId, kPanelStroke.withAlpha(0.65f));
+        searchBox.setColour(juce::TextEditor::focusedOutlineColourId, kAccent.withAlpha(0.9f));
+        searchBox.setColour(juce::TextEditor::textColourId, kTextPrimary);
+        searchBox.onTextChange = [this]() { rebuildVisibleCombos(); };
+        addAndMakeVisible(searchBox);
+
+        configureModeButton(stutterButton, "Stutter", [this]()
+        {
+            selectedKind = GestureComboKind::Stutter;
+            refreshSelectionButtons();
+            rebuildVisibleCombos();
+        });
+        configureModeButton(scratchButton, "Scratch", [this]()
+        {
+            selectedKind = GestureComboKind::Scratch;
+            refreshSelectionButtons();
+            rebuildVisibleCombos();
+        });
+        configureModeButton(oneButton, "1 Button", [this]()
+        {
+            selectedButtonCount = 1;
+            refreshSelectionButtons();
+            rebuildVisibleCombos();
+        });
+        configureModeButton(twoButton, "2 Button", [this]()
+        {
+            selectedButtonCount = 2;
+            refreshSelectionButtons();
+            rebuildVisibleCombos();
+        });
+        configureModeButton(threeButton, "3 Button", [this]()
+        {
+            selectedButtonCount = 3;
+            refreshSelectionButtons();
+            rebuildVisibleCombos();
+        });
+
+        comboList.setModel(this);
+        comboList.setRowHeight(24);
+        comboList.setColour(juce::ListBox::backgroundColourId, juce::Colours::transparentBlack);
+        comboList.setColour(juce::ListBox::outlineColourId, juce::Colours::transparentBlack);
+        addAndMakeVisible(comboList);
+
+        saveButton.setButtonText("Save");
+        saveButton.onClick = [this]()
+        {
+            processor.flushPersistentGlobalControlsNow();
+            repaint();
+        };
+        addAndMakeVisible(saveButton);
+        styleUiButton(saveButton, true);
+
+        resetComboButton.setButtonText("Reset Combo");
+        resetComboButton.onClick = [this]()
+        {
+            if (visibleComboIndices.empty())
+                return;
+            processor.getGestureCoordinator().resetComboProfile(selectedKind,
+                                                               selectedButtonCount,
+                                                               getSelectedComboIndex());
+            repaint();
+        };
+        addAndMakeVisible(resetComboButton);
+        styleUiButton(resetComboButton);
+
+        resetCountButton.setButtonText("Reset Count");
+        resetCountButton.onClick = [this]()
+        {
+            processor.getGestureCoordinator().resetComboButtonCount(selectedKind, selectedButtonCount);
+            repaint();
+        };
+        addAndMakeVisible(resetCountButton);
+        styleUiButton(resetCountButton);
+
+        resetAllButton.setButtonText("Reset All");
+        resetAllButton.onClick = [this]()
+        {
+            processor.getGestureCoordinator().resetAllComboProfiles();
+            repaint();
+        };
+        addAndMakeVisible(resetAllButton);
+        styleUiButton(resetAllButton);
+
+        closeButton.setButtonText("Close");
+        closeButton.onClick = [this]()
+        {
+            if (onClose)
+                onClose();
+        };
+        addAndMakeVisible(closeButton);
+        styleUiButton(closeButton);
+
+        setInterceptsMouseClicks(true, true);
+        refreshSelectionButtons();
+        rebuildVisibleCombos();
+    }
+
+    void syncSelectionFromLiveMonome()
+    {
+        GestureComboKind liveKind = GestureComboKind::Stutter;
+        int liveButtonCount = 0;
+        int liveComboIndex = 0;
+        if (!processor.getLiveMonomeGestureComboSelection(liveKind, liveButtonCount, liveComboIndex))
+            return;
+
+        const bool selectionChanged = (selectedKind != liveKind)
+            || (selectedButtonCount != liveButtonCount)
+            || (selectedComboIndex != liveComboIndex);
+        if (!selectionChanged)
+            return;
+
+        selectedKind = liveKind;
+        selectedButtonCount = juce::jlimit(1, 3, liveButtonCount);
+        selectedComboIndex = juce::jmax(0, liveComboIndex);
+        refreshSelectionButtons();
+
+        if (!isCurrentComboVisible())
+        {
+            if (!searchBox.getText().isEmpty())
+                searchBox.setText({}, juce::dontSendNotification);
+            rebuildVisibleCombos();
+            return;
+        }
+
+        syncListSelectionToCurrentCombo();
+        refreshSelectionButtons();
+        resized();
+        repaint();
+    }
+
+    void paint(juce::Graphics& g) override
+    {
+        g.fillAll(juce::Colours::black.withAlpha(0.56f));
+
+        const auto panel = getPanelBounds().toFloat();
+        drawPanel(g, panel, kAccent, 10.0f);
+
+        if (!sidebarBounds.isEmpty())
+        {
+            g.setColour(kSurfaceDark.withAlpha(0.36f));
+            g.fillRoundedRectangle(sidebarBounds.toFloat(), 8.0f);
+            g.setColour(kPanelStroke.withAlpha(0.55f));
+            g.drawRoundedRectangle(sidebarBounds.toFloat(), 8.0f, 1.0f);
+        }
+
+        if (visibleComboIndices.empty())
+        {
+            g.setColour(kTextMuted);
+            g.setFont(juce::Font(juce::FontOptions(13.0f)));
+            g.drawFittedText("No combos match the current filter.",
+                             graphAreaBounds.reduced(12),
+                             juce::Justification::centred,
+                             2);
+            return;
+        }
+
+        const auto state = processor.getGestureCoordinator().getComboProfileState(selectedKind,
+                                                                                  selectedButtonCount,
+                                                                                  getSelectedComboIndex());
+        const int laneCount = getGestureComboLaneCount(selectedKind);
+        for (int lane = 0; lane < laneCount; ++lane)
+        {
+            auto rowBounds = laneRows[static_cast<size_t>(lane)];
+            if (rowBounds.isEmpty())
+                continue;
+
+            const auto graphBounds = laneGraphs[static_cast<size_t>(lane)];
+            g.setColour(juce::Colours::black.withAlpha(0.16f));
+            g.fillRoundedRectangle(graphBounds.expanded(0.0f, 1.0f), 5.0f);
+            g.setColour(kPanelStroke.withAlpha(0.75f));
+            g.drawRoundedRectangle(graphBounds.expanded(0.0f, 1.0f), 5.0f, 1.0f);
+
+            g.setColour(kTextPrimary);
+            g.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+            g.drawText(gestureLaneName(selectedKind, lane),
+                       rowBounds.removeFromLeft(84),
+                       juce::Justification::centredLeft,
+                       false);
+
+            const float zeroY = graphBounds.getCentreY();
+            g.setColour(kTextMuted.withAlpha(0.45f));
+            g.drawLine(graphBounds.getX(), zeroY, graphBounds.getRight(), zeroY, 1.0f);
+
+            for (int step = 0; step <= kGestureProfileSteps; ++step)
+            {
+                const float x = graphBounds.getX()
+                    + (graphBounds.getWidth() * static_cast<float>(step) / static_cast<float>(kGestureProfileSteps));
+                g.setColour((step % 4 == 0) ? kTextMuted.withAlpha(0.30f) : kTextMuted.withAlpha(0.14f));
+                g.drawVerticalLine(static_cast<int>(std::round(x)), graphBounds.getY(), graphBounds.getBottom());
+            }
+
+            juce::Path lanePath;
+            juce::Path laneFill;
+            for (int step = 0; step < kGestureProfileSteps; ++step)
+            {
+                const float value = juce::jlimit(-1.0f, 1.0f, state.lanes[static_cast<size_t>(lane)][static_cast<size_t>(step)]);
+                const float x = graphBounds.getX()
+                    + ((static_cast<float>(step) + 0.5f) * graphBounds.getWidth() / static_cast<float>(kGestureProfileSteps));
+                const float y = zeroY - (value * (graphBounds.getHeight() * 0.46f));
+                if (step == 0)
+                {
+                    lanePath.startNewSubPath(x, y);
+                    laneFill.startNewSubPath(x, zeroY);
+                    laneFill.lineTo(x, y);
+                }
+                else
+                {
+                    lanePath.lineTo(x, y);
+                    laneFill.lineTo(x, y);
+                }
+            }
+
+            const float finalX = graphBounds.getX()
+                + (((static_cast<float>(kGestureProfileSteps) - 1.0f) + 0.5f)
+                    * graphBounds.getWidth() / static_cast<float>(kGestureProfileSteps));
+            laneFill.lineTo(finalX, zeroY);
+            laneFill.closeSubPath();
+
+            g.setColour(kAccent.withAlpha(0.16f));
+            g.fillPath(laneFill);
+            g.setColour(kAccent.brighter(0.08f));
+            g.strokePath(lanePath, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+            for (int step = 0; step < kGestureProfileSteps; ++step)
+            {
+                const float value = juce::jlimit(-1.0f, 1.0f, state.lanes[static_cast<size_t>(lane)][static_cast<size_t>(step)]);
+                const float x = graphBounds.getX()
+                    + ((static_cast<float>(step) + 0.5f) * graphBounds.getWidth() / static_cast<float>(kGestureProfileSteps));
+                const float y = zeroY - (value * (graphBounds.getHeight() * 0.46f));
+                g.setColour(juce::Colours::black.withAlpha(0.6f));
+                g.fillEllipse(x - 3.5f, y - 3.5f, 7.0f, 7.0f);
+                g.setColour(kAccent.brighter(0.18f));
+                g.fillEllipse(x - 2.5f, y - 2.5f, 5.0f, 5.0f);
+            }
+        }
+    }
+
+    void resized() override
+    {
+        auto panel = getPanelBounds().reduced(12);
+        auto header = panel.removeFromTop(24);
+        titleLabel.setBounds(header.removeFromLeft(180));
+        searchBox.setBounds(header.removeFromRight(180));
+        header.removeFromRight(8);
+        saveButton.setBounds(header.removeFromRight(56));
+        header.removeFromRight(6);
+        closeButton.setBounds(header.removeFromRight(58));
+        header.removeFromRight(6);
+        resetAllButton.setBounds(header.removeFromRight(72));
+        header.removeFromRight(6);
+        resetCountButton.setBounds(header.removeFromRight(84));
+        header.removeFromRight(6);
+        resetComboButton.setBounds(header.removeFromRight(88));
+
+        panel.removeFromTop(2);
+        profileLabel.setBounds(panel.removeFromTop(16));
+        panel.removeFromTop(4);
+
+        auto selectorRow = panel.removeFromTop(24);
+        stutterButton.setBounds(selectorRow.removeFromLeft(72));
+        selectorRow.removeFromLeft(6);
+        scratchButton.setBounds(selectorRow.removeFromLeft(72));
+        selectorRow.removeFromLeft(12);
+        oneButton.setBounds(selectorRow.removeFromLeft(68));
+        selectorRow.removeFromLeft(6);
+        twoButton.setBounds(selectorRow.removeFromLeft(68));
+        selectorRow.removeFromLeft(6);
+        threeButton.setBounds(selectorRow.removeFromLeft(74));
+
+        panel.removeFromTop(6);
+        hintLabel.setBounds(panel.removeFromTop(16));
+        panel.removeFromTop(8);
+
+        sidebarBounds = panel.removeFromLeft(228);
+        auto listArea = sidebarBounds.reduced(6);
+        comboList.setBounds(listArea);
+        panel.removeFromLeft(10);
+        graphAreaBounds = panel;
+
+        const int laneGap = 8;
+        const int laneCount = getGestureComboLaneCount(selectedKind);
+        const int laneHeight = juce::jmax(38, (panel.getHeight() - (laneGap * juce::jmax(0, laneCount - 1))) / juce::jmax(1, laneCount));
+        for (auto& row : laneRows)
+            row = {};
+        for (auto& graph : laneGraphs)
+            graph = {};
+
+        for (int lane = 0; lane < laneCount; ++lane)
+        {
+            auto row = panel.removeFromTop(laneHeight);
+            laneRows[static_cast<size_t>(lane)] = row;
+            auto graphRow = row;
+            graphRow.removeFromLeft(86);
+            laneGraphs[static_cast<size_t>(lane)] = graphRow.reduced(4, 2).toFloat();
+            panel.removeFromTop(laneGap);
+        }
+    }
+
+    void mouseDown(const juce::MouseEvent& event) override
+    {
+        beginGestureEdit(event.position);
+    }
+
+    void mouseDrag(const juce::MouseEvent& event) override
+    {
+        continueGestureEdit(event.position);
+    }
+
+    void mouseUp(const juce::MouseEvent&) override
+    {
+        activeLane = -1;
+        lastEditedStep = -1;
+    }
+
+    void mouseDoubleClick(const juce::MouseEvent& event) override
+    {
+        const int lane = findLaneAt(event.position);
+        if (lane < 0)
+            return;
+
+        if (visibleComboIndices.empty())
+            return;
+
+        processor.getGestureCoordinator().materializeComboDisplayState(selectedKind,
+                                                                      selectedButtonCount,
+                                                                      getSelectedComboIndex());
+        for (int step = 0; step < kGestureProfileSteps; ++step)
+            processor.getGestureCoordinator().setComboProfileStepValue(selectedKind,
+                                                                      selectedButtonCount,
+                                                                      getSelectedComboIndex(),
+                                                                      lane,
+                                                                      step,
+                                                                      0.0f);
+        repaint();
+    }
+
+private:
+    void configureModeButton(juce::TextButton& button,
+                             const juce::String& text,
+                             std::function<void()> onClick)
+    {
+        button.setButtonText(text);
+        button.setClickingTogglesState(true);
+        button.onClick = std::move(onClick);
+        addAndMakeVisible(button);
+        styleUiButton(button);
+    }
+
+    int getNumRows() override
+    {
+        return static_cast<int>(visibleComboIndices.size());
+    }
+
+    void paintListBoxItem(int rowNumber,
+                          juce::Graphics& g,
+                          int width,
+                          int height,
+                          bool rowIsSelected) override
+    {
+        const bool validRow = rowNumber >= 0 && rowNumber < static_cast<int>(visibleComboLabels.size());
+        const auto rowBounds = juce::Rectangle<int>(0, 0, width, height).reduced(2, 1);
+
+        g.setColour(rowIsSelected ? kAccent.withAlpha(0.24f) : juce::Colours::black.withAlpha(0.10f));
+        g.fillRoundedRectangle(rowBounds.toFloat(), 5.0f);
+        g.setColour(rowIsSelected ? kAccent.withAlpha(0.85f) : kPanelStroke.withAlpha(0.35f));
+        g.drawRoundedRectangle(rowBounds.toFloat(), 5.0f, 1.0f);
+
+        if (!validRow)
+            return;
+
+        g.setColour(rowIsSelected ? kTextPrimary : kTextSecondary);
+        g.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+        g.drawText(visibleComboLabels[static_cast<size_t>(rowNumber)],
+                   rowBounds.reduced(10, 0),
+                   juce::Justification::centredLeft,
+                   false);
+    }
+
+    void selectedRowsChanged(int lastRowSelected) override
+    {
+        if (lastRowSelected < 0 || lastRowSelected >= static_cast<int>(visibleComboIndices.size()))
+            return;
+        selectedComboIndex = visibleComboIndices[static_cast<size_t>(lastRowSelected)];
+        refreshSelectionButtons();
+        repaint();
+    }
+
+    void refreshSelectionButtons()
+    {
+        stutterButton.setToggleState(selectedKind == GestureComboKind::Stutter, juce::dontSendNotification);
+        scratchButton.setToggleState(selectedKind == GestureComboKind::Scratch, juce::dontSendNotification);
+        oneButton.setToggleState(selectedButtonCount == 1, juce::dontSendNotification);
+        twoButton.setToggleState(selectedButtonCount == 2, juce::dontSendNotification);
+        threeButton.setToggleState(selectedButtonCount == 3, juce::dontSendNotification);
+
+        if (visibleComboIndices.empty())
+        {
+            profileLabel.setText("No combos selected", juce::dontSendNotification);
+            return;
+        }
+
+        const juce::String familyName = (selectedKind == GestureComboKind::Scratch) ? "Scratch" : "Stutter";
+        profileLabel.setText(familyName + " " + juce::String(selectedButtonCount) + "-button / "
+                                 + gestureComboDisplayLabel(selectedKind, selectedButtonCount, getSelectedComboIndex()),
+                             juce::dontSendNotification);
+    }
+
+    void rebuildVisibleCombos()
+    {
+        visibleComboIndices.clear();
+        visibleComboLabels.clear();
+
+        const juce::String filter = searchBox.getText().trim().toLowerCase();
+        const int comboCount = getGestureComboCountForButtonCount(selectedKind, selectedButtonCount);
+        for (int comboIndex = 0; comboIndex < comboCount; ++comboIndex)
+        {
+            const juce::String label = gestureComboDisplayLabel(selectedKind, selectedButtonCount, comboIndex);
+            if (!filter.isEmpty() && !label.toLowerCase().contains(filter))
+                continue;
+            visibleComboIndices.push_back(comboIndex);
+            visibleComboLabels.push_back(label);
+        }
+
+        comboList.updateContent();
+        if (visibleComboIndices.empty())
+        {
+            comboList.deselectAllRows();
+            refreshSelectionButtons();
+            repaint();
+            return;
+        }
+
+        syncListSelectionToCurrentCombo();
+        refreshSelectionButtons();
+        resized();
+        repaint();
+    }
+
+    juce::Rectangle<int> getPanelBounds() const
+    {
+        return getLocalBounds().reduced(20);
+    }
+
+    int getSelectedComboIndex() const noexcept
+    {
+        return juce::jmax(0, selectedComboIndex);
+    }
+
+    bool isCurrentComboVisible() const
+    {
+        return std::find(visibleComboIndices.begin(), visibleComboIndices.end(), selectedComboIndex) != visibleComboIndices.end();
+    }
+
+    void syncListSelectionToCurrentCombo()
+    {
+        if (visibleComboIndices.empty())
+            return;
+
+        int selectedRow = 0;
+        for (int row = 0; row < static_cast<int>(visibleComboIndices.size()); ++row)
+        {
+            if (visibleComboIndices[static_cast<size_t>(row)] == selectedComboIndex)
+            {
+                selectedRow = row;
+                break;
+            }
+        }
+
+        selectedComboIndex = visibleComboIndices[static_cast<size_t>(selectedRow)];
+        comboList.selectRow(selectedRow, true, true);
+    }
+
+    int findLaneAt(juce::Point<float> point) const
+    {
+        for (int lane = 0; lane < getGestureComboLaneCount(selectedKind); ++lane)
+        {
+            if (laneGraphs[static_cast<size_t>(lane)].contains(point))
+                return lane;
+        }
+        return -1;
+    }
+
+    int stepForPoint(int lane, juce::Point<float> point) const
+    {
+        const auto bounds = laneGraphs[static_cast<size_t>(lane)];
+        if (bounds.isEmpty())
+            return 0;
+        const float rel = juce::jlimit(0.0f, 0.9999f, (point.x - bounds.getX()) / juce::jmax(1.0f, bounds.getWidth()));
+        return juce::jlimit(0, kGestureProfileSteps - 1, static_cast<int>(std::floor(rel * static_cast<float>(kGestureProfileSteps))));
+    }
+
+    float valueForPoint(int lane, juce::Point<float> point) const
+    {
+        const auto bounds = laneGraphs[static_cast<size_t>(lane)];
+        if (bounds.isEmpty())
+            return 0.0f;
+        const float rel = juce::jlimit(0.0f, 1.0f, 1.0f - ((point.y - bounds.getY()) / juce::jmax(1.0f, bounds.getHeight())));
+        return juce::jlimit(-1.0f, 1.0f, (rel * 2.0f) - 1.0f);
+    }
+
+    void beginGestureEdit(juce::Point<float> point)
+    {
+        if (visibleComboIndices.empty())
+            return;
+
+        activeLane = findLaneAt(point);
+        if (activeLane < 0)
+            return;
+
+        processor.getGestureCoordinator().materializeComboDisplayState(selectedKind,
+                                                                      selectedButtonCount,
+                                                                      getSelectedComboIndex());
+        const int step = stepForPoint(activeLane, point);
+        const float value = valueForPoint(activeLane, point);
+        processor.getGestureCoordinator().setComboProfileStepValue(selectedKind,
+                                                                  selectedButtonCount,
+                                                                  getSelectedComboIndex(),
+                                                                  activeLane,
+                                                                  step,
+                                                                  value);
+        lastEditedStep = step;
+        lastEditedValue = value;
+        repaint();
+    }
+
+    void continueGestureEdit(juce::Point<float> point)
+    {
+        if (visibleComboIndices.empty())
+            return;
+
+        if (activeLane < 0)
+            return;
+
+        const int step = stepForPoint(activeLane, point);
+        const float value = valueForPoint(activeLane, point);
+
+        if (lastEditedStep < 0 || step == lastEditedStep)
+        {
+            processor.getGestureCoordinator().setComboProfileStepValue(selectedKind,
+                                                                      selectedButtonCount,
+                                                                      getSelectedComboIndex(),
+                                                                      activeLane,
+                                                                      step,
+                                                                      value);
+        }
+        else
+        {
+            const int startStep = juce::jmin(lastEditedStep, step);
+            const int endStep = juce::jmax(lastEditedStep, step);
+            for (int currentStep = startStep; currentStep <= endStep; ++currentStep)
+            {
+                const float mix = (endStep == startStep)
+                    ? 1.0f
+                    : static_cast<float>(currentStep - startStep) / static_cast<float>(endStep - startStep);
+                const float interpolated = juce::jmap(mix,
+                                                      (step >= lastEditedStep) ? lastEditedValue : value,
+                                                      (step >= lastEditedStep) ? value : lastEditedValue);
+                processor.getGestureCoordinator().setComboProfileStepValue(selectedKind,
+                                                                          selectedButtonCount,
+                                                                          getSelectedComboIndex(),
+                                                                          activeLane,
+                                                                          currentStep,
+                                                                          interpolated);
+            }
+        }
+
+        lastEditedStep = step;
+        lastEditedValue = value;
+        repaint();
+    }
+
+    MlrVSTAudioProcessor& processor;
+    std::function<void()> onClose;
+    juce::Label titleLabel;
+    juce::Label profileLabel;
+    juce::Label hintLabel;
+    juce::TextEditor searchBox;
+    juce::TextButton stutterButton;
+    juce::TextButton scratchButton;
+    juce::TextButton oneButton;
+    juce::TextButton twoButton;
+    juce::TextButton threeButton;
+    juce::ListBox comboList;
+    juce::TextButton saveButton;
+    juce::TextButton resetComboButton;
+    juce::TextButton resetCountButton;
+    juce::TextButton resetAllButton;
+    juce::TextButton closeButton;
+    std::array<juce::Rectangle<int>, kGestureComboMaxLaneCount> laneRows{};
+    std::array<juce::Rectangle<float>, kGestureComboMaxLaneCount> laneGraphs{};
+    juce::Rectangle<int> sidebarBounds;
+    juce::Rectangle<int> graphAreaBounds;
+    std::vector<int> visibleComboIndices;
+    std::vector<juce::String> visibleComboLabels;
+    GestureComboKind selectedKind = GestureComboKind::Stutter;
+    int selectedButtonCount = 1;
+    int selectedComboIndex = 0;
+    int activeLane = -1;
+    int lastEditedStep = -1;
+    float lastEditedValue = 0.0f;
+};
+
+GlobalControlPanel::~GlobalControlPanel() = default;
+
 GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     : processor(p)
 {
@@ -13770,6 +14641,32 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(momentaryToggle);
     styleUiButton(momentaryToggle);
 
+    gestureEditorButton.setButtonText("Gestures");
+    gestureEditorButton.setTooltip("Open the full-screen editor for exact stutter and scratch button-combo gesture graphs.");
+    gestureEditorButton.onClick = [this]()
+    {
+        if (gestureEditorOverlay != nullptr)
+        {
+            if (auto* editor = findParentComponentOfClass<MlrVSTAudioProcessorEditor>())
+            {
+                if (gestureEditorOverlay->getParentComponent() != editor)
+                    editor->addAndMakeVisible(*gestureEditorOverlay);
+                gestureEditorOverlay->setBounds(editor->getLocalBounds());
+            }
+            else
+            {
+                if (gestureEditorOverlay->getParentComponent() != this)
+                    addAndMakeVisible(*gestureEditorOverlay);
+                gestureEditorOverlay->setBounds(getLocalBounds());
+            }
+            gestureEditorOverlay->setVisible(true);
+            gestureEditorOverlay->toFront(true);
+            gestureEditorOverlay->repaint();
+        }
+    };
+    addAndMakeVisible(gestureEditorButton);
+    styleUiButton(gestureEditorButton);
+
     stretchBackendLabel.setText("Stretch", juce::dontSendNotification);
     stretchBackendLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(stretchBackendLabel);
@@ -13898,6 +14795,14 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
             processor.markPersistentGlobalUserChange();
     };
 
+    gestureEditorOverlay = std::make_unique<GlobalGestureEditorOverlay>(processor, [this]()
+    {
+        if (gestureEditorOverlay != nullptr)
+            gestureEditorOverlay->setVisible(false);
+    });
+    addChildComponent(*gestureEditorOverlay);
+    gestureEditorOverlay->setVisible(false);
+
     refreshFromProcessor();
     globalUiReady = true;
 }
@@ -13913,6 +14818,8 @@ void GlobalControlPanel::resized()
 
     auto titleRow = bounds.removeFromTop(16);
     tooltipsToggle.setBounds(titleRow.removeFromRight(86));
+    titleRow.removeFromRight(6);
+    gestureEditorButton.setBounds(titleRow.removeFromRight(84));
     titleRow.removeFromRight(6);
     momentaryToggle.setBounds(titleRow.removeFromRight(92));
     versionLabel.setBounds({});
@@ -14070,6 +14977,12 @@ void GlobalControlPanel::resized()
     layoutAlignedComboCell(transientCell2, transientSensitivityLabel, transientSensitivityBox, transientSensitivityLabelWidth, 72);
     layoutAlignedComboCell(transientCell3, transientSnapLabel, transientSnapBox, transientSnapLabelWidth, 72);
     layoutAlignedComboCell(transientCell4, transientSpacingLabel, transientSpacingBox, transientSpacingLabelWidth, 72);
+
+    if (gestureEditorOverlay != nullptr)
+    {
+        if (auto* parent = gestureEditorOverlay->getParentComponent())
+            gestureEditorOverlay->setBounds(parent->getLocalBounds());
+    }
 }
 
 void GlobalControlPanel::updateMeters(float leftLevel, float rightLevel)
@@ -14090,6 +15003,11 @@ void GlobalControlPanel::refreshFromProcessor()
                                ? "PM is active, so the root note is currently driven by the Pitch Master strip."
                                : "Global target root note. PS strips follow this target tonal center.");
     globalScaleBox.setSelectedId(pitchScaleToComboId(processor.getGlobalPitchScale()), juce::dontSendNotification);
+    if (gestureEditorOverlay != nullptr && gestureEditorOverlay->isVisible())
+    {
+        gestureEditorOverlay->syncSelectionFromLiveMonome();
+        gestureEditorOverlay->repaint();
+    }
 }
 
 //==============================================================================
@@ -14232,19 +15150,17 @@ void MonomePagesPanel::refreshFromProcessor()
     {
         auto& row = rows[static_cast<size_t>(i)];
         const auto modeAtButton = order[static_cast<size_t>(i)];
-        const bool hideSceneOwnedPage = processor.isSceneModeEnabled()
+        const bool sceneAlias = processor.isSceneModeEnabled()
             && modeAtButton == MlrVSTAudioProcessor::ControlMode::GroupAssign;
         const bool isActive = (activeMode == modeAtButton) && (activeMode != MlrVSTAudioProcessor::ControlMode::Normal);
 
-        row.positionLabel.setVisible(!hideSceneOwnedPage);
-        row.modeButton.setVisible(!hideSceneOwnedPage);
-        row.upButton.setVisible(!hideSceneOwnedPage);
-        row.downButton.setVisible(!hideSceneOwnedPage);
-        if (hideSceneOwnedPage)
-            continue;
+        row.positionLabel.setVisible(true);
+        row.modeButton.setVisible(true);
+        row.upButton.setVisible(true);
+        row.downButton.setVisible(true);
         row.positionLabel.setText("#" + juce::String(i + 1), juce::dontSendNotification);
-        row.modeButton.setButtonText(getMonomePageShortName(modeAtButton));
-        row.modeButton.setTooltip(getMonomePageDisplayName(modeAtButton));
+        row.modeButton.setButtonText(sceneAlias ? "SCN" : getMonomePageShortName(modeAtButton));
+        row.modeButton.setTooltip(sceneAlias ? "Scene Controls" : getMonomePageDisplayName(modeAtButton));
         row.positionLabel.setColour(juce::Label::textColourId, isActive ? kAccent.brighter(0.15f) : kTextSecondary);
         row.modeButton.setColour(juce::TextButton::buttonColourId,
                                  isActive ? kAccent.withAlpha(0.78f) : juce::Colour(0xff3a3a3a));

@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <set>
 #include <random>
 #include <vector>
@@ -110,6 +111,113 @@ private:
 
 // Forward declaration
 class EnhancedAudioStrip;
+
+constexpr int kGestureProfileLaneCount = 5;
+constexpr int kGestureProfileSteps = 16;
+
+enum class GestureProfileId
+{
+    Stutter1 = 0,
+    Stutter2,
+    Stutter3,
+    Scratch1,
+    Scratch2,
+    Scratch3,
+    Count
+};
+
+constexpr int kGestureProfileCount = static_cast<int>(GestureProfileId::Count);
+constexpr int kGestureProfileValueCount = kGestureProfileCount * kGestureProfileLaneCount * kGestureProfileSteps;
+
+struct GestureProfileState
+{
+    std::array<std::array<float, kGestureProfileSteps>, kGestureProfileLaneCount> lanes{};
+};
+
+enum class GestureComboKind
+{
+    Stutter = 0,
+    Scratch
+};
+
+constexpr int kStutterGestureComboLaneCount = 8;
+constexpr int kScratchGestureComboLaneCount = 11;
+constexpr int kGestureComboMaxLaneCount = kScratchGestureComboLaneCount;
+constexpr int kStutterGestureComboCount = 63;
+constexpr int kScratchGestureComboCount = 696;
+constexpr int kStutterGestureComboValueCount = kStutterGestureComboCount
+    * kStutterGestureComboLaneCount
+    * kGestureProfileSteps;
+constexpr int kScratchGestureComboValueCount = kScratchGestureComboCount
+    * kScratchGestureComboLaneCount
+    * kGestureProfileSteps;
+
+enum class StutterGestureLane
+{
+    Speed = 0,
+    Pitch,
+    Pan,
+    Cutoff,
+    Resonance,
+    Morph,
+    Division,
+    Slice
+};
+
+enum class ScratchGestureLane
+{
+    Motion = 0,
+    Pitch,
+    SceneMix,
+    Size,
+    Density,
+    Spread,
+    Position,
+    Window,
+    Division,
+    Duration,
+    MotionEnd
+};
+
+int getGestureComboLaneCount(GestureComboKind kind) noexcept;
+int getGestureComboTotalCount(GestureComboKind kind) noexcept;
+int getGestureComboCountForButtonCount(GestureComboKind kind, int buttonCount) noexcept;
+int getGestureComboFlatOffsetForButtonCount(GestureComboKind kind, int buttonCount) noexcept;
+bool getGestureComboColumns(GestureComboKind kind,
+                            int buttonCount,
+                            int comboIndex,
+                            std::array<int, 3>& outColumns) noexcept;
+bool getGestureComboColumnsFromFlatIndex(GestureComboKind kind,
+                                         int flatIndex,
+                                         int& outButtonCount,
+                                         std::array<int, 3>& outColumns) noexcept;
+int getGestureComboFlatIndexFromColumns(GestureComboKind kind,
+                                        int buttonCount,
+                                        const std::array<int, 3>& columns) noexcept;
+int getStutterGestureComboFlatIndexFromMask(uint8_t mask) noexcept;
+
+struct GestureComboProfileState
+{
+    std::array<std::array<float, kGestureProfileSteps>, kGestureComboMaxLaneCount> lanes{};
+};
+
+class GestureComboProfileStore
+{
+public:
+    float getStepValue(GestureComboKind kind, int comboFlatIndex, int laneIndex, int stepIndex) const noexcept;
+    void setStepValue(GestureComboKind kind, int comboFlatIndex, int laneIndex, int stepIndex, float value) noexcept;
+    GestureComboProfileState getState(GestureComboKind kind, int comboFlatIndex) const noexcept;
+    float sampleLane(GestureComboKind kind, int comboFlatIndex, int laneIndex, float phase) const noexcept;
+    void clearCombo(GestureComboKind kind, int comboFlatIndex) noexcept;
+    void clearButtonCount(GestureComboKind kind, int buttonCount) noexcept;
+    void clearAllCombos(GestureComboKind kind) noexcept;
+    void clearAll() noexcept;
+    bool comboHasAnyValue(GestureComboKind kind, int comboFlatIndex) const noexcept;
+
+private:
+    std::array<std::atomic<float>, kStutterGestureComboValueCount> stutterValues{};
+    std::array<std::atomic<float>, kScratchGestureComboValueCount> scratchValues{};
+};
 
 struct QuantisedTrigger
 {
@@ -735,6 +843,24 @@ public:
     bool isSoundTouchEnabled() const { return getStretchBackend() != TimeStretchBackend::Resample; }
     void setScratchAmount(float amount) { scratchAmount = juce::jlimit(0.0f, 100.0f, amount); }
     float getScratchAmount() const { return scratchAmount.load(); }
+    void setGestureProfiles(const std::array<GestureProfileState, kGestureProfileCount>& profiles);
+    void setGestureComboProfileStore(const std::shared_ptr<GestureComboProfileStore>& store);
+    int getScratchGestureComboButtonCount() const
+    {
+        return scratchGestureComboButtonCount.load(std::memory_order_acquire);
+    }
+    int getScratchGestureComboFlatIndex() const
+    {
+        return scratchGestureComboFlatIndex.load(std::memory_order_acquire);
+    }
+    int getGrainGestureComboButtonCount() const
+    {
+        return grainGestureComboButtonCount.load(std::memory_order_acquire);
+    }
+    int getGrainGestureComboFlatIndex() const
+    {
+        return grainGestureComboFlatIndex.load(std::memory_order_acquire);
+    }
     void setReverse(bool shouldReverse);
     bool isReversed() const { return reverse; }
     void setTransientSliceMode(bool enabled);
@@ -1256,6 +1382,7 @@ private:
     std::atomic<int> soundTouchEnabled{1};
     std::atomic<int> tempoMatchBackend{0};
     std::atomic<float> scratchAmount{0.0f};  // Per-strip scratch: 0-100%
+    std::array<std::atomic<float>, kGestureProfileValueCount> gestureProfileValues{};
     std::atomic<float> loopCrossfadeLengthMs{10.0f};
     std::atomic<float> triggerFadeInMs{12.0f};
     std::atomic<bool> transientSliceMode{false};
@@ -1634,9 +1761,16 @@ private:
     GrainParams grainParamsBeforeGesture;
     bool grainParamsSnapshotValid = false;
     bool grainThreeButtonSnapshotActive = false;
+    std::shared_ptr<GestureComboProfileStore> gestureComboProfileStore;
+    std::atomic<int> scratchGestureComboFlatIndex{-1};
+    std::atomic<int> scratchGestureComboButtonCount{0};
+    std::atomic<int> grainGestureComboFlatIndex{-1};
+    std::atomic<int> grainGestureComboButtonCount{0};
     
 private:
     void resetStepShapeAtIndex(int absoluteStep);
+    void refreshScratchGestureComboCache() noexcept;
+    void refreshGrainGestureComboCache() noexcept;
     double lastStepTime = 0.0;        // Last step trigger time (in beats)
     bool stepSequencerActive = false; // Is step sequencer running?
     bool stepSamplePlaying = false;   // Is a step-triggered sample currently playing?
@@ -1731,6 +1865,7 @@ public:
     void spawnGrainVoice(double centerSamplePos, float sizeMs, float density, float spread, float pitchOffsetSemitones, double playbackStepBase);
     void renderGrainAtSample(float& outL, float& outR, double centerSamplePos, double effectiveSpeed, int64_t globalSample);
     void resetScratchComboState();
+    float sampleGestureProfileLane(GestureProfileId profileId, int laneIndex, float phase) const;
     
     // Musical scratching helpers
     void snapToTimeline(int64_t currentGlobalSample);
@@ -1972,6 +2107,8 @@ public:
     void setMomentaryStutterRetriggerFadeMs(float fadeMs);
     void setMomentaryStutterStrip(int stripIndex, int column, double offsetRatio, bool enabled);
     void clearMomentaryStutterStrips();
+    void setGestureProfiles(const std::array<GestureProfileState, kGestureProfileCount>& profiles);
+    void setGestureComboProfileStore(const std::shared_ptr<GestureComboProfileStore>& store);
     void setMacroRetriggerAmount(int stripIndex, float amount01);
     float getMacroRetriggerAmount(int stripIndex) const;
     void clearPendingQuantizedTriggersForStrip(int stripIndex);
@@ -2223,6 +2360,7 @@ private:
     void setModBipolarOnSequencer(ModSequencer& seq, bool bipolar, ModBipolarToggleMode mode);
 
     std::array<std::unique_ptr<EnhancedAudioStrip>, MaxStrips> strips;
+    std::shared_ptr<GestureComboProfileStore> gestureComboProfileStore;
     std::array<std::unique_ptr<StripGroup>, MaxGroups> groups;
     std::array<std::unique_ptr<PatternRecorder>, 4> patterns;
     std::array<std::array<ModSequencer, NumModSequencers>, MaxStrips> modSequencers;

@@ -114,6 +114,11 @@ Grid rows:
 - `y=0, x=9..15`: momentary stutter divisions
 - `y=1..6`: strip triggers (step-mode strips are editable from main page)
 
+Scene mode:
+- `y=0, x=0..6`: scene launch pads
+- `y=0, x=7`: scene recorder
+- Hold `x7` and play a scratch, grain, scratch-hold, or stutter gesture to start recording/overdub directly before the gesture is written. Release of `x7` is consumed; tap `x7` later to stop recording.
+
 ### Control Pages (row 7)
 Row 7 buttons open control pages (order is configurable in `Monome Pages`):
 - `Speed`, `Pan`, `Volume`, `Grain Size`, `Swing`, `Gate`, `Browser`,
