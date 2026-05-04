@@ -295,19 +295,17 @@ void MlrVSTAudioProcessor::renderMonomePlaybackStripRow(EnhancedAudioStrip& stri
     {
         const auto visiblePattern = strip.getVisibleStepPattern();
         const int visibleCurrentStep = strip.getVisibleCurrentStep();
+        const bool stepTransportActive = strip.isPlaying();
         for (int x = 0; x < 16; ++x)
         {
             const bool isCurrentStep = (x == visibleCurrentStep);
             const bool isActiveStep = visiblePattern[static_cast<size_t>(x)];
+            int level = isActiveStep ? 15 : 0;
 
-            if (isCurrentStep && isActiveStep)
-                newLedState[x][row] = 15;
-            else if (isCurrentStep)
-                newLedState[x][row] = 6;
-            else if (isActiveStep)
-                newLedState[x][row] = 10;
-            else
-                newLedState[x][row] = 2;
+            if (isCurrentStep && stepTransportActive)
+                level = fastBlinkOn ? 15 : 0;
+
+            newLedState[x][row] = level;
         }
         return;
     }

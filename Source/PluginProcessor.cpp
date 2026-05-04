@@ -1256,7 +1256,10 @@ void MonomeConnection::connectEndpoint(DeviceRole role)
     configureEndpoint(role);
 
     if (role == DeviceRole::Grid)
+    {
         setAllLEDs(0);
+        setAllLEDLevels(0);
+    }
 
     sendPing(role);
     endpoint.lastPingTime = juce::Time::currentTimeMillis();
@@ -1750,6 +1753,9 @@ MlrVSTAudioProcessor::MlrVSTAudioProcessor()
 
         if (monomeConnection.supportsGrid())
         {
+            monomeConnection.setAllLEDs(0);
+            monomeConnection.setAllLEDLevels(0);
+
             // Force full LED resend after any reconnect to avoid stale cache mismatch.
             for (int y = 0; y < MaxGridHeight; ++y)
                 for (int x = 0; x < MaxGridWidth; ++x)
@@ -3429,6 +3435,8 @@ void MlrVSTAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
             if (monomeConnection.supportsGrid())
             {
                 monomeConnection.setAllLEDs(0);
+                monomeConnection.setAllLEDLevels(0);
+
                 // Initialize LED cache
                 for (int y = 0; y < MaxGridHeight; ++y)
                     for (int x = 0; x < MaxGridWidth; ++x)
