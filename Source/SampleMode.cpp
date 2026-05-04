@@ -2714,7 +2714,7 @@ SampleModePersistentState SampleModePersistentState::fromValueTree(const juce::V
     persistentState.visibleSliceBankIndex = juce::jmax(0, static_cast<int>(state.getProperty("visibleSliceBankIndex", 0)));
     persistentState.sliceMode = sampleSliceModeFromString(state.getProperty("sliceMode", "transient").toString());
     persistentState.triggerMode = sampleTriggerModeFromString(state.getProperty("triggerMode", "oneshot").toString());
-    persistentState.useLegacyLoopEngine = static_cast<bool>(state.getProperty("useLegacyLoopEngine", false));
+    persistentState.useLegacyLoopEngine = static_cast<bool>(state.getProperty("useLegacyLoopEngine", true));
     persistentState.legacyLoopBarSelection = static_cast<int>(state.getProperty("legacyLoopBarSelection", 0));
     persistentState.beatDivision = juce::jlimit(1, 8, static_cast<int>(state.getProperty("beatDivision", 1)));
     persistentState.viewZoom = juce::jlimit(kMinViewZoom, kMaxViewZoom, static_cast<float>(state.getProperty("viewZoom", 1.0f)));

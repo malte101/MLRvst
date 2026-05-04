@@ -175,7 +175,7 @@ float ModernAudioEngine::defaultModStepValueForTarget(ModTarget target)
         case ModTarget::Cutoff:
             return 0.5f;
         case ModTarget::Resonance:
-            return 0.0f;
+            return 0.5f;
         case ModTarget::GrainSize:
             return 0.5f;
         case ModTarget::GrainDensity:

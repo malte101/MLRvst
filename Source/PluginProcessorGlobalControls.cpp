@@ -36,7 +36,17 @@ void MlrVSTAudioProcessor::handleUserStripPlayModeChange(int stripIndex)
     if (stripIndex < 0 || stripIndex >= MaxStrips || audioEngine == nullptr)
         return;
 
+    auto* strip = audioEngine->getStrip(stripIndex);
+    const bool isFlipMode = strip != nullptr
+        && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample;
+
     ensureSampleModeAudioAvailableForStrip(stripIndex);
+    if (isFlipMode)
+    {
+        if (auto* engine = getSampleModeEngine(stripIndex, true))
+            engine->setLegacyLoopEngineEnabled(true);
+    }
+
     reapplyStripStateForCurrentPlayMode(stripIndex);
 
     if (isSceneModeEnabled())

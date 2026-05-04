@@ -12945,31 +12945,42 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
                 if (laneTarget != ModTarget::Cutoff && laneTarget != ModTarget::Resonance)
                     return false;
 
-                if (laneSeq.bipolar.load(std::memory_order_acquire) != 0
-                    || laneSeq.curveMode.load(std::memory_order_acquire) != 0
+                const auto transportMode = static_cast<ModTransportMode>(juce::jlimit(
+                    0,
+                    static_cast<int>(ModTransportMode::Scene),
+                    laneSeq.transportMode.load(std::memory_order_acquire)));
+                if (laneSeq.curveMode.load(std::memory_order_acquire) != 0
                     || laneSeq.offset.load(std::memory_order_acquire) != 0
                     || laneSeq.lengthBars.load(std::memory_order_acquire) != 1
                     || std::abs(laneSeq.depth.load(std::memory_order_acquire) - 1.0f) > 1.0e-4f
                     || std::abs(laneSeq.rate.load(std::memory_order_acquire) - 1.0f) > 1.0e-4f
                     || std::abs(laneSeq.smoothingMs.load(std::memory_order_acquire)) > 1.0e-4f
-                    || laneSeq.transportMode.load(std::memory_order_acquire) != static_cast<int>(ModTransportMode::Free))
-                    return false;
-
-                const float expectedValue = (laneTarget == ModTarget::Cutoff)
-                    ? 1.0f
-                    : filterResonanceToNormalized(0.707f);
-
-                for (size_t stepIndex = 0; stepIndex < laneSeq.steps.size(); ++stepIndex)
+                    || (transportMode != ModTransportMode::Free && transportMode != ModTransportMode::Sync))
                 {
-                    if (laneSeq.stepSubdivisions[stepIndex].load(std::memory_order_acquire) != 1)
-                        return false;
-                    if (std::abs(laneSeq.steps[stepIndex].load(std::memory_order_acquire) - expectedValue) > 1.0e-4f)
-                        return false;
-                    if (std::abs(laneSeq.stepEndValues[stepIndex].load(std::memory_order_acquire) - expectedValue) > 1.0e-4f)
-                        return false;
+                    return false;
                 }
 
-                return true;
+                const auto allStepsMatch = [&laneSeq](float expectedValue)
+                {
+                    for (size_t stepIndex = 0; stepIndex < laneSeq.steps.size(); ++stepIndex)
+                    {
+                        if (laneSeq.stepSubdivisions[stepIndex].load(std::memory_order_acquire) != 1)
+                            return false;
+                        if (std::abs(laneSeq.steps[stepIndex].load(std::memory_order_acquire) - expectedValue) > 1.0e-4f)
+                            return false;
+                        if (std::abs(laneSeq.stepEndValues[stepIndex].load(std::memory_order_acquire) - expectedValue) > 1.0e-4f)
+                            return false;
+                    }
+
+                    return true;
+                };
+
+                if (laneTarget == ModTarget::Cutoff)
+                    return allStepsMatch(0.5f) || allStepsMatch(1.0f);
+
+                return allStepsMatch(0.5f)
+                    || allStepsMatch(0.0f)
+                    || allStepsMatch(filterResonanceToNormalized(0.707f));
             };
 
             auto resolveLanePhase = [&](ModSequencer& laneSeq,

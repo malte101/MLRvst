@@ -111,7 +111,7 @@ struct SampleModePersistentState
     int visibleSliceBankIndex = 0;
     SampleSliceMode sliceMode = SampleSliceMode::Transient;
     SampleTriggerMode triggerMode = SampleTriggerMode::OneShot;
-    bool useLegacyLoopEngine = false;
+    bool useLegacyLoopEngine = true;
     int legacyLoopBarSelection = 0;
     int beatDivision = 1;
     float viewZoom = 1.0f;
@@ -305,7 +305,7 @@ public:
         float playbackProgress = -1.0f;
         SampleSliceMode sliceMode = SampleSliceMode::Transient;
         SampleTriggerMode triggerMode = SampleTriggerMode::OneShot;
-        bool useLegacyLoopEngine = false;
+        bool useLegacyLoopEngine = true;
         int legacyLoopBarSelection = 0;
         int beatDivision = 1;
         float viewZoom = 1.0f;

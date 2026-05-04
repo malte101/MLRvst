@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "MonomeFileBrowserActions.h"
+#include "SceneAutomationRules.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -114,50 +115,6 @@ float quantizeMonomeRearrangeValue(float value01)
                             / static_cast<float>(juce::jmax(1, ModernAudioEngine::MaxColumns - 1)));
 }
 
-MlrVSTAudioProcessor::ControlMode sceneControlModeForTarget(ScenePerformanceControlTarget target)
-{
-    using ControlMode = MlrVSTAudioProcessor::ControlMode;
-
-    switch (target)
-    {
-        case ScenePerformanceControlTarget::Speed:            return ControlMode::Speed;
-        case ScenePerformanceControlTarget::Pitch:
-        case ScenePerformanceControlTarget::GrainPitch:       return ControlMode::Pitch;
-        case ScenePerformanceControlTarget::Pan:              return ControlMode::Pan;
-        case ScenePerformanceControlTarget::Volume:           return ControlMode::Volume;
-        case ScenePerformanceControlTarget::Swing:            return ControlMode::Swing;
-        case ScenePerformanceControlTarget::GrainSize:
-        case ScenePerformanceControlTarget::GrainDensity:
-        case ScenePerformanceControlTarget::GrainPitchJitter:
-        case ScenePerformanceControlTarget::GrainSpread:
-        case ScenePerformanceControlTarget::GrainJitter:
-        case ScenePerformanceControlTarget::GrainPositionJitter:
-        case ScenePerformanceControlTarget::GrainRandomDepth:
-        case ScenePerformanceControlTarget::GrainArp:
-        case ScenePerformanceControlTarget::GrainCloud:
-        case ScenePerformanceControlTarget::GrainEmitter:
-        case ScenePerformanceControlTarget::GrainEnvelope:
-        case ScenePerformanceControlTarget::GrainShape:       return ControlMode::GrainSize;
-        case ScenePerformanceControlTarget::FilterFrequency:
-        case ScenePerformanceControlTarget::FilterResonance:
-        case ScenePerformanceControlTarget::FilterEnabled:
-        case ScenePerformanceControlTarget::FilterMorph:      return ControlMode::Filter;
-        case ScenePerformanceControlTarget::DelayMix:
-        case ScenePerformanceControlTarget::DelayTime:
-        case ScenePerformanceControlTarget::DelayFeedback:
-        case ScenePerformanceControlTarget::DelayLowCut:
-        case ScenePerformanceControlTarget::DelayHighCut:
-        case ScenePerformanceControlTarget::DelayMode:
-        case ScenePerformanceControlTarget::DelaySyncEnabled: return ControlMode::Delay;
-        case ScenePerformanceControlTarget::SliceLength:
-        case ScenePerformanceControlTarget::Scratch:
-        case ScenePerformanceControlTarget::Retrigger:
-        case ScenePerformanceControlTarget::Rearrange:
-        case ScenePerformanceControlTarget::None:
-        default:                                              return ControlMode::Normal;
-    }
-}
-
 ScenePerformanceControlTarget sceneControlTargetForModTarget(bool grainMode,
                                                              ModernAudioEngine::ModTarget target)
 {
@@ -243,149 +200,6 @@ float defaultNormalizedSceneAutomationValue(ScenePerformanceControlTarget target
     }
 }
 
-float normalizeSceneAutomationValueForMonome(const ScenePerformanceEvent& event)
-{
-    switch (event.controlTarget)
-    {
-        case ScenePerformanceControlTarget::Speed:
-        {
-            const float safeValue = juce::jlimit(0.125f, 8.0f, event.value);
-            return juce::jlimit(0.0f, 1.0f, (std::log2(safeValue) + 3.0f) / 6.0f);
-        }
-        case ScenePerformanceControlTarget::Pitch:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 24.0f) / 48.0f);
-        case ScenePerformanceControlTarget::GrainPitch:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 48.0f) / 96.0f);
-        case ScenePerformanceControlTarget::Pan:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 1.0f) * 0.5f);
-        case ScenePerformanceControlTarget::Volume:
-        case ScenePerformanceControlTarget::Swing:
-        case ScenePerformanceControlTarget::GrainSpread:
-        case ScenePerformanceControlTarget::GrainJitter:
-        case ScenePerformanceControlTarget::GrainPositionJitter:
-        case ScenePerformanceControlTarget::GrainRandomDepth:
-        case ScenePerformanceControlTarget::GrainArp:
-        case ScenePerformanceControlTarget::GrainCloud:
-        case ScenePerformanceControlTarget::GrainEmitter:
-        case ScenePerformanceControlTarget::GrainEnvelope:
-        case ScenePerformanceControlTarget::DelayMix:
-        case ScenePerformanceControlTarget::FilterMorph:
-        case ScenePerformanceControlTarget::FilterEnabled:
-        case ScenePerformanceControlTarget::Retrigger:
-        case ScenePerformanceControlTarget::Rearrange:
-        case ScenePerformanceControlTarget::DelaySyncEnabled:
-            return juce::jlimit(0.0f, 1.0f, event.value);
-        case ScenePerformanceControlTarget::SliceLength:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.02f) / 0.98f);
-        case ScenePerformanceControlTarget::Scratch:
-            return juce::jlimit(0.0f, 1.0f, event.value / 100.0f);
-        case ScenePerformanceControlTarget::GrainSize:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 5.0f) / (2400.0f - 5.0f));
-        case ScenePerformanceControlTarget::GrainDensity:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.05f) / (0.9f - 0.05f));
-        case ScenePerformanceControlTarget::GrainPitchJitter:
-            return juce::jlimit(0.0f, 1.0f, event.value / 48.0f);
-        case ScenePerformanceControlTarget::GrainShape:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 1.0f) * 0.5f);
-        case ScenePerformanceControlTarget::FilterFrequency:
-        {
-            const float safeValue = juce::jlimit(20.0f, 20000.0f, event.value);
-            return juce::jlimit(0.0f, 1.0f, std::log(safeValue / 20.0f) / std::log(1000.0f));
-        }
-        case ScenePerformanceControlTarget::FilterResonance:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.1f) / 9.9f);
-        case ScenePerformanceControlTarget::DelayTime:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.25f) / (4.0f - 0.25f));
-        case ScenePerformanceControlTarget::DelayFeedback:
-            return juce::jlimit(0.0f, 1.0f, event.value / 0.97f);
-        case ScenePerformanceControlTarget::DelayLowCut:
-        {
-            const juce::NormalisableRange<float> range(20.0f, 12000.0f, 1.0f, 0.25f);
-            return juce::jlimit(0.0f, 1.0f, range.convertTo0to1(event.value));
-        }
-        case ScenePerformanceControlTarget::DelayHighCut:
-        {
-            const juce::NormalisableRange<float> range(200.0f, 20000.0f, 1.0f, 0.3f);
-            return juce::jlimit(0.0f, 1.0f, range.convertTo0to1(event.value));
-        }
-        case ScenePerformanceControlTarget::DelayMode:
-            return juce::jlimit(0.0f, 1.0f, event.value / 2.0f);
-        case ScenePerformanceControlTarget::None:
-        default:
-            return 0.5f;
-    }
-}
-
-float denormalizeSceneAutomationValueForMonome(const ScenePerformanceEvent& event, float normalizedValue)
-{
-    const float t = juce::jlimit(0.0f, 1.0f, normalizedValue);
-
-    switch (event.controlTarget)
-    {
-        case ScenePerformanceControlTarget::Speed:
-            return juce::jlimit(0.125f, 8.0f, std::pow(2.0f, -3.0f + (t * 6.0f)));
-        case ScenePerformanceControlTarget::Pitch:
-            return -24.0f + (t * 48.0f);
-        case ScenePerformanceControlTarget::GrainPitch:
-            return -48.0f + (t * 96.0f);
-        case ScenePerformanceControlTarget::Pan:
-            return (t * 2.0f) - 1.0f;
-        case ScenePerformanceControlTarget::Volume:
-        case ScenePerformanceControlTarget::Swing:
-        case ScenePerformanceControlTarget::GrainSpread:
-        case ScenePerformanceControlTarget::GrainJitter:
-        case ScenePerformanceControlTarget::GrainPositionJitter:
-        case ScenePerformanceControlTarget::GrainRandomDepth:
-        case ScenePerformanceControlTarget::GrainArp:
-        case ScenePerformanceControlTarget::GrainCloud:
-        case ScenePerformanceControlTarget::GrainEmitter:
-        case ScenePerformanceControlTarget::GrainEnvelope:
-        case ScenePerformanceControlTarget::DelayMix:
-        case ScenePerformanceControlTarget::FilterMorph:
-        case ScenePerformanceControlTarget::FilterEnabled:
-        case ScenePerformanceControlTarget::Retrigger:
-        case ScenePerformanceControlTarget::Rearrange:
-            return t;
-        case ScenePerformanceControlTarget::SliceLength:
-            return 0.02f + (t * 0.98f);
-        case ScenePerformanceControlTarget::Scratch:
-            return 100.0f * t;
-        case ScenePerformanceControlTarget::GrainSize:
-            return 5.0f + (t * (2400.0f - 5.0f));
-        case ScenePerformanceControlTarget::GrainDensity:
-            return 0.05f + (t * (0.9f - 0.05f));
-        case ScenePerformanceControlTarget::GrainPitchJitter:
-            return 48.0f * t;
-        case ScenePerformanceControlTarget::GrainShape:
-            return (t * 2.0f) - 1.0f;
-        case ScenePerformanceControlTarget::FilterFrequency:
-            return 20.0f * std::pow(1000.0f, t);
-        case ScenePerformanceControlTarget::FilterResonance:
-            return 0.1f + (t * 9.9f);
-        case ScenePerformanceControlTarget::DelayTime:
-            return 0.25f + (t * (4.0f - 0.25f));
-        case ScenePerformanceControlTarget::DelayFeedback:
-            return 0.97f * t;
-        case ScenePerformanceControlTarget::DelayLowCut:
-        {
-            const juce::NormalisableRange<float> range(20.0f, 12000.0f, 1.0f, 0.25f);
-            return range.convertFrom0to1(t);
-        }
-        case ScenePerformanceControlTarget::DelayHighCut:
-        {
-            const juce::NormalisableRange<float> range(200.0f, 20000.0f, 1.0f, 0.3f);
-            return range.convertFrom0to1(t);
-        }
-        case ScenePerformanceControlTarget::DelayMode:
-            return static_cast<float>(juce::jlimit(0, 2, static_cast<int>(std::round(t * 2.0f))));
-        case ScenePerformanceControlTarget::DelaySyncEnabled:
-            return t >= 0.5f ? 1.0f : 0.0f;
-        case ScenePerformanceControlTarget::None:
-        default:
-            return event.value;
-    }
-}
-
 bool isSceneMainAutomationMonomeActive(const MlrVSTAudioProcessor& processor)
 {
     return processor.isSceneModeEnabled()
@@ -441,7 +255,7 @@ bool sceneAutomationTargetIsBipolarForMonome(ScenePerformanceControlTarget targe
 
 bool sceneAutomationTargetUsesGlobalStripForMonome(ScenePerformanceControlTarget target)
 {
-    return target == ScenePerformanceControlTarget::Retrigger;
+    return SceneAutomationRules::targetUsesGlobalStrip(target);
 }
 
 ScenePerformanceControlTarget activeSceneMainAutomationTarget(const MlrVSTAudioProcessor& processor,
@@ -598,7 +412,7 @@ float sceneMainAutomationColumnNormalizedValue(const MlrVSTAudioProcessor& proce
         chosenEvent = lastEvent;
     if (chosenEvent != nullptr)
     {
-        const float normalized = normalizeSceneAutomationValueForMonome(*chosenEvent);
+        const float normalized = SceneAutomationRules::normalizeValue(*chosenEvent);
         if (std::isfinite(normalized))
             return juce::jlimit(0.0f, 1.0f, normalized);
     }
@@ -629,38 +443,26 @@ bool writeSceneMainAutomationColumn(MlrVSTAudioProcessor& processor,
         return false;
 
     const int eventStripIndex = sceneAutomationTargetUsesGlobalStripForMonome(target) ? -1 : safeStripIndex;
-    const double matchEpsilon = 0.1125;
+    const bool drawModeEnabled = processor.getSceneEditorDrawModeEnabled();
     const double nextBeat = beat + 0.25;
     const double lengthBeats = juce::jmax(1.0, processor.getResolvedSceneLengthBeats(sceneSlot));
     const double maxBeat = juce::jmax(0.0, std::nextafter(lengthBeats, 0.0));
     auto events = processor.getScenePerformanceEventsSnapshot(sceneSlot);
-    events.erase(std::remove_if(events.begin(),
-                                events.end(),
-                                [target, eventStripIndex, beat, matchEpsilon](const ScenePerformanceEvent& event)
-                                {
-                                    return event.type == ScenePerformanceEventType::ControlPoint
-                                        && event.controlTarget == target
-                                        && event.stripIndex == eventStripIndex
-                                        && std::abs(event.timeBeats - beat) <= matchEpsilon;
-                                }),
-                 events.end());
+    auto writeResult = SceneAutomationRules::writeControlPoint(events,
+                                                               { eventStripIndex,
+                                                                 target,
+                                                                 beat,
+                                                                 normalizedValue,
+                                                                 lengthBeats,
+                                                                 16,
+                                                                 true,
+                                                                 drawModeEnabled });
+    if (!writeResult.changed)
+        return false;
 
-    ScenePerformanceEvent event;
-    event.type = ScenePerformanceEventType::ControlPoint;
-    event.stripIndex = eventStripIndex;
-    event.timeBeats = beat;
-    event.controlRow = 0;
-    event.column = juce::jlimit(0,
-                                ModernAudioEngine::MaxColumns - 1,
-                                static_cast<int>(std::round(juce::jlimit(0.0f, 1.0f, normalizedValue)
-                                                            * static_cast<float>(ModernAudioEngine::MaxColumns - 1))));
-    event.controlTarget = target;
-    event.controlMode = static_cast<int>(sceneControlModeForTarget(target));
-    event.value = denormalizeSceneAutomationValueForMonome(event, normalizedValue);
-    events.push_back(event);
-
-    if (nextBeat <= maxBeat + 1.0e-6)
+    if (!drawModeEnabled && nextBeat <= maxBeat + 1.0e-6)
     {
+        const double matchEpsilon = SceneAutomationRules::pointMatchEpsilon(16, true);
         const bool hasNextStepAnchor = std::any_of(events.begin(),
                                                    events.end(),
                                                    [target, eventStripIndex, nextBeat, matchEpsilon](const ScenePerformanceEvent& existingEvent)
@@ -673,17 +475,15 @@ bool writeSceneMainAutomationColumn(MlrVSTAudioProcessor& processor,
 
         if (!hasNextStepAnchor)
         {
-            ScenePerformanceEvent resetEvent = event;
-            resetEvent.timeBeats = juce::jlimit(0.0, maxBeat, nextBeat);
             const float resetNormalizedValue = storedSceneAutomationNormalizedValueForMonome(processor,
                                                                                             sceneSlot,
                                                                                             safeStripIndex,
                                                                                             target);
-            resetEvent.column = juce::jlimit(0,
-                                             ModernAudioEngine::MaxColumns - 1,
-                                             static_cast<int>(std::round(juce::jlimit(0.0f, 1.0f, resetNormalizedValue)
-                                                                         * static_cast<float>(ModernAudioEngine::MaxColumns - 1))));
-            resetEvent.value = denormalizeSceneAutomationValueForMonome(resetEvent, resetNormalizedValue);
+            auto resetEvent = SceneAutomationRules::makeControlPointEvent(eventStripIndex,
+                                                                          target,
+                                                                          juce::jlimit(0.0, maxBeat, nextBeat),
+                                                                          resetNormalizedValue,
+                                                                          false);
             events.push_back(resetEvent);
         }
     }

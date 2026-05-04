@@ -249,6 +249,8 @@ target_sources(mlrVST
         Source/PluginProcessorSceneSwitch.cpp
         Source/SceneScheduler.cpp
         Source/SceneScheduler.h
+        Source/SceneAutomationRules.cpp
+        Source/SceneAutomationRules.h
         Source/ScenePerformanceRecorder.cpp
         Source/ScenePerformanceRecorder.h
         Source/SceneStore.cpp
