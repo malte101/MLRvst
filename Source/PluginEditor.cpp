@@ -1901,7 +1901,7 @@ void StripControl::setupComponents()
                            {
                                if (safeThis == nullptr || result <= 0)
                                    return;
-                               safeThis->playModeBox.setSelectedId(result, juce::sendNotification);
+                               safeThis->applyPlayModeSelection(result);
                            });
     };
     identityModeButton.setTooltip("Playback mode for this strip.");
@@ -2066,37 +2066,7 @@ void StripControl::setupComponents()
     playModeBox.setTooltip("Playback mode for this strip.");
     playModeBox.onChange = [this]()
     {
-        if (!processor.getAudioEngine()) return;
-        if (auto* strip = processor.getAudioEngine()->getStrip(stripIndex))
-        {
-            const int selectedId = playModeBox.getSelectedId();
-            if (selectedId <= 0)
-                return;
-
-            const int modeId = selectedId - 1;
-            if (modeId < static_cast<int>(EnhancedAudioStrip::PlayMode::OneShot)
-                || modeId > static_cast<int>(EnhancedAudioStrip::PlayMode::Sample))
-            {
-                return;
-            }
-
-            strip->setPlayMode(static_cast<EnhancedAudioStrip::PlayMode>(modeId));
-            processor.handleUserStripPlayModeChange(stripIndex);
-
-            // Defer the heavier UI relayout until after the combo popup closes
-            // so the mode switch applies reliably on the first selection.
-            auto safeThis = juce::Component::SafePointer<StripControl>(this);
-            juce::MessageManager::callAsync([safeThis]()
-            {
-                if (safeThis == nullptr)
-                    return;
-
-                safeThis->refreshModeDependentUiState(true);
-                safeThis->updateFromEngine();
-            });
-            
-            DBG("Strip " << stripIndex << " mode changed to " << modeId);
-        }
+        applyPlayModeSelection(playModeBox.getSelectedId());
     };
     addAndMakeVisible(playModeBox);
     
@@ -3174,6 +3144,44 @@ void StripControl::refreshModeDependentUiState(bool relayout)
         resized();
 
     repaint();
+}
+
+bool StripControl::applyPlayModeSelection(int selectedId)
+{
+    auto* engine = processor.getAudioEngine();
+    if (engine == nullptr || selectedId <= 0)
+        return false;
+
+    auto* strip = engine->getStrip(stripIndex);
+    if (strip == nullptr)
+        return false;
+
+    const int modeId = selectedId - 1;
+    if (modeId < static_cast<int>(EnhancedAudioStrip::PlayMode::OneShot)
+        || modeId > static_cast<int>(EnhancedAudioStrip::PlayMode::Sample))
+    {
+        return false;
+    }
+
+    const auto mode = static_cast<EnhancedAudioStrip::PlayMode>(modeId);
+    if (playModeBox.getSelectedId() != selectedId)
+        playModeBox.setSelectedId(selectedId, juce::dontSendNotification);
+
+    strip->setPlayMode(mode);
+    processor.handleUserStripPlayModeChange(stripIndex);
+
+    auto safeThis = juce::Component::SafePointer<StripControl>(this);
+    juce::MessageManager::callAsync([safeThis]()
+    {
+        if (safeThis == nullptr)
+            return;
+
+        safeThis->refreshModeDependentUiState(true);
+        safeThis->updateFromEngine();
+    });
+
+    DBG("Strip " << stripIndex << " mode changed to " << modeId);
+    return true;
 }
 
 void StripControl::updateGrainTabButtons()

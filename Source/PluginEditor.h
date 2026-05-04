@@ -673,6 +673,7 @@ private:
     void applyModulationCellCurveFromDrag(int deltaY, bool rampUpMode);
     void hideAllPrimaryControls();
     void hideAllGrainControls();
+    bool applyPlayModeSelection(int selectedId);
     void refreshModeDependentUiState(bool relayout);
     void updateGrainOverlayVisibility();
     void updateGrainTabButtons();

@@ -10278,7 +10278,6 @@ void EnhancedAudioStrip::setGlobalPitchContext(int rootMidi, int scaleIndex)
         0, static_cast<int>(ModernAudioEngine::PitchScale::PentatonicMinor), scaleIndex);
     const int previousRoot = globalPitchRootMidi.exchange(clampedRoot, std::memory_order_acq_rel);
     const int previousScale = globalPitchScale.exchange(clampedScale, std::memory_order_acq_rel);
-    stepSampler.setRootMidi(clampedRoot);
     if (previousScale != clampedScale || previousRoot != clampedRoot)
         setGrainPitch(grainPitchAtomic.load(std::memory_order_acquire));
 }

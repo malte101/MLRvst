@@ -2308,7 +2308,6 @@ void MlrVSTAudioProcessor::applyResolvedPitchControl(EnhancedAudioStrip& strip,
         strip.setResamplePitchRatio(1.0f);
         if (auto* stepSampler = strip.getStepSampler())
         {
-            stepSampler->setRootMidi(resolved.globalRootMidi);
             stepSampler->setSpeed(resolved.stepSamplerRatio);
         }
         return;
