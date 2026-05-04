@@ -2422,7 +2422,11 @@ void MlrVSTAudioProcessor::triggerSampleModeStripAtSample(int stripIndex,
             && currentSyncInfo.legacyLoopBarSelection <= 0
             && currentSyncInfo.visibleBankIndex < 0
             && currentSyncInfo.bankEndSample <= currentSyncInfo.bankStartSample;
-        const bool resolveFromCurrentVisibleSlot = hasExplicitLegacyWindow || usesAutoLegacyLoopOverride;
+        const bool livePendingVisibleSlice = engine->getPendingVisibleSliceSlot() == visibleSlot;
+        const bool hasRecordedSliceReference = !livePendingVisibleSlice
+            && (sampleSliceId >= 0 || sampleStartSample >= 0);
+        const bool resolveFromCurrentVisibleSlot = !hasRecordedSliceReference
+            && (hasExplicitLegacyWindow || usesAutoLegacyLoopOverride);
         const int resolvedSliceId = resolveFromCurrentVisibleSlot ? -1 : sampleSliceId;
         const int64_t resolvedSliceStartSample = resolveFromCurrentVisibleSlot ? -1 : sampleStartSample;
         if (!engine->resolveLegacyLoopTriggerSyncInfo(visibleSlot,

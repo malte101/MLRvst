@@ -6090,6 +6090,13 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
         sampleSliceId = visibleSlice.id;
         sampleStartSample = visibleSlice.startSample;
     }
+    else if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Step)
+    {
+        // Scene/pattern playback should retrigger the same audio boundary that
+        // the live grid press hit, even if transient markers or loop state have
+        // been recalled since the event was recorded.
+        sampleStartSample = strip->getTriggerTargetSampleForColumn(column);
+    }
 
     uint32_t autosaveDelayMs = 0;
     if (useQuantize)
@@ -6183,8 +6190,8 @@ void MlrVSTAudioProcessor::triggerStrip(int stripIndex, int column)
             auto* pattern = audioEngine->getPattern(i);
             if (pattern && pattern->isRecording() && audioEngine->patternRecorderMatchesStrip(i, stripIndex))
             {
-                int recordedSliceId = -1;
-                int64_t recordedSliceStartSample = -1;
+                int recordedSliceId = sampleSliceId;
+                int64_t recordedSliceStartSample = sampleStartSample;
                 if (isSampleMode)
                 {
                     if (auto* sampleEngine = getSampleModeEngine(stripIndex, false))

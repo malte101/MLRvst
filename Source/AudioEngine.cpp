@@ -2420,6 +2420,55 @@ std::array<int, 16> EnhancedAudioStrip::getCachedTransientSliceSamples() const
     return out;
 }
 
+int64_t EnhancedAudioStrip::getTriggerTargetSampleForColumn(int column) const
+{
+    if (sampleLength <= 0.0)
+        return -1;
+
+    int loopCols = loopEnd - loopStart;
+    if (loopCols <= 0)
+        loopCols = ModernAudioEngine::MaxColumns;
+
+    const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
+    const double loopLength = (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
+    if (loopLength <= 0.0)
+        return -1;
+
+    const double rawTarget = getTriggerTargetPositionForColumn(column, loopStartSamples, loopLength);
+    const bool transientModeActive = transientSliceMode.load(std::memory_order_acquire);
+    const int zeroSnapRadius = transientModeActive ? 0 : juce::jmax(8, static_cast<int>(currentSampleRate * 0.0007));
+    const double target = zeroSnapRadius > 0
+        ? snapToNearestZeroCrossing(rawTarget, zeroSnapRadius)
+        : rawTarget;
+    return static_cast<int64_t>(std::llround(
+        juce::jlimit(0.0, juce::jmax(0.0, sampleLength - 1.0), target)));
+}
+
+double EnhancedAudioStrip::getLoopOffsetRatioForSamplePosition(int64_t samplePosition) const
+{
+    if (sampleLength <= 0.0 || samplePosition < 0)
+        return -1.0;
+
+    int loopCols = loopEnd - loopStart;
+    if (loopCols <= 0)
+        loopCols = ModernAudioEngine::MaxColumns;
+
+    const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
+    const double loopLength = (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
+    if (loopLength <= 0.0)
+        return -1.0;
+
+    const double clampedPosition = juce::jlimit(
+        0.0,
+        juce::jmax(0.0, sampleLength - 1.0),
+        static_cast<double>(samplePosition));
+    double positionInLoop = std::fmod(clampedPosition - loopStartSamples, loopLength);
+    if (positionInLoop < 0.0)
+        positionInLoop += loopLength;
+
+    return juce::jlimit(0.0, 0.999999, positionInLoop / loopLength);
+}
+
 void EnhancedAudioStrip::commitTransientSlicePositionsLocked(const std::array<int, 16>& positions)
 {
     const int totalSamples = sampleBuffer.getNumSamples();
@@ -6309,8 +6358,36 @@ void EnhancedAudioStrip::process(juce::AudioBuffer<float>& output,
             }
         };
 
+        const bool stepStutterTimingActive =
+            (momentaryStutterTimingActive.load(std::memory_order_acquire) != 0);
+
         // Sample-accurate in-block scheduling using PPQ timeline.
-        if (positionInfo.getPpqPosition().hasValue() && tempo > 0.0)
+        if (stepStutterTimingActive)
+        {
+            // While hold-stutter owns this strip, the engine-level stutter clock
+            // retriggers the step sampler. Keep rendering the active voice here,
+            // but do not let the normal step clock trigger underneath it.
+            stepSampler.process(*stepOutputBuffer, stepOutputStartSample, numSamples);
+
+            if (positionInfo.getPpqPosition().hasValue() && tempo > 0.0 && currentSampleRate > 0.0)
+            {
+                const double samplesPerBeatLocal = (60.0 / tempo) * currentSampleRate;
+                const double ppqAtSegmentEndRaw =
+                    *positionInfo.getPpqPosition() + (static_cast<double>(numSamples) / samplesPerBeatLocal);
+                const double ppqAtSegmentEnd = applySwingToPpq(ppqAtSegmentEndRaw);
+                if (std::isfinite(ppqAtSegmentEnd))
+                {
+                    const double sequencePosAtEnd =
+                        (ppqAtSegmentEnd * stepEventsPerPpq) + stepTraversalPhaseOffsetTicks;
+                    stepTraversalTick = static_cast<int64_t>(std::floor(sequencePosAtEnd));
+                }
+            }
+
+            stepSubdivisionSixteenth = std::numeric_limits<int64_t>::min();
+            stepSubdivisionTriggerIndex = 0;
+            stepSubdivisionGateOpen = false;
+        }
+        else if (positionInfo.getPpqPosition().hasValue() && tempo > 0.0)
         {
             const double ppqStartRaw = *positionInfo.getPpqPosition();
             const double samplesPerBeatLocal = (60.0 / tempo) * currentSampleRate;
@@ -8018,10 +8095,9 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
     if (loopCols <= 0) loopCols = ModernAudioEngine::MaxColumns;
     loopLengthSamples = (loopCols / static_cast<double>(ModernAudioEngine::MaxColumns)) * sampleLength;
 
-    const bool useStutterOffsetOverride = stutterRetrigger
-        && std::isfinite(stutterOffsetRatioOverride)
+    const bool useOffsetRatioOverride = std::isfinite(stutterOffsetRatioOverride)
         && stutterOffsetRatioOverride >= 0.0;
-    const double clampedStutterOffsetRatio = juce::jlimit(0.0, 0.999999, stutterOffsetRatioOverride);
+    const double clampedOffsetRatio = juce::jlimit(0.0, 0.999999, stutterOffsetRatioOverride);
     
     // Update trigger info
     triggerColumn = column;
@@ -8042,11 +8118,11 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
         // One-shot should be trigger-relative and must not be phase-wrapped
         // to host timeline. Loop/Gate keep timeline anchoring.
         const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
-        const double rawTriggerTargetPos = useStutterOffsetOverride
-            ? (loopStartSamples + (clampedStutterOffsetRatio * loopLengthSamples))
+        const double rawTriggerTargetPos = useOffsetRatioOverride
+            ? (loopStartSamples + (clampedOffsetRatio * loopLengthSamples))
             : getTriggerTargetPositionForColumn(column, loopStartSamples, loopLengthSamples);
         const bool transientModeActive = transientSliceMode.load(std::memory_order_acquire);
-        const int zeroSnapRadius = (transientModeActive || stutterRetrigger)
+        const int zeroSnapRadius = (transientModeActive || stutterRetrigger || useOffsetRatioOverride)
             ? 0
             : juce::jmax(8, static_cast<int>(currentSampleRate * 0.0007)); // ~0.7ms
         const double triggerTargetPos = (zeroSnapRadius > 0)
@@ -8085,11 +8161,11 @@ void EnhancedAudioStrip::triggerAtSample(int column, double tempo, int64_t globa
     
     // Calculate target position for this column
     const double loopStartSamples = loopStart * (sampleLength / ModernAudioEngine::MaxColumns);
-    const double rawTargetPosition = useStutterOffsetOverride
-        ? (loopStartSamples + (clampedStutterOffsetRatio * loopLengthSamples))
+    const double rawTargetPosition = useOffsetRatioOverride
+        ? (loopStartSamples + (clampedOffsetRatio * loopLengthSamples))
         : getTriggerTargetPositionForColumn(column, loopStartSamples, loopLengthSamples);
     const bool transientModeActive = transientSliceMode.load(std::memory_order_acquire);
-    const int zeroSnapRadius = (transientModeActive || stutterRetrigger)
+    const int zeroSnapRadius = (transientModeActive || stutterRetrigger || useOffsetRatioOverride)
         ? 0
         : juce::jmax(8, static_cast<int>(currentSampleRate * 0.0007)); // ~0.7ms
     const double newTargetPosition = (zeroSnapRadius > 0)
@@ -11528,6 +11604,15 @@ double EnhancedAudioStrip::getEffectiveLoopDisplayEndColumn() const
 
 int EnhancedAudioStrip::getCurrentColumn() const
 {
+    if (playMode == PlayMode::Step)
+    {
+        const int totalSteps = juce::jmax(1, getStepTotalSteps());
+        const int wrappedStep = ((currentStep % totalSteps) + totalSteps) % totalSteps;
+        return juce::jlimit(0,
+                            ModernAudioEngine::MaxColumns - 1,
+                            wrappedStep % ModernAudioEngine::MaxColumns);
+    }
+
     if (sampleLength <= 0.0)
         return juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, triggerColumn);
 
@@ -11587,6 +11672,9 @@ int EnhancedAudioStrip::getCurrentColumn() const
 
 int EnhancedAudioStrip::getStutterEntryColumn() const
 {
+    if (playMode == PlayMode::Step)
+        return getCurrentColumn();
+
     const int safeLoopStart = juce::jlimit(0, ModernAudioEngine::MaxColumns - 1, loopStart);
     const int safeLoopEnd = juce::jlimit(safeLoopStart + 1, ModernAudioEngine::MaxColumns, loopEnd);
     const int loopCols = juce::jmax(1, safeLoopEnd - safeLoopStart);
@@ -13963,7 +14051,7 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
 
                 if (stepRetriggerEvent)
                 {
-                    strip->retriggerStepVoiceAtColumn(event.column, event.isMomentaryStutter);
+                    strip->retriggerStepVoiceAtColumn(event.column, false);
                 }
                 else if (sampleModeEvent && sampleModeTriggerCallback)
                 {
@@ -13993,6 +14081,8 @@ void ModernAudioEngine::processBlock(juce::AudioBuffer<float>& buffer,
 
                     const int64_t triggerSample = blockStart + eventOffset;
                     double stutterOffsetRatioOverride = event.stutterOffsetRatioOverride;
+                    if (stutterOffsetRatioOverride < 0.0 && event.sampleStartSample >= 0)
+                        stutterOffsetRatioOverride = strip->getLoopOffsetRatioForSamplePosition(event.sampleStartSample);
                     if (stutterOffsetRatioOverride < 0.0
                         && event.isMomentaryStutter
                         && event.stripIndex >= 0
@@ -14473,7 +14563,15 @@ void ModernAudioEngine::triggerStripWithQuantization(int stripIndex,
         }
         else
         {
-            strip->triggerAtSample(column, currentTempo.load(), globalSampleCount.load(), immediatePosInfo);
+            const double recordedOffsetRatio = sampleStartSample >= 0
+                ? strip->getLoopOffsetRatioForSamplePosition(sampleStartSample)
+                : -1.0;
+            strip->triggerAtSample(column,
+                                   currentTempo.load(),
+                                   globalSampleCount.load(),
+                                   immediatePosInfo,
+                                   false,
+                                   recordedOffsetRatio);
         }
     }
 }

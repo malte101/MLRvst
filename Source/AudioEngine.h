@@ -886,6 +886,8 @@ public:
     double getLoopPhaseNormalized() const;
     std::array<int, 16> getSliceStartSamples(bool transientMode) const;
     std::array<int, 16> getCachedTransientSliceSamples() const;
+    int64_t getTriggerTargetSampleForColumn(int column) const;
+    double getLoopOffsetRatioForSamplePosition(int64_t samplePosition) const;
     void setTransientSliceMarkerSample(int sliceIndex, int sampleIndex);
     std::array<float, 128> getCachedRmsMap() const;
     std::array<int, 128> getCachedZeroCrossMap() const;
