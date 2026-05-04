@@ -113,6 +113,8 @@ struct SampleModePersistentState
     SampleTriggerMode triggerMode = SampleTriggerMode::OneShot;
     bool useLegacyLoopEngine = true;
     int legacyLoopBarSelection = 0;
+    int64_t legacyLoopWindowStartSample = -1;
+    bool legacyLoopWindowManualAnchor = false;
     int beatDivision = 1;
     float viewZoom = 1.0f;
     float viewScroll = 0.0f;

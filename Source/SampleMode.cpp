@@ -2643,6 +2643,8 @@ juce::ValueTree SampleModePersistentState::createValueTree(const juce::Identifie
     tree.setProperty("triggerMode", sampleTriggerModeName(triggerMode), nullptr);
     tree.setProperty("useLegacyLoopEngine", useLegacyLoopEngine, nullptr);
     tree.setProperty("legacyLoopBarSelection", legacyLoopBarSelection, nullptr);
+    tree.setProperty("legacyLoopWindowStartSample", static_cast<juce::int64>(legacyLoopWindowStartSample), nullptr);
+    tree.setProperty("legacyLoopWindowManualAnchor", legacyLoopWindowManualAnchor, nullptr);
     tree.setProperty("beatDivision", beatDivision, nullptr);
     tree.setProperty("viewZoom", viewZoom, nullptr);
     tree.setProperty("viewScroll", viewScroll, nullptr);
@@ -2716,6 +2718,9 @@ SampleModePersistentState SampleModePersistentState::fromValueTree(const juce::V
     persistentState.triggerMode = sampleTriggerModeFromString(state.getProperty("triggerMode", "oneshot").toString());
     persistentState.useLegacyLoopEngine = static_cast<bool>(state.getProperty("useLegacyLoopEngine", true));
     persistentState.legacyLoopBarSelection = static_cast<int>(state.getProperty("legacyLoopBarSelection", 0));
+    persistentState.legacyLoopWindowStartSample = static_cast<int64_t>(
+        static_cast<juce::int64>(state.getProperty("legacyLoopWindowStartSample", -1)));
+    persistentState.legacyLoopWindowManualAnchor = static_cast<bool>(state.getProperty("legacyLoopWindowManualAnchor", false));
     persistentState.beatDivision = juce::jlimit(1, 8, static_cast<int>(state.getProperty("beatDivision", 1)));
     persistentState.viewZoom = juce::jlimit(kMinViewZoom, kMaxViewZoom, static_cast<float>(state.getProperty("viewZoom", 1.0f)));
     persistentState.viewScroll = juce::jlimit(0.0f, 1.0f, static_cast<float>(state.getProperty("viewScroll", 0.0f)));
@@ -2801,6 +2806,8 @@ std::unique_ptr<juce::XmlElement> SampleModePersistentState::createXml(const juc
     xml->setAttribute("triggerMode", sampleTriggerModeName(triggerMode));
     xml->setAttribute("useLegacyLoopEngine", useLegacyLoopEngine);
     xml->setAttribute("legacyLoopBarSelection", legacyLoopBarSelection);
+    xml->setAttribute("legacyLoopWindowStartSample", juce::String(static_cast<juce::int64>(legacyLoopWindowStartSample)));
+    xml->setAttribute("legacyLoopWindowManualAnchor", legacyLoopWindowManualAnchor);
     xml->setAttribute("beatDivision", beatDivision);
     xml->setAttribute("viewZoom", viewZoom);
     xml->setAttribute("viewScroll", viewScroll);
@@ -4039,21 +4046,14 @@ bool SampleModeEngine::resolveLegacyLoopTriggerSyncInfo(int preferredVisibleSlot
     const auto& allSlices = sliceModel.getAllSlices();
     int64_t legacyRangeStartSample = 0;
     int64_t legacyRangeEndSample = 0;
-    const bool useLegacyWindowSlices = computeLegacyLoopWindowRangeLocked(legacyRangeStartSample, legacyRangeEndSample)
-        && sliceId < 0
-        && sliceStartSample < 0;
-    const bool useRandomVisibleSlices = randomVisibleSliceOverrideActive
-        && !useLegacyWindowSlices
-        && sliceId < 0
-        && sliceStartSample < 0;
-
-    if (useLegacyWindowSlices)
+    const bool hasLegacyWindowRange = computeLegacyLoopWindowRangeLocked(legacyRangeStartSample, legacyRangeEndSample);
+    auto buildLegacyWindowSyncInfo = [&](int triggerSlot) -> bool
     {
         syncInfo = {};
         syncInfo.loadedSample = loadedSample;
         syncInfo.visibleSlices = buildLegacyLoopWindowVisibleSlicesLocked(legacyRangeStartSample, legacyRangeEndSample);
         syncInfo.visibleBankIndex = -1;
-        syncInfo.triggerVisibleSlot = clampedSlot;
+        syncInfo.triggerVisibleSlot = juce::jlimit(0, SliceModel::VisibleSliceCount - 1, triggerSlot);
         syncInfo.bankStartSample = legacyRangeStartSample;
         syncInfo.bankEndSample = legacyRangeEndSample;
         syncInfo.analyzedTempoBpm = persistentState.analyzedTempoBpm > 0.0
@@ -4090,7 +4090,49 @@ bool SampleModeEngine::resolveLegacyLoopTriggerSyncInfo(int preferredVisibleSlot
                                                                 syncInfo.analyzedTempoBpm,
                                                                 persistentState.legacyLoopBarSelection);
         return true;
+    };
+
+    const bool useLegacyWindowSlices = hasLegacyWindowRange && sliceId < 0 && sliceStartSample < 0;
+    const bool useRandomVisibleSlices = randomVisibleSliceOverrideActive
+        && !useLegacyWindowSlices
+        && sliceId < 0
+        && sliceStartSample < 0;
+
+    if (hasLegacyWindowRange && (sliceId >= 0 || sliceStartSample >= 0))
+    {
+        const auto windowSlices = buildLegacyLoopWindowVisibleSlicesLocked(legacyRangeStartSample, legacyRangeEndSample);
+        int resolvedWindowSlot = -1;
+        if (sliceStartSample >= 0)
+        {
+            for (int slot = 0; slot < SliceModel::VisibleSliceCount; ++slot)
+            {
+                const auto& slice = windowSlices[static_cast<size_t>(slot)];
+                if (slice.startSample == sliceStartSample
+                    && (sliceId < 0 || slice.id == sliceId))
+                {
+                    resolvedWindowSlot = slot;
+                    break;
+                }
+            }
+        }
+        if (resolvedWindowSlot < 0
+            && sliceId >= 0
+            && sliceId < SliceModel::VisibleSliceCount)
+        {
+            const auto& slice = windowSlices[static_cast<size_t>(sliceId)];
+            if (slice.id >= 0
+                && slice.endSample > slice.startSample
+                && (sliceStartSample < 0 || slice.startSample == sliceStartSample))
+            {
+                resolvedWindowSlot = sliceId;
+            }
+        }
+        if (resolvedWindowSlot >= 0)
+            return buildLegacyWindowSyncInfo(resolvedWindowSlot);
     }
+
+    if (useLegacyWindowSlices)
+        return buildLegacyWindowSyncInfo(clampedSlot);
 
     if (useRandomVisibleSlices)
     {
@@ -4924,6 +4966,8 @@ SampleModePersistentState SampleModeEngine::capturePersistentState() const
     const juce::ScopedLock lock(stateLock);
     auto state = persistentState;
     state.visibleSliceBankIndex = sliceModel.getVisibleBankIndex();
+    state.legacyLoopWindowStartSample = legacyLoopWindowStartSample;
+    state.legacyLoopWindowManualAnchor = legacyLoopWindowManualAnchor;
     state.storedSlices.clear();
     if (loadedSample != nullptr)
     {
@@ -4969,7 +5013,28 @@ void SampleModeEngine::applyPersistentState(const SampleModePersistentState& sta
             [[maybe_unused]] const auto warmedCanonicalMarkers = buildCanonicalTransientMarkerSamplesLocked();
             sliceModel.setVisibleBankIndex(persistentState.visibleSliceBankIndex);
         }
+        if (persistentState.useLegacyLoopEngine
+            && persistentState.legacyLoopBarSelection > 0
+            && loadedSample != nullptr)
+        {
+            legacyLoopWindowStartSample = persistentState.legacyLoopWindowStartSample >= 0
+                ? juce::jlimit<int64_t>(0,
+                                         juce::jmax<int64_t>(0, loadedSample->sourceLengthSamples - 1),
+                                         persistentState.legacyLoopWindowStartSample)
+                : getDefaultLegacyLoopWindowStartSampleLocked();
+            legacyLoopWindowManualAnchor = persistentState.legacyLoopWindowStartSample >= 0
+                && persistentState.legacyLoopWindowManualAnchor;
+        }
+        else
+        {
+            legacyLoopWindowStartSample = -1;
+            legacyLoopWindowManualAnchor = false;
+        }
+        persistentState.legacyLoopWindowStartSample = legacyLoopWindowStartSample;
+        persistentState.legacyLoopWindowManualAnchor = legacyLoopWindowManualAnchor;
         legacyLoopTransientPageStartIndex = 0;
+        if (persistentState.useLegacyLoopEngine && persistentState.legacyLoopBarSelection > 0)
+            fitViewToLegacyLoopWindowLocked();
     }
 
     notifyLegacyLoopRenderStateChanged();
@@ -7378,14 +7443,15 @@ bool SampleModeEngine::buildLegacyLoopSyncInfoForSliceIndexLocked(int sliceIndex
     syncInfo.sliceMode = persistentState.sliceMode;
     syncInfo.warpMarkers = persistentState.warpMarkers;
 
+    for (int slot = 0; slot < SliceModel::VisibleSliceCount; ++slot)
+    {
+        const int sourceIndex = bankStart + slot;
+        if (sourceIndex >= 0 && sourceIndex < static_cast<int>(allSlices.size()))
+            syncInfo.visibleSlices[static_cast<size_t>(slot)] = allSlices[static_cast<size_t>(sourceIndex)];
+    }
+
     if (persistentState.sliceMode == SampleSliceMode::Transient)
     {
-        for (int slot = 0; slot < SliceModel::VisibleSliceCount; ++slot)
-        {
-            const int sourceIndex = bankStart + slot;
-            if (sourceIndex >= 0 && sourceIndex < static_cast<int>(allSlices.size()))
-                syncInfo.visibleSlices[static_cast<size_t>(slot)] = allSlices[static_cast<size_t>(sourceIndex)];
-        }
         syncInfo.markerSamples = buildCanonicalTransientMarkerSamplesLocked();
     }
     else if (persistentState.sliceMode == SampleSliceMode::Manual)
@@ -7402,14 +7468,9 @@ bool SampleModeEngine::buildLegacyLoopSyncInfoForSliceIndexLocked(int sliceIndex
         syncInfo.markerSamples.reserve(static_cast<size_t>(juce::jmax(0, SliceModel::VisibleSliceCount)));
         for (int slot = 0; slot < SliceModel::VisibleSliceCount; ++slot)
         {
-            const int sourceIndex = bankStart + slot;
-            if (sourceIndex >= 0 && sourceIndex < static_cast<int>(allSlices.size()))
-            {
-                syncInfo.visibleSlices[static_cast<size_t>(slot)] = allSlices[static_cast<size_t>(sourceIndex)];
-                const auto& slice = allSlices[static_cast<size_t>(sourceIndex)];
-                if (slice.id >= 0 && slice.endSample > slice.startSample)
-                    syncInfo.markerSamples.push_back(slice.startSample);
-            }
+            const auto& slice = syncInfo.visibleSlices[static_cast<size_t>(slot)];
+            if (slice.id >= 0 && slice.endSample > slice.startSample)
+                syncInfo.markerSamples.push_back(slice.startSample);
         }
     }
 
