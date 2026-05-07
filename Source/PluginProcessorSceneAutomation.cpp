@@ -8,6 +8,7 @@
 */
 
 #include "PluginProcessor.h"
+#include "SceneAutomationRules.h"
 #include <cmath>
 
 namespace
@@ -386,7 +387,9 @@ void MlrVSTAudioProcessor::clearActiveSceneAutomationOverrides(bool restoreWritt
                                                                chosenEvent))
                     {
                         float liveValue = 0.0f;
+                        const bool isSteppedControlPoint = SceneAutomationRules::eventUsesSteppedSegments(chosenEvent);
                         const bool shouldSeedTransition = sceneControlSupportsTransitionSmoothing(target)
+                            && !isSteppedControlPoint
                             && getSceneControlCurrentValue(targetStripIndex, target, liveValue);
                         applyScenePerformanceEvent(chosenEvent, StripControlWriteMode::NotifyHost);
                         if (shouldSeedTransition)

@@ -8,6 +8,7 @@
 */
 
 #include "PluginProcessor.h"
+#include "SceneAutomationRules.h"
 #include <cmath>
 #include <limits>
 
@@ -636,7 +637,10 @@ void MlrVSTAudioProcessor::playbackScenePerformanceEvent(const ScenePerformanceE
         return;
 
     float liveValue = 0.0f;
+    const bool isSteppedControlPoint = event.type == ScenePerformanceEventType::ControlPoint
+        && SceneAutomationRules::eventUsesSteppedSegments(event);
     const bool shouldSeedTransition = event.type == ScenePerformanceEventType::ControlPoint
+        && !isSteppedControlPoint
         && shouldSmoothLiveSceneControlTarget(event.controlTarget)
         && getSceneControlCurrentValue(event.stripIndex, event.controlTarget, liveValue);
 
