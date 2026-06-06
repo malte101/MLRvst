@@ -445,9 +445,12 @@ target_link_libraries(mlrVST
         juce::juce_osc
     PUBLIC
         juce::juce_recommended_config_flags
-        juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
 )
+
+if(NOT (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND MLRVST_ALLOW_UNSUPPORTED_MINGW_WINDOWS))
+    target_link_libraries(mlrVST PUBLIC juce::juce_recommended_lto_flags)
+endif()
 
 # Platform-specific settings
 if(APPLE)
@@ -492,7 +495,10 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND MLRVST_ALLOW_UNSUPPORTED_M
     set(MLRVST_MINGW_SHIM_DEFINES
         JUCE_ALLOW_MINGW=1
         JUCE_MINGW=1
-        JUCE_USE_WINDOWS_MEDIA_FORMAT=0)
+        JUCE_USE_WINDOWS_MEDIA_FORMAT=0
+        CaretPosition_Unknown=0
+        CaretPosition_EndOfLine=1
+        CaretPosition_BeginningOfLine=2)
     set(MLRVST_MINGW_SHIM_C_OPTIONS
         -U__MINGW32__
         -D_WIN64)
@@ -539,6 +545,9 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND MLRVST_ALLOW_UNSUPPORTED_M
             dxguid
             shlwapi
             version
+            wininet
+            dbghelp
+            sapi
             ws2_32)
 
         target_compile_definitions(mlrVST PRIVATE ${MLRVST_MINGW_SHIM_DEFINES})
