@@ -77,3 +77,6 @@ third_party/_native/*
 # CMake build tree (only the release artefacts below are tracked)
 cmake-build-release/*
 !cmake-build-release/mlrVST_artefacts/
+
+# MinGW cross-build tree; its output ships as a zip in release/ instead
+cmake-build-windows/

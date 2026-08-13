@@ -23,8 +23,28 @@ option(MLRVST_WINDOWS_STATIC_RUNTIME
     ON)
 set(MLRVST_NATIVE_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/_native" CACHE PATH
     "Path to persistent repo-local native dependency prefixes")
-set(MLRVST_DEFAULT_ESSENTIA_PREFIX "${MLRVST_NATIVE_DEPS_DIR}/essentia-prefix")
-set(MLRVST_DEFAULT_BUNGEE_PREFIX "${MLRVST_NATIVE_DEPS_DIR}/bungee-prefix")
+# The native prefixes hold real static archives, so they are per-target, not
+# per-host. When a macOS host cross-builds for Windows the host prefixes are
+# Mach-O and mingw's linker quietly skips them — the build only fails much later
+# with a wall of undefined references. Point Windows cross-builds at their own
+# "-win" prefixes instead, and let the dependency simply report as unavailable
+# when one has not been built yet.
+set(MLRVST_NATIVE_PREFIX_SUFFIX "")
+if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    set(MLRVST_NATIVE_PREFIX_SUFFIX "-win")
+endif()
+
+set(MLRVST_DEFAULT_ESSENTIA_PREFIX "${MLRVST_NATIVE_DEPS_DIR}/essentia-prefix${MLRVST_NATIVE_PREFIX_SUFFIX}")
+set(MLRVST_DEFAULT_BUNGEE_PREFIX "${MLRVST_NATIVE_DEPS_DIR}/bungee-prefix${MLRVST_NATIVE_PREFIX_SUFFIX}")
+
+# Same reasoning for the Homebrew/local fallbacks the find_* calls sweep: they
+# are host libraries and must stay out of a cross-build.
+set(MLRVST_HOST_INCLUDE_FALLBACKS /opt/homebrew/include /usr/local/include)
+set(MLRVST_HOST_LIB_FALLBACKS /opt/homebrew/lib /usr/local/lib)
+if(CMAKE_CROSSCOMPILING)
+    set(MLRVST_HOST_INCLUDE_FALLBACKS "")
+    set(MLRVST_HOST_LIB_FALLBACKS "")
+endif()
 set(MLRVST_ESSENTIA_PREFIX "${MLRVST_DEFAULT_ESSENTIA_PREFIX}" CACHE PATH
     "Path to a native Essentia install prefix")
 set(MLRVST_BUNGEE_PREFIX "${MLRVST_DEFAULT_BUNGEE_PREFIX}" CACHE PATH
@@ -360,16 +380,14 @@ if(MLRVST_ENABLE_BUNGEE)
         PATHS
             "${MLRVST_BUNGEE_PREFIX}/include"
             "${MLRVST_BUNGEE_SOURCE_DIR}"
-            /opt/homebrew/include
-            /usr/local/include)
+            ${MLRVST_HOST_INCLUDE_FALLBACKS})
     find_library(MLRVST_BUNGEE_LIBRARY
         NAMES bungee libbungee
         PATHS
             "${MLRVST_BUNGEE_PREFIX}/lib"
             "${MLRVST_BUNGEE_BUILD_DIR}"
             "${MLRVST_BUNGEE_BUILD_DIR}/Release"
-            /opt/homebrew/lib
-            /usr/local/lib)
+            ${MLRVST_HOST_LIB_FALLBACKS})
     find_library(MLRVST_BUNGEE_PFFFT_LIBRARY
         NAMES pffft libpffft
         PATHS
@@ -396,14 +414,12 @@ if(MLRVST_ENABLE_ESSENTIA_NATIVE)
         NAMES essentia/essentia.h
         PATHS
             "${MLRVST_ESSENTIA_PREFIX}/include"
-            /opt/homebrew/include
-            /usr/local/include)
+            ${MLRVST_HOST_INCLUDE_FALLBACKS})
     find_library(MLRVST_ESSENTIA_LIBRARY
         NAMES essentia libessentia
         PATHS
             "${MLRVST_ESSENTIA_PREFIX}/lib"
-            /opt/homebrew/lib
-            /usr/local/lib)
+            ${MLRVST_HOST_LIB_FALLBACKS})
 
     if(MLRVST_ESSENTIA_INCLUDE_DIR AND MLRVST_ESSENTIA_LIBRARY)
         target_include_directories(mlrVST SYSTEM PRIVATE
@@ -495,10 +511,17 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND MLRVST_ALLOW_UNSUPPORTED_M
     set(MLRVST_MINGW_SHIM_DEFINES
         JUCE_ALLOW_MINGW=1
         JUCE_MINGW=1
+        # CMAKE_CXX_EXTENSIONS is OFF, so gcc defines __STRICT_ANSI__ and mingw's
+        # math.h then withholds M_PI/M_LN2/... which Essentia's headers rely on.
+        _USE_MATH_DEFINES=1
         JUCE_USE_WINDOWS_MEDIA_FORMAT=0
         CaretPosition_Unknown=0
         CaretPosition_EndOfLine=1
-        CaretPosition_BeginningOfLine=2)
+        CaretPosition_BeginningOfLine=2
+        # mingw's d2d1effects.h declares CLSID_D2D1Saturation but omits the
+        # matching D2D1_SATURATION_PROP enum that JUCE's Direct2D image code
+        # writes to. 0 is the value from the Windows SDK.
+        D2D1_SATURATION_PROP_SATURATION=0)
     set(MLRVST_MINGW_SHIM_C_OPTIONS
         -U__MINGW32__
         -D_WIN64)
@@ -507,7 +530,7 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND MLRVST_ALLOW_UNSUPPORTED_M
         -D_WIN64
         -DJUCE_64BIT=1
         -include
-        cstring)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/mingw_compat.h")
 
     get_filename_component(MLRVST_MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
     get_filename_component(MLRVST_MINGW_ROOT_DIR "${MLRVST_MINGW_BIN_DIR}/.." ABSOLUTE)
@@ -549,6 +572,8 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND MLRVST_ALLOW_UNSUPPORTED_M
             dbghelp
             sapi
             ws2_32)
+
+        target_sources(mlrVST PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/mingw_uuid_shims.cpp")
 
         target_compile_definitions(mlrVST PRIVATE ${MLRVST_MINGW_SHIM_DEFINES})
         target_compile_definitions(mlrVST_VST3 PRIVATE ${MLRVST_MINGW_SHIM_DEFINES})
