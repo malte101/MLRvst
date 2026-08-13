@@ -9,15 +9,7 @@ namespace
 {
 constexpr int kMonomeModPrevColumn = 14;
 constexpr int kMonomeModNextColumn = 15;
-
-float quantizeMonomeRearrangeValue(float value01)
-{
-    return juce::jlimit(0.0f, 1.0f,
-                        std::round(juce::jlimit(0.0f, 1.0f, value01)
-                                   * static_cast<float>(ModernAudioEngine::MaxColumns - 1))
-                            / static_cast<float>(juce::jmax(1, ModernAudioEngine::MaxColumns - 1)));
-}
-}
+} // namespace
 
 bool MlrVSTAudioProcessor::handleMonomeControlPageStripPress(const MonomeLayoutState& layout,
                                                              EnhancedAudioStrip& strip,
@@ -46,14 +38,20 @@ bool MlrVSTAudioProcessor::handleMonomeControlPageStripPress(const MonomeLayoutS
     {
         const bool modulationPageActive = isControlModeActive()
             && getCurrentControlMode() == ControlMode::Modulation;
-        const bool reservedTopCell = modulationPageActive
+        const bool navigationColumn = modulationPageActive
             ? (sourceColumn == kMonomeModPrevColumn || sourceColumn == kMonomeModNextColumn)
             : (sceneStepMotionPageNavigationActive()
                 ? (sourceColumn == kMonomeModPrevColumn || sourceColumn == kMonomeModNextColumn)
                 : (sourceColumn == kMonomeModNextColumn));
-        const int denom = reservedTopCell
-            ? juce::jmax(1, visibleStripCount - 1)
-            : modulationRowsDenom;
+        // Row 0 is only writable when the Modulation top-row overlay is on;
+        // with the overlay off every column tops out at the first strip row,
+        // so all columns must share the same scale (columns 0-13 previously
+        // could never reach 1.0 while the nav columns could).
+        const bool topRowWritable = layout.topRowMode == MonomeLayoutState::TopRowMode::Modulation
+            && !navigationColumn;
+        const int denom = topRowWritable
+            ? modulationRowsDenom
+            : juce::jmax(1, visibleStripCount - 1);
         return juce::jlimit(0.0f, 1.0f, static_cast<float>((CONTROL_ROW - 1) - sourceRow)
             / static_cast<float>(denom));
     };
@@ -108,6 +106,11 @@ bool MlrVSTAudioProcessor::handleMonomeControlPageStripPress(const MonomeLayoutS
                                    value,
                                    column,
                                    applyWrite);
+        // Scene mode records via the touch path above; in Normal mode the
+        // pattern recorder captures the ride (playback support has existed
+        // all along - only this capture call was missing).
+        if (!isSceneModeEnabled())
+            recordMonomeControlPatternEvent(controlMode, stripIndex, controlRow, column);
     };
 
     switch (currentControlMode)
@@ -121,7 +124,9 @@ bool MlrVSTAudioProcessor::handleMonomeControlPageStripPress(const MonomeLayoutS
 
         case ControlMode::Pan:
         {
-            float pan = (column - 8) / 8.0f;
+            // Piecewise so column 15 reaches full right (+1.0); left half
+            // keeps its historical 1/8 spacing.
+            float pan = column <= 8 ? (column - 8) / 8.0f : (column - 8) / 7.0f;
             pan = juce::jlimit(-1.0f, 1.0f, pan);
             applySceneAwareMonomeControl(ScenePerformanceControlTarget::Pan,
                                          ControlMode::Pan,
@@ -239,6 +244,11 @@ bool MlrVSTAudioProcessor::handleMonomeControlPageStripPress(const MonomeLayoutS
             }
             else if (MonomeGroupAssignActions::handleButtonPress(*audioEngine, stripIndex, column))
             {
+                // Play-mode cells (13-15) bypassed the shared mode-change
+                // cleanup (Flip engine stop, state reapply, scene autosave);
+                // route them through it like the GUI combo does.
+                if (column >= 13 && column <= 15)
+                    handleUserStripPlayModeChange(stripIndex);
                 updateMonomeLEDs();
             }
             return true;
@@ -259,15 +269,12 @@ bool MlrVSTAudioProcessor::handleMonomeControlPageStripPress(const MonomeLayoutS
             {
                 const float normalizedY = modulationRowToUnitForColumn(row, column);
                 const bool bipolar = audioEngine->isModBipolar(targetStrip);
-                const bool rearrangeTarget = (audioEngine->getModTarget(targetStrip) == ModernAudioEngine::ModTarget::Rearrange);
                 float value = normalizedY;
                 if (bipolar)
                 {
                     const float signedValue = (normalizedY * 2.0f) - 1.0f;
                     value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
                 }
-                if (rearrangeTarget)
-                    value = quantizeMonomeRearrangeValue(value);
                 audioEngine->setModStepValue(targetStrip, column, value);
                 if (sceneModPageWritesSceneMotion)
                     syncFocusedSceneMotionState();

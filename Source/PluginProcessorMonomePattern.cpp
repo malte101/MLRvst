@@ -22,7 +22,34 @@ void MlrVSTAudioProcessor::recordMonomeControlPatternEvent(ControlMode mode,
         return;
 
     if (isSceneModeEnabled())
+    {
         recordMonomeControlSceneEvent(mode, targetStripIndex, controlRow, column);
+        return;
+    }
+
+    // Normal mode: capture control rides into any recording pattern, mirroring
+    // the trigger-recording path (PluginProcessor.cpp stopStrip-area loop).
+    // Playback filters by patternRecorderMatchesStrip as well, so recording
+    // uses the same strip-match rule for symmetric behavior.
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, targetStripIndex);
+    const double eventBeat = audioEngine->getTimelineBeat();
+    if (!std::isfinite(eventBeat))
+        return;
+
+    for (int patternIndex = 0; patternIndex < ModernAudioEngine::MaxPatterns; ++patternIndex)
+    {
+        auto* pattern = audioEngine->getPattern(patternIndex);
+        if (pattern != nullptr
+            && pattern->isRecording()
+            && audioEngine->patternRecorderMatchesStrip(patternIndex, safeStripIndex))
+        {
+            pattern->recordControlEvent(safeStripIndex,
+                                        static_cast<int>(mode),
+                                        controlRow,
+                                        column,
+                                        eventBeat);
+        }
+    }
 }
 
 void MlrVSTAudioProcessor::playbackMonomeControlPatternEvent(const PatternRecorder::Event& event)
@@ -53,7 +80,12 @@ void MlrVSTAudioProcessor::playbackMonomeControlPatternEvent(const PatternRecord
 
         case ControlMode::Pan:
         {
-            const float pan = juce::jlimit(-1.0f, 1.0f, (column - 8) / 8.0f);
+            // Same piecewise map as the live handler so replayed automation
+            // matches what was performed (column 15 reaches full right).
+            const float pan = juce::jlimit(-1.0f,
+                                           1.0f,
+                                           column <= 8 ? (column - 8) / 8.0f
+                                                       : (column - 8) / 7.0f);
             setStripPanControlValue(stripIndex,
                                     pan,
                                     StripControlWriteMode::CacheOnly);

@@ -504,23 +504,38 @@ void MlrVSTAudioProcessor::armSceneBoundaryTransition(SceneChainTransitionType t
     sceneBoundaryTransitionTargetSample.store(targetSample, std::memory_order_release);
     sceneBoundaryTransitionTempo.store((std::isfinite(targetTempo) && targetTempo > 0.0) ? targetTempo : 120.0,
                                        std::memory_order_release);
-    sceneBoundaryTransitionEndSampleFromStep.store(fromStepIndex, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleTargetPpq.store(endSampleTargetPpq, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleTargetSample.store(endSampleTargetSample, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleIntensity.store(safeIntensity, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleGainDb.store(endSampleSettings.gainDb, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleFadeInMs.store(endSampleSettings.fadeInMs, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleFadeOutMs.store(endSampleSettings.fadeOutMs, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleChokePrevious.store(endSampleSettings.chokePrevious ? 1 : 0,
-                                                        std::memory_order_release);
-    sceneBoundaryTransitionEndSampleReverse.store(endSampleSettings.reverse ? 1 : 0,
-                                                  std::memory_order_release);
-    sceneBoundaryTransitionEndSamplePitchSemitones.store(endSampleSettings.pitchSemitones, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleLowpassHz.store(endSampleSettings.lowpassHz, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleHighpassHz.store(endSampleSettings.highpassHz, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleDuckSource.store(endSampleSettings.duckSource, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleDuckAmount.store(endSampleSettings.duckAmount, std::memory_order_release);
-    sceneBoundaryTransitionEndSampleTriggered.store(0, std::memory_order_release);
+    // An end sample scheduled at the previous boundary fires up to a bar after
+    // that switch; re-arming for the next boundary (which happens on the very
+    // next block) must not destroy it while it is still waiting. A schedule
+    // with an earlier fire time than the one being armed is that pending shot.
+    const double pendingEndSamplePpq =
+        sceneBoundaryTransitionEndSampleTargetPpq.load(std::memory_order_acquire);
+    const bool preservePendingEndSample =
+        sceneBoundaryTransitionEndSampleTriggered.load(std::memory_order_acquire) == 0
+        && sceneBoundaryTransitionEndSampleFromStep.load(std::memory_order_acquire) >= 0
+        && pendingEndSamplePpq >= 0.0
+        && endSampleTargetPpq >= 0.0
+        && pendingEndSamplePpq < endSampleTargetPpq - 1.0e-6;
+    if (!preservePendingEndSample)
+    {
+        sceneBoundaryTransitionEndSampleFromStep.store(fromStepIndex, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleTargetPpq.store(endSampleTargetPpq, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleTargetSample.store(endSampleTargetSample, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleIntensity.store(safeIntensity, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleGainDb.store(endSampleSettings.gainDb, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleFadeInMs.store(endSampleSettings.fadeInMs, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleFadeOutMs.store(endSampleSettings.fadeOutMs, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleChokePrevious.store(endSampleSettings.chokePrevious ? 1 : 0,
+                                                            std::memory_order_release);
+        sceneBoundaryTransitionEndSampleReverse.store(endSampleSettings.reverse ? 1 : 0,
+                                                      std::memory_order_release);
+        sceneBoundaryTransitionEndSamplePitchSemitones.store(endSampleSettings.pitchSemitones, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleLowpassHz.store(endSampleSettings.lowpassHz, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleHighpassHz.store(endSampleSettings.highpassHz, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleDuckSource.store(endSampleSettings.duckSource, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleDuckAmount.store(endSampleSettings.duckAmount, std::memory_order_release);
+        sceneBoundaryTransitionEndSampleTriggered.store(0, std::memory_order_release);
+    }
 }
 
 void MlrVSTAudioProcessor::armSceneChainReturnOverride(int sourceStepIndex, int triggerStepIndex)

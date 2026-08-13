@@ -76,7 +76,7 @@ ResolvedOwnedStripControlState resolveFromParameters(const ParameterView& view,
     state.filterAlgorithm = (view.filterAlgorithmParam != nullptr)
         ? static_cast<EnhancedAudioStrip::FilterAlgorithm>(juce::jlimit(
               0,
-              5,
+              6,
               static_cast<int>(view.filterAlgorithmParam->load(std::memory_order_acquire))))
         : strip.getFilterAlgorithm();
 
@@ -133,8 +133,9 @@ void applyFilter(EnhancedAudioStrip& strip,
     strip.setFilterEnabled(state.filterEnabled);
     strip.setFilterFrequency(state.filterFrequency);
     strip.setFilterResonance(state.filterResonance);
+    // setFilterMorph derives the discrete filter type itself; calling
+    // setFilterType here would snap the continuous morph to 0/0.5/1.
     strip.setFilterMorph(state.filterMorph);
-    strip.setFilterType(filterTypeFromMorphValue(state.filterMorph));
     strip.setFilterAlgorithm(state.filterAlgorithm);
 
     if (auto* stepSampler = strip.getStepSampler())

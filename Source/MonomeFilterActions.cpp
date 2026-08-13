@@ -98,7 +98,9 @@ void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][16], 
 
         float t = std::log(freq / 20.0f) / std::log(1000.0f);
         t = juce::jlimit(0.0f, 1.0f, t);
-        int currentColumn = static_cast<int>(t * 15.0f);
+        // Round, don't truncate: float32 log round-trips land a hair under
+        // the integer for some columns and rendered one pad low.
+        int currentColumn = static_cast<int>(std::round(t * 15.0f));
 
         for (int x = 0; x < 16; ++x)
         {
@@ -119,7 +121,8 @@ void renderRow(const EnhancedAudioStrip& strip, int y, int newLedState[16][16], 
 
         float t = (res - 0.1f) / 9.9f;
         t = juce::jlimit(0.0f, 1.0f, t);
-        int currentColumn = static_cast<int>(t * 15.0f);
+        // Round, don't truncate (same float32 round-trip issue as frequency).
+        int currentColumn = static_cast<int>(std::round(t * 15.0f));
 
         for (int x = 0; x < 16; ++x)
         {

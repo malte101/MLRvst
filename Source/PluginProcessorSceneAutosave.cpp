@@ -55,6 +55,11 @@ bool MlrVSTAudioProcessor::canPersistActiveSceneSnapshotSafely() const
     if (audioEngine == nullptr)
         return false;
 
+    // A degraded recall (stored sample unavailable) wiped strip content the
+    // stored snapshot still has; capturing now would make the loss permanent.
+    if (activeSceneRecallDegraded.load(std::memory_order_acquire) != 0)
+        return false;
+
     for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
     {
         const auto* strip = audioEngine->getStrip(stripIndex);
@@ -85,7 +90,18 @@ bool MlrVSTAudioProcessor::refreshStoredSceneSlotSnapshot(int mainPresetIndex, i
     const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
     const auto* storedSceneState = getStoredSceneSlotState(safeMainPresetIndex, safeSceneSlot);
     if (storedSceneState == nullptr)
+    {
+        // An empty active scene materializes on its first content edit (drawn
+        // automation, loaded sample, control change) instead of staying
+        // "EMPTY" until an explicit save.
+        if (isSceneModeEnabled()
+            && safeSceneSlot == juce::jlimit(0, SceneSlots - 1, activeSceneSlot)
+            && safeMainPresetIndex == juce::jlimit(0, MaxPresetSlots - 1, activeSceneMainPresetIndex))
+        {
+            return SceneScheduler::saveSceneForMainPreset(*this, safeMainPresetIndex, safeSceneSlot);
+        }
         return false;
+    }
 
     if (!storedSceneState->implicitMainPresetFallback)
         return SceneScheduler::saveSceneForMainPreset(*this, safeMainPresetIndex, safeSceneSlot);

@@ -8,7 +8,6 @@ bool modTargetAutoDefaultBipolar(ModernAudioEngine::ModTarget target);
 bool isGrainModTarget(ModernAudioEngine::ModTarget target);
 bool modTargetUsesForcedBipolar(ModernAudioEngine::ModTarget target);
 float quantizeModLaneRate(float rate) noexcept;
-float defaultRearrangeStepValueForIndex(int absoluteStep, int totalSteps) noexcept;
 float filterCutoffToNormalized(float hz) noexcept;
 float normalizedToFilterCutoff(float normalized) noexcept;
 float filterResonanceToNormalized(float q) noexcept;

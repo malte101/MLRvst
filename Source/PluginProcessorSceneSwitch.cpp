@@ -10,6 +10,7 @@
 #include "PluginProcessor.h"
 #include "PlayheadSpeedQuantizer.h"
 #include "PresetStore.h"
+#include "SceneScheduler.h"
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -291,6 +292,34 @@ void MlrVSTAudioProcessor::applyPendingSceneParameterState()
         parameters.replaceState(stateCopy);
         endSceneManualControlHandlingSuppression();
     }
+
+    suppressOwnedStripParameterSync.store(0, std::memory_order_release);
+}
+
+void MlrVSTAudioProcessor::applyPendingSceneRawParameterResync()
+{
+    if (pendingSceneRawParameterResync.exchange(0, std::memory_order_acq_rel) == 0)
+        return;
+
+    // Rebuild every parameter from its raw atomic (the engine truth after
+    // CacheOnly scene writes). Parameters that were untouched sync to their
+    // own current value, so this is a no-op for them.
+    suppressPersistentGlobalControlsSave.store(1, std::memory_order_release);
+    beginSceneManualControlHandlingSuppression();
+    for (auto* param : getParameters())
+    {
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(param))
+        {
+            if (auto* raw = parameters.getRawParameterValue(ranged->paramID))
+            {
+                const float normalized = ranged->convertTo0to1(raw->load(std::memory_order_acquire));
+                if (std::abs(ranged->getValue() - normalized) > 1.0e-6f)
+                    ranged->setValueNotifyingHost(normalized);
+            }
+        }
+    }
+    endSceneManualControlHandlingSuppression();
+    suppressPersistentGlobalControlsSave.store(0, std::memory_order_release);
 
     suppressOwnedStripParameterSync.store(0, std::memory_order_release);
 }
@@ -882,6 +911,7 @@ bool MlrVSTAudioProcessor::applyPreparedSceneSwitchPayload(const PreparedSceneSw
 
     const ResolvedOwnedStripControlState defaultOwnedControls;
     ScopedSceneAutosaveSuppression suppressSceneAutosave(*this);
+    bool anyStoredStripContentUnavailable = false;
     for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
     {
         auto* strip = audioEngine->getStrip(stripIndex);
@@ -1480,6 +1510,10 @@ bool MlrVSTAudioProcessor::applyPreparedSceneSwitchPayload(const PreparedSceneSw
 
         if (!loadedStripAudio)
         {
+            // The scene stored real content for this strip but it could not be
+            // loaded (missing/unreadable sample). The wiped strip must not be
+            // re-captured over the stored snapshot by any automatic save.
+            anyStoredStripContentUnavailable = true;
             stopStripForUnavailableScene(true);
             continue;
         }
@@ -1572,6 +1606,8 @@ bool MlrVSTAudioProcessor::applyPreparedSceneSwitchPayload(const PreparedSceneSw
 
     setSceneChainAttachStartPpq(event.targetPpq);
     applySceneClipSlotRuntimeState(payload.mainPresetIndex, payload.sceneSlot);
+    activeSceneRecallDegraded.store(anyStoredStripContentUnavailable ? 1 : 0,
+                                    std::memory_order_release);
     activeSceneNeedsCaptureBeforeManualRecall =
         getSceneClipSlotState(payload.sceneSlot, payload.mainPresetIndex).liveStripControlDirty;
     resolveLoopPitchRecallStateImmediately();
@@ -1609,7 +1645,13 @@ bool MlrVSTAudioProcessor::applyPreparedSceneSwitchPayload(const PreparedSceneSw
     }
     else
     {
-        suppressOwnedStripParameterSync.store(0, std::memory_order_release);
+        // Legacy/partial scene without a parameter snapshot: the CacheOnly
+        // writes above changed the raw atomics but not the APVTS parameters.
+        // Keep the per-block sync suppressed until the message thread has
+        // pushed the raw values back into the parameters, otherwise the stale
+        // parameter values would immediately overwrite the recalled scene.
+        pendingSceneRawParameterResync.store(1, std::memory_order_release);
+        suppressOwnedStripParameterSync.store(1, std::memory_order_release);
     }
 
     syncSceneModeFromParameters();
@@ -1744,6 +1786,7 @@ bool MlrVSTAudioProcessor::renderPendingPreparedSceneSwitch(juce::AudioBuffer<fl
                                                                ? switchEvent.sequenceStepIndex
                                                                : fallbackStepIndex));
     }
+    const int outgoingSequenceStepIndex = sceneSequenceActive ? sceneSequenceCurrentStepIndex : -1;
 
     activeSceneMainPresetIndex = switchEvent.mainPresetIndex;
     activeSceneSlot = switchEvent.sceneSlot;
@@ -1765,9 +1808,19 @@ bool MlrVSTAudioProcessor::renderPendingPreparedSceneSwitch(juce::AudioBuffer<fl
     if (PresetStore::presetExists(switchEvent.mainPresetIndex))
         loadedPresetIndex = switchEvent.mainPresetIndex;
     if (switchEvent.sequenceDriven)
+    {
+        // Mirrors the stopped-transport apply path: a Return ("Back") step arms
+        // an override consumed by armNextSceneInSequence so the chain bounces
+        // back to it after the entered step ends.
+        SceneScheduler::armReturnRouteForSequenceHandoff(*this,
+                                                         outgoingSequenceStepIndex,
+                                                         appliedSequenceStepIndex,
+                                                         switchEvent.targetPpq);
         armNextSceneInSequence(switchEvent.mainPresetIndex, switchEvent.sceneSlot, appliedSceneStartPpq);
+    }
     else
     {
+        clearSceneChainReturnOverride();
         activeScenePlaybackHandle.sequenceDriven = false;
         activeScenePlaybackHandle.sequenceStepIndex = -1;
     }

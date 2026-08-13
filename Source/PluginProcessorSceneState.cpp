@@ -8,7 +8,8 @@
 */
 
 #include "PluginProcessor.h"
-#include "PlayheadSpeedQuantizer.h"
+#include "SceneAutomationRules.h"
+#include <cmath>
 
 namespace
 {
@@ -26,22 +27,6 @@ struct ScopedSceneAutosaveSuppression
 
     MlrVSTAudioProcessor& processor;
 };
-
-int sceneAutomationMaskIndex(int stripIndex, ScenePerformanceControlTarget target) noexcept
-{
-    if (target == ScenePerformanceControlTarget::Retrigger && stripIndex < 0)
-        return MlrVSTAudioProcessor::MaxStrips;
-
-    return juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
-}
-
-uint64_t sceneAutomationTargetBit(ScenePerformanceControlTarget target) noexcept
-{
-    if (target == ScenePerformanceControlTarget::None)
-        return 0;
-
-    return uint64_t{ 1 } << juce::jlimit(0, 63, static_cast<int>(target));
-}
 
 uint32_t sceneSlotColourArgb(int sceneSlot) noexcept
 {
@@ -253,6 +238,7 @@ void MlrVSTAudioProcessor::startManualScenePlayback(int sceneSlot,
 
     if (!sceneSequenceActive
         && activeSceneNeedsCaptureBeforeManualRecall
+        && activeSceneRecallDegraded.load(std::memory_order_acquire) == 0
         && activeSceneMainPresetIndex == mainPresetIndex)
     {
         const int captureSceneSlot = juce::jlimit(0,
@@ -310,23 +296,29 @@ void MlrVSTAudioProcessor::syncActiveSceneClipSlotRuntimeStateFromEngine(bool ma
     for (int stripIndex = 0; stripIndex < MaxStrips; ++stripIndex)
     {
         auto& stripState = runtimeState.stripControls[static_cast<size_t>(stripIndex)];
+        stripState.controlValues.fill(0.0f);
+        stripState.controlValueValid.fill(false);
+
         if (auto* strip = audioEngine->getStrip(stripIndex))
         {
-            stripState.volume = juce::jlimit(0.0f,
-                                             1.0f,
-                                             stripVolumeParams[static_cast<size_t>(stripIndex)] != nullptr
-                                                 ? stripVolumeParams[static_cast<size_t>(stripIndex)]->load(std::memory_order_acquire)
-                                                 : strip->getVolume());
-            stripState.pan = juce::jlimit(-1.0f,
-                                          1.0f,
-                                          stripPanParams[static_cast<size_t>(stripIndex)] != nullptr
-                                              ? stripPanParams[static_cast<size_t>(stripIndex)]->load(std::memory_order_acquire)
-                                              : strip->getPan());
-            stripState.speed = PlayheadSpeedQuantizer::quantizeRatio(
-                stripSpeedParams[static_cast<size_t>(stripIndex)] != nullptr
-                    ? stripSpeedParams[static_cast<size_t>(stripIndex)]->load(std::memory_order_acquire)
-                    : strip->getPlayheadSpeedRatio());
             stripState.playMode = strip->getPlayMode();
+
+            for (int targetValue = static_cast<int>(ScenePerformanceControlTarget::Speed);
+                 targetValue <= static_cast<int>(ScenePerformanceControlTarget::GrainShape);
+                 ++targetValue)
+            {
+                const auto target = static_cast<ScenePerformanceControlTarget>(targetValue);
+                if (!SceneAutomationRules::targetUsesStripRuntimeState(target))
+                    continue;
+
+                float value = 0.0f;
+                if (!getSceneControlCurrentValue(stripIndex, target, value) || !std::isfinite(value))
+                    continue;
+
+                const auto targetIndex = static_cast<size_t>(SceneAutomationRules::controlTargetIndex(target));
+                stripState.controlValues[targetIndex] = value;
+                stripState.controlValueValid[targetIndex] = true;
+            }
         }
     }
 }
@@ -353,16 +345,37 @@ void MlrVSTAudioProcessor::applySceneClipSlotRuntimeState(int mainPresetIndex, i
         if (auto* strip = audioEngine->getStrip(stripIndex))
             strip->setPlayMode(stripState.playMode);
 
-        setStripVolumeControlValue(stripIndex, stripState.volume, StripControlWriteMode::CacheOnly);
-        setStripPanControlValue(stripIndex, stripState.pan, StripControlWriteMode::CacheOnly);
+        for (int targetValue = static_cast<int>(ScenePerformanceControlTarget::Speed);
+             targetValue <= static_cast<int>(ScenePerformanceControlTarget::GrainShape);
+             ++targetValue)
+        {
+            const auto target = static_cast<ScenePerformanceControlTarget>(targetValue);
+            if (!SceneAutomationRules::targetUsesStripRuntimeState(target))
+                continue;
 
-        // Stored scene payloads are the canonical source of strip speed on recall.
-        // The runtime slot cache is useful for empty scenes and unsaved live state,
-        // but speed is much more likely to be dirtied by transient scene/stutter
-        // handoffs. Reapplying that cached speed over a stored scene can produce
-        // the brief "double speed then snap back" glitch on scene changes.
-        if (!hasStoredSceneState)
-            setStripSpeedControlValue(stripIndex, stripState.speed, StripControlWriteMode::CacheOnly);
+            const auto targetIndex = static_cast<size_t>(SceneAutomationRules::controlTargetIndex(target));
+            if (!stripState.controlValueValid[targetIndex])
+                continue;
+
+            // Stored scene payloads are the canonical source of strip speed on recall.
+            // The runtime slot cache is useful for empty scenes and unsaved live state,
+            // but speed is much more likely to be dirtied by transient scene/stutter
+            // handoffs. Reapplying that cached speed over a stored scene can produce
+            // the brief "double speed then snap back" glitch on scene changes.
+            if (hasStoredSceneState && target == ScenePerformanceControlTarget::Speed)
+                continue;
+
+            ScenePerformanceEvent event;
+            event.type = ScenePerformanceEventType::ControlPoint;
+            event.stripIndex = stripIndex;
+            event.controlTarget = target;
+            event.controlMode = static_cast<int>(SceneAutomationRules::controlModeForTarget(target));
+            event.controlRow = SceneAutomationRules::controlRowForTarget(target);
+            event.value = stripState.controlValues[targetIndex];
+            event.column = SceneAutomationRules::columnFromNormalizedValue(
+                SceneAutomationRules::normalizeValue(target, event.value));
+            applyScenePerformanceEvent(event, StripControlWriteMode::CacheOnly);
+        }
 
         reapplyStripStateForCurrentPlayMode(stripIndex);
     }
@@ -416,8 +429,8 @@ void MlrVSTAudioProcessor::refreshSceneAutomationTargetMask(int sceneSlot)
         if (event.type != ScenePerformanceEventType::ControlPoint)
             continue;
 
-        masks[static_cast<size_t>(sceneAutomationMaskIndex(event.stripIndex, event.controlTarget))]
-            |= sceneAutomationTargetBit(event.controlTarget);
+        masks[static_cast<size_t>(SceneAutomationRules::automationMaskIndex(event.stripIndex, event.controlTarget))]
+            |= SceneAutomationRules::automationTargetBit(event.controlTarget);
     }
 
     auto& sceneMasks = sceneClipAutomationTargetMasks[static_cast<size_t>(safeSceneSlot)];
@@ -440,16 +453,17 @@ bool MlrVSTAudioProcessor::sceneClipHasAutomationTarget(int sceneSlot,
 {
     const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
     const auto& sceneMasks = sceneClipAutomationTargetMasks[static_cast<size_t>(safeSceneSlot)];
-    const uint64_t mask = sceneMasks[static_cast<size_t>(sceneAutomationMaskIndex(stripIndex, target))]
+    const uint64_t mask = sceneMasks[static_cast<size_t>(SceneAutomationRules::automationMaskIndex(stripIndex, target))]
         .load(std::memory_order_acquire);
-    return (mask & sceneAutomationTargetBit(target)) != 0;
+    return (mask & SceneAutomationRules::automationTargetBit(target)) != 0;
 }
 
 bool MlrVSTAudioProcessor::isActiveSceneAutomationOverridden(int stripIndex,
                                                              ScenePerformanceControlTarget target) const
 {
-    const auto& mask = activeSceneAutomationOverrideMasks[static_cast<size_t>(sceneAutomationMaskIndex(stripIndex, target))];
-    return (mask.load(std::memory_order_acquire) & sceneAutomationTargetBit(target)) != 0;
+    const auto& mask = activeSceneAutomationOverrideMasks[static_cast<size_t>(
+        SceneAutomationRules::automationMaskIndex(stripIndex, target))];
+    return (mask.load(std::memory_order_acquire) & SceneAutomationRules::automationTargetBit(target)) != 0;
 }
 
 bool MlrVSTAudioProcessor::hasAnyActiveSceneAutomationOverrides() const

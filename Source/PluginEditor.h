@@ -15,6 +15,7 @@
 #include <functional>
 #include <vector>
 #include "PluginProcessor.h"
+#include "PluginEditorStyle.h"
 #include "SampleMode.h"
 #include "StepSequencerDisplay.h"
 
@@ -98,11 +99,19 @@ private:
     juce::Point<int> viewDragStart;
     float viewDragStartNorm = 0.0f;
     
+    // The wave body (well + path fill/stroke) is cached into an image so the
+    // per-tick playhead updates only blit + draw overlays instead of
+    // rebuilding and rasterizing the whole path.
+    juce::Image waveLayer;
+    bool waveLayerDirty = true;
+    float waveLayerScale = 1.0f;
+
     void generateThumbnail(const juce::AudioBuffer<float>& buffer);
     void resetView();
+    void renderWaveLayer(juce::Graphics& g, juce::Rectangle<float> bounds);
     float normalizedPositionFromX(float x) const;
     float xFromNormalizedPosition(float normalizedPosition, float width) const;
-    
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(WaveformDisplay)
 };
 
@@ -125,9 +134,16 @@ private:
     int stripIndex;
     MlrVSTAudioProcessor& processor;
     juce::Colour stripColor;
-    
+
+    // StripControl::ColoredKnobLookAndFeel, created in the ctor (the type is
+    // declared later in this header). Must precede the sliders that use it so
+    // it outlives them during destruction.
+    std::unique_ptr<juce::LookAndFeel_V4> fxKnobLookAndFeel;
+
     juce::Label stripLabel;
-    juce::ToggleButton filterEnableButton;
+    juce::ToggleButton filterEnableButton;   // small enable dot (authoritative)
+    bool filterEnableUserOverride = false;   // set once the dot is clicked
+    void syncFilterEnabledFromControls();
     juce::Slider filterFreqSlider;
     juce::Slider filterResSlider;
     juce::Slider filterMorphSlider;
@@ -224,10 +240,10 @@ public:
             auto angle = rotaryStartAngle + sliderPos * (rotaryEndAngle - rotaryStartAngle);
             
             // Flat dark body with subtle ring and a single bright pointer.
-            g.setColour(juce::Colour(0xff2a2a2a));
+            g.setColour(PluginEditorStyle::kSurfaceHi);
             g.fillEllipse(rx, ry, rw, rw);
             
-            g.setColour(juce::Colour(0xff515151));
+            g.setColour(PluginEditorStyle::kStroke);
             g.drawEllipse(rx, ry, rw, rw, 1.0f);
             
             const auto ringColour = slider.findColour(juce::Slider::rotarySliderFillColourId)
@@ -247,7 +263,7 @@ public:
                 const float my1 = centreY + (std::sin(midAngle - juce::MathConstants<float>::halfPi) * rInner);
                 const float mx2 = centreX + (std::cos(midAngle - juce::MathConstants<float>::halfPi) * rOuter);
                 const float my2 = centreY + (std::sin(midAngle - juce::MathConstants<float>::halfPi) * rOuter);
-                g.setColour(juce::Colour(0xfff0f0f0).withAlpha(0.9f));
+                g.setColour(PluginEditorStyle::kTextPrimary.withAlpha(0.9f));
                 g.drawLine(mx1, my1, mx2, my2, 1.4f);
 
                 juce::Path bipolarArc;
@@ -308,7 +324,7 @@ public:
             p.addRectangle(-pointerThickness * 0.5f, -radius, pointerThickness, pointerLength);
             p.applyTransform(juce::AffineTransform::rotation(angle).translated(centreX, centreY));
             
-            g.setColour(juce::Colour(0xfff2f2f2));
+            g.setColour(PluginEditorStyle::kTextPrimary);
             g.fillPath(p);
         }
 
@@ -342,7 +358,7 @@ public:
                     g.fillRoundedRectangle(fillX, trackY, fillW, trackH, trackH * 0.5f);
                 }
 
-                g.setColour(juce::Colour(0xfff0f0f0).withAlpha(0.95f));
+                g.setColour(PluginEditorStyle::kTextPrimary.withAlpha(0.95f));
                 g.drawLine(cx, static_cast<float>(y + 2), cx, static_cast<float>(y + height - 2), 1.2f);
 
                 g.setColour(slider.findColour(juce::Slider::thumbColourId));
@@ -363,7 +379,7 @@ public:
                 const auto baseColour = slider.findColour(juce::Slider::trackColourId).withAlpha(0.9f);
                 g.setColour(baseColour);
                 g.drawLine(centerX, cy, sliderPos, cy, 2.0f); // bipolar value segment from center
-                g.setColour(juce::Colour(0xfff0f0f0).withAlpha(0.9f));
+                g.setColour(PluginEditorStyle::kTextPrimary.withAlpha(0.9f));
                 g.drawLine(centerX, static_cast<float>(y + 2), centerX, static_cast<float>(y + height - 2), 1.2f);
             }
 
@@ -511,7 +527,7 @@ public:
             g.drawRoundedRectangle(bounds, radius, 1.0f);
 
             g.setColour(text.withAlpha(isEnabled() ? 1.0f : 0.55f));
-            g.setFont(juce::Font(juce::FontOptions(8.6f, juce::Font::bold)));
+            g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
             g.drawText(getTextFromValue(getValue()), getLocalBounds(), juce::Justification::centred);
         }
     };
@@ -529,10 +545,6 @@ private:
     bool showingStepDisplay = false;   // Toggle between waveform and step display
     bool showingSampleMode = false;
     bool modulationLaneView = false;
-    bool preModulationShowingStepDisplay = false;
-    bool preModulationWaveformVisible = true;
-    bool preModulationStepVisible = false;
-    bool preModulationSampleVisible = false;
     juce::Rectangle<int> modulationLaneBounds;
     juce::Rectangle<int> loopPitchProgressBounds;
     int modulationLastDrawStep = -1;
@@ -648,6 +660,19 @@ private:
     juce::Label stripLabel;         // Small
     juce::Label stripSampleNameLabel;
     ValueReadoutSlider trimSlider;
+
+    // Progressive disclosure: collapsed = three hero knobs, expanded = the
+    // full per-mode control stack.
+    juce::TextButton stripMoreButton;
+    bool stripDetailExpanded = false;
+
+    // Playhead updates ride the display's vertical blank instead of the 30ms
+    // timer, so marker motion stays locked to the frame rate.
+    juce::VBlankAttachment playheadVBlank;
+    void updatePlayheadFromEngine();
+
+    int lastSpeedSliderGrainMode = -1;  // -1 = not yet applied
+    uint64_t lastWaveformSourceVersion = 0;  // engine sample-version last pushed to the waveform
     
     // Attachments
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> volumeAttachment;
@@ -663,7 +688,6 @@ private:
     void loadSample();
     void loadSampleFromFile(const juce::File& file);
     static bool isSupportedAudioFile(const juce::File& file);
-    void paintLEDOverlay(juce::Graphics& g);  // Draw LED blocks over waveform
     void paintLoopPitchAnalysisProgress(juce::Graphics& g);
     void paintModulationLane(juce::Graphics& g);
     juce::Rectangle<int> getModulationLaneBounds() const;
@@ -673,6 +697,7 @@ private:
     void applyModulationCellCurveFromDrag(int deltaY, bool rampUpMode);
     void hideAllPrimaryControls();
     void hideAllGrainControls();
+    void hideAllModulationControls();
     bool applyPlayModeSelection(int selectedId);
     void refreshModeDependentUiState(bool relayout);
     void updateGrainOverlayVisibility();
@@ -731,10 +756,22 @@ public:
     
     void updateFromEngine();
     void sendGridStateToMonome();  // Send LED state to actual hardware
-    
+
+    // Compact mode: title-less, tight-pitch, display-only mirror for the
+    // status strip (clicks would be 5px targets — disabled there).
+    void setCompactMode(bool shouldBeCompact)
+    {
+        if (compactMode == shouldBeCompact)
+            return;
+        compactMode = shouldBeCompact;
+        setInterceptsMouseClicks(!compactMode, !compactMode);
+        repaint();
+    }
+
 private:
     MlrVSTAudioProcessor& processor;
-    
+    bool compactMode = false;
+
     static constexpr int gridWidth = 16;
     static constexpr int gridHeight = 8;
     
@@ -833,11 +870,7 @@ private:
     
     juce::Label titleLabel;
     juce::Label versionLabel;
-    juce::Slider masterVolumeSlider;
-    juce::Label masterVolumeLabel;
     juce::ToggleButton limiterToggle;
-    juce::ComboBox quantizeSelector;
-    juce::Label quantizeLabel;
     juce::ComboBox innerLoopLengthBox;
     juce::Label innerLoopLengthLabel;
     juce::ComboBox resamplingQualityBox;
@@ -883,9 +916,7 @@ private:
     juce::TextButton gestureEditorButton;
     std::unique_ptr<GlobalGestureEditorOverlay> gestureEditorOverlay;
     
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterVolumeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> limiterEnabledAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> quantizeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> innerLoopLengthAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> grainQualityAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> inputMonitorAttachment;
@@ -901,7 +932,12 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> transientSpacingAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> continuousTraversalAttachment;
     bool globalUiReady = false;
-    
+
+    // Flat section wells painted behind the control groups.
+    juce::Rectangle<int> sectionInputBounds;
+    juce::Rectangle<int> sectionFadesBounds;
+    juce::Rectangle<int> sectionSettingsBounds;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GlobalControlPanel)
 };
 
@@ -967,6 +1003,7 @@ public:
     void resized() override;
     void timerCallback() override;
     void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override;
+    void mouseUp(const juce::MouseEvent& e) override;
 
 private:
     MlrVSTAudioProcessor& processor;
@@ -977,21 +1014,11 @@ private:
     struct PageRow
     {
         juce::Label positionLabel;
-        juce::TextButton modeButton;
-        juce::TextButton upButton;
-        juce::TextButton downButton;
+        PluginEditorStyle::PopupSafeButton modeButton;
     };
     std::array<PageRow, MlrVSTAudioProcessor::NumControlRowPages> rows;
-    juce::Label presetGridLabel;
-    juce::Label presetInstructionsLabel;
-    juce::Viewport presetViewport;
-    juce::Component presetGridContent;
-    std::array<juce::TextButton, MlrVSTAudioProcessor::MaxPresetSlots> presetButtons;
 
     void refreshFromProcessor();
-    void updatePresetButtons();
-    void layoutPresetButtons();
-    void onPresetButtonClicked(int presetIndex);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MonomePagesPanel)
 };
@@ -1287,16 +1314,26 @@ private:
     juce::TextEditor presetNameEditor;
     juce::TextButton initButton;
     juce::TextButton saveButton;
+    juce::TextButton renameButton;
     juce::TextButton deleteButton;
     juce::TextButton exportWavButton;
     juce::Viewport presetViewport;
     juce::Component presetGridContent;
-    std::array<juce::TextButton, MlrVSTAudioProcessor::MaxPresetSlots> presetButtons;
+    std::array<PluginEditorStyle::PopupSafeButton, MlrVSTAudioProcessor::MaxPresetSlots> presetButtons;
+
+    // Performance bank: the first 16 slots as stage-sized targets (default
+    // view); the full 112-grid stays one toggle away.
+    static constexpr int BankSlots = 16;
+    std::array<PluginEditorStyle::PopupSafeButton, BankSlots> bankButtons;
+    juce::TextButton showAllButton;
+    bool showFullGrid = false;
+
     int selectedPresetIndex = 0;
     juce::String presetNameDraft;
     juce::File lastExportDirectory;
     
     void savePresetClicked(int index, juce::String typedName = {});
+    void renamePresetClicked(int index, juce::String typedName = {});
     void loadPresetClicked(int index);
     void exportRecordingsAsWav();
     void updatePresetButtons();
@@ -1604,7 +1641,30 @@ private:
     juce::TextButton sceneSceneCopyButton;
     juce::TextButton sceneScenePasteButton;
     juce::TextButton sceneChainPlayButton;
+    juce::TextButton sceneChainLoopButton;
     juce::TextButton sceneChainClearButton;
+    juce::Label sceneStatusNowLabel;
+    juce::Label sceneStatusNextLabel;
+    juce::Label sceneStatusLoopLabel;
+    juce::Label sceneStatusRecLabel;
+    juce::TextButton sceneFillMoreButton;
+    bool sceneFillInspectorExpanded = false;
+    juce::String sceneFillSummaryInfoText;
+    juce::String sceneGestureLegendOverride;
+    juce::TextButton sceneUndoToastButton;
+    std::vector<MlrVSTAudioProcessor::SceneChainStep> sceneChainUndoSteps;
+    juce::String sceneChainUndoPostFingerprint;
+    bool sceneChainUndoLoopEnabled = true;
+    int sceneChainUndoLoopStart = 0;
+    int sceneChainUndoLoopEnd = 0;
+    bool sceneChainUndoAvailable = false;
+    juce::uint32 sceneUndoToastExpiresMs = 0;
+    void captureSceneChainUndoSnapshot();
+    void showSceneChainUndoToast(const juce::String& message);
+    void hideSceneChainUndoToast();
+    void setSceneGestureLegend(const juce::String& text);
+    void showSceneChainStepContextMenu(int stepIndex);
+    void showSceneChainTransitionContextMenu(int transitionIndex);
     juce::TextButton sceneCaptureButton;
     juce::TextButton sceneInsertBeforeButton;
     juce::TextButton sceneInsertAfterButton;
@@ -1646,6 +1706,7 @@ private:
     juce::TextButton sceneTransitionLiftButton;
     juce::TextButton sceneTransitionEchoButton;
     juce::TextButton sceneTransitionDropButton;
+    std::array<juce::TextButton, MlrVSTAudioProcessor::SceneTransitionFavoriteSlots> sceneTransitionFavoriteButtons;
     juce::ComboBox sceneTransitionEndSampleBox;
     juce::TextButton sceneTransitionEndSampleFolderButton;
     SceneChainCanvas sceneChainCanvas;
@@ -1815,6 +1876,8 @@ private:
     void mouseDown(const juce::MouseEvent& e) override;
     void mouseDrag(const juce::MouseEvent& e) override;
     void mouseUp(const juce::MouseEvent& e) override;
+    void mouseEnter(const juce::MouseEvent& e) override;
+    void mouseExit(const juce::MouseEvent& e) override;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SceneControlPanel)
 };
@@ -1842,12 +1905,58 @@ private:
     public:
         juce::Font getComboBoxFont(juce::ComboBox&) override
         {
-            return juce::Font(juce::FontOptions(12.5f, juce::Font::bold));
+            return PluginEditorStyle::roleFont(PluginEditorStyle::FontRole::Body);
         }
 
         juce::Font getPopupMenuFont() override
         {
-            return juce::Font(juce::FontOptions(15.0f, juce::Font::bold));
+            return juce::Font(juce::FontOptions(13.0f));
+        }
+
+        // Two unequal tab tiers ("tabTier" property on the TabbedButtonBar):
+        // tier 1 = workspace tabs, flat text with an accent underline;
+        // tier 2 (default) = utility drawer, quiet pills.
+        void drawTabButton(juce::TabBarButton& button, juce::Graphics& g, bool isMouseOver, bool) override
+        {
+            namespace Style = PluginEditorStyle;
+            auto area = button.getActiveArea().toFloat();
+            auto& bar = button.getTabbedButtonBar();
+            const bool front = button.getIndex() == bar.getCurrentTabIndex();
+            const int tier = static_cast<int>(bar.getProperties().getWithDefault("tabTier", 2));
+
+            if (tier == 1)
+            {
+                if (isMouseOver && !front)
+                {
+                    g.setColour(Style::kSurfaceHover.withAlpha(0.5f));
+                    g.fillRoundedRectangle(area.reduced(2.0f, 5.0f), Style::kRadiusS);
+                }
+
+                g.setColour(front ? Style::kTextPrimary
+                                  : (isMouseOver ? Style::kTextSecondary : Style::kTextMuted));
+                g.setFont(Style::roleFont(Style::FontRole::Body, front));
+                g.drawText(button.getButtonText(), area.toNearestInt(), juce::Justification::centred);
+
+                if (front)
+                {
+                    g.setColour(Style::kAccent);
+                    g.fillRect(area.getX() + 8.0f, area.getBottom() - 2.0f,
+                               juce::jmax(0.0f, area.getWidth() - 16.0f), 2.0f);
+                }
+            }
+            else
+            {
+                auto pill = area.reduced(3.0f, 4.0f);
+                if (front || isMouseOver)
+                {
+                    g.setColour(front ? Style::kSurfaceHi : Style::kSurfaceHi.withAlpha(0.5f));
+                    g.fillRoundedRectangle(pill, pill.getHeight() * 0.5f);
+                }
+
+                g.setColour(front ? Style::kTextPrimary : Style::kTextMuted);
+                g.setFont(Style::roleFont(Style::FontRole::Body, front));
+                g.drawText(button.getButtonText(), pill.toNearestInt(), juce::Justification::centred);
+            }
         }
     };
 
@@ -1866,8 +1975,15 @@ private:
     // Top controls in tabs (to save space)
     std::unique_ptr<juce::TabbedComponent> topTabs;
     
-    // Main unified tabs: Play / FX / Patterns / Groups
-    std::unique_ptr<juce::TabbedComponent> mainTabs;
+    // Workspace = the strip rows directly; FX lives in the drawer inside a
+    // viewport. The drawer itself can collapse to leave only the strips.
+    std::unique_ptr<juce::Component> playPanel;
+    std::unique_ptr<juce::Component> fxPanel;
+    juce::Viewport fxDrawerViewport;
+    // Play/FX/Setup have no drawer content (bar-only); their GUIs live in the
+    // workspace. Macros/Presets auto-expand the drawer.
+    std::array<juce::Component, 4> drawerTabPlaceholders;  // Play, FX, Setup, Pattern
+    void updateFxDrawerContentSize();
     
     // Strip controls (8 rows) - Play tab
     juce::OwnedArray<StripControl> stripControls;
@@ -1878,10 +1994,116 @@ private:
     juce::ComboBox fxMasterDuckTriggerBox;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> fxMasterDuckTriggerAttachment;
     
-    // Pattern and Group controls
+    // Pattern recorder (slide-in overlay over the workspace) and group engine access
     std::unique_ptr<PatternControlPanel> patternControl;
-    std::unique_ptr<GroupControlPanel> groupControl;
-    
+
+    // Status strip (lives in the 40px header): performance controls that must
+    // never cost a tab switch.
+    class GroupChip : public juce::Component,
+                      public juce::SettableTooltipClient
+    {
+    public:
+        GroupChip(MlrVSTAudioProcessor& p, int groupIdx) : processor(p), groupIndex(groupIdx)
+        {
+            setTooltip("Group " + juce::String(groupIndex + 1)
+                       + ": click = mute/unmute, drag up/down = group volume");
+        }
+
+        void refreshFromEngine()
+        {
+            if (auto* engine = processor.getAudioEngine())
+            {
+                if (auto* group = engine->getGroup(groupIndex))
+                {
+                    const bool nowMuted = group->isMuted();
+                    const float nowVolume = group->getVolume();
+                    if (nowMuted != muted || std::abs(nowVolume - volume) > 0.001f)
+                    {
+                        muted = nowMuted;
+                        volume = nowVolume;
+                        repaint();
+                    }
+                }
+            }
+        }
+
+        void paint(juce::Graphics& g) override
+        {
+            namespace Style = PluginEditorStyle;
+            auto bounds = getLocalBounds().toFloat();
+            g.setColour(muted ? Style::kSurfaceHi : Style::kLive.withAlpha(0.16f));
+            g.fillRoundedRectangle(bounds, Style::kRadiusS);
+
+            // volume reads as a bottom fill bar
+            const float vol = juce::jlimit(0.0f, 1.0f, volume);
+            auto volBar = bounds.reduced(1.5f);
+            volBar = volBar.removeFromBottom(volBar.getHeight() * vol);
+            g.setColour((muted ? Style::kDataNeutral : Style::kLive).withAlpha(0.30f));
+            g.fillRoundedRectangle(volBar, 2.0f);
+
+            g.setColour(muted ? Style::kTextMuted : Style::kLive);
+            g.setFont(Style::roleFont(Style::FontRole::Label, !muted));
+            g.drawText("G" + juce::String(groupIndex + 1), getLocalBounds(), juce::Justification::centred);
+        }
+
+        void mouseDown(const juce::MouseEvent& e) override
+        {
+            dragStartVolume = volume;
+            dragMoved = false;
+            juce::ignoreUnused(e);
+        }
+
+        void mouseDrag(const juce::MouseEvent& e) override
+        {
+            if (std::abs(e.getDistanceFromDragStartY()) > 3)
+                dragMoved = true;
+            if (!dragMoved)
+                return;
+
+            const float delta = static_cast<float>(-e.getDistanceFromDragStartY()) / 120.0f;
+            const float newVolume = juce::jlimit(0.0f, 1.0f, dragStartVolume + delta);
+            if (auto* engine = processor.getAudioEngine())
+                if (auto* group = engine->getGroup(groupIndex))
+                    group->setVolume(newVolume);
+            volume = newVolume;
+            repaint();
+        }
+
+        void mouseUp(const juce::MouseEvent& e) override
+        {
+            if (dragMoved || !getLocalBounds().contains(e.getPosition()))
+                return;
+            if (auto* engine = processor.getAudioEngine())
+            {
+                if (auto* group = engine->getGroup(groupIndex))
+                {
+                    group->setMuted(!group->isMuted());
+                    muted = group->isMuted();
+                    repaint();
+                }
+            }
+        }
+
+    private:
+        MlrVSTAudioProcessor& processor;
+        int groupIndex = 0;
+        bool muted = false;
+        float volume = 1.0f;
+        float dragStartVolume = 1.0f;
+        bool dragMoved = false;
+    };
+
+    juce::Slider statusMasterVolume;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> statusMasterVolumeAttachment;
+    juce::ComboBox statusQuantizeBox;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> statusQuantizeAttachment;
+    juce::OwnedArray<GroupChip> statusGroupChips;
+    juce::TextButton sceneModeStripButton;
+
+    // Full-window settings page: global settings + monome device + paths
+    std::unique_ptr<juce::Component> settingsPage;
+    juce::Viewport setupMonomeViewport;
+
     // Layout components
     juce::Viewport stripsViewport;
     juce::Component stripsContainer;
@@ -1901,7 +2123,6 @@ private:
     void setActiveGuiStripCount(int stripCount, bool forceRelayout);
     void createUIComponents();
     void setupLookAndFeel();
-    void layoutComponents();
     void refreshSceneModeLayout();
     void setTooltipsEnabled(bool enabled);
     

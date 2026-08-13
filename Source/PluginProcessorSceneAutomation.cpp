@@ -13,22 +13,6 @@
 
 namespace
 {
-int sceneAutomationMaskIndex(int stripIndex, ScenePerformanceControlTarget target) noexcept
-{
-    if (target == ScenePerformanceControlTarget::Retrigger && stripIndex < 0)
-        return MlrVSTAudioProcessor::MaxStrips;
-
-    return juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
-}
-
-uint64_t sceneAutomationTargetBit(ScenePerformanceControlTarget target) noexcept
-{
-    if (target == ScenePerformanceControlTarget::None)
-        return 0;
-
-    return uint64_t{ 1 } << juce::jlimit(0, 63, static_cast<int>(target));
-}
-
 bool sceneControlSupportsTransitionSmoothing(ScenePerformanceControlTarget target) noexcept
 {
     switch (target)
@@ -71,50 +55,6 @@ bool sceneControlSupportsTransitionSmoothing(ScenePerformanceControlTarget targe
         default:
             return false;
     }
-}
-
-double wrapBeatIntoSceneClip(double currentBeat, double sceneStartBeat, double lengthBeats) noexcept
-{
-    const double safeLength = (std::isfinite(lengthBeats) && lengthBeats > 1.0e-6)
-        ? lengthBeats
-        : 0.0;
-    if (!std::isfinite(currentBeat) || !std::isfinite(sceneStartBeat) || safeLength <= 0.0)
-        return 0.0;
-
-    const double relativeBeat = currentBeat - sceneStartBeat;
-    const double wrapped = std::fmod(relativeBeat, safeLength);
-    return wrapped >= 0.0 ? wrapped : wrapped + safeLength;
-}
-
-bool findHeldSceneAutomationEventAtClipBeat(const std::vector<ScenePerformanceEvent>& events,
-                                            int stripIndex,
-                                            ScenePerformanceControlTarget target,
-                                            double clipBeat,
-                                            ScenePerformanceEvent& outEvent)
-{
-    const ScenePerformanceEvent* lastEvent = nullptr;
-    const ScenePerformanceEvent* chosenEvent = nullptr;
-    for (const auto& event : events)
-    {
-        if (event.type != ScenePerformanceEventType::ControlPoint
-            || event.controlTarget != target
-            || event.stripIndex != stripIndex)
-        {
-            continue;
-        }
-
-        lastEvent = &event;
-        if (event.timeBeats <= clipBeat + 1.0e-6)
-            chosenEvent = &event;
-    }
-
-    if (chosenEvent == nullptr)
-        chosenEvent = lastEvent;
-    if (chosenEvent == nullptr)
-        return false;
-
-    outEvent = *chosenEvent;
-    return true;
 }
 } // namespace
 
@@ -356,7 +296,7 @@ void MlrVSTAudioProcessor::clearActiveSceneAutomationOverrides(bool restoreWritt
         const double lengthBeats = juce::jmax(1.0, getScenePerformanceClipLengthBeats(sceneSlot));
         const double currentBeat = audioEngine->getTimelineBeat();
         const double clipBeat = (activeSceneStartPpqValid && std::isfinite(activeSceneStartPpq))
-            ? wrapBeatIntoSceneClip(currentBeat, activeSceneStartPpq, lengthBeats)
+            ? SceneAutomationRules::wrapBeatIntoClip(currentBeat, activeSceneStartPpq, lengthBeats)
             : 0.0;
         const auto events = getScenePerformanceEventsSnapshot(sceneSlot);
 
@@ -375,16 +315,16 @@ void MlrVSTAudioProcessor::clearActiveSceneAutomationOverrides(bool restoreWritt
                      ++targetValue)
                 {
                     const auto target = static_cast<ScenePerformanceControlTarget>(targetValue);
-                    if ((overrideMask & sceneAutomationTargetBit(target)) == 0)
+                    if ((overrideMask & SceneAutomationRules::automationTargetBit(target)) == 0)
                         continue;
 
                     const int targetStripIndex = (maskIndex == MaxStrips) ? -1 : maskIndex;
                     ScenePerformanceEvent chosenEvent;
-                    if (findHeldSceneAutomationEventAtClipBeat(events,
-                                                               targetStripIndex,
-                                                               target,
-                                                               clipBeat,
-                                                               chosenEvent))
+                    if (SceneAutomationRules::findHeldEventAtClipBeat(events,
+                                                                       targetStripIndex,
+                                                                       target,
+                                                                       clipBeat,
+                                                                       chosenEvent))
                     {
                         float liveValue = 0.0f;
                         const bool isSteppedControlPoint = SceneAutomationRules::eventUsesSteppedSegments(chosenEvent);
@@ -430,8 +370,8 @@ void MlrVSTAudioProcessor::clearActiveSceneAutomationOverrideForRecordedTarget(i
         return;
 
     auto& overrideMask = activeSceneAutomationOverrideMasks[static_cast<size_t>(
-        sceneAutomationMaskIndex(stripIndex, target))];
-    overrideMask.fetch_and(~sceneAutomationTargetBit(target), std::memory_order_acq_rel);
+        SceneAutomationRules::automationMaskIndex(stripIndex, target))];
+    overrideMask.fetch_and(~SceneAutomationRules::automationTargetBit(target), std::memory_order_acq_rel);
 }
 
 void MlrVSTAudioProcessor::reenableActiveSceneAutomation()

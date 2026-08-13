@@ -46,6 +46,12 @@ void MlrVSTAudioProcessor::handleUserStripPlayModeChange(int stripIndex)
         if (auto* engine = getSampleModeEngine(stripIndex, true))
             engine->setLegacyLoopEngineEnabled(true);
     }
+    else
+    {
+        // Leaving Flip mode: release the engine's voices with a fade, or they
+        // freeze mid-waveform and audibly resurrect when Flip is re-entered.
+        stopSampleModeStrip(stripIndex, false);
+    }
 
     reapplyStripStateForCurrentPlayMode(stripIndex);
 

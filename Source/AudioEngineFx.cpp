@@ -71,6 +71,21 @@ void EnhancedAudioStrip::resetDelayState()
     delayHighCutFilterR.reset();
 }
 
+void EnhancedAudioStrip::armDelayGhostMute()
+{
+    if (lastDelaySamplesMax <= 0 || currentSampleRate <= 0.0)
+        return;
+
+    const auto lastProcessMs = delayLastProcessMs.load(std::memory_order_acquire);
+    if (lastProcessMs == 0)
+        return;
+
+    const double delayMs = (static_cast<double>(lastDelaySamplesMax) / currentSampleRate) * 1000.0;
+    const auto nowMs = juce::Time::getMillisecondCounter();
+    if (static_cast<double>(nowMs - lastProcessMs) > juce::jmax(500.0, delayMs))
+        delayGhostMuteSamples = lastDelaySamplesMax;
+}
+
 void EnhancedAudioStrip::processDelaySample(float& leftSample, float& rightSample, double tempo)
 {
     if (stripDelayBuffer.getNumChannels() < 2 || stripDelayBuffer.getNumSamples() <= 1 || currentSampleRate <= 0.0)
@@ -85,8 +100,19 @@ void EnhancedAudioStrip::processDelaySample(float& leftSample, float& rightSampl
     const float lowCut = smoothedDelayLowCutHz.getNextValue();
     const float highCut = juce::jmax(lowCut + 20.0f, smoothedDelayHighCutHz.getNextValue());
 
+    // Cheap activity heartbeat for the ghost-echo guard (~every 23ms at 44.1k).
+    if ((stripDelayWritePos & 0x3FF) == 0)
+        delayLastProcessMs.store(juce::Time::getMillisecondCounter(), std::memory_order_release);
+
     if (mix <= 1.0e-4f && feedback <= 1.0e-4f)
+    {
+        // Keep the buffer coherent while inaudible so raising the mix later
+        // does not replay stale material.
+        stripDelayBuffer.setSample(0, stripDelayWritePos, dryInputL);
+        stripDelayBuffer.setSample(1, stripDelayWritePos, dryInputR);
+        stripDelayWritePos = (stripDelayWritePos + 1) % stripDelayBuffer.getNumSamples();
         return;
+    }
 
     delayLowCutFilterL.setCutoffFrequency(lowCut);
     delayLowCutFilterR.setCutoffFrequency(lowCut);
@@ -102,38 +128,55 @@ void EnhancedAudioStrip::processDelaySample(float& leftSample, float& rightSampl
     const double baseDelaySeconds = syncEnabled
         ? (60.0 / safeTempo) * juce::jlimit(0.25f, 4.0f, timeBeats)
         : juce::jlimit(0.25f, 4.0f, timeBeats);
-    const auto secondsToSamples = [this](double seconds)
+    const auto secondsToDelaySamples = [this](double seconds)
     {
         return juce::jlimit(
-            1,
-            juce::jmax(1, stripDelayBuffer.getNumSamples() - 1),
-            static_cast<int>(std::round(seconds * currentSampleRate)));
+            1.0,
+            static_cast<double>(juce::jmax(1, stripDelayBuffer.getNumSamples() - 1)),
+            seconds * currentSampleRate);
     };
 
-    int delaySamplesL = secondsToSamples(baseDelaySeconds);
-    int delaySamplesR = delaySamplesL;
+    const double delaySamplesL = secondsToDelaySamples(baseDelaySeconds);
+    double delaySamplesR = delaySamplesL;
 
     if (getDelayMode() == DelayMode::Dual)
     {
         const double rightSeconds = juce::jmin(
             7.95,
             baseDelaySeconds * (syncEnabled ? 1.5 : 1.3333333333333333));
-        delaySamplesR = secondsToSamples(rightSeconds);
+        delaySamplesR = secondsToDelaySamples(rightSeconds);
     }
 
-    auto computeReadPos = [this](int delaySamples)
+    lastDelaySamplesMax = static_cast<int>(std::ceil(juce::jmax(delaySamplesL, delaySamplesR)));
+
+    // Fractional read with linear interpolation: smoothed time changes glide
+    // (tape-style) instead of stepping the read head sample by sample.
+    auto readInterpolated = [this](int channel, double delaySamples)
     {
-        int readPos = stripDelayWritePos - delaySamples;
-        while (readPos < 0)
-            readPos += stripDelayBuffer.getNumSamples();
-        return readPos;
+        const int bufferLength = stripDelayBuffer.getNumSamples();
+        double readPos = static_cast<double>(stripDelayWritePos) - delaySamples;
+        while (readPos < 0.0)
+            readPos += static_cast<double>(bufferLength);
+        const int index0 = static_cast<int>(readPos);
+        const int index1 = (index0 + 1) % bufferLength;
+        const float frac = static_cast<float>(readPos - static_cast<double>(index0));
+        const float a = stripDelayBuffer.getSample(channel, index0);
+        const float b = stripDelayBuffer.getSample(channel, index1);
+        return a + ((b - a) * frac);
     };
 
-    const int readPosL = computeReadPos(delaySamplesL);
-    const int readPosR = computeReadPos(delaySamplesR);
+    float delayedL = readInterpolated(0, delaySamplesL);
+    float delayedR = readInterpolated(1, delaySamplesR);
 
-    float delayedL = stripDelayBuffer.getSample(0, readPosL);
-    float delayedR = stripDelayBuffer.getSample(1, readPosR);
+    if (delayGhostMuteSamples > 0)
+    {
+        // Stale pre-stop material: read silence until the buffer holds only
+        // post-retrigger audio. The first new echo lands exactly on time.
+        delayedL = 0.0f;
+        delayedR = 0.0f;
+        --delayGhostMuteSamples;
+    }
+
     delayedL = delayHighCutFilterL.processSample(0, delayLowCutFilterL.processSample(0, delayedL));
     delayedR = delayHighCutFilterR.processSample(0, delayLowCutFilterR.processSample(0, delayedR));
 
@@ -230,6 +273,7 @@ void EnhancedAudioStrip::ensureAnalogFiltersInitialized(FilterAlgorithm algorith
             case FilterAlgorithm::Tpt24:
             case FilterAlgorithm::Ladder12:
             case FilterAlgorithm::Ladder24:
+            case FilterAlgorithm::Comb:
                 return std::make_unique<StilsonMoog>(static_cast<float>(currentSampleRate));
             case FilterAlgorithm::MoogHuov:
 #if MLRVST_ENABLE_HUOVILAINEN
@@ -274,9 +318,83 @@ void EnhancedAudioStrip::ensureAnalogFiltersInitialized(FilterAlgorithm algorith
     }
 }
 
+void EnhancedAudioStrip::resetCombFilterState()
+{
+    filterCombWritePos = 0;
+    filterCombDampingL = 0.0f;
+    filterCombDampingR = 0.0f;
+    if (filterCombBuffer.getNumSamples() > 0)
+        filterCombBuffer.clear();
+}
+
+void EnhancedAudioStrip::processCombFilterSample(float& left, float& right, float frequency, float resonance, float morph)
+{
+    const int bufferSamples = filterCombBuffer.getNumSamples();
+    if (currentSampleRate <= 0.0 || bufferSamples < 4)
+        return;
+
+    const float freq = juce::jlimit(20.0f,
+                                    juce::jmin(20000.0f, static_cast<float>(currentSampleRate * 0.45)),
+                                    frequency);
+    const float q = juce::jlimit(0.1f, 10.0f, resonance);
+    const float qNorm = std::pow(juce::jlimit(0.0f, 1.0f, (q - 0.1f) / 9.9f), 0.45f);
+    const float m = juce::jlimit(0.0f, 1.0f, morph);
+    const float brightness = std::abs((m * 2.0f) - 1.0f);
+    const float polarity = (m < 0.5f) ? 1.0f : -1.0f;
+    const float damping = juce::jmap(brightness, 0.28f, 0.045f);
+    const float feedback = juce::jmap(qNorm, 0.16f, 0.992f);
+    const float wet = juce::jmap(qNorm, 0.34f, 0.93f);
+    const float dry = 1.0f - (wet * 0.48f);
+    const float toneGain = juce::jmap(qNorm, 0.78f, 1.55f);
+    const float delaySamples = juce::jlimit(1.5f,
+                                            static_cast<float>(bufferSamples - 2),
+                                            static_cast<float>(currentSampleRate) / freq);
+
+    auto readDelayed = [&](int channel) -> float
+    {
+        double readPos = static_cast<double>(filterCombWritePos) - static_cast<double>(delaySamples);
+        while (readPos < 0.0)
+            readPos += static_cast<double>(bufferSamples);
+
+        const int index0 = juce::jlimit(0, bufferSamples - 1, static_cast<int>(std::floor(readPos)));
+        const int index1 = (index0 + 1) % bufferSamples;
+        const float frac = static_cast<float>(readPos - static_cast<double>(index0));
+        const float a = filterCombBuffer.getSample(channel, index0);
+        const float b = filterCombBuffer.getSample(channel, index1);
+        return a + ((b - a) * frac);
+    };
+
+    float delayedL = readDelayed(0);
+    float delayedR = readDelayed(1);
+    filterCombDampingL += (delayedL - filterCombDampingL) * damping;
+    filterCombDampingR += (delayedR - filterCombDampingR) * damping;
+    delayedL = filterCombDampingL;
+    delayedR = filterCombDampingR;
+
+    const float writeL = filterLimiter0dB(left + (delayedL * feedback * polarity), qNorm);
+    const float writeR = filterLimiter0dB(right + (delayedR * feedback * polarity), qNorm);
+    filterCombBuffer.setSample(0, filterCombWritePos, writeL);
+    filterCombBuffer.setSample(1, filterCombWritePos, writeR);
+    filterCombWritePos = (filterCombWritePos + 1) % bufferSamples;
+
+    left = (left * dry) + (delayedL * wet * toneGain);
+    right = (right * dry) + (delayedR * wet * toneGain);
+
+    left = filterLimiter0dB(left, qNorm);
+    right = filterLimiter0dB(right, qNorm);
+    left = safetyClip0dB(left);
+    right = safetyClip0dB(right);
+}
+
 void EnhancedAudioStrip::processFilterSample(float& left, float& right, float frequency, float resonance, float morph)
 {
     const auto algorithm = getFilterAlgorithm();
+    if (algorithm == FilterAlgorithm::Comb)
+    {
+        processCombFilterSample(left, right, frequency, resonance, morph);
+        return;
+    }
+
     ensureAnalogFiltersInitialized(algorithm);
     updateFilterCoefficients(frequency, resonance);
 
@@ -379,6 +497,12 @@ constexpr double kMonomeFilterFrequencyRampSeconds = 0.012;
 void EnhancedAudioStrip::setFilterFrequency(float freq)
 {
     const float clamped = juce::jlimit(20.0f, 20000.0f, freq);
+    // This runs every block from the parameter sync: bail on unchanged targets
+    // so in-flight ramps are not restarted (which made the 40ms ramp
+    // effectively exponential) and no state is touched redundantly.
+    if (clamped == filterFrequency.load(std::memory_order_acquire) && currentSampleRate > 0.0)
+        return;
+
     const float currentSmoothed = smoothedFilterFrequency.getCurrentValue();
     filterFrequency.store(clamped, std::memory_order_release);
 
@@ -393,9 +517,6 @@ void EnhancedAudioStrip::setFilterFrequency(float freq)
         smoothedFilterFrequency.setCurrentAndTargetValue(clamped);
         displayedFilterFrequency.store(clamped, std::memory_order_release);
     }
-
-    if (!isFilterEnabled())
-        setFilterEnabled(true);
 }
 
 void EnhancedAudioStrip::setFilterFrequencyMonomeFast(float freq)
@@ -439,8 +560,6 @@ void EnhancedAudioStrip::setFilterResonance(float res)
     const float clamped = juce::jlimit(0.1f, 10.0f, res);
     filterResonance.store(clamped, std::memory_order_release);
     smoothedFilterResonance.setTargetValue(clamped);
-    if (!isFilterEnabled())
-        setFilterEnabled(true);
 }
 
 void EnhancedAudioStrip::seedFilterResonanceTransition(float fromValue, float toValue, double rampSeconds)
@@ -463,12 +582,9 @@ void EnhancedAudioStrip::setFilterMorph(float morph)
     filterMorph.store(clamped, std::memory_order_release);
     smoothedFilterMorph.setTargetValue(clamped);
 
-    if (clamped < 0.3333f) filterType = FilterType::LowPass;
-    else if (clamped < 0.6666f) filterType = FilterType::BandPass;
+    if (clamped < 0.34f) filterType = FilterType::LowPass;
+    else if (clamped <= 0.66f) filterType = FilterType::BandPass;
     else filterType = FilterType::HighPass;
-
-    if (!isFilterEnabled())
-        setFilterEnabled(true);
 }
 
 void EnhancedAudioStrip::seedFilterMorphTransition(float fromValue, float toValue, double rampSeconds)
@@ -481,8 +597,8 @@ void EnhancedAudioStrip::seedFilterMorphTransition(float fromValue, float toValu
     filterMorph.store(target, std::memory_order_release);
     smoothedFilterMorph.setTargetValue(target);
 
-    if (target < 0.3333f) filterType = FilterType::LowPass;
-    else if (target < 0.6666f) filterType = FilterType::BandPass;
+    if (target < 0.34f) filterType = FilterType::LowPass;
+    else if (target <= 0.66f) filterType = FilterType::BandPass;
     else filterType = FilterType::HighPass;
 
     if (!isFilterEnabled())
@@ -503,7 +619,7 @@ void EnhancedAudioStrip::setFilterType(FilterType type)
 
 void EnhancedAudioStrip::setFilterAlgorithm(FilterAlgorithm algorithm)
 {
-    const int raw = juce::jlimit(0, 5, static_cast<int>(algorithm));
+    const int raw = juce::jlimit(0, 6, static_cast<int>(algorithm));
     const int previous = filterAlgorithm.load(std::memory_order_acquire);
     filterAlgorithm.store(raw, std::memory_order_release);
 
@@ -521,6 +637,7 @@ void EnhancedAudioStrip::setFilterAlgorithm(FilterAlgorithm algorithm)
         cachedLadderMode = -1;
         moogLpL.reset();
         moogLpR.reset();
+        resetCombFilterState();
         cachedMoogCutoff = -1.0f;
         cachedMoogResonance = -1.0f;
         cachedMoogModel = -1;
@@ -528,9 +645,6 @@ void EnhancedAudioStrip::setFilterAlgorithm(FilterAlgorithm algorithm)
         updateFilterCoefficients(filterFrequency.load(std::memory_order_acquire),
                                  filterResonance.load(std::memory_order_acquire));
     }
-
-    if (!isFilterEnabled())
-        setFilterEnabled(true);
 }
 
 int EnhancedAudioStrip::resolveDuckDetectorStripIndex(int selfStripIndex, int masterTriggerStripIndex) const

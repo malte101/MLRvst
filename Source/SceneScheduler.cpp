@@ -62,6 +62,11 @@ double scenePreloadLookaheadBeats(double currentTempo)
                         (preloadLookaheadSeconds * safeTempo) / 60.0);
 }
 
+// Scene length and recall modes are deliberately pinned to ManualBars/Manual:
+// the alternate modes (LongestStrip/LongestPattern/AnchorStrip lengths,
+// QuantizeGrid/PatternEnd/SceneEnd recall) have complete but untested timing
+// machinery behind them. Re-enabling is a product decision that needs
+// hardware/DAW validation, not just lifting these pins.
 SceneLengthMode sanitizeSceneLengthMode(int rawMode)
 {
     juce::ignoreUnused(rawMode);
@@ -461,21 +466,23 @@ void normalizeSceneChainState(SceneChainState& state)
         normalized.transitionDelayAmount = step.transitionDelayAmount;
         normalized.transitionFilterAmount = step.transitionFilterAmount;
         normalized.transitionChopAmount = step.transitionChopAmount;
+        normalized.transitionEndSampleFile = step.transitionEndSampleFile;
+        normalized.transitionEndSampleSettings = step.transitionEndSampleSettings;
         sanitizeSceneChainTransitionParameters(normalized);
     }
 
     state.steps = normalizedSteps;
+    // loopEnabled is user intent and survives normalization (including an
+    // empty chain, so rebuilding does not silently re-enable/disable looping).
     if (writeIndex <= 0)
     {
-        state.loopEnabled = false;
         state.loopStart = 0;
         state.loopEnd = 0;
         return;
     }
 
-    state.loopEnabled = writeIndex >= 2;
-    state.loopStart = 0;
-    state.loopEnd = writeIndex - 1;
+    state.loopStart = juce::jlimit(0, writeIndex - 1, state.loopStart);
+    state.loopEnd = juce::jlimit(state.loopStart, writeIndex - 1, state.loopEnd);
 }
 
 } // namespace
@@ -940,7 +947,10 @@ double SceneScheduler::computeLongestPatternSceneSequenceLengthBeats(const MlrVS
 double SceneScheduler::getResolvedSceneLengthBeats(const MlrVSTAudioProcessor& processor, int sceneSlot)
 {
     const int clampedSlot = juce::jlimit(0, MlrVSTAudioProcessor::SceneSlots - 1, sceneSlot);
-    const double manualBeats = static_cast<double>(getSceneManualBars(processor, clampedSlot)) * 4.0;
+    // "Bars" honors the host time signature (cached per audio block).
+    const double barLengthBeats =
+        juce::jlimit(1.0, 16.0, processor.hostBarLengthBeats.load(std::memory_order_acquire));
+    const double manualBeats = static_cast<double>(getSceneManualBars(processor, clampedSlot)) * barLengthBeats;
     double resolvedBeats = manualBeats;
 
     switch (sanitizeSceneLengthMode(getSceneLengthModeIndex(processor, clampedSlot)))
@@ -1111,10 +1121,16 @@ SceneScheduler::getSceneChainStepTransitionEndSampleSettings(const MlrVSTAudioPr
 
 void SceneScheduler::setSceneChainStep(MlrVSTAudioProcessor& processor, int stepIndex, int sceneSlot, int repeats)
 {
+    const int previousLength = getSceneChainLengthInternal(processor);
+    const bool loopCoveredWholeChain = processor.sceneChainState.loopStart <= 0
+        && processor.sceneChainState.loopEnd >= previousLength - 1;
     const int safeStepIndex = juce::jlimit(0, MlrVSTAudioProcessor::MaxSceneChainSteps - 1, stepIndex);
     auto& step = processor.sceneChainState.steps[static_cast<size_t>(safeStepIndex)];
     step.sceneSlot = sanitizeSceneChainSceneSlot(sceneSlot);
     step.repeats = sanitizeSceneChainRepeats(repeats);
+    // A loop that covered the whole chain keeps covering it when the chain grows.
+    if (loopCoveredWholeChain)
+        processor.sceneChainState.loopEnd = MlrVSTAudioProcessor::MaxSceneChainSteps - 1;
     markSceneChainDefinitionChanged(processor);
 }
 
@@ -1322,24 +1338,100 @@ void SceneScheduler::clearSceneChain(MlrVSTAudioProcessor& processor)
 {
     for (auto& step : processor.sceneChainState.steps)
         clearSceneChainStep(step);
-    processor.sceneChainState.loopEnabled = false;
+    processor.sceneChainState.loopEnabled = true;
     processor.sceneChainState.loopStart = 0;
     processor.sceneChainState.loopEnd = 0;
     markSceneChainDefinitionChanged(processor);
 }
 
+void SceneScheduler::setSceneChainSteps(MlrVSTAudioProcessor& processor,
+                                        const std::vector<SceneChainStep>& steps,
+                                        bool loopEnabled,
+                                        int loopStart,
+                                        int loopEnd)
+{
+    // The playing step is tracked by identity (scene slot) so a reorder/delete
+    // of other steps does not silently retarget playback.
+    const bool wasActive = processor.sceneSequenceActive;
+    const int previousStepIndex = processor.sceneSequenceCurrentStepIndex;
+    const int previousStepScene = (previousStepIndex >= 0
+                                   && previousStepIndex < MlrVSTAudioProcessor::MaxSceneChainSteps)
+        ? processor.sceneChainState.steps[static_cast<size_t>(previousStepIndex)].sceneSlot
+        : -1;
+    const int previousLength = getSceneChainLengthInternal(processor);
+    // A loop that covered the whole chain keeps covering it when steps are
+    // added; normalization clamps the end back to the actual last step.
+    const bool loopCoveredWholeChain = loopStart <= 0 && loopEnd >= previousLength - 1;
+
+    SceneChainState newState = processor.sceneChainState;
+    for (auto& step : newState.steps)
+        clearSceneChainStep(step);
+    const int safeCount = juce::jmin(static_cast<int>(steps.size()),
+                                     MlrVSTAudioProcessor::MaxSceneChainSteps);
+    for (int stepIndex = 0; stepIndex < safeCount; ++stepIndex)
+        newState.steps[static_cast<size_t>(stepIndex)] = steps[static_cast<size_t>(stepIndex)];
+    newState.loopEnabled = loopEnabled;
+    newState.loopStart = loopCoveredWholeChain ? 0 : loopStart;
+    newState.loopEnd = loopCoveredWholeChain ? (MlrVSTAudioProcessor::MaxSceneChainSteps - 1) : loopEnd;
+    normalizeSceneChainState(newState);
+
+    // Single whole-struct assignment: the chain never passes through an empty
+    // transient, so an in-progress chain playback survives the edit.
+    processor.sceneChainState = newState;
+
+    if (wasActive && previousStepScene >= 0)
+    {
+        const int newLength = getSceneChainLengthInternal(processor);
+        int remappedIndex = -1;
+        if (previousStepIndex >= 0
+            && previousStepIndex < newLength
+            && processor.sceneChainState.steps[static_cast<size_t>(previousStepIndex)].sceneSlot
+                == previousStepScene)
+        {
+            remappedIndex = previousStepIndex;
+        }
+        else
+        {
+            int bestDistance = std::numeric_limits<int>::max();
+            for (int stepIndex = 0; stepIndex < newLength; ++stepIndex)
+            {
+                if (processor.sceneChainState.steps[static_cast<size_t>(stepIndex)].sceneSlot
+                    != previousStepScene)
+                    continue;
+                const int distance = std::abs(stepIndex - previousStepIndex);
+                if (distance < bestDistance)
+                {
+                    bestDistance = distance;
+                    remappedIndex = stepIndex;
+                }
+            }
+        }
+        if (remappedIndex >= 0)
+            processor.sceneSequenceCurrentStepIndex = remappedIndex;
+    }
+
+    markSceneChainDefinitionChanged(processor);
+
+    if (processor.sceneSequenceActive && processor.activeSceneStartPpqValid)
+    {
+        armNextSceneInSequence(processor,
+                               processor.activeSceneMainPresetIndex,
+                               processor.getActiveSceneSlot(),
+                               processor.activeSceneStartPpq);
+    }
+}
+
 bool SceneScheduler::isSceneChainLoopEnabled(const MlrVSTAudioProcessor& processor)
 {
-    return getSceneChainLengthInternal(processor) >= 2;
+    return processor.sceneChainState.loopEnabled;
 }
 
 void SceneScheduler::setSceneChainLoopEnabled(MlrVSTAudioProcessor& processor, bool enabled)
 {
-    juce::ignoreUnused(enabled);
-    const int chainLength = getSceneChainLengthInternal(processor);
-    processor.sceneChainState.loopEnabled = chainLength >= 2;
-    processor.sceneChainState.loopStart = 0;
-    processor.sceneChainState.loopEnd = juce::jmax(0, chainLength - 1);
+    if (processor.sceneChainState.loopEnabled == enabled)
+        return;
+
+    processor.sceneChainState.loopEnabled = enabled;
     markSceneChainDefinitionChanged(processor);
 }
 
@@ -1362,11 +1454,16 @@ int SceneScheduler::getSceneChainLoopEndStep(const MlrVSTAudioProcessor& process
 
 void SceneScheduler::setSceneChainLoopRange(MlrVSTAudioProcessor& processor, int startStep, int endStep)
 {
-    juce::ignoreUnused(startStep, endStep);
     const int chainLength = getSceneChainLengthInternal(processor);
-    processor.sceneChainState.loopEnabled = chainLength >= 2;
-    processor.sceneChainState.loopStart = 0;
-    processor.sceneChainState.loopEnd = juce::jmax(0, chainLength - 1);
+    const int maxIndex = juce::jmax(0, chainLength - 1);
+    const int safeStart = juce::jlimit(0, maxIndex, juce::jmin(startStep, endStep));
+    const int safeEnd = juce::jlimit(safeStart, maxIndex, juce::jmax(startStep, endStep));
+    if (processor.sceneChainState.loopStart == safeStart
+        && processor.sceneChainState.loopEnd == safeEnd)
+        return;
+
+    processor.sceneChainState.loopStart = safeStart;
+    processor.sceneChainState.loopEnd = safeEnd;
     markSceneChainDefinitionChanged(processor);
 }
 
@@ -1763,7 +1860,7 @@ void SceneScheduler::applySceneChainStateXml(MlrVSTAudioProcessor& processor,
 
         processor.sceneChainState.transitionEndSampleDirectory =
             inferSceneTransitionEndSampleDirectory(processor.sceneChainState, loadedEndSampleDirectory);
-        processor.sceneChainState.loopEnabled = static_cast<bool>(xml->getBoolAttribute("chainLoopEnabled", false));
+        processor.sceneChainState.loopEnabled = static_cast<bool>(xml->getBoolAttribute("chainLoopEnabled", true));
         processor.sceneChainState.loopStart = xml->getIntAttribute("chainLoopStart", 0);
         processor.sceneChainState.loopEnd = xml->getIntAttribute("chainLoopEnd", juce::jmax(0, chainLength - 1));
         sanitizeSceneChainRuntimeState(processor);
@@ -2151,6 +2248,39 @@ void SceneScheduler::armNextSceneInSequence(MlrVSTAudioProcessor& processor,
         processor.startTimer(MlrVSTAudioProcessor::kGridRefreshMs);
 }
 
+void SceneScheduler::armReturnRouteForSequenceHandoff(MlrVSTAudioProcessor& processor,
+                                                      int outgoingStepIndex,
+                                                      int enteredStepIndex,
+                                                      double targetPpq)
+{
+    if (outgoingStepIndex < 0
+        || outgoingStepIndex >= MlrVSTAudioProcessor::MaxSceneChainSteps
+        || enteredStepIndex < 0)
+        return;
+
+    const auto& outgoingStep =
+        processor.sceneChainState.steps[static_cast<size_t>(outgoingStepIndex)];
+    if (sanitizeSceneChainTransitionType(outgoingStep.transitionToNext)
+        != SceneChainTransitionType::Return)
+        return;
+
+    const bool loopbackHandoff = processor.sceneChainState.loopEnabled
+        && enteredStepIndex <= outgoingStepIndex;
+    if (sceneChainTransitionConditionAllows(
+            sanitizeSceneChainTransitionCondition(outgoingStep.transitionCondition),
+            outgoingStepIndex,
+            enteredStepIndex,
+            targetPpq,
+            loopbackHandoff))
+    {
+        processor.armSceneChainReturnOverride(outgoingStepIndex, enteredStepIndex);
+    }
+    else
+    {
+        processor.clearSceneChainReturnOverride();
+    }
+}
+
 void SceneScheduler::setSceneModeEnabled(MlrVSTAudioProcessor& processor, bool enabled)
 {
     if (auto* param = processor.parameters.getParameter("sceneMode"))
@@ -2405,6 +2535,8 @@ bool SceneScheduler::captureSceneSlot(MlrVSTAudioProcessor& processor, int scene
         && processor.activeSceneSlot == clampedSlot)
     {
         processor.activeSceneNeedsCaptureBeforeManualRecall = false;
+        // An explicit save is user intent: it lifts the degraded-recall block.
+        processor.activeSceneRecallDegraded.store(0, std::memory_order_release);
     }
     if (saved)
         processor.updateMonomeLEDs();
@@ -2433,6 +2565,25 @@ bool SceneScheduler::insertSceneSlot(MlrVSTAudioProcessor& processor, int sceneS
         setSceneAnchorStrip(processor, destSlot, getSceneAnchorStrip(processor, destSlot - 1));
         storageChanged = true;
     }
+
+    // Chain steps reference scenes by slot; they must follow their content
+    // when the insert shifts everything from insertSlot one slot to the right.
+    // A reference shifted past the last slot no longer has content and clears.
+    bool chainChanged = false;
+    for (auto& step : processor.sceneChainState.steps)
+    {
+        if (step.sceneSlot < insertSlot)
+            continue;
+
+        const int shiftedSlot = step.sceneSlot + 1;
+        if (shiftedSlot >= MlrVSTAudioProcessor::SceneSlots)
+            clearSceneChainStep(step);
+        else
+            step.sceneSlot = shiftedSlot;
+        chainChanged = true;
+    }
+    if (chainChanged)
+        markSceneChainDefinitionChanged(processor);
 
     const bool captured = captureSceneSlot(processor, insertSlot);
     if (captured)
@@ -2953,7 +3104,12 @@ void SceneScheduler::updateSceneQuantizedRecall(MlrVSTAudioProcessor& processor,
     }
     else
     {
-        processor.clearSceneBoundaryTransitionState();
+        // A scheduled-but-unfired end sample belongs to the previous boundary
+        // and still has up to a bar left to fire — keep it alive.
+        const bool endSampleStillPending =
+            processor.sceneBoundaryTransitionEndSampleTriggered.load(std::memory_order_acquire) == 0
+            && processor.sceneBoundaryTransitionEndSampleFromStep.load(std::memory_order_acquire) >= 0;
+        processor.clearSceneBoundaryTransitionState(endSampleStillPending);
     }
 
     if (!launchQuantisation.targetResolved || !launchQuantisation.targetWithinCurrentBlock)
@@ -3124,7 +3280,11 @@ void SceneScheduler::processPendingSceneApply(MlrVSTAudioProcessor& processor)
         && processor.activeSceneNeedsCaptureBeforeManualRecall;
     const bool shouldAutosaveOutgoingScene = shouldFlushPendingActiveAutosave
         || shouldCaptureOutgoingUnsavedScene;
-    const bool canAutosaveOutgoingScene = shouldAutosaveOutgoingScene && !autosaveWouldDropAudio();
+    const bool outgoingSceneRecallDegraded =
+        processor.activeSceneRecallDegraded.load(std::memory_order_acquire) != 0;
+    const bool canAutosaveOutgoingScene = shouldAutosaveOutgoingScene
+        && !outgoingSceneRecallDegraded
+        && !autosaveWouldDropAudio();
     auto requeuePendingApply = [&]()
     {
         MlrVSTAudioProcessor::SceneSwitchEvent event;
@@ -3429,6 +3589,14 @@ void SceneScheduler::performEmptySceneLoad(MlrVSTAudioProcessor& processor)
     const auto preservedScenePadLastTapMs = processor.scenePadLastTapMs;
     const int preservedSceneCopySourceSlot = processor.sceneCopySourceSlot;
     const int preservedSceneCopyMainPresetIndex = processor.sceneCopyMainPresetIndex;
+    // Recalling an empty scene clears the strips, but the chain definition and
+    // per-scene timing describe the whole arrangement and must survive it
+    // (mirrors the preservation in performSceneLoad).
+    const auto preservedSceneRepeatCounts = processor.sceneRepeatCounts;
+    const auto preservedSceneLengthModes = processor.sceneLengthModes;
+    const auto preservedSceneManualBars = processor.sceneManualBars;
+    const auto preservedSceneAnchorStrips = processor.sceneAnchorStrips;
+    const auto preservedSceneChainState = processor.sceneChainState;
     processor.resetRuntimePresetStateToDefaults();
     processor.switchScenePlaybackOwner(MlrVSTAudioProcessor::ScenePlaybackOwner::Manual, false);
     processor.setSceneChainAttachStartPpq(std::numeric_limits<double>::quiet_NaN());
@@ -3441,11 +3609,11 @@ void SceneScheduler::performEmptySceneLoad(MlrVSTAudioProcessor& processor)
     processor.scenePadLastTapMs = preservedScenePadLastTapMs;
     processor.sceneCopySourceSlot = preservedSceneCopySourceSlot;
     processor.sceneCopyMainPresetIndex = preservedSceneCopyMainPresetIndex;
-    processor.sceneRepeatCounts.fill(1);
-    processor.sceneLengthModes.fill(static_cast<int>(SceneLengthMode::ManualBars));
-    processor.sceneManualBars.fill(4);
-    processor.sceneAnchorStrips.fill(0);
-    processor.sceneChainState = {};
+    processor.sceneRepeatCounts = preservedSceneRepeatCounts;
+    processor.sceneLengthModes = preservedSceneLengthModes;
+    processor.sceneManualBars = preservedSceneManualBars;
+    processor.sceneAnchorStrips = preservedSceneAnchorStrips;
+    processor.sceneChainState = preservedSceneChainState;
     sanitizeSceneChainRuntimeState(processor);
     for (auto& f : processor.currentStripFiles)
         f = juce::File();
@@ -3801,7 +3969,10 @@ void SceneScheduler::loadSceneModeStateFromState(MlrVSTAudioProcessor& processor
 
     // Fresh plugin/session loads always start from Scene 1 to avoid reviving a stale
     // previously-active scene slot or queued scene handoff from an earlier session.
-    processor.activeSceneMainPresetIndex = 0;
+    // The main-preset context must match what getActiveMainPresetIndexForScenes()
+    // resolves after the session restored loadedPresetIndex, or every stored-scene
+    // lookup misses the restored slots.
+    processor.activeSceneMainPresetIndex = processor.getActiveMainPresetIndexForScenes();
     processor.activeSceneSlot = 0;
     processor.focusedSceneSlot = juce::jlimit(
         0,
@@ -3936,7 +4107,7 @@ void SceneScheduler::loadSceneModeStateFromState(MlrVSTAudioProcessor& processor
     }
     processor.sceneChainState.transitionEndSampleDirectory =
         inferSceneTransitionEndSampleDirectory(processor.sceneChainState, loadedEndSampleDirectory);
-    processor.sceneChainState.loopEnabled = static_cast<bool>(sceneState.getProperty("chainLoopEnabled", false));
+    processor.sceneChainState.loopEnabled = static_cast<bool>(sceneState.getProperty("chainLoopEnabled", true));
     processor.sceneChainState.loopStart = static_cast<int>(sceneState.getProperty("chainLoopStart", 0));
     processor.sceneChainState.loopEnd = static_cast<int>(sceneState.getProperty("chainLoopEnd",
                                                                                 juce::jmax(0, storedChainLength - 1)));

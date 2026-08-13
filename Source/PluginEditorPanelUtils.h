@@ -1,11 +1,39 @@
 #pragma once
 
 #include "PluginProcessor.h"
+#include "PluginEditorStyle.h"
 #include "PlayheadSpeedQuantizer.h"
 #include <cmath>
 
 namespace PluginEditorPanelUtils
 {
+// Shared color language for recorded control events (pattern cards, scene
+// automation lanes, monome page tints). Fallback is the neutral data color —
+// amber stays reserved for selection/focus.
+inline juce::Colour controlModeEventColour(int controlMode)
+{
+    using ControlMode = MlrVSTAudioProcessor::ControlMode;
+
+    switch (static_cast<ControlMode>(controlMode))
+    {
+        case ControlMode::Speed:     return juce::Colour(0xff6bbcff);
+        case ControlMode::Pitch:     return juce::Colour(0xffff8f6b);
+        case ControlMode::Pan:       return juce::Colour(0xff6ce0c4);
+        case ControlMode::Volume:    return juce::Colour(0xff88d96b);
+        case ControlMode::GrainSize: return juce::Colour(0xffffc86b);
+        case ControlMode::Swing:     return juce::Colour(0xffffdd74);
+        case ControlMode::Gate:      return juce::Colour(0xffff7d9c);
+        case ControlMode::Delay:     return juce::Colour(0xff74d6ff);
+        case ControlMode::Filter:    return juce::Colour(0xffff9d5a);
+        case ControlMode::Normal:
+        case ControlMode::FileBrowser:
+        case ControlMode::GroupAssign:
+        case ControlMode::Modulation:
+        case ControlMode::Preset:
+        case ControlMode::StepEdit:
+        default:                     return PluginEditorStyle::kDataNeutral;
+    }
+}
 inline juce::String getMonomePageDisplayName(MlrVSTAudioProcessor::ControlMode mode)
 {
     switch (mode)

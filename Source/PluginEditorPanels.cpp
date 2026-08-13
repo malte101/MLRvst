@@ -19,7 +19,7 @@ PathsControlPanel::PathsControlPanel(MlrVSTAudioProcessor& p)
     : processor(p)
 {
     titleLabel.setText("DEFAULT LOAD PATHS", juce::dontSendNotification);
-    titleLabel.setFont(juce::Font(juce::FontOptions(12.0f, juce::Font::bold)));
+    titleLabel.setFont(juce::Font(juce::FontOptions(13.0f, juce::Font::bold)));
     titleLabel.setColour(juce::Label::textColourId, kTextPrimary);
     titleLabel.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(titleLabel);
@@ -128,14 +128,16 @@ void PathsControlPanel::resized()
     const int stripWidth = 42;
     const int buttonWidth = 48;
     const int gap = 4;
-    const int pathAreaWidth = (header.getWidth() - stripWidth - (6 * buttonWidth) - (9 * gap)) / 3;
+    // The rows below spend eleven gaps (a double gap between each path group),
+    // so budget eleven here or the last Clear button gets clipped.
+    const int pathAreaWidth = (header.getWidth() - stripWidth - (6 * buttonWidth) - (11 * gap)) / 3;
 
     headerStripLabel.setBounds(header.removeFromLeft(stripWidth));
     header.removeFromLeft(gap);
     headerLoopLabel.setBounds(header.removeFromLeft(pathAreaWidth + (2 * buttonWidth) + (2 * gap)));
-    header.removeFromLeft(gap);
+    header.removeFromLeft(gap * 2);
     headerStepLabel.setBounds(header.removeFromLeft(pathAreaWidth + (2 * buttonWidth) + (2 * gap)));
-    header.removeFromLeft(gap);
+    header.removeFromLeft(gap * 2);
     headerFlipLabel.setBounds(header);
 
     layout.removeFromTop(4);
@@ -474,27 +476,7 @@ int sceneAutomationVisibleLaneCount(const MlrVSTAudioProcessor& processor, int s
 
 juce::Colour sceneAutomationColour(const ScenePerformanceEvent& event)
 {
-    using ControlMode = MlrVSTAudioProcessor::ControlMode;
-
-    switch (static_cast<ControlMode>(event.controlMode))
-    {
-        case ControlMode::Speed:     return juce::Colour(0xff6bbcff);
-        case ControlMode::Pitch:     return juce::Colour(0xffff8f6b);
-        case ControlMode::Pan:       return juce::Colour(0xff6ce0c4);
-        case ControlMode::Volume:    return juce::Colour(0xff88d96b);
-        case ControlMode::GrainSize: return juce::Colour(0xffffc86b);
-        case ControlMode::Swing:     return juce::Colour(0xffffdd74);
-        case ControlMode::Delay:     return juce::Colour(0xff74d6ff);
-        case ControlMode::Filter:    return juce::Colour(0xffff9d5a);
-        case ControlMode::Normal:
-        case ControlMode::Gate:
-        case ControlMode::FileBrowser:
-        case ControlMode::GroupAssign:
-        case ControlMode::Modulation:
-        case ControlMode::Preset:
-        case ControlMode::StepEdit:
-        default:                     return kAccent;
-    }
+    return PluginEditorPanelUtils::controlModeEventColour(event.controlMode);
 }
 
 int sceneAutomationLaneIndex(const ScenePerformanceEvent& event)
@@ -2200,7 +2182,7 @@ void drawSceneAutomationPoint(juce::Graphics& g,
 
     if (selected)
     {
-        g.setColour(juce::Colours::white.withAlpha(0.92f));
+        g.setColour(kAccent.withAlpha(0.92f));
         g.drawEllipse(markerBounds.reduced(juce::jmax(0.3f, markerBounds.getWidth() * 0.08f)),
                       juce::jmax(0.85f, markerBounds.getWidth() * 0.18f));
     }
@@ -2212,7 +2194,7 @@ void drawSceneHeaderActionChip(juce::Graphics& g,
                                juce::Colour colour,
                                bool enabled)
 {
-    const auto fill = enabled ? colour.withAlpha(0.18f) : juce::Colour(0xff2d3135);
+    const auto fill = enabled ? colour.withAlpha(0.18f) : kSurfaceHi;
     const auto outline = enabled ? colour.withAlpha(0.46f) : juce::Colours::white.withAlpha(0.05f);
     const auto text = enabled ? colour.brighter(0.25f) : kTextMuted.withAlpha(0.7f);
     g.setColour(fill);
@@ -2220,7 +2202,7 @@ void drawSceneHeaderActionChip(juce::Graphics& g,
     g.setColour(outline);
     g.drawRoundedRectangle(bounds.reduced(0.5f), 4.0f, 1.0f);
     g.setColour(text);
-    g.setFont(juce::Font(juce::FontOptions(8.6f, juce::Font::bold)));
+    g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
     g.drawText(label, bounds.toNearestInt(), juce::Justification::centred, false);
 }
 
@@ -2736,8 +2718,13 @@ SceneChainLayout makeSceneChainLayout(juce::Rectangle<float> bounds)
     layout.headerBounds = content.removeFromTop(0.0f);
     layout.legendBounds = layout.headerBounds;
     layout.railBounds = content;
-    const float chipHeight = 13.0f;
-    const float stepHeight = juce::jlimit(30.0f, 34.0f, layout.railBounds.getHeight() - 20.0f);
+    const float chipHeight = juce::jlimit(13.0f, 18.0f, layout.railBounds.getHeight() * 0.28f);
+    // Step cells never exceed the rail's interior; at tiny rail heights they
+    // shrink instead of overflowing the canvas.
+    const float stepHeight = juce::jlimit(16.0f,
+                                          58.0f,
+                                          juce::jmin(layout.railBounds.getHeight() - 2.0f,
+                                                     juce::jmax(30.0f, layout.railBounds.getHeight() - 22.0f)));
     const float stepTop = layout.railBounds.getY()
         + ((layout.railBounds.getHeight() - stepHeight) * 0.5f);
     const float chipTop = stepTop + ((stepHeight - chipHeight) * 0.5f);
@@ -2815,12 +2802,12 @@ juce::Colour sceneChainTransitionColour(MlrVSTAudioProcessor::SceneChainTransiti
         case TransitionType::Stutter:    return juce::Colour(0xfff06f45);
         case TransitionType::FilterRise: return juce::Colour(0xff58c96d);
         case TransitionType::Drop:       return juce::Colour(0xffe35576);
-        case TransitionType::MuteTail:   return juce::Colour(0xff8ca1b8);
+        case TransitionType::MuteTail:   return kDataNeutral;
         case TransitionType::Break:      return juce::Colour(0xff41b7e8);
         case TransitionType::Return:     return juce::Colour(0xffc48d44);
         case TransitionType::None:
         default:
-            return juce::Colour(0xff465158);
+            return kSurfaceHi;
     }
 }
 
@@ -2958,35 +2945,24 @@ void applySceneChainSteps(MlrVSTAudioProcessor& processor,
                           int loopStart,
                           int loopEnd)
 {
-    processor.clearSceneChain();
-    const int safeCount = juce::jmin(static_cast<int>(steps.size()), MlrVSTAudioProcessor::MaxSceneChainSteps);
-    for (int stepIndex = 0; stepIndex < safeCount; ++stepIndex)
-    {
-        const auto& step = steps[static_cast<size_t>(stepIndex)];
-        processor.setSceneChainStep(stepIndex, step.sceneSlot, step.repeats);
-        processor.setSceneChainStepTransitionType(stepIndex, step.transitionToNext);
-        processor.setSceneChainStepTransitionOption(stepIndex, step.transitionOption);
-        processor.setSceneChainStepTransitionScope(stepIndex, step.transitionScope);
-        processor.setSceneChainStepTransitionContour(stepIndex, step.transitionContour);
-        processor.setSceneChainStepTransitionCondition(stepIndex, step.transitionCondition);
-        processor.setSceneChainStepTransitionLengthBeats(stepIndex, step.transitionLengthBeats);
-        processor.setSceneChainStepTransitionSubtractsFromSceneLength(stepIndex,
-                                                                      step.transitionSubtractsFromSceneLength);
-        processor.setSceneChainStepTransitionIntensity(stepIndex, step.transitionIntensity);
-        processor.setSceneChainStepTransitionDelayAmount(stepIndex, step.transitionDelayAmount);
-        processor.setSceneChainStepTransitionFilterAmount(stepIndex, step.transitionFilterAmount);
-        processor.setSceneChainStepTransitionChopAmount(stepIndex, step.transitionChopAmount);
-        processor.setSceneChainStepTransitionEndSampleFile(stepIndex, step.transitionEndSampleFile);
-        processor.setSceneChainStepTransitionEndSampleSettings(stepIndex, step.transitionEndSampleSettings);
-    }
+    processor.setSceneChainSteps(steps, loopEnabled, loopStart, loopEnd);
+}
 
-    if (loopEnabled && safeCount >= 2)
+juce::String sceneChainStateFingerprint(const MlrVSTAudioProcessor& processor)
+{
+    juce::String fingerprint;
+    const int chainLength = processor.getSceneChainLength();
+    fingerprint << chainLength << ":" << (processor.isSceneChainLoopEnabled() ? 1 : 0) << ":";
+    for (int stepIndex = 0; stepIndex < chainLength; ++stepIndex)
     {
-        const int safeLoopStart = juce::jlimit(0, safeCount - 1, loopStart);
-        const int safeLoopEnd = juce::jlimit(safeLoopStart, safeCount - 1, loopEnd);
-        processor.setSceneChainLoopRange(safeLoopStart, safeLoopEnd);
-        processor.setSceneChainLoopEnabled(true);
+        fingerprint << processor.getSceneChainStepSceneSlot(stepIndex) << ","
+                    << processor.getSceneChainStepRepeatCount(stepIndex) << ","
+                    << static_cast<int>(processor.getSceneChainStepTransitionType(stepIndex)) << ","
+                    << static_cast<int>(processor.getSceneChainStepTransitionOption(stepIndex)) << ","
+                    << juce::String(processor.getSceneChainStepTransitionLengthBeats(stepIndex), 3) << ","
+                    << juce::String(processor.getSceneChainStepTransitionIntensity(stepIndex), 3) << ";";
     }
+    return fingerprint;
 }
 
 int sceneChainStepAtPosition(const SceneChainLayout& layout, juce::Point<float> position)
@@ -3143,28 +3119,35 @@ void SceneChainCanvas::mouseWheelMove(const juce::MouseEvent& e, const juce::Mou
 
 juce::Font SceneControlPanel::SceneControlLookAndFeel::getComboBoxFont(juce::ComboBox&)
 {
-    return juce::Font(juce::FontOptions(10.2f, juce::Font::bold));
+    return roleFont(FontRole::Label);
 }
 
 juce::Font SceneControlPanel::SceneControlLookAndFeel::getPopupMenuFont()
 {
-    return juce::Font(juce::FontOptions(13.5f, juce::Font::bold));
+    return juce::Font(juce::FontOptions(13.0f));
 }
 
 juce::Font SceneControlPanel::SceneControlLookAndFeel::getTextButtonFont(juce::TextButton& button, int buttonHeight)
 {
     const auto role = button.getProperties()["sceneRole"].toString();
-    float size = buttonHeight >= 24 ? 10.8f : 9.8f;
+    float size = buttonHeight >= 24 ? 11.0f : 10.0f;
+    bool emphasized = false;
     if (role == "chip")
-        size = 9.2f;
+        size = 9.5f;
     else if (role == "tool")
-        size = 9.6f;
+        size = 10.0f;
     else if (role == "transport")
-        size = juce::jmax(11.2f, buttonHeight * 0.46f);
+    {
+        size = juce::jmax(11.5f, buttonHeight * 0.46f);
+        emphasized = true;
+    }
     else if (role == "slot")
-        size = juce::jmax(10.4f, buttonHeight * 0.41f);
+    {
+        size = juce::jmax(10.5f, buttonHeight * 0.41f);
+        emphasized = true;
+    }
 
-    return juce::Font(juce::FontOptions(size, juce::Font::bold));
+    return juce::Font(juce::FontOptions(size, emphasized ? juce::Font::bold : juce::Font::plain));
 }
 
 void SceneControlPanel::SceneControlLookAndFeel::drawButtonBackground(juce::Graphics& g,
@@ -3179,54 +3162,28 @@ void SceneControlPanel::SceneControlLookAndFeel::drawButtonBackground(juce::Grap
 
     const auto role = button.getProperties()["sceneRole"].toString();
     const bool isSlot = role == "slot";
-    const bool isChip = role == "chip";
     const bool isTransport = role == "transport";
     const bool slotHasStoredData = !isSlot
         || static_cast<bool>(button.getProperties().getWithDefault("sceneHasStoredData", true));
-    const float cornerSize = isSlot ? 8.4f : (isTransport ? 8.6f : (isChip ? 6.0f : 7.0f));
+    const float cornerSize = (isSlot || isTransport) ? kRadiusL : kRadiusS;
 
     auto baseColour = button.getToggleState()
         ? button.findColour(juce::TextButton::buttonOnColourId)
         : backgroundColour;
 
     if (shouldDrawButtonAsDown)
-        baseColour = baseColour.brighter(0.10f);
+        baseColour = baseColour.withMultipliedBrightness(0.85f);
     else if (shouldDrawButtonAsHighlighted)
-        baseColour = baseColour.brighter(isSlot ? 0.07f : 0.05f);
+        baseColour = baseColour.brighter(0.06f);
 
     if (isSlot && !slotHasStoredData)
-        baseColour = baseColour.interpolatedWith(juce::Colour(0xff3b4249), 0.56f);
+        baseColour = baseColour.interpolatedWith(kSurface, 0.56f);
 
     if (!button.isEnabled())
         baseColour = baseColour.withMultipliedAlpha(0.42f);
 
-    g.setColour(juce::Colours::black.withAlpha(isTransport ? 0.28f : 0.20f));
-    g.fillRoundedRectangle(bounds.translated(0.0f, isTransport ? 1.4f : 1.0f), cornerSize);
-
-    juce::ColourGradient fill(baseColour.brighter(isTransport ? 0.16f : (isSlot ? 0.10f : 0.05f)),
-                              bounds.getX(),
-                              bounds.getY(),
-                              baseColour.darker(isTransport ? 0.22f : (isChip ? 0.08f : 0.15f)),
-                              bounds.getX(),
-                              bounds.getBottom(),
-                              false);
-    g.setGradientFill(fill);
+    g.setColour(baseColour);
     g.fillRoundedRectangle(bounds, cornerSize);
-
-    g.setColour(juce::Colours::white.withAlpha(shouldDrawButtonAsHighlighted
-                                                   ? (isTransport ? 0.16f : 0.11f)
-                                                   : (isTransport ? 0.10f : 0.06f)));
-    g.drawRoundedRectangle(bounds.reduced(0.45f), cornerSize, 1.0f);
-
-    g.setColour(baseColour.contrasting(isTransport ? 0.22f : 0.16f)
-                    .withAlpha(isSlot ? 0.28f : (isTransport ? 0.24f : 0.18f)));
-    g.drawRoundedRectangle(bounds.reduced(1.35f), juce::jmax(2.0f, cornerSize - 1.4f), 1.0f);
-
-    if (isTransport)
-    {
-        g.setColour(baseColour.brighter(0.55f).withAlpha(button.getToggleState() ? 0.38f : 0.22f));
-        g.drawRoundedRectangle(bounds.reduced(2.2f), juce::jmax(3.0f, cornerSize - 2.2f), 1.2f);
-    }
 }
 
 void SceneControlPanel::SceneControlLookAndFeel::drawButtonText(juce::Graphics& g,
@@ -3248,7 +3205,7 @@ void SceneControlPanel::SceneControlLookAndFeel::drawButtonText(juce::Graphics& 
     if (isSlot && !slotHasStoredData)
     {
         auto mainTextBounds = textBounds;
-        auto badgeBounds = mainTextBounds.removeFromBottom(9);
+        auto badgeBounds = mainTextBounds.removeFromBottom(12);
         mainTextBounds.removeFromBottom(1);
 
         g.setFont(getTextButtonFont(button, button.getHeight()));
@@ -3261,19 +3218,17 @@ void SceneControlPanel::SceneControlLookAndFeel::drawButtonText(juce::Graphics& 
         const auto badgeText = button.getProperties().getWithDefault("sceneDataBadgeText", "EMPTY").toString();
         if (badgeText.isNotEmpty())
         {
-            const auto badgeFont = juce::Font(juce::FontOptions(6.0f, juce::Font::bold));
-            const int badgeWidth = juce::jlimit(22,
-                                                juce::jmax(22, badgeBounds.getWidth()),
+            const auto badgeFont = roleFont(FontRole::Micro, true);
+            const int badgeWidth = juce::jlimit(24,
+                                                juce::jmax(24, badgeBounds.getWidth()),
                                                 juce::GlyphArrangement::getStringWidthInt(badgeFont, badgeText) + 10);
-            auto badgeArea = juce::Rectangle<int>(badgeWidth, 7).withCentre(badgeBounds.getCentre());
-            badgeArea.setY(badgeBounds.getY() + 1);
+            auto badgeArea = juce::Rectangle<int>(badgeWidth, 11).withCentre(badgeBounds.getCentre());
+            badgeArea.setY(badgeBounds.getY());
 
-            g.setColour(juce::Colour(0xff0f1317).withAlpha(0.70f));
+            g.setColour(kWell.withAlpha(0.80f));
             g.fillRoundedRectangle(badgeArea.toFloat(), 3.0f);
-            g.setColour(juce::Colours::white.withAlpha(0.11f));
-            g.drawRoundedRectangle(badgeArea.toFloat().reduced(0.5f), 3.0f, 0.8f);
             g.setFont(badgeFont);
-            g.setColour(colour.withMultipliedAlpha(0.74f));
+            g.setColour(colour.withMultipliedAlpha(0.80f));
             g.drawFittedText(badgeText,
                              badgeArea,
                              juce::Justification::centred,
@@ -3315,24 +3270,11 @@ void SceneControlPanel::SceneControlLookAndFeel::drawComboBox(juce::Graphics& g,
         arrow = arrow.withMultipliedAlpha(0.40f);
     }
 
-    juce::ColourGradient fill(background.brighter(0.05f),
-                              bounds.getX(),
-                              bounds.getY(),
-                              background.darker(0.12f),
-                              bounds.getX(),
-                              bounds.getBottom(),
-                              false);
-    g.setGradientFill(fill);
-    g.fillRoundedRectangle(bounds, 7.0f);
+    g.setColour(background);
+    g.fillRoundedRectangle(bounds, kRadiusS);
 
-    const auto sheenBounds = bounds.reduced(1.0f).removeFromTop(bounds.getHeight() * 0.46f);
-    g.setColour(juce::Colours::white.withAlpha(0.035f));
-    g.fillRoundedRectangle(sheenBounds, 6.0f);
-
-    g.setColour(outline.withAlpha(0.78f));
-    g.drawRoundedRectangle(bounds, 7.0f, 1.0f);
-    g.setColour(juce::Colours::white.withAlpha(0.05f));
-    g.drawRoundedRectangle(bounds.reduced(1.2f), 5.8f, 1.0f);
+    g.setColour(outline);
+    g.drawRoundedRectangle(bounds, kRadiusS, 1.0f);
 
     auto arrowBounds = bounds.toNearestInt().removeFromRight(18).reduced(4, 5).toFloat();
     juce::Path arrowPath;
@@ -3509,7 +3451,7 @@ SceneTransitionEndSampleEditorPanel::SceneTransitionEndSampleEditorPanel(MlrVSTA
     addAndMakeVisible(titleLabel);
 
     contextLabel.setColour(juce::Label::textColourId, kTextMuted);
-    contextLabel.setFont(juce::Font(juce::FontOptions(9.8f, juce::Font::bold)));
+    contextLabel.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
     contextLabel.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(contextLabel);
 
@@ -3524,7 +3466,7 @@ SceneTransitionEndSampleEditorPanel::SceneTransitionEndSampleEditorPanel(MlrVSTA
     addAndMakeVisible(closeButton);
 
     currentSampleLabel.setColour(juce::Label::textColourId, kTextPrimary);
-    currentSampleLabel.setFont(juce::Font(juce::FontOptions(11.4f, juce::Font::bold)));
+    currentSampleLabel.setFont(juce::Font(juce::FontOptions(11.5f, juce::Font::bold)));
     currentSampleLabel.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(currentSampleLabel);
 
@@ -3575,21 +3517,21 @@ SceneTransitionEndSampleEditorPanel::SceneTransitionEndSampleEditorPanel(MlrVSTA
     addAndMakeVisible(clearButton);
 
     sampleListLabel.setColour(juce::Label::textColourId, kTextMuted);
-    sampleListLabel.setFont(juce::Font(juce::FontOptions(9.6f, juce::Font::bold)));
+    sampleListLabel.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
     sampleListLabel.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(sampleListLabel);
 
     sampleListBox.setModel(this);
     sampleListBox.setRowHeight(24);
     sampleListBox.setColour(juce::ListBox::backgroundColourId, juce::Colour(0xff171a1d));
-    sampleListBox.setColour(juce::ListBox::outlineColourId, juce::Colour(0xff596068));
+    sampleListBox.setColour(juce::ListBox::outlineColourId, kStroke);
     sampleListBox.setColour(juce::ListBox::textColourId, kTextPrimary);
     sampleListBox.setOutlineThickness(1);
     addAndMakeVisible(sampleListBox);
 
     shapeLabel.setText("Playback Shape", juce::dontSendNotification);
     shapeLabel.setColour(juce::Label::textColourId, kTextSecondary);
-    shapeLabel.setFont(juce::Font(juce::FontOptions(9.6f, juce::Font::bold)));
+    shapeLabel.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
     shapeLabel.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(shapeLabel);
 
@@ -3609,7 +3551,7 @@ SceneTransitionEndSampleEditorPanel::SceneTransitionEndSampleEditorPanel(MlrVSTA
         slider.setColour(juce::Slider::trackColourId, kAccent.withAlpha(0.82f));
         slider.setColour(juce::Slider::thumbColourId, juce::Colours::white.withAlpha(0.94f));
         slider.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour(0xff1b1f22));
-        slider.setColour(juce::Slider::textBoxOutlineColourId, juce::Colour(0xff596068));
+        slider.setColour(juce::Slider::textBoxOutlineColourId, kStroke);
         slider.setColour(juce::Slider::textBoxTextColourId, kTextPrimary);
     };
 
@@ -3768,7 +3710,7 @@ SceneTransitionEndSampleEditorPanel::SceneTransitionEndSampleEditorPanel(MlrVSTA
     addAndMakeVisible(reverseToggle);
 
     hintLabel.setColour(juce::Label::textColourId, kTextMuted);
-    hintLabel.setFont(juce::Font(juce::FontOptions(9.6f)));
+    hintLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
     hintLabel.setJustificationType(juce::Justification::centredLeft);
     hintLabel.setText("Click a sample to audition and assign it. Duck can follow master or any strip.",
                       juce::dontSendNotification);
@@ -3904,7 +3846,7 @@ void SceneTransitionEndSampleEditorPanel::paintListBoxItem(int rowNumber,
     }
 
     g.setColour(kTextPrimary.withAlpha(rowIsSelected ? 0.98f : 0.92f));
-    g.setFont(juce::Font(juce::FontOptions(10.6f)));
+    g.setFont(juce::Font(juce::FontOptions(10.0f)));
     g.drawFittedText(sampleChoiceLabel(file), textBounds, juce::Justification::centredLeft, 1);
 }
 
@@ -4172,7 +4114,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
         styleSceneButton(button,
                          "chip",
                          juce::Colour(0xff272d33),
-                         juce::Colour(0xff404a53),
+                         kSurfaceHi,
                          juce::Colour(0xffdbe1e6),
                          juce::Colour(0xfff5f7f8));
     };
@@ -4193,7 +4135,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
         styleSceneButton(button,
                          "tool",
                          juce::Colour(0xff2a3138),
-                         juce::Colour(0xff46525c),
+                         kSurfaceHi,
                          juce::Colour(0xffd6dde2),
                          juce::Colour(0xfff4f7f8));
     };
@@ -4222,7 +4164,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     {
         label.setText(text, juce::dontSendNotification);
         label.setFont(juce::Font(juce::FontOptions(9.5f, juce::Font::bold)));
-        label.setColour(juce::Label::textColourId, juce::Colour(0xffaeb8c0));
+        label.setColour(juce::Label::textColourId, kTextSecondary);
         label.setJustificationType(juce::Justification::centredLeft);
     };
 
@@ -4243,7 +4185,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(titleLabel);
 
     hintLabel.setText("Pick a scene, set how it advances, then shape the chain and fills below.", juce::dontSendNotification);
-    hintLabel.setFont(juce::Font(juce::FontOptions(10.2f)));
+    hintLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
     hintLabel.setColour(juce::Label::textColourId, kTextMuted);
     hintLabel.setJustificationType(juce::Justification::centredLeft);
     hintLabel.setTooltip("Scene buttons focus and launch scenes. Playback controls decide when the next scene starts. The chain rail sets order, repeats, and fill/route chips between scenes.");
@@ -4367,6 +4309,77 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(sceneChainPlayButton);
     styleScenePrimaryButton(sceneChainPlayButton, "transport");
 
+    sceneChainLoopButton.setButtonText("Loop");
+    sceneChainLoopButton.setClickingTogglesState(true);
+    sceneChainLoopButton.setTooltip(
+        "Loop the chain back to the start after the last step. Off: play the chain once, then hold on the last scene.");
+    sceneChainLoopButton.onClick = [this]()
+    {
+        processor.setSceneChainLoopEnabled(sceneChainLoopButton.getToggleState());
+        refreshFromProcessor();
+    };
+    addAndMakeVisible(sceneChainLoopButton);
+    styleSceneUtilityButton(sceneChainLoopButton);
+
+    auto configureStatusChip = [this](juce::Label& label, float fontSize, bool bold)
+    {
+        label.setFont(juce::Font(juce::FontOptions(fontSize, bold ? juce::Font::bold : juce::Font::plain)));
+        label.setJustificationType(juce::Justification::centred);
+        label.setColour(juce::Label::backgroundColourId, juce::Colour(0xff1b2125));
+        label.setColour(juce::Label::outlineColourId, juce::Colours::white.withAlpha(0.12f));
+        label.setColour(juce::Label::textColourId, kTextPrimary);
+        addAndMakeVisible(label);
+    };
+    configureStatusChip(sceneStatusNowLabel, 11.0f, true);
+    sceneStatusNowLabel.setTooltip("The scene playing right now.");
+    configureStatusChip(sceneStatusNextLabel, 10.2f, true);
+    sceneStatusNextLabel.setJustificationType(juce::Justification::centredLeft);
+    sceneStatusNextLabel.setColour(juce::Label::backgroundColourId, juce::Colours::transparentBlack);
+    sceneStatusNextLabel.setColour(juce::Label::outlineColourId, juce::Colours::transparentBlack);
+    sceneStatusNextLabel.setTooltip("Queued scene, chain position, and repeat progress.");
+    configureStatusChip(sceneStatusLoopLabel, 9.6f, true);
+    sceneStatusLoopLabel.setTooltip("Chain loop state. Toggle with the LOOP button below.");
+    configureStatusChip(sceneStatusRecLabel, 9.6f, true);
+    sceneStatusRecLabel.setTooltip("Scene clip recorder state.");
+
+    sceneFillMoreButton.setButtonText("More");
+    sceneFillMoreButton.setClickingTogglesState(true);
+    sceneFillMoreButton.setTooltip("Show or hide the full fill editor: Style, Lead, Shorten/Ride, Scope, Contour, When, Echo/Tone/Gate, and the end sample.");
+    sceneFillMoreButton.onClick = [this]()
+    {
+        sceneFillInspectorExpanded = sceneFillMoreButton.getToggleState();
+        resized();
+        refreshFromProcessor();
+    };
+    addAndMakeVisible(sceneFillMoreButton);
+    styleSceneUtilityButton(sceneFillMoreButton);
+
+    sceneUndoToastButton.setVisible(false);
+    sceneUndoToastButton.onClick = [this]()
+    {
+        if (sceneChainUndoAvailable
+            && sceneChainStateFingerprint(processor) == sceneChainUndoPostFingerprint)
+        {
+            applySceneChainSteps(processor,
+                                 sceneChainUndoSteps,
+                                 sceneChainUndoLoopEnabled,
+                                 sceneChainUndoLoopStart,
+                                 sceneChainUndoLoopEnd);
+        }
+        sceneChainUndoAvailable = false;
+        hideSceneChainUndoToast();
+        refreshFromProcessor();
+    };
+    addChildComponent(sceneUndoToastButton);
+    styleSceneUtilityButton(sceneUndoToastButton);
+    sceneUndoToastButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff3a4d63));
+
+    addAndMakeVisible(sceneTransitionSmartLinkButton);
+    addAndMakeVisible(sceneTransitionPunchButton);
+    addAndMakeVisible(sceneTransitionLiftButton);
+    addAndMakeVisible(sceneTransitionEchoButton);
+    addAndMakeVisible(sceneTransitionDropButton);
+
     sceneChainClearButton.setButtonText("Reset");
     sceneChainClearButton.setTooltip("Reset the focused scene slot to its default empty state. Alt-click clears the chain.");
     sceneChainClearButton.onClick = [this]()
@@ -4374,7 +4387,9 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
         const auto modifiers = juce::ModifierKeys::getCurrentModifiersRealtime();
         if (modifiers.isAltDown())
         {
+            captureSceneChainUndoSnapshot();
             processor.clearSceneChain();
+            showSceneChainUndoToast("Chain cleared - Undo");
             refreshFromProcessor();
             return;
         }
@@ -4508,7 +4523,7 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
         styleSceneButton(selectorButton,
                          "slot",
                          juce::Colour(0xff323841),
-                         juce::Colour(0xff4b5560),
+                         kSurfaceHi,
                          kTextPrimary,
                          juce::Colour(0xfff7f7f7));
         selectorButton.addMouseListener(this, false);
@@ -4536,13 +4551,15 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
 
         for (int bars = 1; bars <= MlrVSTAudioProcessor::MaxSceneManualBars; ++bars)
             manualBarsBox.addItem(juce::String(bars), bars);
-        manualBarsBox.setTooltip("Number of bars the focused scene runs before it is eligible to end.");
+        manualBarsBox.setTooltip("Bars (host time signature) the focused scene runs before it is eligible to end. Editable while the scene plays; the boundary moves to the new length.");
         manualBarsBox.onChange = [this, sceneSlot]()
         {
             const int selectedId = sceneManualBarsBoxes[static_cast<size_t>(sceneSlot)].getSelectedId();
             if (selectedId > 0)
             {
-                processor.setSceneLengthCount(sceneSlot, selectedId);
+                // setSceneManualBars, not setSceneLengthCount: the latter also
+                // resets the scene's repeat count to 1 as a side effect.
+                processor.setSceneManualBars(sceneSlot, selectedId);
                 processor.persistSceneTimingForSlot(sceneSlot);
                 refreshFromProcessor();
             }
@@ -4987,6 +5004,27 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
                                    true,
                                    MlrVSTAudioProcessor::SceneChainTransitionContour::LateHit);
 
+    for (int favoriteIndex = 0; favoriteIndex < MlrVSTAudioProcessor::SceneTransitionFavoriteSlots; ++favoriteIndex)
+    {
+        auto& favoriteButton = sceneTransitionFavoriteButtons[static_cast<size_t>(favoriteIndex)];
+        favoriteButton.setButtonText("F" + juce::String(favoriteIndex + 1));
+        favoriteButton.onClick = [this, favoriteIndex]()
+        {
+            const int focusedStep = getFocusedSceneChainStep();
+            if (focusedStep < 0)
+                return;
+
+            const auto modifiers = juce::ModifierKeys::getCurrentModifiersRealtime();
+            if (modifiers.isAltDown())
+                processor.captureSceneTransitionFavorite(favoriteIndex, focusedStep);
+            else if (processor.hasSceneTransitionFavorite(favoriteIndex))
+                processor.applySceneTransitionFavorite(favoriteIndex, focusedStep);
+            refreshFromProcessor();
+        };
+        addAndMakeVisible(favoriteButton);
+        styleSceneUtilityButton(favoriteButton);
+    }
+
     addAndMakeVisible(sceneChainCanvas);
 
     sceneRecorderTitleLabel.setText("CLIP", juce::dontSendNotification);
@@ -5241,19 +5279,19 @@ SceneControlPanel::SceneControlPanel(MlrVSTAudioProcessor& p)
     styleSceneUtilityButton(sceneCollapseAllLanesButton);
 
     sceneStatusLabel.setText("EMPTY", juce::dontSendNotification);
-    sceneStatusLabel.setFont(juce::Font(juce::FontOptions(9.8f, juce::Font::bold)));
+    sceneStatusLabel.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
     sceneStatusLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xff1b2125));
     sceneStatusLabel.setColour(juce::Label::outlineColourId, juce::Colours::white.withAlpha(0.12f));
     sceneStatusLabel.setBorderSize({2, 8, 2, 8});
     sceneStatusLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(sceneStatusLabel);
 
-    sceneDetailLabel.setFont(juce::Font(juce::FontOptions(9.8f)));
+    sceneDetailLabel.setFont(juce::Font(juce::FontOptions(10.0f)));
     sceneDetailLabel.setColour(juce::Label::textColourId, kTextSecondary);
     sceneDetailLabel.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(sceneDetailLabel);
 
-    sceneSelectionLabel.setFont(juce::Font(juce::FontOptions(9.1f)));
+    sceneSelectionLabel.setFont(juce::Font(juce::FontOptions(9.0f)));
     sceneSelectionLabel.setColour(juce::Label::textColourId, kTextSecondary.withAlpha(0.92f));
     sceneSelectionLabel.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(sceneSelectionLabel);
@@ -5402,28 +5440,18 @@ void SceneControlPanel::paint(juce::Graphics& g)
             return;
 
         auto sectionBounds = bounds.toFloat().expanded(6.0f, 6.0f);
-        juce::ColourGradient sectionFill(juce::Colour(0xff161c21).withAlpha(0.92f),
-                                         sectionBounds.getX(),
-                                         sectionBounds.getY(),
-                                         juce::Colour(0xff101419).withAlpha(0.96f),
-                                         sectionBounds.getX(),
-                                         sectionBounds.getBottom(),
-                                         false);
-        g.setGradientFill(sectionFill);
-        g.fillRoundedRectangle(sectionBounds, 10.0f);
+        g.setColour(kInset);
+        g.fillRoundedRectangle(sectionBounds, kRadiusL);
 
-        const auto topSheen = sectionBounds.reduced(1.0f).removeFromTop(sectionBounds.getHeight() * 0.42f);
-        g.setColour(juce::Colours::white.withAlpha(0.035f));
-        g.fillRoundedRectangle(topSheen, 8.8f);
+        g.setColour(kStroke);
+        g.drawRoundedRectangle(sectionBounds.reduced(0.5f), kRadiusL, 1.0f);
 
-        g.setColour(juce::Colours::white.withAlpha(0.045f));
-        g.drawRoundedRectangle(sectionBounds.reduced(0.5f), 10.0f, 1.0f);
-
-        g.setColour(accent.withAlpha(0.20f));
-        g.drawRoundedRectangle(sectionBounds.reduced(1.5f), 8.8f, 1.0f);
-
-        g.setColour(juce::Colours::black.withAlpha(0.18f));
-        g.drawRoundedRectangle(sectionBounds.reduced(2.4f), 7.6f, 1.0f);
+        juce::Graphics::ScopedSaveState save(g);
+        juce::Path clip;
+        clip.addRoundedRectangle(sectionBounds, kRadiusL);
+        g.reduceClipRegion(clip);
+        g.setColour(accent.withAlpha(0.85f));
+        g.fillRect(juce::Rectangle<float>(sectionBounds.getX(), sectionBounds.getY(), 3.0f, sectionBounds.getHeight()));
     };
 
     auto unionVisibleBounds = [](juce::Rectangle<int>& target, const juce::Component& component)
@@ -5456,7 +5484,7 @@ void SceneControlPanel::paint(juce::Graphics& g)
     unionVisibleBounds(actionBounds, sceneScenePasteButton);
     unionVisibleBounds(actionBounds, sceneDuplicateLengthButton);
     unionVisibleBounds(actionBounds, sceneChainClearButton);
-    drawInsetSection(actionBounds, juce::Colour(0xff89949d));
+    drawInsetSection(actionBounds, kDataNeutral);
 
     juce::Rectangle<int> chainBounds;
     unionVisibleBounds(chainBounds, sceneChainCanvas);
@@ -6688,7 +6716,7 @@ bool SceneControlPanel::thinSceneLane(int stripIndex, int laneIndex, bool trigge
 void SceneControlPanel::resized()
 {
     auto bounds = getLocalBounds().reduced(8);
-    const auto comboFont = juce::Font(juce::FontOptions(12.0f, juce::Font::bold));
+    const auto comboFont = juce::Font(juce::FontOptions(13.0f, juce::Font::bold));
     auto comboWidthForTexts = [&comboFont](std::initializer_list<juce::String> labels, int minWidth, int maxWidth)
     {
         int textWidth = 0;
@@ -6701,8 +6729,17 @@ void SceneControlPanel::resized()
     sceneModeToggle.setBounds(titleRow.removeFromRight(106));
     titleLabel.setBounds(titleRow);
 
-    hintLabel.setBounds(bounds.removeFromTop(16));
-    bounds.removeFromTop(5);
+    // Status strip: NOW / NEXT / LOOP / REC replaces the static hint sentence.
+    hintLabel.setBounds({});
+    auto statusRow = bounds.removeFromTop(20);
+    sceneStatusNowLabel.setBounds(statusRow.removeFromLeft(76));
+    statusRow.removeFromLeft(6);
+    sceneStatusRecLabel.setBounds(statusRow.removeFromRight(52));
+    statusRow.removeFromRight(4);
+    sceneStatusLoopLabel.setBounds(statusRow.removeFromRight(52));
+    statusRow.removeFromRight(8);
+    sceneStatusNextLabel.setBounds(statusRow);
+    bounds.removeFromTop(4);
 
     auto compactButtonWidthForText = [&comboFont](const juce::String& label, int minWidth, int maxWidth)
     {
@@ -6710,11 +6747,25 @@ void SceneControlPanel::resized()
         return juce::jlimit(minWidth, maxWidth, textWidth + 20);
     };
 
-    const int settingsHeight = juce::jlimit(198, 214, static_cast<int>(std::round(getHeight() * 0.296f)));
-    auto settingsBounds = bounds.removeFromTop(settingsHeight);
     const int sectionGap = 6;
     const int sceneButtonGap = 10;
     const int controlHeight = 22;
+
+    // Below ~420px the page cannot fit the edit surface; show a deliberate
+    // perform layout (slots + transport + tall rail) instead of clipping.
+    const bool performLayout = getHeight() < 420;
+    const int fixedAboveRail = 2 + 26 + sceneButtonGap + controlHeight + sectionGap;
+    // The rail takes exactly what remains in perform mode; flooring above the
+    // available space would push the canvas past the settings clamp and
+    // truncate it.
+    const int railHeight = performLayout
+        ? juce::jmax(24, bounds.getHeight() - fixedAboveRail)
+        : 92;
+    const int inspectorRowCount = performLayout ? 0 : (sceneFillInspectorExpanded ? 3 : 1);
+    // Settings height derives from its content so no interior row can clip.
+    const int settingsHeight = fixedAboveRail + railHeight
+        + (inspectorRowCount > 0 ? (sectionGap + inspectorRowCount * (controlHeight + 4)) : 0);
+    auto settingsBounds = bounds.removeFromTop(juce::jmin(settingsHeight, bounds.getHeight()));
 
     sceneSlotsSectionLabel.setBounds({});
     settingsBounds.removeFromTop(2);
@@ -6732,6 +6783,7 @@ void SceneControlPanel::resized()
     const auto sceneContentX = sceneSelectorButtons.front().getX();
     const auto sceneContentWidth = sceneSelectorButtons.back().getRight() - sceneContentX;
     sceneChainPlayButton.setBounds({});
+    sceneChainLoopButton.setBounds({});
     sceneRecordButton.setBounds({});
     sceneSceneCaptureButton.setBounds({});
 
@@ -6775,6 +6827,9 @@ void SceneControlPanel::resized()
                                               44,
                                               juce::jmax(52, timingRow.getWidth() / 9));
     sceneChainPlayButton.setBounds(timingRow.removeFromLeft(transportWidth));
+    timingRow.removeFromLeft(labelGap);
+    const int loopWidth = compactButtonWidthForText("LOOP", 48, 58);
+    sceneChainLoopButton.setBounds(timingRow.removeFromLeft(loopWidth));
     timingRow.removeFromLeft(labelGap + 3);
     sceneChangeModeLabel.setBounds({});
     sceneLengthHeaderLabel.setBounds({});
@@ -6792,64 +6847,58 @@ void SceneControlPanel::resized()
     sceneManualBarsBoxes[static_cast<size_t>(focusedSceneSlot)].setBounds(timingRow.removeFromLeft(countWidth));
     sceneTimingLayoutFocusedSlot = focusedSceneSlot;
 
+    // Punch-fill cluster in the transport row's previously-dead middle span.
+    sceneTransitionSmartLinkButton.setBounds({});
+    sceneTransitionPunchButton.setBounds({});
+    sceneTransitionLiftButton.setBounds({});
+    sceneTransitionEchoButton.setBounds({});
+    sceneTransitionDropButton.setBounds({});
+    if (!performLayout)
+    {
+        const int linkedWidth = 56;
+        const int quickWidth = 52;
+        const int quickGap = 4;
+        const int clusterWidth = linkedWidth + 8 + (quickWidth * 4) + (quickGap * 3);
+        if (timingRow.getWidth() >= clusterWidth + 12)
+        {
+            auto cluster = timingRow.withSizeKeepingCentre(clusterWidth, timingRow.getHeight());
+            sceneTransitionSmartLinkButton.setBounds(cluster.removeFromLeft(linkedWidth));
+            cluster.removeFromLeft(8);
+            sceneTransitionPunchButton.setBounds(cluster.removeFromLeft(quickWidth));
+            cluster.removeFromLeft(quickGap);
+            sceneTransitionLiftButton.setBounds(cluster.removeFromLeft(quickWidth));
+            cluster.removeFromLeft(quickGap);
+            sceneTransitionEchoButton.setBounds(cluster.removeFromLeft(quickWidth));
+            cluster.removeFromLeft(quickGap);
+            sceneTransitionDropButton.setBounds(cluster.removeFromLeft(quickWidth));
+        }
+    }
+
     settingsBounds.removeFromTop(sectionGap);
     sceneFillSectionLabel.setBounds({});
 
-    auto chainRow = settingsBounds.removeFromTop(60);
+    auto chainRow = settingsBounds.removeFromTop(railHeight);
     chainRow.setX(sceneContentX);
     chainRow.setWidth(sceneContentWidth);
     sceneChainCanvas.setBounds(chainRow);
 
-    settingsBounds.removeFromTop(sectionGap);
-
-    auto transitionRow = settingsBounds.removeFromTop(controlHeight);
-    transitionRow.setX(sceneContentX);
-    transitionRow.setWidth(sceneContentWidth);
-    const int fillCellGap = 6;
-    const int fillCellWidth = (transitionRow.getWidth() - (fillCellGap * 3)) / 4;
-    auto takeFillCell = [&](juce::Rectangle<int>& row, bool lastCell = false)
-    {
-        auto cell = lastCell ? row : row.removeFromLeft(fillCellWidth);
-        if (!lastCell && row.getWidth() > 0)
-            row.removeFromLeft(fillCellGap);
-        return cell;
-    };
+    // ---- Fill inspector: one collapsed row; "More" expands two detail rows ----
     auto layoutFillField = [&](juce::Rectangle<int> cell, juce::Label& label, juce::Component& component, int labelWidth)
     {
         label.setBounds(cell.removeFromLeft(labelWidth));
         cell.removeFromLeft(4);
         component.setBounds(cell);
     };
-    layoutFillField(takeFillCell(transitionRow), sceneTransitionHeaderLabel, sceneTransitionTypeBox, 34);
-    layoutFillField(takeFillCell(transitionRow), sceneTransitionOptionsHeaderLabel, sceneTransitionOptionsBox, 34);
-    layoutFillField(takeFillCell(transitionRow), sceneTransitionLengthHeaderLabel, sceneTransitionLengthBox, 34);
-    sceneTransitionSubtractButton.setBounds(takeFillCell(transitionRow, true));
-    sceneTimingLayoutFocusedStep = getFocusedSceneChainStep();
 
-    settingsBounds.removeFromTop(4);
-
-    auto transitionParamRow = settingsBounds.removeFromTop(controlHeight);
-    transitionParamRow.setX(sceneContentX);
-    transitionParamRow.setWidth(sceneContentWidth);
-    const int transitionParamLabelWidth = 36;
-    auto layoutTransitionParam = [&](juce::Rectangle<int> cell, juce::Label& label, juce::Component& component)
-    {
-        label.setBounds(cell.removeFromLeft(transitionParamLabelWidth));
-        cell.removeFromLeft(4);
-        component.setBounds(cell);
-    };
-    layoutTransitionParam(takeFillCell(transitionParamRow), sceneTransitionMixHeaderLabel, sceneTransitionMixSlider);
-    layoutTransitionParam(takeFillCell(transitionParamRow), sceneTransitionDelayHeaderLabel, sceneTransitionDelaySlider);
-    layoutTransitionParam(takeFillCell(transitionParamRow), sceneTransitionFilterHeaderLabel, sceneTransitionFilterSlider);
-    layoutTransitionParam(takeFillCell(transitionParamRow, true), sceneTransitionChopHeaderLabel, sceneTransitionChopSlider);
-
-    settingsBounds.removeFromTop(4);
-
-    sceneTransitionSmartLinkButton.setBounds({});
-    sceneTransitionPunchButton.setBounds({});
-    sceneTransitionLiftButton.setBounds({});
-    sceneTransitionEchoButton.setBounds({});
-    sceneTransitionDropButton.setBounds({});
+    sceneTransitionHeaderLabel.setBounds({});
+    sceneTransitionTypeBox.setBounds({});
+    sceneTransitionMixHeaderLabel.setBounds({});
+    sceneTransitionMixSlider.setBounds({});
+    sceneTransitionOptionsHeaderLabel.setBounds({});
+    sceneTransitionOptionsBox.setBounds({});
+    sceneTransitionLengthHeaderLabel.setBounds({});
+    sceneTransitionLengthBox.setBounds({});
+    sceneTransitionSubtractButton.setBounds({});
     sceneTransitionScopeHeaderLabel.setBounds({});
     sceneTransitionScopeBox.setBounds({});
     sceneTransitionContourHeaderLabel.setBounds({});
@@ -6859,37 +6908,96 @@ void SceneControlPanel::resized()
     sceneTransitionEndSampleHeaderLabel.setBounds({});
     sceneTransitionEndSampleBox.setBounds({});
     sceneTransitionEndSampleFolderButton.setBounds({});
+    sceneTransitionDelayHeaderLabel.setBounds({});
+    sceneTransitionDelaySlider.setBounds({});
+    sceneTransitionFilterHeaderLabel.setBounds({});
+    sceneTransitionFilterSlider.setBounds({});
+    sceneTransitionChopHeaderLabel.setBounds({});
+    sceneTransitionChopSlider.setBounds({});
+    sceneTransitionSummaryLabel.setBounds({});
+    sceneTransitionMetaLabel.setBounds({});
+    sceneFillMoreButton.setBounds({});
+    for (auto& favoriteButton : sceneTransitionFavoriteButtons)
+        favoriteButton.setBounds({});
 
-    auto transitionDetailRow = settingsBounds.removeFromTop(controlHeight);
-    transitionDetailRow.setX(sceneContentX);
-    transitionDetailRow.setWidth(sceneContentWidth);
-    layoutFillField(takeFillCell(transitionDetailRow), sceneTransitionScopeHeaderLabel, sceneTransitionScopeBox, 38);
-    layoutFillField(takeFillCell(transitionDetailRow), sceneTransitionContourHeaderLabel, sceneTransitionContourBox, 48);
-    layoutFillField(takeFillCell(transitionDetailRow), sceneTransitionConditionHeaderLabel, sceneTransitionConditionBox, 36);
-    auto endSampleCell = takeFillCell(transitionDetailRow, true);
-    sceneTransitionEndSampleHeaderLabel.setBounds(endSampleCell.removeFromLeft(24));
-    endSampleCell.removeFromLeft(4);
-    const int folderButtonWidth = juce::jlimit(54, 84, juce::jmax(54, endSampleCell.getWidth() / 3));
-    sceneTransitionEndSampleFolderButton.setBounds(endSampleCell.removeFromRight(folderButtonWidth));
-    endSampleCell.removeFromRight(4);
-    sceneTransitionEndSampleBox.setBounds(endSampleCell);
+    if (!performLayout)
+    {
+        settingsBounds.removeFromTop(sectionGap);
+        auto inspectorRow = settingsBounds.removeFromTop(controlHeight);
+        inspectorRow.setX(sceneContentX);
+        inspectorRow.setWidth(sceneContentWidth);
 
-    settingsBounds.removeFromTop(4);
+        sceneFillMoreButton.setBounds(inspectorRow.removeFromRight(54));
+        inspectorRow.removeFromRight(6);
+        const int favoriteButtonWidth = 26;
+        const int favoriteGap = 3;
+        auto favoriteCluster = inspectorRow.removeFromRight(
+            MlrVSTAudioProcessor::SceneTransitionFavoriteSlots * favoriteButtonWidth
+            + (MlrVSTAudioProcessor::SceneTransitionFavoriteSlots - 1) * favoriteGap);
+        for (int favoriteIndex = 0; favoriteIndex < MlrVSTAudioProcessor::SceneTransitionFavoriteSlots; ++favoriteIndex)
+        {
+            sceneTransitionFavoriteButtons[static_cast<size_t>(favoriteIndex)]
+                .setBounds(favoriteCluster.removeFromLeft(favoriteButtonWidth));
+            if (favoriteIndex < MlrVSTAudioProcessor::SceneTransitionFavoriteSlots - 1)
+                favoriteCluster.removeFromLeft(favoriteGap);
+        }
+        inspectorRow.removeFromRight(8);
 
-    auto summaryRow = settingsBounds.removeFromTop(controlHeight);
-    summaryRow.setX(sceneContentX);
-    summaryRow.setWidth(sceneContentWidth);
-    const int summaryGap = 6;
-    const int summaryWidth = juce::jmax(0, (summaryRow.getWidth() - summaryGap) / 2);
-    sceneTransitionSummaryLabel.setBounds(summaryRow.removeFromLeft(summaryWidth));
-    summaryRow.removeFromLeft(summaryGap);
-    sceneTransitionMetaLabel.setBounds(summaryRow);
+        // Binding header: what the inspector is editing, pinned vs following.
+        sceneTransitionSummaryLabel.setBounds(
+            inspectorRow.removeFromLeft(juce::jlimit(180, 300, inspectorRow.getWidth() * 2 / 5)));
+        inspectorRow.removeFromLeft(8);
+        auto typeCell = inspectorRow.removeFromLeft(juce::jlimit(140, 190, inspectorRow.getWidth() / 2));
+        layoutFillField(typeCell, sceneTransitionHeaderLabel, sceneTransitionTypeBox, 34);
+        inspectorRow.removeFromLeft(8);
+        layoutFillField(inspectorRow, sceneTransitionMixHeaderLabel, sceneTransitionMixSlider, 36);
+
+        if (sceneFillInspectorExpanded)
+        {
+            const int detailCellGap = 6;
+            auto takeDetailCell = [&](juce::Rectangle<int>& row, int cellWidth, bool lastCell = false)
+            {
+                auto cell = lastCell ? row : row.removeFromLeft(cellWidth);
+                if (!lastCell && row.getWidth() > 0)
+                    row.removeFromLeft(detailCellGap);
+                return cell;
+            };
+
+            settingsBounds.removeFromTop(4);
+            auto detailRowA = settingsBounds.removeFromTop(controlHeight);
+            detailRowA.setX(sceneContentX);
+            detailRowA.setWidth(sceneContentWidth);
+            const int detailCellWidth = (detailRowA.getWidth() - (detailCellGap * 4)) / 5;
+            layoutFillField(takeDetailCell(detailRowA, detailCellWidth), sceneTransitionOptionsHeaderLabel, sceneTransitionOptionsBox, 34);
+            layoutFillField(takeDetailCell(detailRowA, detailCellWidth), sceneTransitionLengthHeaderLabel, sceneTransitionLengthBox, 34);
+            sceneTransitionSubtractButton.setBounds(takeDetailCell(detailRowA, detailCellWidth));
+            layoutFillField(takeDetailCell(detailRowA, detailCellWidth), sceneTransitionScopeHeaderLabel, sceneTransitionScopeBox, 38);
+            auto endSampleCell = takeDetailCell(detailRowA, detailCellWidth, true);
+            sceneTransitionEndSampleHeaderLabel.setBounds(endSampleCell.removeFromLeft(24));
+            endSampleCell.removeFromLeft(4);
+            const int folderButtonWidth = juce::jlimit(44, 70, juce::jmax(44, endSampleCell.getWidth() / 3));
+            sceneTransitionEndSampleFolderButton.setBounds(endSampleCell.removeFromRight(folderButtonWidth));
+            endSampleCell.removeFromRight(4);
+            sceneTransitionEndSampleBox.setBounds(endSampleCell);
+
+            settingsBounds.removeFromTop(4);
+            auto detailRowB = settingsBounds.removeFromTop(controlHeight);
+            detailRowB.setX(sceneContentX);
+            detailRowB.setWidth(sceneContentWidth);
+            layoutFillField(takeDetailCell(detailRowB, detailCellWidth), sceneTransitionDelayHeaderLabel, sceneTransitionDelaySlider, 36);
+            layoutFillField(takeDetailCell(detailRowB, detailCellWidth), sceneTransitionFilterHeaderLabel, sceneTransitionFilterSlider, 36);
+            layoutFillField(takeDetailCell(detailRowB, detailCellWidth), sceneTransitionChopHeaderLabel, sceneTransitionChopSlider, 36);
+            layoutFillField(takeDetailCell(detailRowB, detailCellWidth), sceneTransitionContourHeaderLabel, sceneTransitionContourBox, 48);
+            layoutFillField(takeDetailCell(detailRowB, detailCellWidth, true), sceneTransitionConditionHeaderLabel, sceneTransitionConditionBox, 36);
+        }
+    }
+    sceneTimingLayoutFocusedStep = getFocusedSceneChainStep();
 
     sceneAdvanceSummaryLabel.setBounds({});
 
-    bounds.removeFromTop(4);
+    bounds.removeFromTop(performLayout ? 0 : 4);
 
-    auto recorderRow = bounds.removeFromTop(22);
+    auto recorderRow = bounds.removeFromTop(performLayout ? 0 : 22);
     const int clipGap = 4;
     const int reenableWidth = compactButtonWidthForText("Re-enable", 86, 100);
     const int recWidth = compactButtonWidthForText("Rec", 44, 50);
@@ -6920,21 +7028,49 @@ void SceneControlPanel::resized()
     sceneClearTriggersButton.setBounds({});
     sceneClearControlsButton.setBounds({});
 
-    bounds.removeFromTop(3);
-    auto detailRow = bounds.removeFromTop(15);
+    bounds.removeFromTop(performLayout ? 0 : 3);
+    auto detailRow = bounds.removeFromTop(performLayout ? 0 : 15);
     sceneStatusLabel.setBounds(detailRow.removeFromRight(86));
     detailRow.removeFromRight(10);
     sceneDetailLabel.setBounds(detailRow);
-    bounds.removeFromTop(2);
+    bounds.removeFromTop(performLayout ? 0 : 2);
     sceneSelectionLabel.setBounds({});
 
     sceneViewport.setBounds(bounds);
     updateSceneTimelineContentSize();
 
-    sceneLegacyModBackdrop.setBounds(sceneViewport.getBounds());
-    sceneLegacyModBackdrop.setVisible(sceneLegacyModEditorVisible);
+    // Overlays are anchored to the viewport; with an empty viewport (perform
+    // layout) they would render degenerate half-clipped modals, so park them
+    // at zero bounds until the edit surface is back.
+    const bool viewportUsable = sceneViewport.getBounds().getHeight() >= 120;
 
-    if (sceneLegacyModEditor != nullptr)
+    if (sceneUndoToastButton.isVisible())
+    {
+        const auto railBounds = sceneChainCanvas.getBounds();
+        const int toastWidth = juce::jmax(160, sceneUndoToastButton.getWidth());
+        sceneUndoToastButton.setBounds(railBounds.getRight() - toastWidth - 8,
+                                       railBounds.getBottom() - 26,
+                                       toastWidth,
+                                       22);
+        sceneUndoToastButton.toFront(false);
+    }
+
+    sceneLegacyModBackdrop.setBounds(viewportUsable ? sceneViewport.getBounds() : juce::Rectangle<int>());
+    sceneLegacyModBackdrop.setVisible(sceneLegacyModEditorVisible && viewportUsable);
+
+    if (sceneLegacyModEditor != nullptr && !viewportUsable)
+    {
+        sceneLegacyModEditor->setBounds({});
+        sceneLegacyModCloseButton.setBounds({});
+        sceneDuplicateButton.setBounds({});
+        sceneNudgeLeftButton.setBounds({});
+        sceneNudgeRightButton.setBounds({});
+        sceneQuantizeButton.setBounds({});
+        sceneLaneOverlayButton.setBounds({});
+        sceneExpandAllLanesButton.setBounds({});
+        sceneCollapseAllLanesButton.setBounds({});
+    }
+    else if (sceneLegacyModEditor != nullptr)
     {
         const auto editorBounds = sceneViewport.getBounds().reduced(20);
         const int editorWidth = juce::jlimit(320, 520, editorBounds.getWidth());
@@ -6992,10 +7128,14 @@ void SceneControlPanel::resized()
         }
     }
 
-    sceneEndSampleEditorBackdrop.setBounds(sceneViewport.getBounds());
-    sceneEndSampleEditorBackdrop.setVisible(sceneEndSampleEditorVisible);
+    sceneEndSampleEditorBackdrop.setBounds(viewportUsable ? sceneViewport.getBounds() : juce::Rectangle<int>());
+    sceneEndSampleEditorBackdrop.setVisible(sceneEndSampleEditorVisible && viewportUsable);
 
-    if (sceneEndSampleEditor != nullptr)
+    if (sceneEndSampleEditor != nullptr && !viewportUsable)
+    {
+        sceneEndSampleEditor->setBounds({});
+    }
+    else if (sceneEndSampleEditor != nullptr)
     {
         const auto editorBounds = sceneViewport.getBounds().reduced(22);
         const int editorWidth = juce::jlimit(360, 520, editorBounds.getWidth());
@@ -7169,7 +7309,7 @@ void SceneControlPanel::updateSceneEditorState(double beat)
                                 recordingThisScene
                                     ? (overdubbingThisScene
                                            ? (blinkOn ? juce::Colour(0xffdf9152) : juce::Colour(0xff7a4a31))
-                                           : (blinkOn ? juce::Colour(0xffd45b5b) : juce::Colour(0xff6d3434)))
+                                           : (blinkOn ? kRec : kRec.darker(0.5f)))
                                     : juce::Colour(0xff374048));
     sceneRecordButton.setColour(juce::TextButton::textColourOffId, juce::Colour(0xfff2f4f6));
     sceneRecordButton.setColour(juce::TextButton::textColourOnId,
@@ -7181,10 +7321,10 @@ void SceneControlPanel::updateSceneEditorState(double beat)
                                                  : "Touch a recorded scene control live to temporarily grey it out, then click here to re-enable its written automation. Step motion lanes are unaffected.");
     sceneReenableAutomationButton.setColour(juce::TextButton::buttonColourId,
                                             hasAutomationOverrides ? kAccent.withAlpha(0.92f)
-                                                                   : juce::Colour(0xff3b4146));
+                                                                   : kSurfaceHi);
     sceneReenableAutomationButton.setColour(juce::TextButton::buttonOnColourId,
                                             hasAutomationOverrides ? kAccent.brighter(0.12f)
-                                                                   : juce::Colour(0xff4a5258));
+                                                                   : kSurfaceHover);
     sceneReenableAutomationButton.setColour(juce::TextButton::textColourOffId,
                                             hasAutomationOverrides ? juce::Colour(0xff141414)
                                                                    : kTextPrimary);
@@ -7231,7 +7371,7 @@ void SceneControlPanel::updateSceneEditorState(double beat)
         sceneEditorState.transportRecording = true;
         sceneStatusLabel.setText(processor.isScenePerformanceOverdubbing() ? "DUB" : "REC",
                                  juce::dontSendNotification);
-        sceneStatusLabel.setColour(juce::Label::textColourId, juce::Colour(0xffd46b62));
+        sceneStatusLabel.setColour(juce::Label::textColourId, kRec);
         juce::String detail = "S" + juce::String(sceneSlot + 1)
             + " • " + juce::String(lengthBeats, 2) + " beats"
             + " • " + eventSummary
@@ -7248,7 +7388,7 @@ void SceneControlPanel::updateSceneEditorState(double beat)
                 sceneEditorState.transportProgress = static_cast<float>(
                     juce::jlimit(0.0, 1.0, clipProgress * (clipLengthBeats / juce::jmax(1.0, lengthBeats))));
             sceneStatusLabel.setText("LIVE", juce::dontSendNotification);
-            sceneStatusLabel.setColour(juce::Label::textColourId, juce::Colour(0xff76be7e));
+            sceneStatusLabel.setColour(juce::Label::textColourId, kLive);
             juce::String detail = "S" + juce::String(sceneSlot + 1) + " • " + juce::String(resolvedLengthBeats, 2) + " beats";
             if (std::abs(clipLengthBeats - resolvedLengthBeats) > 1.0e-6)
                 detail << " • Clip " << juce::String(clipLengthBeats, 2) << " beats";
@@ -7277,6 +7417,8 @@ void SceneControlPanel::updateSceneEditorState(double beat)
                                  juce::dontSendNotification);
     }
 
+    if (sceneGestureLegendOverride.isNotEmpty())
+        sceneDetailLabel.setText(sceneGestureLegendOverride, juce::dontSendNotification);
     sceneDetailLabel.setTooltip(sceneDetailLabel.getText());
     const auto statusAccent = sceneStatusLabel.findColour(juce::Label::textColourId);
     sceneStatusLabel.setColour(juce::Label::backgroundColourId, statusAccent.withAlpha(0.16f));
@@ -7517,13 +7659,20 @@ void SceneControlPanel::refreshFromProcessor()
     sceneChainPlayButton.setToggleState(sceneChainPlaybackActive, juce::dontSendNotification);
     sceneChainPlayButton.setButtonText(sceneChainPlaybackActive ? "STOP" : "PLAY");
     sceneChainPlayButton.setColour(juce::TextButton::buttonColourId,
-                                   chainLength >= 2 ? juce::Colour(0xff315649)
+                                   chainLength >= 2 ? kLive.darker(0.55f)
                                                     : juce::Colour(0xff2b3137));
-    sceneChainPlayButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xffc9eb74));
+    sceneChainPlayButton.setColour(juce::TextButton::buttonOnColourId, kLive.brighter(0.25f));
     sceneChainPlayButton.setColour(juce::TextButton::textColourOffId,
-                                   chainLength >= 2 ? juce::Colour(0xfff2f6f3)
+                                   chainLength >= 2 ? kTextPrimary
                                                     : kTextMuted.withAlpha(0.84f));
-    sceneChainPlayButton.setColour(juce::TextButton::textColourOnId, juce::Colour(0xff10150f));
+    sceneChainPlayButton.setColour(juce::TextButton::textColourOnId, kAccentInk);
+    const bool sceneChainLoopOn = processor.isSceneChainLoopEnabled();
+    sceneChainLoopButton.setEnabled(chainLength >= 1);
+    sceneChainLoopButton.setToggleState(sceneChainLoopOn, juce::dontSendNotification);
+    sceneChainLoopButton.setColour(juce::TextButton::buttonOnColourId, kLive.darker(0.35f));
+    sceneChainLoopButton.setTooltip(sceneChainLoopOn
+                                        ? "Loop on: the chain returns to the start after the last step. Click to play once and hold on the last scene."
+                                        : "Loop off: the chain plays once and holds on the last scene. Click to loop the chain.");
     sceneChainClearButton.setEnabled(processor.isSceneModeEnabled());
     const int focusedLengthCount = processor.getSceneLengthCount(focusedSceneSlot);
     const int focusedStep = getFocusedSceneChainStep() >= 0
@@ -7580,7 +7729,9 @@ void SceneControlPanel::refreshFromProcessor()
 
     const bool queuedSceneBlinkOn = ((juce::Time::getMillisecondCounter() / 500u) & 1u) == 0u;
 
-    if (sceneTimingLayoutFocusedStep != focusedStep)
+    // Compare against the same expression resized() stores, or a divergence
+    // (e.g. end-sample-editor fallback focus) re-triggers resized() every tick.
+    if (sceneTimingLayoutFocusedStep != getFocusedSceneChainStep())
         resized();
 
     sceneTransitionTypeBox.setSelectedId(hasFocusedStep
@@ -7666,7 +7817,7 @@ void SceneControlPanel::refreshFromProcessor()
     const auto endSampleDirectory = processor.getSceneTransitionEndSampleDirectory();
     const auto transitionColour = hasFocusedStep
         ? sceneChainTransitionColour(focusedTransitionType)
-        : juce::Colour(0xff465158);
+        : kSurfaceHi;
     auto tintTransitionSlider = [&](juce::Slider& slider, float value)
     {
         slider.setColour(juce::Slider::trackColourId, transitionColour.withAlpha(hasFocusedStep ? 0.84f : 0.26f));
@@ -7783,7 +7934,7 @@ void SceneControlPanel::refreshFromProcessor()
                                              hasFocusedStep
                                                  ? (sceneTransitionSmartLinkEnabled && focusedTransitionHasFillControls
                                                         ? transitionColour.withAlpha(0.88f)
-                                                        : juce::Colour(0xff454b52))
+                                                        : kSurfaceHi)
                                                  : juce::Colour(0xff3a4046));
     sceneTransitionSmartLinkButton.setColour(juce::TextButton::buttonOnColourId,
                                              transitionColour.brighter(0.18f));
@@ -7801,7 +7952,7 @@ void SceneControlPanel::refreshFromProcessor()
         button.setEnabled(hasFocusedStep);
         button.setColour(juce::TextButton::buttonColourId,
                          active ? colour.withAlpha(0.90f)
-                                : juce::Colour(0xff3d4349));
+                                : kSurfaceHi);
         button.setColour(juce::TextButton::buttonOnColourId,
                          colour.brighter(0.12f));
         button.setColour(juce::TextButton::textColourOffId,
@@ -7813,12 +7964,12 @@ void SceneControlPanel::refreshFromProcessor()
                     hasFocusedStep
                         && focusedTransitionType == MlrVSTAudioProcessor::SceneChainTransitionType::Stutter
                         && focusedTransitionOption == MlrVSTAudioProcessor::SceneChainTransitionOption::Tight,
-                    juce::Colour(0xffdf7b45));
+                    kRec);
     tintQuickButton(sceneTransitionLiftButton,
                     hasFocusedStep
                         && focusedTransitionType == MlrVSTAudioProcessor::SceneChainTransitionType::FilterRise
                         && focusedTransitionOption == MlrVSTAudioProcessor::SceneChainTransitionOption::Sweep,
-                    juce::Colour(0xff76b98f));
+                    kLive);
     tintQuickButton(sceneTransitionEchoButton,
                     hasFocusedStep
                         && focusedTransitionType == MlrVSTAudioProcessor::SceneChainTransitionType::Fill
@@ -7828,7 +7979,7 @@ void SceneControlPanel::refreshFromProcessor()
                     hasFocusedStep
                         && focusedTransitionType == MlrVSTAudioProcessor::SceneChainTransitionType::Drop
                         && focusedTransitionOption == MlrVSTAudioProcessor::SceneChainTransitionOption::Gate,
-                    juce::Colour(0xffd5695a));
+                    kRec);
 
     if (hasFocusedStep)
     {
@@ -7848,10 +7999,9 @@ void SceneControlPanel::refreshFromProcessor()
 
         if (focusedTransitionRoutesBack)
         {
-            sceneTransitionSummaryLabel.setText("Return Route / no fill FX • visit "
+            sceneFillSummaryInfoText = "Return Route / no fill FX • visit "
                                                     + routeDestinationLabel
-                                                    + ", then back here",
-                                                juce::dontSendNotification);
+                                                    + ", then back here";
             sceneTransitionMetaLabel.setText("Routing only • "
                                                  + sceneChainTransitionConditionLabel(focusedTransitionCondition)
                                                  + " • after "
@@ -7862,7 +8012,7 @@ void SceneControlPanel::refreshFromProcessor()
         }
         else
         {
-            sceneTransitionSummaryLabel.setText(sceneChainTransitionTypeLabel(focusedTransitionType)
+            sceneFillSummaryInfoText = sceneChainTransitionTypeLabel(focusedTransitionType)
                                                     + " / "
                                                     + sceneChainTransitionOptionLabel(focusedTransitionOption)
                                                     + " • "
@@ -7870,8 +8020,7 @@ void SceneControlPanel::refreshFromProcessor()
                                                                                  focusedTransitionFilter,
                                                                                  focusedTransitionChop)
                                                     + " • "
-                                                    + sceneChainTransitionScopeLabel(focusedTransitionScope),
-                                                juce::dontSendNotification);
+                                                    + sceneChainTransitionScopeLabel(focusedTransitionScope);
             sceneTransitionMetaLabel.setText(formatSceneTransitionLengthBeats(focusedTransitionLength)
                                                  + " • "
                                                  + sceneTransitionEnergySummary(focusedTransitionIntensity)
@@ -7979,7 +8128,7 @@ void SceneControlPanel::refreshFromProcessor()
     }
     else
     {
-        sceneTransitionSummaryLabel.setText("No connector chip", juce::dontSendNotification);
+        sceneFillSummaryInfoText = "No connector chip";
         sceneTransitionMetaLabel.setText("Click a connector chip or the loop clamp to edit the current Chain Fill or Return Route",
                                          juce::dontSendNotification);
         sceneTransitionSummaryLabel.setTooltip("The fill/route editor follows the focused connector chip or loopback clamp.");
@@ -8002,6 +8151,119 @@ void SceneControlPanel::refreshFromProcessor()
         sceneTransitionLiftButton.setTooltip("Select a connector chip or loop clamp first.");
         sceneTransitionEchoButton.setTooltip("Select a connector chip or loop clamp first.");
         sceneTransitionDropButton.setTooltip("Select a connector chip or loop clamp first.");
+    }
+
+    for (int favoriteIndex = 0; favoriteIndex < MlrVSTAudioProcessor::SceneTransitionFavoriteSlots; ++favoriteIndex)
+    {
+        auto& favoriteButton = sceneTransitionFavoriteButtons[static_cast<size_t>(favoriteIndex)];
+        const bool favoriteStored = processor.hasSceneTransitionFavorite(favoriteIndex);
+        favoriteButton.setEnabled(hasFocusedStep);
+        favoriteButton.setColour(juce::TextButton::buttonColourId,
+                                 favoriteStored ? juce::Colour(0xff3a4d63) : juce::Colour(0xff2b3137));
+        favoriteButton.setColour(juce::TextButton::textColourOffId,
+                                 favoriteStored ? juce::Colour(0xffdce6f2) : kTextMuted.withAlpha(0.8f));
+        if (!hasFocusedStep)
+            favoriteButton.setTooltip("Select a connector chip or loop clamp first. F" + juce::String(favoriteIndex + 1)
+                                      + " applies a stored fill favorite; Alt-click stores the focused fill.");
+        else if (favoriteStored)
+            favoriteButton.setTooltip("Apply fill favorite F" + juce::String(favoriteIndex + 1)
+                                      + " to the focused connector. Alt-click overwrites it with the focused fill.");
+        else
+            favoriteButton.setTooltip("Empty favorite slot. Alt-click stores the focused connector's fill as F"
+                                      + juce::String(favoriteIndex + 1) + ".");
+    }
+
+    // ---- Status strip: NOW / NEXT / LOOP / REC ----
+    {
+        const auto chainStatus = processor.getSceneChainPlaybackStatus();
+        const int nowSlot = processor.getActiveSceneSlot();
+        const auto nowColour = sceneSlotUiColour(processor, nowSlot);
+        sceneStatusNowLabel.setText("NOW S" + juce::String(nowSlot + 1), juce::dontSendNotification);
+        sceneStatusNowLabel.setColour(juce::Label::backgroundColourId, nowColour.withAlpha(0.30f));
+        sceneStatusNowLabel.setColour(juce::Label::outlineColourId, nowColour.withAlpha(0.85f));
+        sceneStatusNowLabel.setColour(juce::Label::textColourId, juce::Colours::white.withAlpha(0.95f));
+
+        juce::String nextText;
+        if (chainStatus.active)
+        {
+            if (chainStatus.queuedSceneSlot >= 0)
+                nextText << juce::String(juce::CharPointer_UTF8("\xe2\x86\x92")) << " NEXT S"
+                         << juce::String(chainStatus.queuedSceneSlot + 1);
+            if (chainStatus.stepIndex >= 0)
+                nextText << (nextText.isNotEmpty() ? "  -  " : "") << "STEP "
+                         << juce::String(chainStatus.stepIndex + 1) << "/" << juce::String(chainLength);
+            if (chainStatus.repeatCount > 1)
+                nextText << "  -  REP " << juce::String(chainStatus.repeatIndex) << "/"
+                         << juce::String(chainStatus.repeatCount);
+        }
+        else
+        {
+            const int queuedSlot = processor.getQueuedSceneSlot();
+            if (queuedSlot >= 0)
+                nextText << juce::String(juce::CharPointer_UTF8("\xe2\x86\x92")) << " NEXT S"
+                         << juce::String(queuedSlot + 1) << "  -  QUEUED";
+            else
+                nextText << "CHAIN STOPPED";
+        }
+        sceneStatusNextLabel.setText(nextText, juce::dontSendNotification);
+        sceneStatusNextLabel.setColour(juce::Label::textColourId,
+                                       chainStatus.active ? kTextPrimary : kTextMuted.withAlpha(0.85f));
+
+        const bool loopOn = processor.isSceneChainLoopEnabled();
+        sceneStatusLoopLabel.setText(loopOn ? "LOOP" : "1-SHOT", juce::dontSendNotification);
+        const auto loopChipColour = loopOn ? juce::Colour(0xffffb347) : kTextMuted;
+        sceneStatusLoopLabel.setColour(juce::Label::textColourId,
+                                       loopOn ? juce::Colour(0xffffd9a0) : kTextMuted.withAlpha(0.8f));
+        sceneStatusLoopLabel.setColour(juce::Label::backgroundColourId, loopChipColour.withAlpha(loopOn ? 0.18f : 0.05f));
+        sceneStatusLoopLabel.setColour(juce::Label::outlineColourId, loopChipColour.withAlpha(loopOn ? 0.5f : 0.25f));
+
+        const bool recording = processor.isScenePerformanceRecording();
+        sceneStatusRecLabel.setText(recording && processor.isScenePerformanceOverdubbing() ? "DUB" : "REC",
+                                    juce::dontSendNotification);
+        const auto recColour = kRec;
+        sceneStatusRecLabel.setColour(juce::Label::textColourId,
+                                      recording ? kRec.brighter(0.35f) : kTextMuted.withAlpha(0.6f));
+        sceneStatusRecLabel.setColour(juce::Label::backgroundColourId,
+                                      recColour.withAlpha(recording ? 0.30f : 0.04f));
+        sceneStatusRecLabel.setColour(juce::Label::outlineColourId,
+                                      recColour.withAlpha(recording ? 0.8f : 0.2f));
+    }
+
+    // ---- Fill inspector binding header + expansion sync ----
+    {
+        sceneFillMoreButton.setToggleState(sceneFillInspectorExpanded, juce::dontSendNotification);
+        sceneFillMoreButton.setButtonText(sceneFillInspectorExpanded ? "Less" : "More");
+        const int bindingStep = getFocusedSceneChainStep();
+        const bool pinned = selectedSceneChainStep >= 0 && selectedSceneChainStep < chainLength;
+        juce::String bindingText;
+        if (bindingStep >= 0 && bindingStep < chainLength)
+        {
+            const int bindingScene = processor.getSceneChainStepSceneSlot(bindingStep);
+            const auto bindingType = processor.getSceneChainStepTransitionType(bindingStep);
+            bindingText << "Fill: S" << juce::String(bindingScene + 1)
+                        << " step " << juce::String(bindingStep + 1)
+                        << " - " << sceneChainTransitionTypeLabel(bindingType);
+            bindingText << (pinned ? "" : "  (following playback)");
+        }
+        else
+        {
+            bindingText = "No fill selected - click a connector chip";
+        }
+        if (sceneTransitionSummaryLabel.getText() != bindingText)
+            sceneTransitionSummaryLabel.setText(bindingText, juce::dontSendNotification);
+        juce::String bindingTooltip =
+            pinned ? "The fill editor is pinned to this chip. Click another chip to move it."
+                   : "No chip is pinned, so the editor follows the live playback step. Click a chip to pin.";
+        if (sceneFillSummaryInfoText.isNotEmpty())
+            bindingTooltip << "\n" << sceneFillSummaryInfoText;
+        sceneTransitionSummaryLabel.setTooltip(bindingTooltip);
+    }
+
+    if (sceneUndoToastButton.isVisible()
+        && sceneUndoToastExpiresMs != 0
+        && juce::Time::getMillisecondCounter() > sceneUndoToastExpiresMs)
+    {
+        hideSceneChainUndoToast();
     }
 
     const auto sceneWatcher = processor.getSceneWatcherState();
@@ -8060,8 +8322,8 @@ void SceneControlPanel::refreshFromProcessor()
                                            hasStoredSceneData ? juce::String()
                                                               : juce::String("EMPTY"));
         const auto identityColour = sceneSlotUiColour(processor, sceneSlot);
-        const auto emptySlotColour = juce::Colour(0xff394047);
-        const auto emptySlotFocusColour = juce::Colour(0xff56606b);
+        const auto emptySlotColour = kSurfaceHi;
+        const auto emptySlotFocusColour = kSurfaceHover;
         const auto queuedBlinkColour = hasStoredSceneData
             ? identityColour.interpolatedWith(juce::Colour(0xffd6a345), 0.36f)
             : emptySlotFocusColour.interpolatedWith(juce::Colour(0xffd6a345), 0.18f);
@@ -8174,13 +8436,243 @@ void SceneControlPanel::refreshFromProcessor()
     sceneTimelineCanvas.repaint();
 }
 
+void SceneControlPanel::captureSceneChainUndoSnapshot()
+{
+    sceneChainUndoSteps = snapshotSceneChainSteps(processor);
+    sceneChainUndoLoopEnabled = processor.isSceneChainLoopEnabled();
+    sceneChainUndoLoopStart = processor.getSceneChainLoopStartStep();
+    sceneChainUndoLoopEnd = processor.getSceneChainLoopEndStep();
+    sceneChainUndoAvailable = true;
+}
+
+void SceneControlPanel::showSceneChainUndoToast(const juce::String& message)
+{
+    // Fingerprint the chain as it stands after the destructive edit; the undo
+    // only fires while the chain still matches, so it can never clobber edits
+    // made after the toast appeared.
+    sceneChainUndoPostFingerprint = sceneChainStateFingerprint(processor);
+    sceneUndoToastButton.setButtonText(message);
+    const auto railBounds = sceneChainCanvas.getBounds();
+    const int toastWidth = juce::jlimit(160, 300, 40 + message.length() * 7);
+    sceneUndoToastButton.setBounds(railBounds.getRight() - toastWidth - 8,
+                                   railBounds.getBottom() - 26,
+                                   toastWidth,
+                                   22);
+    sceneUndoToastButton.setVisible(true);
+    sceneUndoToastButton.toFront(false);
+    sceneUndoToastExpiresMs = juce::Time::getMillisecondCounter() + 6000;
+}
+
+void SceneControlPanel::hideSceneChainUndoToast()
+{
+    sceneUndoToastButton.setVisible(false);
+    sceneUndoToastExpiresMs = 0;
+}
+
+void SceneControlPanel::setSceneGestureLegend(const juce::String& text)
+{
+    if (sceneGestureLegendOverride == text)
+        return;
+
+    sceneGestureLegendOverride = text;
+    if (text.isNotEmpty())
+        sceneDetailLabel.setText(text, juce::dontSendNotification);
+}
+
+void SceneControlPanel::showSceneChainStepContextMenu(int stepIndex)
+{
+    // The modal menu suppresses mouseExit, so clear hover/legend state here.
+    setSceneGestureLegend({});
+    sceneChainHoverStep = -1;
+    sceneChainHoverTransition = -1;
+
+    auto chainSteps = snapshotSceneChainSteps(processor);
+    const int chainLength = static_cast<int>(chainSteps.size());
+    if (stepIndex < 0 || stepIndex >= chainLength)
+        return;
+
+    const int sceneSlot = chainSteps[static_cast<size_t>(stepIndex)].sceneSlot;
+    const int currentRepeats = chainSteps[static_cast<size_t>(stepIndex)].repeats;
+
+    juce::PopupMenu repeatsMenu;
+    for (int repeats = 1; repeats <= 8; ++repeats)
+        repeatsMenu.addItem(100 + repeats,
+                            juce::String(repeats) + (repeats == 1 ? " time" : " times"),
+                            true,
+                            repeats == currentRepeats);
+
+    juce::PopupMenu menu;
+    menu.addSectionHeader("Step " + juce::String(stepIndex + 1)
+                          + " - Scene S" + juce::String(sceneSlot + 1));
+    menu.addSubMenu("Play repeats", repeatsMenu);
+    menu.addItem(2, "Duplicate step");
+    menu.addItem(3,
+                 "Insert focused scene after (S" + juce::String(getFocusedSceneSlot() + 1) + ")",
+                 chainLength < MlrVSTAudioProcessor::MaxSceneChainSteps);
+    menu.addSeparator();
+    menu.addItem(4, "Delete step");
+
+    menu.showMenuAsync(
+        juce::PopupMenu::Options().withTargetComponent(&sceneChainCanvas),
+        [safeThis = juce::Component::SafePointer<SceneControlPanel>(this), stepIndex](int result)
+        {
+            if (safeThis == nullptr || result == 0)
+                return;
+            auto& panel = *safeThis;
+            auto steps = snapshotSceneChainSteps(panel.processor);
+            const int length = static_cast<int>(steps.size());
+            if (stepIndex < 0 || stepIndex >= length)
+                return;
+            const bool loopEnabled = panel.processor.isSceneChainLoopEnabled();
+            const int loopStart = panel.processor.getSceneChainLoopStartStep();
+            const int loopEnd = panel.processor.getSceneChainLoopEndStep();
+
+            if (result > 100 && result <= 100 + MlrVSTAudioProcessor::MaxSceneRepeatCount)
+            {
+                steps[static_cast<size_t>(stepIndex)].repeats = result - 100;
+                applySceneChainSteps(panel.processor, steps, loopEnabled, loopStart, loopEnd);
+            }
+            else if (result == 2 && length < MlrVSTAudioProcessor::MaxSceneChainSteps)
+            {
+                steps.insert(steps.begin() + stepIndex + 1, steps[static_cast<size_t>(stepIndex)]);
+                applySceneChainSteps(panel.processor, steps, loopEnabled, loopStart, loopEnd);
+                panel.selectedSceneChainStep = stepIndex + 1;
+            }
+            else if (result == 3 && length < MlrVSTAudioProcessor::MaxSceneChainSteps)
+            {
+                MlrVSTAudioProcessor::SceneChainStep newStep;
+                newStep.sceneSlot = panel.getFocusedSceneSlot();
+                newStep.repeats = 1;
+                steps.insert(steps.begin() + stepIndex + 1, newStep);
+                applySceneChainSteps(panel.processor, steps, loopEnabled, loopStart, loopEnd);
+                panel.selectedSceneChainStep = stepIndex + 1;
+            }
+            else if (result == 4)
+            {
+                panel.captureSceneChainUndoSnapshot();
+                steps.erase(steps.begin() + stepIndex);
+                applySceneChainSteps(panel.processor, steps, loopEnabled, loopStart, loopEnd);
+                if (panel.selectedSceneChainStep >= static_cast<int>(steps.size()))
+                    panel.selectedSceneChainStep = -1;
+                panel.showSceneChainUndoToast("Step " + juce::String(stepIndex + 1) + " deleted - Undo");
+            }
+            panel.refreshFromProcessor();
+        });
+}
+
+void SceneControlPanel::showSceneChainTransitionContextMenu(int transitionIndex)
+{
+    // The modal menu suppresses mouseExit, so clear hover/legend state here.
+    setSceneGestureLegend({});
+    sceneChainHoverStep = -1;
+    sceneChainHoverTransition = -1;
+
+    const int chainLength = processor.getSceneChainLength();
+    if (transitionIndex < 0 || transitionIndex >= chainLength)
+        return;
+
+    using TransitionType = MlrVSTAudioProcessor::SceneChainTransitionType;
+    using TransitionOption = MlrVSTAudioProcessor::SceneChainTransitionOption;
+    const auto currentType = processor.getSceneChainStepTransitionType(transitionIndex);
+    const auto currentOption = processor.getSceneChainStepTransitionOption(transitionIndex);
+    const bool subtracts = processor.getSceneChainStepTransitionSubtractsFromSceneLength(transitionIndex);
+    const bool audibleFill = currentType != TransitionType::None && currentType != TransitionType::Return;
+
+    juce::PopupMenu typeMenu;
+    for (int typeIndex = 0; typeIndex <= static_cast<int>(TransitionType::Return); ++typeIndex)
+    {
+        const auto type = static_cast<TransitionType>(typeIndex);
+        typeMenu.addItem(200 + typeIndex, sceneChainTransitionTypeLabel(type), true, type == currentType);
+    }
+
+    juce::PopupMenu styleMenu;
+    for (int optionIndex = 0; optionIndex <= static_cast<int>(TransitionOption::Gate); ++optionIndex)
+    {
+        const auto option = static_cast<TransitionOption>(optionIndex);
+        styleMenu.addItem(300 + optionIndex, sceneChainTransitionOptionLabel(option), audibleFill, option == currentOption);
+    }
+
+    juce::PopupMenu applyFavoriteMenu;
+    juce::PopupMenu storeFavoriteMenu;
+    for (int favoriteIndex = 0; favoriteIndex < MlrVSTAudioProcessor::SceneTransitionFavoriteSlots; ++favoriteIndex)
+    {
+        applyFavoriteMenu.addItem(400 + favoriteIndex,
+                                  "F" + juce::String(favoriteIndex + 1),
+                                  processor.hasSceneTransitionFavorite(favoriteIndex));
+        storeFavoriteMenu.addItem(500 + favoriteIndex,
+                                  "F" + juce::String(favoriteIndex + 1)
+                                      + (processor.hasSceneTransitionFavorite(favoriteIndex) ? " (overwrite)" : ""));
+    }
+
+    juce::PopupMenu menu;
+    menu.addSectionHeader("Fill: step " + juce::String(transitionIndex + 1)
+                          + (transitionIndex + 1 < chainLength
+                                 ? " > " + juce::String(transitionIndex + 2)
+                                 : " > loop start"));
+    menu.addSubMenu("Type", typeMenu);
+    menu.addSubMenu("Style", styleMenu, audibleFill);
+    menu.addItem(6, "Shorten scene (lead subtracts)", audibleFill, subtracts);
+    menu.addItem(7, "Edit end sample...", audibleFill);
+    menu.addSeparator();
+    menu.addSubMenu("Apply favorite", applyFavoriteMenu);
+    menu.addSubMenu("Store as favorite", storeFavoriteMenu);
+    menu.addSeparator();
+    menu.addItem(8, "Reset to None", currentType != TransitionType::None);
+
+    menu.showMenuAsync(
+        juce::PopupMenu::Options().withTargetComponent(&sceneChainCanvas),
+        [safeThis = juce::Component::SafePointer<SceneControlPanel>(this), transitionIndex](int result)
+        {
+            if (safeThis == nullptr || result == 0)
+                return;
+            auto& panel = *safeThis;
+            if (transitionIndex < 0 || transitionIndex >= panel.processor.getSceneChainLength())
+                return;
+
+            panel.selectedSceneChainStep = transitionIndex;
+            if (result >= 200 && result <= 200 + static_cast<int>(TransitionType::Return))
+            {
+                panel.processor.setSceneChainStepTransitionType(
+                    transitionIndex, static_cast<TransitionType>(result - 200));
+            }
+            else if (result >= 300 && result <= 300 + static_cast<int>(TransitionOption::Gate))
+            {
+                panel.processor.setSceneChainStepTransitionOption(
+                    transitionIndex, static_cast<TransitionOption>(result - 300));
+            }
+            else if (result >= 400 && result < 400 + MlrVSTAudioProcessor::SceneTransitionFavoriteSlots)
+            {
+                panel.processor.applySceneTransitionFavorite(result - 400, transitionIndex);
+            }
+            else if (result >= 500 && result < 500 + MlrVSTAudioProcessor::SceneTransitionFavoriteSlots)
+            {
+                panel.processor.captureSceneTransitionFavorite(result - 500, transitionIndex);
+            }
+            else if (result == 6)
+            {
+                panel.processor.setSceneChainStepTransitionSubtractsFromSceneLength(
+                    transitionIndex,
+                    !panel.processor.getSceneChainStepTransitionSubtractsFromSceneLength(transitionIndex));
+            }
+            else if (result == 7)
+            {
+                panel.openSceneTransitionEndSampleEditor(transitionIndex);
+            }
+            else if (result == 8)
+            {
+                panel.processor.setSceneChainStepTransitionType(transitionIndex, TransitionType::None);
+            }
+            panel.refreshFromProcessor();
+        });
+}
+
 void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
 {
     const auto layout = makeSceneChainLayout(sceneChainCanvas.getLocalBounds().toFloat());
-    g.setColour(juce::Colour(0xff161b1f));
-    g.fillRoundedRectangle(layout.bounds, 8.0f);
-    g.setColour(juce::Colours::white.withAlpha(0.08f));
-    g.drawRoundedRectangle(layout.bounds.reduced(0.5f), 8.0f, 1.0f);
+    g.setColour(kWell);
+    g.fillRoundedRectangle(layout.bounds, kRadiusL);
+    g.setColour(kStroke);
+    g.drawRoundedRectangle(layout.bounds.reduced(0.5f), kRadiusL, 1.0f);
 
     const int chainLength = processor.getSceneChainLength();
     const bool loopEnabled = processor.isSceneChainLoopEnabled();
@@ -8195,14 +8687,22 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
                        MlrVSTAudioProcessor::MaxSceneChainSteps - 1,
                        sceneChainExternalDropStep)
         : -1;
-    const int queuedSceneSlot = processor.getQueuedSceneSlot();
-    int queuedStep = -1;
-    for (int stepIndex = 0; stepIndex < chainLength; ++stepIndex)
+    const auto chainStatus = processor.getSceneChainPlaybackStatus();
+    // Sequence-driven queues know their exact step; fall back to first
+    // slot-match only for manual (non-chain) queued recalls.
+    int queuedStep = (chainStatus.queuedStepIndex >= 0 && chainStatus.queuedStepIndex < chainLength)
+        ? chainStatus.queuedStepIndex
+        : -1;
+    if (queuedStep < 0)
     {
-        if (processor.getSceneChainStepSceneSlot(stepIndex) == queuedSceneSlot)
+        const int queuedSceneSlot = processor.getQueuedSceneSlot();
+        for (int stepIndex = 0; stepIndex < chainLength; ++stepIndex)
         {
-            queuedStep = stepIndex;
-            break;
+            if (processor.getSceneChainStepSceneSlot(stepIndex) == queuedSceneSlot)
+            {
+                queuedStep = stepIndex;
+                break;
+            }
         }
     }
 
@@ -8264,63 +8764,31 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
                 g.setColour(chipColour.withAlpha(0.10f + (0.10f * pulse)));
                 g.fillRoundedRectangle(chipBounds.expanded(3.0f, 2.5f), 7.5f);
             }
-            g.setColour(juce::Colours::black.withAlpha(0.22f));
-            g.fillRoundedRectangle(chipBounds.translated(0.0f, 1.0f), 5.8f);
-            juce::ColourGradient chipGradient(chipSecondaryColour.withAlpha(noTransition
-                                                                                ? ((hovered || focused) ? 0.58f : 0.44f)
-                                                                                : ((hovered || focused || transitionLive) ? 0.94f : 0.82f)),
-                                              chipBounds.getX(),
-                                              chipBounds.getBottom(),
-                                              chipColour.withAlpha(noTransition
-                                                                       ? ((hovered || focused) ? 0.32f : 0.20f)
-                                                                       : ((hovered || focused || transitionLive) ? 0.98f : 0.88f)),
-                                              chipBounds.getRight(),
-                                              chipBounds.getY(),
-                                              false);
-            g.setGradientFill(chipGradient);
-            g.fillRoundedRectangle(chipBounds, 5.8f);
-            if (!noTransition)
-            {
-                auto topSheen = chipBounds.reduced(1.0f).removeFromTop(chipBounds.getHeight() * 0.45f);
-                juce::ColourGradient sheenGradient(juce::Colours::white.withAlpha((hovered || focused) ? 0.14f : 0.09f),
-                                                   topSheen.getCentreX(),
-                                                   topSheen.getY(),
-                                                   juce::Colours::transparentBlack,
-                                                   topSheen.getCentreX(),
-                                                   topSheen.getBottom(),
-                                                   false);
-                g.setGradientFill(sheenGradient);
-                g.fillRoundedRectangle(topSheen, 4.8f);
-            }
+            juce::ignoreUnused(chipSecondaryColour);
+            g.setColour(chipColour.withAlpha(noTransition
+                                                 ? ((hovered || focused) ? 0.30f : 0.20f)
+                                                 : ((hovered || focused || transitionLive) ? 0.96f : 0.85f)));
+            g.fillRoundedRectangle(chipBounds, kRadiusS);
             g.setColour(chipOutline);
-            g.drawRoundedRectangle(chipBounds.reduced(0.5f), 5.8f, (hovered || focused) ? 1.15f : 1.0f);
+            g.drawRoundedRectangle(chipBounds.reduced(0.5f), kRadiusS, (hovered || focused) ? 1.15f : 1.0f);
 
             if (transitionLive)
             {
                 const float pulse = 0.5f + (0.5f * std::sin(static_cast<float>(
                     juce::Time::getMillisecondCounterHiRes() * 0.0105)));
-                g.setColour(juce::Colours::white.withAlpha(0.62f + (0.22f * pulse)));
-                g.drawRoundedRectangle(chipBounds.expanded(1.4f, 1.2f), 6.1f, 1.45f);
-                g.setColour(chipColour.brighter(0.45f).withAlpha(0.52f + (0.20f * pulse)));
-                g.drawRoundedRectangle(chipBounds.expanded(2.4f, 2.0f), 7.2f, 1.0f);
+                g.setColour(chipColour.brighter(0.45f).withAlpha(0.45f + (0.35f * pulse)));
+                g.drawRoundedRectangle(chipBounds.expanded(1.8f, 1.5f), kRadiusS + 1.5f, 1.4f);
             }
 
             auto chipLabelBounds = chipBounds.reduced(4.0f, 2.0f);
             g.setColour(noTransition
                             ? kTextPrimary.withAlpha((hovered || focused) ? 0.92f : 0.78f)
                             : chipColour.contrasting(0.82f).withAlpha((hovered || focused) ? 0.98f : 0.94f));
-            g.setFont(juce::Font(juce::FontOptions(7.0f, juce::Font::bold)));
+            g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
             g.drawFittedText(sceneChainTransitionChipLabel(transitionType),
                              chipLabelBounds.toNearestInt(),
                              juce::Justification::centred,
                              1);
-
-            if (hovered || focused)
-            {
-                g.setColour((focused ? juce::Colours::white.withAlpha(0.34f)
-                                     : juce::Colours::white.withAlpha(0.22f)));
-                g.drawRoundedRectangle(chipBounds.reduced(0.5f), 6.0f, 1.0f);
-            }
 
             if (sceneChainDragTransition == stepIndex)
             {
@@ -8344,7 +8812,7 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
                 g.setColour(chipColour.withAlpha(0.82f));
                 g.drawRoundedRectangle(dragBounds.reduced(0.5f), 4.0f, 0.95f);
                 g.setColour(kTextPrimary.withAlpha(0.98f));
-                g.setFont(juce::Font(juce::FontOptions(5.8f, juce::Font::bold)));
+                g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
                 g.drawFittedText(dragText,
                                  dragBounds.reduced(3.0f, 0.0f).toNearestInt(),
                                  juce::Justification::centred,
@@ -8401,6 +8869,19 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
         loopIcon.lineTo(iconBounds.getX() + 1.4f, iconBounds.getBottom() - 1.9f);
         loopIcon.lineTo(iconBounds.getX() + 2.5f, iconBounds.getBottom() - 4.1f);
         g.strokePath(loopIcon, juce::PathStrokeType(1.25f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+        if (clampBounds.getWidth() > 130.0f)
+        {
+            g.setColour(loopColour.withAlpha(chainActive ? 0.92f : 0.6f));
+            g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+            g.drawText("LOOP",
+                       juce::Rectangle<float>(iconBounds.getRight() + 8.0f,
+                                              clampBounds.getY() - 1.0f,
+                                              34.0f,
+                                              clampBounds.getHeight() + 2.0f).toNearestInt(),
+                       juce::Justification::centredLeft,
+                       false);
+        }
     }
 
     for (int stepIndex = 0; stepIndex < MlrVSTAudioProcessor::MaxSceneChainSteps; ++stepIndex)
@@ -8443,6 +8924,41 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
         }
         g.setColour(fill);
         g.fillRoundedRectangle(drawBounds, 7.0f);
+        if (active)
+        {
+            const float progress = juce::jlimit(0.0f, 1.0f, chainStatus.progress01);
+            if (progress > 0.0f)
+            {
+                // Left-to-right progress fill tracking position within this
+                // step (all repeats included).
+                juce::Graphics::ScopedSaveState progressClip(g);
+                auto progressBounds = drawBounds;
+                progressBounds.setWidth(drawBounds.getWidth() * progress);
+                g.reduceClipRegion(progressBounds.toNearestInt());
+                g.setColour(juce::Colours::white.withAlpha(0.30f));
+                g.fillRoundedRectangle(drawBounds, 7.0f);
+            }
+
+            // Bright pulsing playhead line at the progress edge — the "you are
+            // here" marker readable from across the room.
+            const float playheadPulse = 0.5f + (0.5f * std::sin(static_cast<float>(
+                juce::Time::getMillisecondCounterHiRes() * 0.008)));
+            const float playheadX = drawBounds.getX() + 1.5f
+                + ((drawBounds.getWidth() - 3.0f) * progress);
+            g.setColour(juce::Colours::white.withAlpha(0.72f + (0.28f * playheadPulse)));
+            g.fillRoundedRectangle(playheadX - 1.4f,
+                                   drawBounds.getY() + 2.0f,
+                                   2.8f,
+                                   drawBounds.getHeight() - 4.0f,
+                                   1.3f);
+        }
+        if (queued)
+        {
+            const float pulse = 0.5f + (0.5f * std::sin(static_cast<float>(
+                juce::Time::getMillisecondCounterHiRes() * 0.006)));
+            g.setColour(juce::Colour(0xfff0c567).withAlpha(0.30f + (0.35f * pulse)));
+            g.drawRoundedRectangle(drawBounds.expanded(1.6f, 1.6f), 8.2f, 1.4f);
+        }
         g.setColour(outline);
         g.drawRoundedRectangle(drawBounds.reduced(0.5f), 7.0f, (active || focused) ? 1.4f : 1.0f);
 
@@ -8459,24 +8975,31 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
         if (occupied)
         {
             const auto sceneName = sceneSlotShortDisplayName(processor, sceneSlot, 18);
-            const juce::String sceneNameText = sceneName.isNotEmpty()
+            juce::String sceneNameText = sceneName.isNotEmpty()
                 ? sceneName
                 : ("Scene " + juce::String(sceneSlot + 1));
-            auto topRow = bodyBounds.removeFromTop(11.0f);
+            // Below ~40px there is no room for badge/status rows; the cell
+            // shows a single "S3 · name" line instead of clipping to nothing.
+            const bool compactCell = stepBounds.getHeight() < 40.0f;
+            auto topRow = compactCell ? juce::Rectangle<float>() : bodyBounds.removeFromTop(11.0f);
             auto nameBounds = bodyBounds;
+            if (compactCell)
+                sceneNameText = "S" + juce::String(sceneSlot + 1) + " " + sceneNameText;
 
+            if (!compactCell)
+            {
             auto slotBadge = topRow.removeFromLeft(18.0f);
             g.setColour(juce::Colour(0xff0f1215).withAlpha(active ? 0.88f : 0.74f));
             g.fillRoundedRectangle(slotBadge, 3.5f);
             g.setColour(active ? juce::Colours::white.withAlpha(0.94f) : kTextPrimary.withAlpha(0.88f));
-            g.setFont(juce::Font(juce::FontOptions(7.0f, juce::Font::bold)));
+            g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
             g.drawText("S" + juce::String(sceneSlot + 1),
                        slotBadge.toNearestInt(),
                        juce::Justification::centred,
                        false);
 
             g.setColour(juce::Colour(0xff0f1215).withAlpha(0.72f));
-            g.setFont(juce::Font(juce::FontOptions(6.8f, juce::Font::bold)));
+            g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
             g.drawText("#" + juce::String(stepIndex + 1),
                        juce::Rectangle<float>(topRow.getX() + 2.0f, topRow.getY(), 18.0f, topRow.getHeight()).toNearestInt(),
                        juce::Justification::centredLeft,
@@ -8485,16 +9008,42 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
             if (active || queued)
             {
                 g.setColour(active ? juce::Colour(0xff0f1215).withAlpha(0.92f) : juce::Colour(0xfff6e2aa).withAlpha(0.92f));
-                g.setFont(juce::Font(juce::FontOptions(6.8f, juce::Font::bold)));
+                g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
                 g.drawText(active ? "LIVE" : "NEXT",
                            topRow.toNearestInt(),
                            juce::Justification::centredRight,
                            false);
             }
+            }
+
+            const int stepRepeats = processor.getSceneChainStepRepeatCount(stepIndex);
+            auto bottomRow = compactCell ? juce::Rectangle<float>() : nameBounds.removeFromBottom(9.0f);
+            if (!compactCell && (stepRepeats > 1 || (active && chainStatus.repeatCount > 1)))
+            {
+                g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+                if (active && chainStatus.repeatCount > 1)
+                {
+                    g.setColour(juce::Colour(0xff0f1215).withAlpha(0.85f));
+                    g.drawText("REP " + juce::String(chainStatus.repeatIndex) + "/"
+                                   + juce::String(chainStatus.repeatCount),
+                               bottomRow.toNearestInt(),
+                               juce::Justification::centredLeft,
+                               false);
+                }
+                if (stepRepeats > 1)
+                {
+                    g.setColour(active ? juce::Colour(0xff0f1215).withAlpha(0.9f)
+                                       : juce::Colour(0xffd7e6bd).withAlpha(0.92f));
+                    g.drawText(juce::String(juce::CharPointer_UTF8("\xc3\x97")) + juce::String(stepRepeats),
+                               bottomRow.toNearestInt(),
+                               juce::Justification::centredRight,
+                               false);
+                }
+            }
 
             g.setColour(active ? juce::Colour(0xff0e1114)
                                : (focused ? kTextPrimary.withAlpha(0.98f) : kTextPrimary.withAlpha(0.92f)));
-            g.setFont(juce::Font(juce::FontOptions(8.8f, juce::Font::bold)));
+            g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
             g.drawFittedText(sceneNameText,
                              nameBounds.toNearestInt(),
                              juce::Justification::centred,
@@ -8505,7 +9054,7 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
         {
             const bool nextInsertSlot = stepIndex == chainLength;
             g.setColour(kTextMuted.withAlpha(nextInsertSlot ? 0.82f : 0.36f));
-            g.setFont(juce::Font(juce::FontOptions(7.8f, juce::Font::bold)));
+            g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
             g.drawText(nextInsertSlot ? "Add" : "Empty",
                        bodyBounds.toNearestInt(),
                        juce::Justification::centred,
@@ -8539,7 +9088,7 @@ void SceneControlPanel::paintSceneChainCanvas(juce::Graphics& g) const
         g.setColour(juce::Colour(0xff101214).withAlpha(0.95f));
         g.drawRoundedRectangle(markerTag.reduced(0.5f), 5.0f, 1.0f);
         g.setColour(juce::Colour(0xff101214));
-        g.setFont(juce::Font(juce::FontOptions(7.4f, juce::Font::bold)));
+        g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
         g.drawText("DROP S" + juce::String(sceneSlotDragSource + 1),
                    markerTag.toNearestInt(),
                    juce::Justification::centred,
@@ -8586,6 +9135,12 @@ void SceneControlPanel::handleSceneChainMouseDown(const juce::MouseEvent& e)
     if (hitTransition >= 0 && hitTransition < chainLength)
     {
         selectedSceneChainStep = hitTransition;
+        if (e.mods.isPopupMenu())
+        {
+            refreshFromProcessor();
+            showSceneChainTransitionContextMenu(hitTransition);
+            return;
+        }
         sceneChainDragTransition = hitTransition;
         sceneChainDragTransitionStartPosition = e.position;
         sceneChainDragTransitionStartLengthBeats =
@@ -8602,24 +9157,15 @@ void SceneControlPanel::handleSceneChainMouseDown(const juce::MouseEvent& e)
         return;
     }
 
+    // Right-click opens the step menu; destructive actions live there
+    // (with undo), never on a bare click.
     if (e.mods.isPopupMenu())
     {
         if (hitStep < chainLength)
         {
-            chainSteps.erase(chainSteps.begin() + hitStep);
-            applySceneChainSteps(processor, chainSteps, loopEnabled, loopStart, loopEnd);
+            selectedSceneChainStep = hitStep;
             refreshFromProcessor();
-        }
-        return;
-    }
-
-    if (e.mods.isAltDown())
-    {
-        if (hitStep < chainLength)
-        {
-            chainSteps.erase(chainSteps.begin() + hitStep);
-            applySceneChainSteps(processor, chainSteps, loopEnabled, loopStart, loopEnd);
-            refreshFromProcessor();
+            showSceneChainStepContextMenu(hitStep);
         }
         return;
     }
@@ -8672,15 +9218,15 @@ void SceneControlPanel::handleSceneChainMouseDoubleClick(const juce::MouseEvent&
     if (hitTransition < 0 || hitTransition >= chainLength)
         return;
 
-    const auto transitionType = processor.getSceneChainStepTransitionType(hitTransition);
-    if (transitionType == MlrVSTAudioProcessor::SceneChainTransitionType::None
-        || transitionType == MlrVSTAudioProcessor::SceneChainTransitionType::Return)
-        return;
-
+    // Double-click opens the full fill editor for the chip (Shorten/Ride and
+    // everything else live there and in the right-click menu).
     selectedSceneChainStep = hitTransition;
-    processor.setSceneChainStepTransitionSubtractsFromSceneLength(
-        hitTransition,
-        !processor.getSceneChainStepTransitionSubtractsFromSceneLength(hitTransition));
+    if (!sceneFillInspectorExpanded)
+    {
+        sceneFillInspectorExpanded = true;
+        sceneFillMoreButton.setToggleState(true, juce::dontSendNotification);
+        resized();
+    }
     refreshFromProcessor();
 }
 
@@ -8787,10 +9333,56 @@ void SceneControlPanel::handleSceneChainMouseMove(const juce::MouseEvent& e)
         sceneChainHoverTransition = hitTransition;
         sceneChainCanvas.repaint();
     }
+
+    // Live gesture legend: rewrite the detail line for whatever the cursor is
+    // over, so every canvas gesture is discoverable at the point of use.
+    const int chainLength = processor.getSceneChainLength();
+    juce::String legend;
+    bool overLoopClamp = false;
+    if (processor.isSceneChainLoopEnabled() && chainLength >= 2)
+    {
+        const auto loopClampBounds = sceneChainLoopClampBounds(layout,
+                                                               processor.getSceneChainLoopStartStep(),
+                                                               processor.getSceneChainLoopEndStep());
+        overLoopClamp = !loopClampBounds.isEmpty()
+            && loopClampBounds.expanded(4.0f, 6.0f).contains(e.position);
+    }
+    if (overLoopClamp)
+    {
+        legend = "Loop clamp: edits the loopback fill (last chip) - same gestures as a chip";
+    }
+    else if (hitTransition >= 0 && hitTransition < chainLength)
+    {
+        const bool returnRoute = processor.getSceneChainStepTransitionType(hitTransition)
+            == MlrVSTAudioProcessor::SceneChainTransitionType::Return;
+        legend = returnRoute
+            ? juce::String("Route chip: Wheel When - ") + juce::String(juce::CharPointer_UTF8("\xe2\x8c\xa5")) + "Wheel Type - Right-click menu - Dbl-click full editor"
+            : juce::String("Chip: Drag") + juce::String(juce::CharPointer_UTF8("\xe2\x86\x92")) + " Lead - Drag" + juce::String(juce::CharPointer_UTF8("\xe2\x86\x93")) + " Blend - Wheel Style - "
+              + juce::String(juce::CharPointer_UTF8("\xe2\x87\xa7")) + "Lead "
+              + juce::String(juce::CharPointer_UTF8("\xe2\x8c\x98")) + "Blend "
+              + juce::String(juce::CharPointer_UTF8("\xe2\x8c\xa5")) + "Type "
+              + juce::String(juce::CharPointer_UTF8("\xe2\x87\xa7\xe2\x8c\x98")) + "Scope "
+              + juce::String(juce::CharPointer_UTF8("\xe2\x87\xa7\xe2\x8c\xa5")) + "Contour "
+              + juce::String(juce::CharPointer_UTF8("\xe2\x8c\x98\xe2\x8c\xa5")) + "When - Right-click menu";
+    }
+    else if (hitStep >= 0 && hitStep < chainLength)
+    {
+        legend = juce::String("Step: Click focus - Drag reorder - Wheel repeats (")
+            + juce::String(juce::CharPointer_UTF8("\xc3\x97"))
+            + juce::String(processor.getSceneChainStepRepeatCount(hitStep))
+            + ") - Right-click menu";
+    }
+    else if (hitStep >= chainLength && hitStep >= 0)
+    {
+        legend = "Empty cell: Click appends the focused scene (S"
+            + juce::String(getFocusedSceneSlot() + 1) + ")";
+    }
+    setSceneGestureLegend(legend);
 }
 
 void SceneControlPanel::handleSceneChainMouseExit(const juce::MouseEvent&)
 {
+    setSceneGestureLegend({});
     if (sceneChainDragTransition >= 0)
         return;
 
@@ -8813,38 +9405,14 @@ void SceneControlPanel::handleSceneChainMouseUp(const juce::MouseEvent& e)
         const int chainLength = processor.getSceneChainLength();
         if (dragTransition >= 0 && dragTransition < chainLength)
         {
+            // A plain chip click only selects; mutations live in the wheel
+            // matrices, the inspector, and the right-click menu. Alt-click
+            // stays as the expert shortcut for resetting to None.
             selectedSceneChainStep = dragTransition;
-            if (!transitionDragMoved)
+            if (!transitionDragMoved && e.mods.isAltDown())
             {
-                auto transitionType = processor.getSceneChainStepTransitionType(dragTransition);
-                if (e.mods.isAltDown())
-                {
-                    transitionType = MlrVSTAudioProcessor::SceneChainTransitionType::None;
-                }
-                else if (e.mods.isRightButtonDown() || e.mods.isCtrlDown())
-                {
-                    transitionType = previousSceneChainTransitionType(transitionType);
-                }
-                else
-                {
-                    transitionType = nextSceneChainTransitionType(transitionType);
-                }
-
-                processor.setSceneChainStepTransitionType(dragTransition, transitionType);
-                if (sceneTransitionSmartLinkEnabled
-                    && transitionType != MlrVSTAudioProcessor::SceneChainTransitionType::None
-                    && transitionType != MlrVSTAudioProcessor::SceneChainTransitionType::Return)
-                {
-                    applySceneTransitionSmartTuning(dragTransition,
-                                                    transitionType,
-                                                    processor.getSceneChainStepTransitionOption(dragTransition),
-                                                    processor.getSceneChainStepTransitionIntensity(dragTransition),
-                                                    processor.getSceneChainStepTransitionLengthBeats(dragTransition),
-                                                    processor.getSceneChainStepTransitionSubtractsFromSceneLength(dragTransition),
-                                                    false,
-                                                    false);
-                    return;
-                }
+                processor.setSceneChainStepTransitionType(
+                    dragTransition, MlrVSTAudioProcessor::SceneChainTransitionType::None);
             }
 
             refreshFromProcessor();
@@ -9124,6 +9692,11 @@ void SceneControlPanel::handleSceneChainMouseWheel(const juce::MouseEvent& e, co
     const int loopEnd = processor.getSceneChainLoopEndStep();
     step.repeats = newRepeats;
     applySceneChainSteps(processor, chainSteps, loopEnabled, loopStart, loopEnd);
+    // The hover legend shows the repeat count; refresh it with the new value.
+    setSceneGestureLegend(juce::String("Step: Click focus - Drag reorder - Wheel repeats (")
+                          + juce::String(juce::CharPointer_UTF8("\xc3\x97"))
+                          + juce::String(newRepeats)
+                          + ") - Right-click menu");
     refreshFromProcessor();
 }
 
@@ -9764,7 +10337,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
         g.fillRoundedRectangle(globalLayout.cardBounds.withWidth(3.0f).reduced(0.0f, 6.0f), 1.5f);
 
         g.setColour(globalColour);
-        g.setFont(juce::Font(juce::FontOptions(12.0f, juce::Font::bold)));
+        g.setFont(juce::Font(juce::FontOptions(13.0f, juce::Font::bold)));
         g.drawText("GLOBAL",
                    globalLayout.titleBounds.toNearestInt(),
                    juce::Justification::centredLeft);
@@ -9790,7 +10363,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
         if (scaleLabels[0].isNotEmpty() || scaleLabels[1].isNotEmpty() || scaleLabels[2].isNotEmpty())
         {
             g.setColour(kTextMuted.withAlpha(0.82f));
-            g.setFont(juce::Font(juce::FontOptions(8.0f)));
+            g.setFont(juce::Font(juce::FontOptions(9.0f)));
             g.drawText(scaleLabels[0],
                        juce::Rectangle<int>(static_cast<int>(globalLayout.laneBounds.getX() + 4.0f),
                                             static_cast<int>(globalLayout.laneBounds.getY() + 1.0f),
@@ -9971,7 +10544,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
         if (globalEventCount == 0)
         {
             g.setColour(kTextMuted.withAlpha(0.42f));
-            g.setFont(juce::Font(juce::FontOptions(8.4f)));
+            g.setFont(juce::Font(juce::FontOptions(9.0f)));
             g.drawText("Double-click to add " + sceneAutomationLaneCreateHint(globalLane),
                        globalLayout.laneBounds.toNearestInt(),
                        juce::Justification::centredRight);
@@ -9981,8 +10554,8 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
         {
             const float headX = globalLayout.laneBounds.getX()
                 + (globalLayout.laneBounds.getWidth() * sceneEditorState.transportProgress);
-            const auto headColour = (sceneEditorState.transportRecording ? juce::Colour(0xffd46b62)
-                                                                         : juce::Colour(0xff76be7e)).withAlpha(0.95f);
+            const auto headColour = (sceneEditorState.transportRecording ? kRec
+                                                                         : kLive).withAlpha(0.95f);
             g.setColour(headColour);
             g.drawLine(headX,
                        globalLayout.cardBounds.getY() + 2.0f,
@@ -10037,7 +10610,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
         }
 
         g.setColour(stripColour);
-        g.setFont(juce::Font(juce::FontOptions(12.0f, juce::Font::bold)));
+        g.setFont(juce::Font(juce::FontOptions(13.0f, juce::Font::bold)));
         g.drawText("STRIP " + juce::String(visibleStrip + 1),
                    layout.titleBounds.toNearestInt(),
                    juce::Justification::centredLeft);
@@ -10375,7 +10948,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
             else if (!stripHasEvents)
             {
                 g.setColour(kTextMuted.withAlpha(0.52f));
-                g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+                g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
                 const auto openHintBounds = juce::Rectangle<float>(layout.triggerTimelineBounds.getRight() - 38.0f,
                                                                    layout.triggerTimelineBounds.getY(),
                                                                    34.0f,
@@ -10558,7 +11131,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                         ? (juce::String(barNumber) + "." + juce::String(beatInBar))
                         : ("B" + juce::String(barNumber));
                     g.setColour(kTextMuted.withAlpha(isBarStart ? 0.95f : 0.72f));
-                    g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+                    g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
                     g.drawText(label,
                                juce::Rectangle<int>(static_cast<int>(std::round(x + 2.0f)),
                                                     static_cast<int>(layout.rulerTimelineBounds.getY()),
@@ -10618,7 +11191,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                      layout.triggerTimelineBounds.getRight() - 1.0f);
             }
 
-            g.setFont(juce::Font(juce::FontOptions(7.6f, juce::Font::bold)));
+            g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
             for (const auto& guide : std::array<std::pair<int, const char*>, 3>{{
                      {15, "16"}, {8, "9"}, {0, "1"}
                  }})
@@ -10741,7 +11314,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
             g.setColour(stripColour.withAlpha(0.28f));
             g.drawRoundedRectangle(layout.triggerTimelineBounds.reduced(0.8f), 4.0f, 1.0f);
             g.setColour(kTextPrimary.withAlpha(0.92f));
-            g.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+            g.setFont(juce::Font(juce::FontOptions(11.5f, juce::Font::bold)));
             g.drawText(sceneStripPlaybackUnavailableReason(processor, visibleStrip),
                        layout.triggerTimelineBounds.toNearestInt().reduced(12, 10),
                        juce::Justification::centred,
@@ -10838,19 +11411,8 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                            1.25f);
                 }
                 g.setColour(kTextMuted);
-                g.setFont(juce::Font(juce::FontOptions(8.8f, juce::Font::bold)));
+                g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
                 g.drawText(sceneAutomationLaneName(lane), nameBounds.toNearestInt(), juce::Justification::centredLeft);
-                if (laneOverrideActive)
-                {
-                    drawSceneHeaderActionChip(g,
-                                              juce::Rectangle<float>(laneBounds.getRight() - 50.0f,
-                                                                     laneBounds.getY() + 2.0f,
-                                                                     44.0f,
-                                                                     12.0f),
-                                              "Manual",
-                                              kAccent,
-                                              true);
-                }
 
                 g.setColour(kSurfaceDark.brighter(0.03f));
                 g.fillRoundedRectangle(laneBounds, 3.0f);
@@ -10873,7 +11435,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                          laneBounds.getX() + 2.0f,
                                          laneBounds.getRight() - 2.0f);
                     const auto scaleLabels = sceneAutomationLaneScaleLabels(lane);
-                    g.setFont(juce::Font(juce::FontOptions(7.3f, juce::Font::bold)));
+                    g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
                     g.setColour(laneTint.withAlpha(0.88f));
                     g.drawText(scaleLabels[0],
                                juce::Rectangle<int>(static_cast<int>(laneBounds.getX() + 4.0f),
@@ -11130,7 +11692,7 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                                                                                        24.0f,
                                                                                        9.0f);
                                 g.setColour(labelColour);
-                                g.setFont(juce::Font(juce::FontOptions(7.0f, juce::Font::bold)));
+                                g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
                                 g.drawText(sceneControlTargetShortName(target),
                                            overlayLabelBounds.toNearestInt(),
                                            juce::Justification::centred,
@@ -11143,10 +11705,24 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
                 if (laneEventCount == 0 && !showLiveHoldOverlay)
                 {
                     g.setColour(kTextMuted.withAlpha(0.42f));
-                    g.setFont(juce::Font(juce::FontOptions(8.4f)));
+                    g.setFont(juce::Font(juce::FontOptions(9.0f)));
                     g.drawText("Double-click to add " + sceneAutomationLaneCreateHint(lane),
                                laneBounds.toNearestInt(),
                                juce::Justification::centredRight);
+                }
+
+                // Drawn last so the override indicator sits above the lane
+                // fill, grid, and curves.
+                if (laneOverrideActive)
+                {
+                    drawSceneHeaderActionChip(g,
+                                              juce::Rectangle<float>(laneBounds.getRight() - 50.0f,
+                                                                     laneBounds.getY() + 2.0f,
+                                                                     44.0f,
+                                                                     12.0f),
+                                              "Manual",
+                                              kAccent,
+                                              true);
                 }
             }
         }
@@ -11156,8 +11732,8 @@ void SceneControlPanel::paintSceneTimelineCanvas(juce::Graphics& g) const
             const auto headBounds = stepTriggerLane ? triggerTimeBounds : layout.triggerTimelineBounds;
             const float headX = headBounds.getX()
                 + (headBounds.getWidth() * sceneEditorState.transportProgress);
-            const auto headColour = (sceneEditorState.transportRecording ? juce::Colour(0xffd46b62)
-                                                                         : juce::Colour(0xff76be7e)).withAlpha(0.95f);
+            const auto headColour = (sceneEditorState.transportRecording ? kRec
+                                                                         : kLive).withAlpha(0.95f);
             g.setColour(headColour);
             g.drawLine(headX, timelineUnion.getY(), headX, timelineUnion.getBottom(), 1.4f);
         }
@@ -12723,6 +13299,33 @@ void SceneControlPanel::handleSceneTimelineMouseWheel(const juce::MouseEvent& e,
     sceneTimelineCanvas.repaint();
 }
 
+void SceneControlPanel::mouseEnter(const juce::MouseEvent& e)
+{
+    for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
+    {
+        if (e.eventComponent == &sceneSelectorButtons[static_cast<size_t>(sceneSlot)])
+        {
+            setSceneGestureLegend("Scene S" + juce::String(sceneSlot + 1)
+                                  + ": Click launch - Drag onto the rail adds a step - Drag onto a scene replaces it - "
+                                  + juce::String(juce::CharPointer_UTF8("\xe2\x8c\xa5"))
+                                  + "drag copies only the clip - Hold to save");
+            return;
+        }
+    }
+}
+
+void SceneControlPanel::mouseExit(const juce::MouseEvent& e)
+{
+    for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
+    {
+        if (e.eventComponent == &sceneSelectorButtons[static_cast<size_t>(sceneSlot)])
+        {
+            setSceneGestureLegend({});
+            return;
+        }
+    }
+}
+
 void SceneControlPanel::mouseDown(const juce::MouseEvent& e)
 {
     auto sceneSlotForComponent = [this](const juce::Component* component) -> int
@@ -12771,7 +13374,7 @@ void SceneControlPanel::mouseDrag(const juce::MouseEvent& e)
     }
 
     int hoveredSlot = -1;
-    if (sceneSlotDragMoved && externalDropStep < 0 && e.mods.isAltDown())
+    if (sceneSlotDragMoved && externalDropStep < 0)
     {
         const auto screenPosition = e.getScreenPosition();
         for (int sceneSlot = 0; sceneSlot < MlrVSTAudioProcessor::SceneSlots; ++sceneSlot)
@@ -12785,6 +13388,22 @@ void SceneControlPanel::mouseDrag(const juce::MouseEvent& e)
     }
 
     sceneSlotDragTarget = hoveredSlot;
+    if (sceneSlotDragMoved)
+    {
+        if (hoveredSlot >= 0 && hoveredSlot != sceneSlotDragSource)
+            setSceneGestureLegend(e.mods.isAltDown()
+                                      ? ("Release to copy S" + juce::String(sceneSlotDragSource + 1)
+                                         + "'s clip onto S" + juce::String(hoveredSlot + 1))
+                                      : ("Release to REPLACE S" + juce::String(hoveredSlot + 1)
+                                         + " with S" + juce::String(sceneSlotDragSource + 1)));
+        else if (externalDropStep >= 0)
+            setSceneGestureLegend("Release to add S" + juce::String(sceneSlotDragSource + 1)
+                                  + " to the chain at step " + juce::String(externalDropStep + 1));
+        else
+            setSceneGestureLegend("Drop on the rail to add a step - drop on another scene to replace it ("
+                                  + juce::String(juce::CharPointer_UTF8("\xe2\x8c\xa5"))
+                                  + " = copy clip only)");
+    }
     if (externalDropStep != sceneChainExternalDropStep)
     {
         sceneChainExternalDropStep = externalDropStep;
@@ -12826,6 +13445,17 @@ void SceneControlPanel::mouseUp(const juce::MouseEvent& e)
             processor.duplicateScenePerformanceClip(sourceSceneSlot, duplicateTarget);
             stateChanged = true;
         }
+        else if (duplicateTarget >= 0 && sourceSceneSlot != duplicateTarget)
+        {
+            // Plain drag onto another scene slot: replace that scene entirely
+            // (stored snapshot + performance clip + timing follow the source).
+            if (processor.replaceSceneSlotWithScene(sourceSceneSlot, duplicateTarget))
+            {
+                selectedSceneActionSlot = duplicateTarget;
+                processor.focusSceneSlot(duplicateTarget);
+                stateChanged = true;
+            }
+        }
     }
 
     sceneSlotDragSuppressClick = (sourceSceneSlot >= 0 && dragMoved);
@@ -12833,6 +13463,7 @@ void SceneControlPanel::mouseUp(const juce::MouseEvent& e)
     sceneSlotDragTarget = -1;
     sceneChainExternalDropStep = -1;
     sceneSlotDragMoved = false;
+    setSceneGestureLegend({});
     sceneChainCanvas.repaint();
 
     if (stateChanged)
@@ -12846,7 +13477,7 @@ void SceneControlPanel::mouseUp(const juce::MouseEvent& e)
 PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     : processor(p)
 {
-    instructionsLabel.setText("Click=load default/preset  Shift+Click=save  Right-click=delete  Init=resets runtime", juce::dontSendNotification);
+    instructionsLabel.setText("Click=load default/preset  Shift+Click=store  Right-click=delete  Init=resets runtime", juce::dontSendNotification);
     instructionsLabel.setJustificationType(juce::Justification::centredLeft);
     instructionsLabel.setColour(juce::Label::textColourId, kTextMuted);
     addAndMakeVisible(instructionsLabel);
@@ -12856,7 +13487,11 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     presetNameEditor.setReturnKeyStartsNewLine(false);
     presetNameEditor.setSelectAllWhenFocused(true);
     presetNameEditor.setMouseClickGrabsKeyboardFocus(true);
-    presetNameEditor.onTextChange = [this]() { presetNameDraft = presetNameEditor.getText(); };
+    presetNameEditor.onTextChange = [this]()
+    {
+        presetNameDraft = presetNameEditor.getText();
+        renameButton.setEnabled(presetNameDraft.trim().isNotEmpty());
+    };
     presetNameEditor.onFocusLost = [this]()
     {
         presetNameDraft = presetNameEditor.getText();
@@ -12881,7 +13516,7 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(initButton);
     styleUiButton(initButton);
 
-    saveButton.setButtonText("Save");
+    saveButton.setButtonText("Store");
     saveButton.onClick = [this]()
     {
         auto safePanel = juce::Component::SafePointer<PresetControlPanel>(this);
@@ -12895,11 +13530,24 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
     addAndMakeVisible(saveButton);
     styleUiButton(saveButton, true);
 
+    renameButton.setButtonText("Rename");
+    renameButton.onClick = [this]()
+    {
+        renamePresetClicked(selectedPresetIndex, presetNameEditor.getText());
+    };
+    renameButton.setTooltip("Rename the selected preset slot without storing the current runtime state.");
+    addAndMakeVisible(renameButton);
+    styleUiButton(renameButton);
+
     deleteButton.setButtonText("Delete");
     deleteButton.onClick = [this]()
     {
         if (processor.deletePreset(selectedPresetIndex))
+        {
+            presetNameDraft = processor.getPresetName(selectedPresetIndex);
+            presetNameEditor.setText(presetNameDraft, juce::dontSendNotification);
             updatePresetButtons();
+        }
     };
     addAndMakeVisible(deleteButton);
     styleUiButton(deleteButton);
@@ -12946,6 +13594,44 @@ PresetControlPanel::PresetControlPanel(MlrVSTAudioProcessor& p)
         presetGridContent.addAndMakeVisible(button);
     }
 
+    // Performance bank: slots 0-15 as large single-click targets.
+    for (int i = 0; i < BankSlots; ++i)
+    {
+        auto& button = bankButtons[static_cast<size_t>(i)];
+        button.setClickingTogglesState(false);
+        styleUiButton(button);
+        button.addMouseListener(this, false);
+        button.onClick = [this, i]()
+        {
+            if (juce::ModifierKeys::getCurrentModifiersRealtime().isShiftDown())
+            {
+                auto safePanel = juce::Component::SafePointer<PresetControlPanel>(this);
+                juce::MessageManager::callAsync([safe = safePanel, i]()
+                {
+                    if (safe == nullptr)
+                        return;
+                    safe->savePresetClicked(i, safe->presetNameEditor.getText());
+                });
+            }
+            else
+            {
+                loadPresetClicked(i);
+            }
+        };
+        addAndMakeVisible(button);
+    }
+
+    showAllButton.setButtonText("All 112");
+    showAllButton.setClickingTogglesState(true);
+    showAllButton.setTooltip("Toggle between the 16-slot performance bank and the full preset grid.");
+    styleUiButton(showAllButton);
+    showAllButton.onClick = [this]()
+    {
+        showFullGrid = showAllButton.getToggleState();
+        resized();
+    };
+    addAndMakeVisible(showAllButton);
+
     selectedPresetIndex = juce::jmax(0, processor.getLoadedPresetIndex());
     presetNameDraft = processor.getPresetName(selectedPresetIndex);
     presetNameEditor.setText(presetNameDraft, juce::dontSendNotification);
@@ -12964,11 +13650,14 @@ void PresetControlPanel::resized()
 
     auto editorArea = bounds.removeFromTop(26);
     const int saveDeleteButtonW = 60;
+    const int renameButtonW = 76;
     const int initButtonW = 52;
     const int exportButtonW = 78;
     deleteButton.setBounds(editorArea.removeFromRight(saveDeleteButtonW));
     editorArea.removeFromRight(4);
     exportWavButton.setBounds(editorArea.removeFromRight(exportButtonW));
+    editorArea.removeFromRight(4);
+    renameButton.setBounds(editorArea.removeFromRight(renameButtonW));
     editorArea.removeFromRight(4);
     saveButton.setBounds(editorArea.removeFromRight(saveDeleteButtonW));
     editorArea.removeFromRight(6);
@@ -12979,11 +13668,35 @@ void PresetControlPanel::resized()
     const int nameW = juce::jmin(kNameFieldMaxW, editorArea.getWidth());
     presetNameEditor.setBounds(editorArea.removeFromLeft(nameW));
     editorArea.removeFromLeft(6);
+    showAllButton.setBounds(editorArea.removeFromLeft(64));
+    editorArea.removeFromLeft(6);
     instructionsLabel.setBounds(editorArea);
-    bounds.removeFromTop(2);
+    bounds.removeFromTop(4);
 
-    presetViewport.setBounds(bounds);
-    layoutPresetButtons();
+    presetViewport.setVisible(showFullGrid);
+    for (auto& button : bankButtons)
+        button.setVisible(!showFullGrid);
+
+    if (showFullGrid)
+    {
+        presetViewport.setBounds(bounds);
+        layoutPresetButtons();
+        return;
+    }
+
+    // Performance bank: 2 rows x 8 stage-sized slots.
+    const int gap = 6;
+    const int rowHeight = juce::jmax(24, (bounds.getHeight() - gap) / 2);
+    for (int i = 0; i < BankSlots; ++i)
+    {
+        const int col = i % 8;
+        const int row = i / 8;
+        const int slotWidth = (bounds.getWidth() - (7 * gap)) / 8;
+        bankButtons[static_cast<size_t>(i)].setBounds(bounds.getX() + col * (slotWidth + gap),
+                                                      bounds.getY() + row * (rowHeight + gap),
+                                                      slotWidth,
+                                                      rowHeight);
+    }
 }
 
 void PresetControlPanel::mouseUp(const juce::MouseEvent& e)
@@ -12991,19 +13704,34 @@ void PresetControlPanel::mouseUp(const juce::MouseEvent& e)
     if (!e.mods.isRightButtonDown())
         return;
 
+    auto deleteSlot = [this](int i)
+    {
+        selectedPresetIndex = i;
+        if (processor.deletePreset(i))
+        {
+            presetNameDraft = processor.getPresetName(i);
+            presetNameEditor.setText(presetNameDraft, juce::dontSendNotification);
+            updatePresetButtons();
+        }
+    };
+
     for (int i = 0; i < MlrVSTAudioProcessor::MaxPresetSlots; ++i)
     {
         auto& button = presetButtons[static_cast<size_t>(i)];
         if (e.originalComponent == &button || e.eventComponent == &button)
         {
-            selectedPresetIndex = i;
-            if (processor.deletePreset(i))
-            {
-                presetNameDraft = processor.getPresetName(i);
-                presetNameEditor.setText(presetNameDraft, juce::dontSendNotification);
-                updatePresetButtons();
-            }
-            break;
+            deleteSlot(i);
+            return;
+        }
+    }
+
+    for (int i = 0; i < BankSlots; ++i)
+    {
+        auto& button = bankButtons[static_cast<size_t>(i)];
+        if (e.originalComponent == &button || e.eventComponent == &button)
+        {
+            deleteSlot(i);
+            return;
         }
     }
 }
@@ -13020,6 +13748,21 @@ void PresetControlPanel::savePresetClicked(int index, juce::String typedName)
 
     processor.savePreset(index);
     selectedPresetIndex = index;
+    updatePresetButtons();
+}
+
+void PresetControlPanel::renamePresetClicked(int index, juce::String typedName)
+{
+    const auto trimmed = typedName.trim();
+    if (trimmed.isEmpty())
+        return;
+
+    if (!processor.setPresetName(index, trimmed))
+        return;
+
+    selectedPresetIndex = index;
+    presetNameDraft = trimmed;
+    presetNameEditor.setText(trimmed, juce::dontSendNotification);
     updatePresetButtons();
 }
 
@@ -13103,11 +13846,11 @@ void PresetControlPanel::updatePresetButtons()
 {
     const int loadedPreset = processor.getLoadedPresetIndex();
     deleteButton.setEnabled(processor.presetExists(selectedPresetIndex));
+    renameButton.setEnabled(presetNameEditor.getText().trim().isNotEmpty());
 
-    for (int i = 0; i < MlrVSTAudioProcessor::MaxPresetSlots; ++i)
+    auto styleSlotButton = [this, loadedPreset](juce::TextButton& button, int i)
     {
-        bool exists = processor.presetExists(i);
-        auto& button = presetButtons[static_cast<size_t>(i)];
+        const bool exists = processor.presetExists(i);
         const juce::String presetName = exists ? processor.getPresetName(i) : juce::String();
         button.setButtonText(makePresetBubbleLabel(presetName, i));
         juce::String tip = "Preset " + juce::String(i + 1);
@@ -13116,8 +13859,8 @@ void PresetControlPanel::updatePresetButtons()
         button.setTooltip(tip);
         if (i == loadedPreset && exists)
         {
-            button.setColour(juce::TextButton::buttonColourId, juce::Colour(0xffb8d478));
-            button.setColour(juce::TextButton::textColourOffId, juce::Colour(0xff111111));
+            button.setColour(juce::TextButton::buttonColourId, kLive);
+            button.setColour(juce::TextButton::textColourOffId, kAccentInk);
         }
         else
         {
@@ -13125,11 +13868,17 @@ void PresetControlPanel::updatePresetButtons()
             button.setColour(juce::TextButton::buttonColourId,
                              exists
                                  ? (isSelected ? kAccent.withMultipliedBrightness(1.1f) : kAccent.withMultipliedBrightness(0.9f))
-                                 : (isSelected ? juce::Colour(0xff3a3a3a) : juce::Colour(0xff2b2b2b)));
+                                 : (isSelected ? kSurfaceHi : kSurface));
             button.setColour(juce::TextButton::textColourOffId,
-                             exists ? juce::Colour(0xfff3f3f3) : kTextMuted);
+                             exists ? kAccentInk : kTextMuted);
         }
-    }
+    };
+
+    for (int i = 0; i < MlrVSTAudioProcessor::MaxPresetSlots; ++i)
+        styleSlotButton(presetButtons[static_cast<size_t>(i)], i);
+
+    for (int i = 0; i < BankSlots; ++i)
+        styleSlotButton(bankButtons[static_cast<size_t>(i)], i);
 }
 
 void PresetControlPanel::layoutPresetButtons()
@@ -13187,7 +13936,7 @@ MacroControlPanel::MacroControlPanel(MlrVSTAudioProcessor& p)
         auto& macro = macros[static_cast<size_t>(i)];
         macro.label.setText("M" + juce::String(i + 1), juce::dontSendNotification);
         macro.label.setJustificationType(juce::Justification::centred);
-        macro.label.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+        macro.label.setFont(juce::Font(juce::FontOptions(11.5f, juce::Font::bold)));
         macro.label.setColour(juce::Label::textColourId, kTextPrimary);
         addAndMakeVisible(macro.label);
 
@@ -13228,7 +13977,7 @@ MacroControlPanel::MacroControlPanel(MlrVSTAudioProcessor& p)
         addAndMakeVisible(macro.targetBox);
 
         macro.slider.setLookAndFeel(&knobLookAndFeel);
-        macro.slider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+        styleRotaryDrag(macro.slider);
         macro.slider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
         macro.slider.setRange(0.0, 1.0, 0.001);
         macro.slider.setValue(MlrVSTAudioProcessor::getDefaultMacroNormalizedValue(processor.getMacroTarget(i)), juce::dontSendNotification);
@@ -13338,7 +14087,7 @@ void MacroControlPanel::refreshFromProcessor()
         macro.slider.setColour(juce::Slider::rotarySliderOutlineColourId, juce::Colour(0xff232323));
         macro.slider.setColour(juce::Slider::thumbColourId, knobColour.brighter(0.18f));
         macro.slider.setColour(juce::Slider::textBoxTextColourId, kTextPrimary);
-        macro.slider.setColour(juce::Slider::textBoxOutlineColourId, juce::Colour(0xff4a4d50));
+        macro.slider.setColour(juce::Slider::textBoxOutlineColourId, kStroke);
         macro.slider.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour(0xff2c3034));
         macro.slider.setDoubleClickReturnValue(true, MlrVSTAudioProcessor::getDefaultMacroNormalizedValue(target));
         macro.slider.setTooltip(!hasTarget
@@ -13350,9 +14099,9 @@ void MacroControlPanel::refreshFromProcessor()
                                          ? "LEARN..."
                                          : macroCcLabelText(processor.getMacroMidiCc(i)));
         macro.ccButton.setColour(juce::TextButton::buttonColourId,
-                                 isLearning ? targetColour.withAlpha(0.92f) : juce::Colour(0xff2d3135));
+                                 isLearning ? targetColour.withAlpha(0.92f) : kSurfaceHi);
         macro.ccButton.setColour(juce::TextButton::buttonOnColourId,
-                                 isLearning ? targetColour.withAlpha(0.98f) : juce::Colour(0xff3b4148));
+                                 isLearning ? targetColour.withAlpha(0.98f) : kSurfaceHi);
         macro.ccButton.setColour(juce::TextButton::textColourOffId,
                                  isLearning ? juce::Colour(0xff101214) : kTextMuted);
         macro.ccButton.setColour(juce::TextButton::textColourOnId,
@@ -13422,7 +14171,7 @@ public:
 
         profileLabel.setColour(juce::Label::textColourId, kAccent.brighter(0.08f));
         profileLabel.setJustificationType(juce::Justification::centredLeft);
-        profileLabel.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+        profileLabel.setFont(juce::Font(juce::FontOptions(11.5f, juce::Font::bold)));
         addAndMakeVisible(profileLabel);
 
         hintLabel.setText("Pick a combo on the left, drag to draw, and double-click a lane to flatten it. The center line is neutral.", juce::dontSendNotification);
@@ -13606,7 +14355,7 @@ public:
             g.drawRoundedRectangle(graphBounds.expanded(0.0f, 1.0f), 5.0f, 1.0f);
 
             g.setColour(kTextPrimary);
-            g.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+            g.setFont(juce::Font(juce::FontOptions(11.5f, juce::Font::bold)));
             g.drawText(gestureLaneName(selectedKind, lane),
                        rowBounds.removeFromLeft(84),
                        juce::Justification::centredLeft,
@@ -13804,7 +14553,7 @@ private:
             return;
 
         g.setColour(rowIsSelected ? kTextPrimary : kTextSecondary);
-        g.setFont(juce::Font(juce::FontOptions(11.0f, juce::Font::bold)));
+        g.setFont(juce::Font(juce::FontOptions(11.5f, juce::Font::bold)));
         g.drawText(visibleComboLabels[static_cast<size_t>(rowNumber)],
                    rowBounds.reduced(10, 0),
                    juce::Justification::centredLeft,
@@ -14047,26 +14796,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     versionLabel.setTooltip("Plugin version. Build " + juce::String(MLRVST_BUILD_STAMP) + ".");
     addChildComponent(versionLabel);
 
-    masterVolumeLabel.setText("Master", juce::dontSendNotification);
-    masterVolumeLabel.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(masterVolumeLabel);
-
-    masterVolumeSlider.setSliderStyle(juce::Slider::LinearVertical);
-    masterVolumeSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-    masterVolumeSlider.setRange(0.0, 1.0, 0.01);
-    masterVolumeSlider.setValue(1.0);
-    enableAltClickReset(masterVolumeSlider, 1.0);
-    masterVolumeSlider.setPopupDisplayEnabled(true, false, this);
-    addAndMakeVisible(masterVolumeSlider);
-
-    masterVolumeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-        processor.parameters, "masterVolume", masterVolumeSlider);
-    masterVolumeSlider.onDragEnd = [this]()
-    {
-        if (globalUiReady)
-            processor.markPersistentGlobalUserChange();
-    };
-
+    // Master volume and quantize live in the always-visible status strip now.
     limiterToggle.setButtonText("Limiter");
     limiterToggle.setClickingTogglesState(true);
     limiterToggle.setTooltip("Enable JUCE limiter on plugin outputs.");
@@ -14075,33 +14805,6 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     limiterEnabledAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
         processor.parameters, "limiterEnabled", limiterToggle);
     limiterToggle.onClick = [this]()
-    {
-        if (globalUiReady)
-            processor.markPersistentGlobalUserChange();
-    };
-
-    quantizeLabel.setText("Quantize", juce::dontSendNotification);
-    quantizeLabel.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(quantizeLabel);
-
-    quantizeSelector.addItem("1", 1);
-    quantizeSelector.addItem("1/2", 2);
-    quantizeSelector.addItem("1/2T", 3);
-    quantizeSelector.addItem("1/4", 4);
-    quantizeSelector.addItem("1/4T", 5);
-    quantizeSelector.addItem("1/8", 6);
-    quantizeSelector.addItem("1/8T", 7);
-    quantizeSelector.addItem("1/16", 8);
-    quantizeSelector.addItem("1/16T", 9);
-    quantizeSelector.addItem("1/32", 10);
-    quantizeSelector.setSelectedId(6);
-    addAndMakeVisible(quantizeSelector);
-    styleUiCombo(quantizeSelector);
-    quantizeSelector.setTooltip("Global trigger quantization grid.");
-
-    quantizeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
-        processor.parameters, "quantize", quantizeSelector);
-    quantizeSelector.onChange = [this]()
     {
         if (globalUiReady)
             processor.markPersistentGlobalUserChange();
@@ -14298,7 +15001,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     crossfadeLengthLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(crossfadeLengthLabel);
 
-    crossfadeLengthSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+    styleRotaryDrag(crossfadeLengthSlider);
     crossfadeLengthSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     crossfadeLengthSlider.setRange(1.0, 50.0, 0.1);
     crossfadeLengthSlider.setValue(10.0);
@@ -14312,7 +15015,7 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
     triggerFadeInLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(triggerFadeInLabel);
 
-    triggerFadeInSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+    styleRotaryDrag(triggerFadeInSlider);
     triggerFadeInSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     triggerFadeInSlider.setRange(0.01, 120.0, 0.01);
     triggerFadeInSlider.setValue(12.0);
@@ -14514,40 +15217,44 @@ GlobalControlPanel::GlobalControlPanel(MlrVSTAudioProcessor& p)
 
 void GlobalControlPanel::paint(juce::Graphics& g)
 {
+    auto drawSectionWell = [&g](juce::Rectangle<int> area, const juce::String& title)
+    {
+        if (area.isEmpty())
+            return;
+        auto wellBounds = area.toFloat();
+        g.setColour(kInset);
+        g.fillRoundedRectangle(wellBounds, kRadiusL);
+        g.setColour(kStroke);
+        g.drawRoundedRectangle(wellBounds.reduced(0.5f), kRadiusL, 1.0f);
+        g.setColour(kTextMuted);
+        g.setFont(roleFont(FontRole::Micro, true));
+        g.drawText(title, area.reduced(8, 0).removeFromTop(18), juce::Justification::centredLeft);
+    };
+
     drawPanel(g, getLocalBounds().toFloat(), kAccent, 8.0f);
+    drawSectionWell(sectionInputBounds, "INPUT");
+    drawSectionWell(sectionFadesBounds, "LOOP FADES");
+    drawSectionWell(sectionSettingsBounds, "SETTINGS");
 }
 
 void GlobalControlPanel::resized()
 {
-    auto bounds = getLocalBounds().reduced(6, 5);
+    auto bounds = getLocalBounds().reduced(8, 6);
 
-    auto titleRow = bounds.removeFromTop(16);
-    tooltipsToggle.setBounds(titleRow.removeFromRight(86));
-    titleRow.removeFromRight(6);
-    gestureEditorButton.setBounds(titleRow.removeFromRight(84));
-    titleRow.removeFromRight(6);
-    momentaryToggle.setBounds(titleRow.removeFromRight(92));
+    const int wellGap = 8;
+    const int wellPad = 8;
+    const int headerHeight = 18;
+
+    sectionInputBounds = bounds.removeFromLeft(196);
+    bounds.removeFromLeft(wellGap);
+    sectionFadesBounds = bounds.removeFromLeft(172);
+    bounds.removeFromLeft(wellGap);
+    sectionSettingsBounds = bounds;
+
     versionLabel.setBounds({});
     titleLabel.setBounds({});
-
-    bounds.removeFromTop(1);
-    auto controlsArea = bounds;
-
-    const int labelHeight = 14;
-    const int controlGap = 6;
-    const int sectionGap = 8;
-    const int sliderWidth = 42;
-    const int utilityColumnWidth = 118;
-    const int meterWidth = 24;
-    const int knobWidth = 80;
-    const int meterVerticalInset = 6;
-
-    auto layoutTallControl = [](juce::Rectangle<int> area, juce::Label& label, juce::Component& control)
-    {
-        label.setBounds(area.removeFromTop(labelHeight));
-        area.removeFromTop(2);
-        control.setBounds(area);
-    };
+    inputMonitorLabel.setBounds({});
+    inputMeterLabel.setBounds({});
 
     auto layoutAlignedComboCell = [](juce::Rectangle<int> area,
                                      juce::Label& label,
@@ -14565,123 +15272,107 @@ void GlobalControlPanel::resized()
         box.setBounds(area.removeFromLeft(boxWidth).withTrimmedTop(1).withTrimmedBottom(1));
     };
 
-    auto gainArea = controlsArea.removeFromLeft((sliderWidth * 2) + utilityColumnWidth + meterWidth + (controlGap * 3));
-    controlsArea.removeFromLeft(sectionGap);
-    auto knobArea = controlsArea.removeFromLeft((knobWidth * 2) + controlGap);
-    controlsArea.removeFromLeft(sectionGap);
-    auto comboArea = controlsArea;
-
-    auto masterArea = gainArea.removeFromLeft(sliderWidth);
-    gainArea.removeFromLeft(controlGap);
-    auto utilityArea = gainArea.removeFromLeft(utilityColumnWidth);
-    gainArea.removeFromLeft(controlGap);
-    auto inputArea = gainArea.removeFromLeft(sliderWidth);
-    gainArea.removeFromLeft(controlGap);
-    auto meterArea = gainArea;
-
-    layoutTallControl(masterArea, masterVolumeLabel, masterVolumeSlider);
-    layoutTallControl(inputArea, inputMonitorLabel, inputMonitorSlider);
-
-    utilityArea.removeFromTop(labelHeight + 2);
-    limiterToggle.setBounds(utilityArea.removeFromTop(24));
-    utilityArea.removeFromTop(6);
-    outputRoutingLabel.setBounds(utilityArea.removeFromTop(labelHeight));
-    utilityArea.removeFromTop(2);
-    outputRoutingBox.setBounds(utilityArea.removeFromTop(22).withTrimmedTop(1).withTrimmedBottom(1));
-    utilityArea.removeFromTop(6);
-    continuousTraversalToggle.setBounds(utilityArea.removeFromTop(24));
-
-    inputMeterLabel.setBounds(meterArea.removeFromTop(labelHeight));
-    meterArea.removeFromTop(2);
-    auto leftMeter = meterArea.removeFromLeft(meterArea.getWidth() / 2);
-    inputMeterL.setBounds(leftMeter.reduced(1, meterVerticalInset));
-    inputMeterR.setBounds(meterArea.reduced(1, meterVerticalInset));
-
-    auto crossfadeArea = knobArea.removeFromLeft(knobWidth);
-    knobArea.removeFromLeft(controlGap);
-    auto triggerFadeArea = knobArea;
-    layoutTallControl(crossfadeArea, crossfadeLengthLabel, crossfadeLengthSlider);
-    layoutTallControl(triggerFadeArea, triggerFadeInLabel, triggerFadeInSlider);
-
-    const int rowGap = 4;
-    const int columnGap = 8;
-    const int comboRowHeight = 26;
-    auto timingRow = comboArea.removeFromTop(comboRowHeight);
-    comboArea.removeFromTop(rowGap);
-    auto policyRow = comboArea.removeFromTop(comboRowHeight);
-    comboArea.removeFromTop(rowGap);
-    auto musicalRow = comboArea.removeFromTop(comboRowHeight);
-    comboArea.removeFromTop(rowGap);
-    auto transientRow = comboArea.removeFromTop(comboRowHeight);
-
-    auto measureLabelWidth = [](juce::Label& label)
+    // ---- INPUT well: monitor slider | meters | toggles ----
     {
-        return juce::GlyphArrangement::getStringWidthInt(label.getFont(), label.getText()) + 12;
-    };
+        auto area = sectionInputBounds.reduced(wellPad);
+        area.removeFromTop(headerHeight);
+        inputMonitorSlider.setBounds(area.removeFromLeft(34));
+        area.removeFromLeft(6);
+        auto meterArea = area.removeFromLeft(22);
+        auto leftMeter = meterArea.removeFromLeft(meterArea.getWidth() / 2);
+        inputMeterL.setBounds(leftMeter.reduced(1, 2));
+        inputMeterR.setBounds(meterArea.reduced(1, 2));
+        area.removeFromLeft(8);
+        limiterToggle.setBounds(area.removeFromTop(24));
+    }
 
-    auto sharedColumnsArea = comboArea;
-    const int sharedColumnWidth = juce::jmax(86, (sharedColumnsArea.getWidth() - (columnGap * 2)) / 3);
-    auto column1 = sharedColumnsArea.removeFromLeft(sharedColumnWidth);
-    sharedColumnsArea.removeFromLeft(columnGap);
-    auto column2 = sharedColumnsArea.removeFromLeft(sharedColumnWidth);
-    sharedColumnsArea.removeFromLeft(columnGap);
-    auto column3 = sharedColumnsArea;
+    // ---- LOOP FADES well: the two fade knobs ----
+    {
+        auto area = sectionFadesBounds.reduced(wellPad);
+        area.removeFromTop(headerHeight);
+        const int knobCell = (area.getWidth() - 6) / 2;
+        auto crossfadeArea = area.removeFromLeft(knobCell);
+        area.removeFromLeft(6);
+        crossfadeLengthLabel.setBounds(crossfadeArea.removeFromTop(14));
+        crossfadeArea.removeFromTop(2);
+        crossfadeLengthSlider.setBounds(crossfadeArea);
+        triggerFadeInLabel.setBounds(area.removeFromTop(14));
+        area.removeFromTop(2);
+        triggerFadeInSlider.setBounds(area);
+    }
 
-    const int column1LabelWidth = juce::jmax(measureLabelWidth(quantizeLabel),
-                                             measureLabelWidth(flipTempoMatchModeLabel),
-                                             measureLabelWidth(rootNoteLabel));
-    const int column2LabelWidth = juce::jmax(measureLabelWidth(innerLoopLengthLabel),
-                                             measureLabelWidth(pitchControlModeLabel),
-                                             measureLabelWidth(globalScaleLabel));
-    const int column3LabelWidth = juce::jmax(measureLabelWidth(swingDivisionLabel),
-                                             measureLabelWidth(stretchBackendLabel),
-                                             measureLabelWidth(qualityLabel));
+    // ---- SETTINGS well: utilities in the header band + aligned combo grid ----
+    {
+        auto area = sectionSettingsBounds.reduced(wellPad);
+        auto headerRow = area.removeFromTop(headerHeight);
+        tooltipsToggle.setBounds(headerRow.removeFromRight(84));
+        headerRow.removeFromRight(6);
+        gestureEditorButton.setBounds(headerRow.removeFromRight(80));
+        headerRow.removeFromRight(6);
+        momentaryToggle.setBounds(headerRow.removeFromRight(96));
+        headerRow.removeFromRight(6);
+        continuousTraversalToggle.setBounds(headerRow.removeFromRight(88));
+        area.removeFromTop(3);
 
-    const int column1BoxWidth = 98;
-    const int column2BoxWidth = 102;
-    const int column3BoxWidth = 112;
+        const int rowGap = 4;
+        const int rowHeight = juce::jmax(22, (area.getHeight() - (rowGap * 2)) / 3);
+        auto row1 = area.removeFromTop(rowHeight);
+        area.removeFromTop(rowGap);
+        auto row2 = area.removeFromTop(rowHeight);
+        area.removeFromTop(rowGap);
+        auto row3 = area.removeFromTop(rowHeight);
 
-    layoutAlignedComboCell({ column1.getX(), timingRow.getY(), column1.getWidth(), timingRow.getHeight() },
-                           quantizeLabel, quantizeSelector, column1LabelWidth, column1BoxWidth);
-    layoutAlignedComboCell({ column2.getX(), timingRow.getY(), column2.getWidth(), timingRow.getHeight() },
-                           innerLoopLengthLabel, innerLoopLengthBox, column2LabelWidth, column2BoxWidth);
-    layoutAlignedComboCell({ column3.getX(), timingRow.getY(), column3.getWidth(), timingRow.getHeight() },
-                           swingDivisionLabel, swingDivisionBox, column3LabelWidth, column3BoxWidth);
+        auto measureLabelWidth = [](juce::Label& label)
+        {
+            return juce::GlyphArrangement::getStringWidthInt(label.getFont(), label.getText()) + 12;
+        };
 
-    layoutAlignedComboCell({ column1.getX(), policyRow.getY(), column1.getWidth(), policyRow.getHeight() },
-                           flipTempoMatchModeLabel, flipTempoMatchModeBox, column1LabelWidth, column1BoxWidth);
-    layoutAlignedComboCell({ column2.getX(), policyRow.getY(), column2.getWidth(), policyRow.getHeight() },
-                           pitchControlModeLabel, pitchControlModeBox, column2LabelWidth, column2BoxWidth);
-    layoutAlignedComboCell({ column3.getX(), policyRow.getY(), column3.getWidth(), policyRow.getHeight() },
-                           stretchBackendLabel, stretchBackendBox, column3LabelWidth, column3BoxWidth);
+        const int columnGap = 8;
+        const int columnWidth = juce::jmax(86, (row1.getWidth() - (columnGap * 2)) / 3);
+        auto columnX = [&](int index) { return row1.getX() + (index * (columnWidth + columnGap)); };
 
-    layoutAlignedComboCell({ column1.getX(), musicalRow.getY(), column1.getWidth(), musicalRow.getHeight() },
-                           rootNoteLabel, rootNoteBox, column1LabelWidth, column1BoxWidth);
-    layoutAlignedComboCell({ column2.getX(), musicalRow.getY(), column2.getWidth(), musicalRow.getHeight() },
-                           globalScaleLabel, globalScaleBox, column2LabelWidth, column2BoxWidth);
-    layoutAlignedComboCell({ column3.getX(), musicalRow.getY(), column3.getWidth(), musicalRow.getHeight() },
-                           qualityLabel, resamplingQualityBox, column3LabelWidth, column3BoxWidth);
+        const int column1LabelWidth = juce::jmax(measureLabelWidth(innerLoopLengthLabel),
+                                                 measureLabelWidth(rootNoteLabel),
+                                                 measureLabelWidth(flipTempoMatchModeLabel));
+        const int column2LabelWidth = juce::jmax(measureLabelWidth(swingDivisionLabel),
+                                                 measureLabelWidth(globalScaleLabel),
+                                                 measureLabelWidth(stretchBackendLabel));
+        const int column3LabelWidth = juce::jmax(measureLabelWidth(outputRoutingLabel),
+                                                 measureLabelWidth(pitchControlModeLabel),
+                                                 measureLabelWidth(qualityLabel));
 
-    auto transientCells = transientRow;
-    const int transientGap = 6;
-    const int transientCellWidth = juce::jmax(76, (transientCells.getWidth() - (transientGap * 3)) / 4);
-    auto transientCell1 = transientCells.removeFromLeft(transientCellWidth);
-    transientCells.removeFromLeft(transientGap);
-    auto transientCell2 = transientCells.removeFromLeft(transientCellWidth);
-    transientCells.removeFromLeft(transientGap);
-    auto transientCell3 = transientCells.removeFromLeft(transientCellWidth);
-    transientCells.removeFromLeft(transientGap);
-    auto transientCell4 = transientCells;
+        auto gridCell = [&](juce::Rectangle<int> row, int column) -> juce::Rectangle<int>
+        {
+            return { columnX(column), row.getY(), columnWidth, row.getHeight() };
+        };
 
-    const int transientMethodLabelWidth = measureLabelWidth(transientMethodLabel);
-    const int transientSensitivityLabelWidth = measureLabelWidth(transientSensitivityLabel);
-    const int transientSnapLabelWidth = measureLabelWidth(transientSnapLabel);
-    const int transientSpacingLabelWidth = measureLabelWidth(transientSpacingLabel);
+        layoutAlignedComboCell(gridCell(row1, 0), innerLoopLengthLabel, innerLoopLengthBox, column1LabelWidth, 96);
+        layoutAlignedComboCell(gridCell(row1, 1), swingDivisionLabel, swingDivisionBox, column2LabelWidth, 100);
+        layoutAlignedComboCell(gridCell(row1, 2), outputRoutingLabel, outputRoutingBox, column3LabelWidth, 104);
 
-    layoutAlignedComboCell(transientCell1, transientMethodLabel, transientMethodBox, transientMethodLabelWidth, 74);
-    layoutAlignedComboCell(transientCell2, transientSensitivityLabel, transientSensitivityBox, transientSensitivityLabelWidth, 72);
-    layoutAlignedComboCell(transientCell3, transientSnapLabel, transientSnapBox, transientSnapLabelWidth, 72);
-    layoutAlignedComboCell(transientCell4, transientSpacingLabel, transientSpacingBox, transientSpacingLabelWidth, 72);
+        layoutAlignedComboCell(gridCell(row2, 0), rootNoteLabel, rootNoteBox, column1LabelWidth, 96);
+        layoutAlignedComboCell(gridCell(row2, 1), globalScaleLabel, globalScaleBox, column2LabelWidth, 100);
+        layoutAlignedComboCell(gridCell(row2, 2), pitchControlModeLabel, pitchControlModeBox, column3LabelWidth, 104);
+
+        layoutAlignedComboCell(gridCell(row3, 0), flipTempoMatchModeLabel, flipTempoMatchModeBox, column1LabelWidth, 96);
+        layoutAlignedComboCell(gridCell(row3, 1), stretchBackendLabel, stretchBackendBox, column2LabelWidth, 100);
+        layoutAlignedComboCell(gridCell(row3, 2), qualityLabel, resamplingQualityBox, column3LabelWidth, 104);
+
+        // Transient detection tuning is hidden for now (parameters and monome
+        // control still work; only the GUI row is gone).
+        for (auto* hidden : { static_cast<juce::Component*>(&transientMethodLabel),
+                              static_cast<juce::Component*>(&transientMethodBox),
+                              static_cast<juce::Component*>(&transientSensitivityLabel),
+                              static_cast<juce::Component*>(&transientSensitivityBox),
+                              static_cast<juce::Component*>(&transientSnapLabel),
+                              static_cast<juce::Component*>(&transientSnapBox),
+                              static_cast<juce::Component*>(&transientSpacingLabel),
+                              static_cast<juce::Component*>(&transientSpacingBox) })
+        {
+            hidden->setVisible(false);
+            hidden->setBounds({});
+        }
+    }
 
     if (gestureEditorOverlay != nullptr)
     {
@@ -14756,27 +15447,8 @@ MonomePagesPanel::MonomePagesPanel(MlrVSTAudioProcessor& p)
                                             !active);
             refreshFromProcessor();
         };
+        row.modeButton.addMouseListener(this, false);
         addAndMakeVisible(row.modeButton);
-
-        row.upButton.setButtonText("^");
-        row.upButton.setTooltip("Move page left");
-        row.upButton.onClick = [this, i]()
-        {
-            processor.moveControlPage(i, i - 1);
-            refreshFromProcessor();
-        };
-        addAndMakeVisible(row.upButton);
-        styleUiButton(row.upButton);
-
-        row.downButton.setButtonText("v");
-        row.downButton.setTooltip("Move page right");
-        row.downButton.onClick = [this, i]()
-        {
-            processor.moveControlPage(i, i + 1);
-            refreshFromProcessor();
-        };
-        addAndMakeVisible(row.downButton);
-        styleUiButton(row.downButton);
     }
 
     refreshFromProcessor();
@@ -14831,13 +15503,35 @@ void MonomePagesPanel::resized()
         row.positionLabel.setBounds(header.removeFromLeft(18));
         slotBounds.removeFromTop(1);
 
-        auto arrows = slotBounds.removeFromRight(16);
-        row.modeButton.setBounds(slotBounds.reduced(0, 2));
+        // Page button owns the full slot; reordering lives on right-click.
+        row.modeButton.setBounds(slotBounds.reduced(0, 1));
+    }
+}
 
-        const int arrowW = 13;
-        const int arrowH = 9;
-        row.upButton.setBounds(arrows.getCentreX() - (arrowW / 2), arrows.getY() + 1, arrowW, arrowH);
-        row.downButton.setBounds(arrows.getCentreX() - (arrowW / 2), arrows.getBottom() - arrowH - 1, arrowW, arrowH);
+void MonomePagesPanel::mouseUp(const juce::MouseEvent& e)
+{
+    if (!e.mods.isRightButtonDown())
+        return;
+
+    for (int i = 0; i < MlrVSTAudioProcessor::NumControlRowPages; ++i)
+    {
+        auto& button = rows[static_cast<size_t>(i)].modeButton;
+        if (e.originalComponent != &button && e.eventComponent != &button)
+            continue;
+
+        juce::PopupMenu menu;
+        menu.addItem(1, "Move page left", i > 0);
+        menu.addItem(2, "Move page right", i < (MlrVSTAudioProcessor::NumControlRowPages - 1));
+        auto safeThis = juce::Component::SafePointer<MonomePagesPanel>(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&button),
+                           [safeThis, i](int result)
+                           {
+                               if (safeThis == nullptr || result == 0)
+                                   return;
+                               safeThis->processor.moveControlPage(i, result == 1 ? i - 1 : i + 1);
+                               safeThis->refreshFromProcessor();
+                           });
+        return;
     }
 }
 
@@ -14861,93 +15555,18 @@ void MonomePagesPanel::refreshFromProcessor()
 
         row.positionLabel.setVisible(true);
         row.modeButton.setVisible(true);
-        row.upButton.setVisible(true);
-        row.downButton.setVisible(true);
         row.positionLabel.setText("#" + juce::String(i + 1), juce::dontSendNotification);
         row.modeButton.setButtonText(sceneAlias ? "SCN" : getMonomePageShortName(modeAtButton));
-        row.modeButton.setTooltip(sceneAlias ? "Scene Controls" : getMonomePageDisplayName(modeAtButton));
+        row.modeButton.setTooltip((sceneAlias ? "Scene Controls" : getMonomePageDisplayName(modeAtButton))
+                                  + juce::String(" (right-click to reorder)"));
         row.positionLabel.setColour(juce::Label::textColourId, isActive ? kAccent.brighter(0.15f) : kTextSecondary);
         row.modeButton.setColour(juce::TextButton::buttonColourId,
-                                 isActive ? kAccent.withAlpha(0.78f) : juce::Colour(0xff3a3a3a));
+                                 isActive ? kAccent.withAlpha(0.78f) : kSurfaceHi);
         row.modeButton.setColour(juce::TextButton::textColourOffId,
-                                 isActive ? juce::Colour(0xff111111) : juce::Colour(0xfff3f3f3));
-        row.upButton.setEnabled(i > 0);
-        row.downButton.setEnabled(i < (MlrVSTAudioProcessor::NumControlRowPages - 1));
-        row.upButton.setColour(juce::TextButton::buttonColourId, isActive ? kAccent.withAlpha(0.6f) : juce::Colour(0xff454545));
-        row.downButton.setColour(juce::TextButton::buttonColourId, isActive ? kAccent.withAlpha(0.6f) : juce::Colour(0xff454545));
+                                 isActive ? kAccentInk : kTextPrimary);
     }
 }
 
-void MonomePagesPanel::updatePresetButtons()
+void MonomePagesPanel::mouseWheelMove(const juce::MouseEvent&, const juce::MouseWheelDetails&)
 {
-    const int loadedPreset = processor.getLoadedPresetIndex();
-    for (int i = 0; i < MlrVSTAudioProcessor::MaxPresetSlots; ++i)
-    {
-        const bool exists = processor.presetExists(i);
-        auto& button = presetButtons[static_cast<size_t>(i)];
-        const juce::String presetName = exists ? processor.getPresetName(i) : juce::String();
-        button.setButtonText(makePresetBubbleLabel(presetName, i));
-        juce::String tip = "Preset " + juce::String(i + 1);
-        if (exists)
-            tip << " - " << presetName;
-        button.setTooltip(tip);
-        if (i == loadedPreset && exists)
-        {
-            button.setColour(juce::TextButton::buttonColourId, juce::Colour(0xffb8d478));
-            button.setColour(juce::TextButton::textColourOffId, juce::Colour(0xff111111));
-        }
-        else
-        {
-            button.setColour(juce::TextButton::buttonColourId,
-                             exists ? kAccent.withMultipliedBrightness(0.9f) : juce::Colour(0xff2b2b2b));
-            button.setColour(juce::TextButton::textColourOffId,
-                             exists ? juce::Colour(0xff111111) : kTextMuted);
-        }
-    }
-}
-
-void MonomePagesPanel::layoutPresetButtons()
-{
-    const int gap = 4;
-    const int buttonHeight = 16;
-    const int minButtonWidth = 26;
-
-    const int viewportWidth = juce::jmax(0, presetViewport.getWidth() - presetViewport.getScrollBarThickness());
-    const int buttonWidth = juce::jmax(minButtonWidth,
-                                       (viewportWidth - ((MlrVSTAudioProcessor::PresetColumns - 1) * gap))
-                                       / MlrVSTAudioProcessor::PresetColumns);
-    const int contentWidth = (MlrVSTAudioProcessor::PresetColumns * buttonWidth)
-                             + ((MlrVSTAudioProcessor::PresetColumns - 1) * gap);
-    const int contentHeight = (MlrVSTAudioProcessor::PresetRows * buttonHeight)
-                              + ((MlrVSTAudioProcessor::PresetRows - 1) * gap);
-
-    presetGridContent.setSize(contentWidth, contentHeight);
-
-    for (int i = 0; i < MlrVSTAudioProcessor::MaxPresetSlots; ++i)
-    {
-        const int x = i % MlrVSTAudioProcessor::PresetColumns;
-        const int y = i / MlrVSTAudioProcessor::PresetColumns;
-        presetButtons[static_cast<size_t>(i)].setBounds(x * (buttonWidth + gap),
-                                                        y * (buttonHeight + gap),
-                                                        buttonWidth,
-                                                        buttonHeight);
-    }
-}
-
-void MonomePagesPanel::mouseWheelMove(const juce::MouseEvent&, const juce::MouseWheelDetails& wheel)
-{
-    const int deltaY = static_cast<int>(-wheel.deltaY * 96.0f);
-    if (deltaY != 0)
-        presetViewport.setViewPosition(presetViewport.getViewPositionX(),
-                                       juce::jmax(0, presetViewport.getViewPositionY() + deltaY));
-}
-
-void MonomePagesPanel::onPresetButtonClicked(int presetIndex)
-{
-    if (juce::ModifierKeys::getCurrentModifiers().isShiftDown())
-        processor.savePreset(presetIndex);
-    else
-        processor.loadPreset(presetIndex);
-
-    updatePresetButtons();
 }

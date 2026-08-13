@@ -9,6 +9,7 @@
 
 #include "PluginProcessor.h"
 #include "SceneScheduler.h"
+#include <cmath>
 
 int MlrVSTAudioProcessor::getSceneRepeatCount(int sceneSlot) const
 {
@@ -363,6 +364,15 @@ void MlrVSTAudioProcessor::clearSceneChain()
     reloadAllSceneChainTransitionEndSamples();
 }
 
+void MlrVSTAudioProcessor::setSceneChainSteps(const std::vector<SceneChainStep>& steps,
+                                              bool loopEnabled,
+                                              int loopStart,
+                                              int loopEnd)
+{
+    SceneScheduler::setSceneChainSteps(*this, steps, loopEnabled, loopStart, loopEnd);
+    reloadAllSceneChainTransitionEndSamples();
+}
+
 bool MlrVSTAudioProcessor::isSceneChainLoopEnabled() const
 {
     return SceneScheduler::isSceneChainLoopEnabled(*this);
@@ -396,6 +406,43 @@ bool MlrVSTAudioProcessor::isSceneChainPlaybackActive() const
 int MlrVSTAudioProcessor::getSceneChainPlaybackStepIndex() const
 {
     return SceneScheduler::getSceneChainPlaybackStepIndex(*this);
+}
+
+MlrVSTAudioProcessor::SceneChainPlaybackStatus MlrVSTAudioProcessor::getSceneChainPlaybackStatus() const
+{
+    SceneChainPlaybackStatus status;
+    status.active = isSceneChainPlaybackActive();
+    status.stepIndex = getSceneChainPlaybackStepIndex();
+    if (pendingSceneRecall.active && pendingSceneRecall.sequenceDriven)
+    {
+        status.queuedStepIndex = pendingSceneRecall.sequenceStepIndex;
+        status.queuedSceneSlot = pendingSceneRecall.sceneSlot;
+    }
+    if (status.stepIndex >= 0 && status.stepIndex < MaxSceneChainSteps)
+        status.repeatCount = juce::jmax(1, getSceneChainStepRepeatCount(status.stepIndex));
+
+    if (status.active
+        && activeScenePlaybackHandle.active
+        && std::isfinite(activeScenePlaybackHandle.startPpq)
+        && audioEngine != nullptr)
+    {
+        const double nowPpq = audioEngine->getTimelineBeat();
+        // Recompute rather than reading the handle's at-switch snapshot, so a
+        // bars/repeats edit mid-scene moves the progress display immediately
+        // (the boundary itself already re-resolves every block).
+        const double totalBeats = computeCurrentSceneSequenceLengthBeats();
+        if (std::isfinite(nowPpq) && std::isfinite(totalBeats) && totalBeats > 0.0)
+        {
+            const double elapsedBeats = juce::jlimit(0.0, totalBeats, nowPpq - activeScenePlaybackHandle.startPpq);
+            status.progress01 = static_cast<float>(elapsedBeats / totalBeats);
+            const double beatsPerRepeat = totalBeats / static_cast<double>(status.repeatCount);
+            if (beatsPerRepeat > 0.0)
+                status.repeatIndex = juce::jlimit(1,
+                                                  status.repeatCount,
+                                                  static_cast<int>(std::floor(elapsedBeats / beatsPerRepeat)) + 1);
+        }
+    }
+    return status;
 }
 
 bool MlrVSTAudioProcessor::startSceneChainPlayback(int startStepIndex)

@@ -1661,7 +1661,7 @@ bool applyPresetXml(const juce::XmlElement& presetXml,
                 clampedInt(stripXml->getIntAttribute("filterType", 0), 0, 2, 0)));
 
         strip->setFilterAlgorithm(static_cast<EnhancedAudioStrip::FilterAlgorithm>(
-            clampedInt(stripXml->getIntAttribute("filterAlgorithm", 0), 0, 5, 0)));
+            clampedInt(stripXml->getIntAttribute("filterAlgorithm", 0), 0, 6, 0)));
         strip->setFilterEnabled(restoreFilterEnabled);
         strip->setSwingAmount(clampedFloat(stripXml->getDoubleAttribute("swingAmount", 0.0), 0.0f, 0.0f, 1.0f));
         strip->setGateAmount(clampedFloat(stripXml->getDoubleAttribute("gateAmount", 0.0), 0.0f, 0.0f, 1.0f));
@@ -1761,7 +1761,7 @@ bool applyPresetXml(const juce::XmlElement& presetXml,
                                     clampedFloat(stripXml->getDoubleAttribute(slotKey("Rate"), 1.0),
                                                  1.0f,
                                                  0.125f,
-                                                 4.0f));
+                                                 8.0f));
             audioEngine->setModTransportMode(stripIndex,
                 static_cast<ModernAudioEngine::ModTransportMode>(clampedInt(
                     stripXml->getIntAttribute(slotKey("TransportMode"),

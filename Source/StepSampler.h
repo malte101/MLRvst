@@ -268,6 +268,11 @@ public:
         smoothedVolume.setTargetValue(this->volume);
     }
 
+    // Group gain is applied on top of the (smoothed) strip volume each block;
+    // the engine sets it per render so Step strips honor group volume like
+    // every other mode (previously it was silently ignored).
+    void setGroupGain(float gain) { groupGain = juce::jlimit(0.0f, 1.0f, gain); }
+
     void setTrimGain(float gain)
     {
         trimGain = juce::jlimit(0.0f, juce::Decibels::decibelsToGain(36.0f), gain);
@@ -390,7 +395,7 @@ public:
         for (int sample = 0; sample < numSamples; ++sample)
         {
             const float currentVolume = smoothedVolume.getNextValue();
-            const float baseGain = currentVolume * trimGain;
+            const float baseGain = currentVolume * trimGain * groupGain;
             float leftGain = 1.0f;
             float rightGain = 1.0f;
 
@@ -433,6 +438,7 @@ private:
     
     // Volume and pan (connected to strip controls)
     float volume = 1.0f;
+    float groupGain = 1.0f;
     juce::SmoothedValue<float> smoothedVolume{1.0f};
     float trimGain = 1.0f;
     float pan = 0.0f;

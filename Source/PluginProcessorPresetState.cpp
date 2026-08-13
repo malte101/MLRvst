@@ -168,6 +168,165 @@ private:
     PresetSaveRequest request;
 };
 
+namespace
+{
+// DAW-session serialization of the per-strip mod sequencer lanes. Presets
+// already carry these (PresetStore); without this block they were silently
+// lost on project reload. Uses the *ForSlot accessors so the live active
+// slot is never re-pointed.
+juce::String encodeModFloatCsv(const std::vector<float>& values)
+{
+    juce::StringArray parts;
+    for (const float v : values)
+        parts.add(juce::String(v, 6));
+    return parts.joinIntoString(",");
+}
+
+juce::String encodeModIntCsv(const std::vector<int>& values)
+{
+    juce::StringArray parts;
+    for (const int v : values)
+        parts.add(juce::String(v));
+    return parts.joinIntoString(",");
+}
+
+void appendModSequencersToSessionState(MlrVSTAudioProcessor& processor, juce::ValueTree& state)
+{
+    auto* engine = processor.getAudioEngine();
+    if (engine == nullptr)
+        return;
+
+    juce::XmlElement root("ModSequencers");
+    for (int stripIndex = 0; stripIndex < MlrVSTAudioProcessor::MaxStrips; ++stripIndex)
+    {
+        auto* stripXml = root.createNewChildElement("Strip");
+        stripXml->setAttribute("index", stripIndex);
+        stripXml->setAttribute("activeSlot", engine->getModSequencerSlot(stripIndex));
+        for (int slot = 0; slot < ModernAudioEngine::NumModSequencers; ++slot)
+        {
+            auto* slotXml = stripXml->createNewChildElement("Slot");
+            slotXml->setAttribute("index", slot);
+            slotXml->setAttribute("target", static_cast<int>(engine->getModTargetForSlot(stripIndex, slot)));
+            slotXml->setAttribute("bipolar", engine->isModBipolarForSlot(stripIndex, slot));
+            slotXml->setAttribute("curveMode", engine->isModCurveModeForSlot(stripIndex, slot));
+            slotXml->setAttribute("depth", engine->getModDepthForSlot(stripIndex, slot));
+            slotXml->setAttribute("rate", engine->getModRateForSlot(stripIndex, slot));
+            slotXml->setAttribute("transportMode", static_cast<int>(engine->getModTransportModeForSlot(stripIndex, slot)));
+            slotXml->setAttribute("offset", engine->getModOffsetForSlot(stripIndex, slot));
+            slotXml->setAttribute("lengthBars", engine->getModLengthBarsForSlot(stripIndex, slot));
+            slotXml->setAttribute("editPage", engine->getModEditPageForSlot(stripIndex, slot));
+            slotXml->setAttribute("smoothMs", engine->getModSmoothingMsForSlot(stripIndex, slot));
+            slotXml->setAttribute("curveBend", engine->getModCurveBendForSlot(stripIndex, slot));
+            slotXml->setAttribute("curveShape", static_cast<int>(engine->getModCurveShapeForSlot(stripIndex, slot)));
+            slotXml->setAttribute("pitchScaleQuantize", engine->isModPitchScaleQuantizeForSlot(stripIndex, slot));
+            slotXml->setAttribute("pitchScale", static_cast<int>(engine->getModPitchScaleForSlot(stripIndex, slot)));
+
+            std::vector<float> steps, endValues;
+            std::vector<int> subdivisions, curveShapes;
+            steps.reserve(ModernAudioEngine::ModTotalSteps);
+            endValues.reserve(ModernAudioEngine::ModTotalSteps);
+            subdivisions.reserve(ModernAudioEngine::ModTotalSteps);
+            curveShapes.reserve(ModernAudioEngine::ModTotalSteps);
+            for (int s = 0; s < ModernAudioEngine::ModTotalSteps; ++s)
+            {
+                steps.push_back(engine->getModStepValueAbsoluteForSlot(stripIndex, slot, s));
+                endValues.push_back(engine->getModStepEndValueAbsoluteForSlot(stripIndex, slot, s));
+                subdivisions.push_back(engine->getModStepSubdivisionAbsoluteForSlot(stripIndex, slot, s));
+                curveShapes.push_back(static_cast<int>(engine->getModStepCurveShapeAbsoluteForSlot(stripIndex, slot, s)));
+            }
+            slotXml->setAttribute("steps", encodeModFloatCsv(steps));
+            slotXml->setAttribute("stepEndValues", encodeModFloatCsv(endValues));
+            slotXml->setAttribute("stepSubdivisions", encodeModIntCsv(subdivisions));
+            slotXml->setAttribute("stepCurveShapes", encodeModIntCsv(curveShapes));
+        }
+    }
+
+    state.setProperty("modSequencersXml", root.toString(juce::XmlElement::TextFormat().singleLine()), nullptr);
+}
+
+void loadModSequencersFromSessionState(MlrVSTAudioProcessor& processor, const juce::ValueTree& state)
+{
+    auto* engine = processor.getAudioEngine();
+    if (engine == nullptr)
+        return;
+
+    const auto xmlText = state.getProperty("modSequencersXml", juce::String()).toString();
+    if (xmlText.isEmpty())
+        return;
+
+    const auto root = juce::parseXML(xmlText);
+    if (root == nullptr || !root->hasTagName("ModSequencers"))
+        return;
+
+    for (auto* stripXml : root->getChildWithTagNameIterator("Strip"))
+    {
+        const int stripIndex = stripXml->getIntAttribute("index", -1);
+        if (stripIndex < 0 || stripIndex >= MlrVSTAudioProcessor::MaxStrips)
+            continue;
+
+        for (auto* slotXml : stripXml->getChildWithTagNameIterator("Slot"))
+        {
+            const int slot = slotXml->getIntAttribute("index", -1);
+            if (slot < 0 || slot >= ModernAudioEngine::NumModSequencers)
+                continue;
+
+            engine->setModTargetForSlot(stripIndex, slot,
+                static_cast<ModernAudioEngine::ModTarget>(slotXml->getIntAttribute("target", 0)));
+            engine->setModBipolarForSlot(stripIndex, slot,
+                slotXml->getBoolAttribute("bipolar", false),
+                ModernAudioEngine::ModBipolarToggleMode::Reinterpret);
+            engine->setModCurveModeForSlot(stripIndex, slot, slotXml->getBoolAttribute("curveMode", false));
+            engine->setModDepthForSlot(stripIndex, slot,
+                juce::jlimit(0.0f, 1.0f, static_cast<float>(slotXml->getDoubleAttribute("depth", 1.0))));
+            engine->setModRateForSlot(stripIndex, slot,
+                juce::jlimit(0.125f, 8.0f, static_cast<float>(slotXml->getDoubleAttribute("rate", 1.0))));
+            engine->setModTransportModeForSlot(stripIndex, slot,
+                static_cast<ModernAudioEngine::ModTransportMode>(slotXml->getIntAttribute("transportMode", 0)));
+            engine->setModOffsetForSlot(stripIndex, slot, slotXml->getIntAttribute("offset", 0));
+            engine->setModLengthBarsForSlot(stripIndex, slot,
+                juce::jlimit(1, ModernAudioEngine::MaxModBars, slotXml->getIntAttribute("lengthBars", 1)));
+            engine->setModEditPageForSlot(stripIndex, slot, slotXml->getIntAttribute("editPage", 0));
+            engine->setModSmoothingMsForSlot(stripIndex, slot,
+                static_cast<float>(slotXml->getDoubleAttribute("smoothMs", 0.0)));
+            engine->setModCurveBendForSlot(stripIndex, slot,
+                static_cast<float>(slotXml->getDoubleAttribute("curveBend", 0.0)));
+            engine->setModCurveShapeForSlot(stripIndex, slot,
+                static_cast<ModernAudioEngine::ModCurveShape>(slotXml->getIntAttribute("curveShape", 0)));
+            engine->setModPitchScaleQuantizeForSlot(stripIndex, slot,
+                slotXml->getBoolAttribute("pitchScaleQuantize", false));
+            engine->setModPitchScaleForSlot(stripIndex, slot,
+                static_cast<ModernAudioEngine::PitchScale>(slotXml->getIntAttribute("pitchScale", 0)));
+
+            juce::StringArray steps, endValues, subdivisions, curveShapes;
+            steps.addTokens(slotXml->getStringAttribute("steps"), ",", "");
+            endValues.addTokens(slotXml->getStringAttribute("stepEndValues"), ",", "");
+            subdivisions.addTokens(slotXml->getStringAttribute("stepSubdivisions"), ",", "");
+            curveShapes.addTokens(slotXml->getStringAttribute("stepCurveShapes"), ",", "");
+            const int stepCount = juce::jmin(ModernAudioEngine::ModTotalSteps, steps.size());
+            for (int s = 0; s < stepCount; ++s)
+            {
+                engine->setModStepValueAbsoluteForSlot(stripIndex, slot, s,
+                    juce::jlimit(0.0f, 1.0f, steps[s].getFloatValue()));
+                const int subdivision = (s < subdivisions.size())
+                    ? juce::jlimit(1, ModernAudioEngine::ModMaxStepSubdivisions, subdivisions[s].getIntValue())
+                    : 1;
+                const float endValue = (s < endValues.size())
+                    ? juce::jlimit(0.0f, 1.0f, endValues[s].getFloatValue())
+                    : steps[s].getFloatValue();
+                engine->setModStepShapeAbsoluteForSlot(stripIndex, slot, s, subdivision, endValue);
+                if (s < curveShapes.size())
+                    engine->setModStepCurveShapeAbsoluteForSlot(stripIndex, slot, s,
+                        static_cast<ModernAudioEngine::ModCurveShape>(curveShapes[s].getIntValue()));
+            }
+        }
+
+        engine->setModSequencerSlot(stripIndex,
+            juce::jlimit(0, ModernAudioEngine::NumModSequencers - 1,
+                         stripXml->getIntAttribute("activeSlot", 0)));
+    }
+}
+} // namespace
+
 void MlrVSTAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
     try
@@ -181,6 +340,9 @@ void MlrVSTAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
         appendControlPagesToState(state);
         appendFlipStatesToState(state);
         appendLoopPitchStateToState(state);
+        state.setProperty("loadedPresetIndex", loadedPresetIndex, nullptr);
+        appendModSequencersToSessionState(*this, state);
+        SceneScheduler::appendSceneModeStateToState(*this, state);
 
         if (!state.isValid())
             return;
@@ -217,6 +379,7 @@ void MlrVSTAudioProcessor::setStateInformation(const void* data, int sizeInBytes
             loadControlPagesFromState(state);
             loadFlipStatesFromState(state);
             loadLoopPitchStateFromState(state);
+            loadModSequencersFromSessionState(*this, state);
             GlobalSettingsStore::loadGlobalControls(*this);
             persistentGlobalControlsApplied = true;
             pendingPersistentGlobalControlsRestore.store(1, std::memory_order_release);
@@ -230,6 +393,18 @@ void MlrVSTAudioProcessor::setStateInformation(const void* data, int sizeInBytes
             lastScenePerformanceProcessSceneStartBeat = std::numeric_limits<double>::quiet_NaN();
             if (isSceneModeEnabled())
                 clearAllStripGroupsForSceneMode();
+
+            loadedPresetIndex = juce::jlimit(
+                -1,
+                MaxPresetSlots - 1,
+                static_cast<int>(state.getProperty("loadedPresetIndex", -1)));
+
+            {
+                // Stored-scene templates can carry embedded audio; keep the
+                // audio thread out while they are rebuilt.
+                ScopedSuspendProcessing scopedSuspend(*this);
+                SceneScheduler::loadSceneModeStateFromState(*this, state);
+            }
         }
 }
 
@@ -485,6 +660,7 @@ void MlrVSTAudioProcessor::resetRuntimePresetStateToDefaults(bool preserveLoaded
 
     ScopedSceneAutosaveSuppression suppressSceneAutosave(*this);
     clearPendingActiveSceneAutosave();
+    activeSceneRecallDegraded.store(0, std::memory_order_release);
 
     pendingPresetLoadIndex.store(-1, std::memory_order_release);
     clearPendingSceneApplyState();

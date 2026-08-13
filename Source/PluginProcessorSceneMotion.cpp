@@ -11,6 +11,7 @@
 #include "AudioEngineModulation.h"
 #include "PluginEditor.h"
 #include "PlayheadSpeedQuantizer.h"
+#include "SceneAutomationRules.h"
 #include "SceneScheduler.h"
 #include <limits>
 
@@ -36,22 +37,6 @@ bool sceneModTargetsMatch(ModernAudioEngine::ModTarget lhs, ModernAudioEngine::M
     return lhs == rhs
         || (lhs == ModernAudioEngine::ModTarget::Pitch && rhs == ModernAudioEngine::ModTarget::GrainPitch)
         || (lhs == ModernAudioEngine::ModTarget::GrainPitch && rhs == ModernAudioEngine::ModTarget::Pitch);
-}
-
-int sceneAutomationMaskIndex(int stripIndex, ScenePerformanceControlTarget target) noexcept
-{
-    if (target == ScenePerformanceControlTarget::Retrigger && stripIndex < 0)
-        return MlrVSTAudioProcessor::MaxStrips;
-
-    return juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
-}
-
-uint64_t sceneAutomationTargetBit(ScenePerformanceControlTarget target) noexcept
-{
-    if (target == ScenePerformanceControlTarget::None)
-        return 0;
-
-    return uint64_t{ 1 } << juce::jlimit(0, 63, static_cast<int>(target));
 }
 
 std::vector<ModernAudioEngine::ModTarget> buildVisibleModTargetsForSceneLaneMode(bool grainStrip)
@@ -571,7 +556,55 @@ void MlrVSTAudioProcessor::restoreSceneStripControlTargetsToStoredState(
     int stripIndex,
     const std::vector<ScenePerformanceControlTarget>& targets)
 {
-    restoreSceneStripControlTargetsToDefaultState(sceneSlot, stripIndex, targets);
+    if (targets.empty()
+        || !isSceneModeEnabled()
+        || audioEngine == nullptr)
+    {
+        return;
+    }
+
+    const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
+    const int safeStripIndex = juce::jlimit(0, MaxStrips - 1, stripIndex);
+    if (safeSceneSlot != juce::jlimit(0, SceneSlots - 1, activeSceneSlot))
+        return;
+
+    if (audioEngine->getStrip(safeStripIndex) == nullptr)
+        return;
+
+    // Targets whose stored scene value can be resolved snap back to that value;
+    // the rest (including Rearrange, whose control-point apply is a no-op) fall
+    // through to the factory-default restore.
+    std::vector<ScenePerformanceControlTarget> defaultTargets;
+    defaultTargets.reserve(targets.size());
+    for (const auto target : targets)
+    {
+        float storedValue = 0.0f;
+        if (target == ScenePerformanceControlTarget::None
+            || target == ScenePerformanceControlTarget::Rearrange
+            || !getStoredSceneControlValue(safeSceneSlot, safeStripIndex, target, storedValue))
+        {
+            defaultTargets.push_back(target);
+            continue;
+        }
+
+        if (target != ScenePerformanceControlTarget::Retrigger)
+        {
+            auto& overrideMask = activeSceneAutomationOverrideMasks[static_cast<size_t>(
+                SceneAutomationRules::automationMaskIndex(safeStripIndex, target))];
+            overrideMask.fetch_and(~SceneAutomationRules::automationTargetBit(target),
+                                   std::memory_order_acq_rel);
+        }
+
+        ScenePerformanceEvent restoreEvent;
+        restoreEvent.type = ScenePerformanceEventType::ControlPoint;
+        restoreEvent.stripIndex = safeStripIndex;
+        restoreEvent.controlTarget = target;
+        restoreEvent.value = storedValue;
+        applyScenePerformanceEvent(restoreEvent, StripControlWriteMode::CacheOnly);
+    }
+
+    if (!defaultTargets.empty())
+        restoreSceneStripControlTargetsToDefaultState(safeSceneSlot, safeStripIndex, defaultTargets);
 }
 
 void MlrVSTAudioProcessor::restoreSceneStripControlTargetsToDefaultState(
@@ -628,8 +661,8 @@ void MlrVSTAudioProcessor::restoreSceneStripControlTargetsToDefaultState(
             && target != ScenePerformanceControlTarget::Retrigger)
         {
             auto& overrideMask = activeSceneAutomationOverrideMasks[static_cast<size_t>(
-                sceneAutomationMaskIndex(safeStripIndex, target))];
-            overrideMask.fetch_and(~sceneAutomationTargetBit(target), std::memory_order_acq_rel);
+                SceneAutomationRules::automationMaskIndex(safeStripIndex, target))];
+            overrideMask.fetch_and(~SceneAutomationRules::automationTargetBit(target), std::memory_order_acq_rel);
         }
 
         switch (target)

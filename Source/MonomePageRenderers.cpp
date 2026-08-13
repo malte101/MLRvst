@@ -191,17 +191,19 @@ bool MlrVSTAudioProcessor::renderMonomeControlPageStripRow(const MonomeLayoutSta
     const bool stripPlaying = audioEngine->getStrip(selectedStrip)
         && audioEngine->getStrip(selectedStrip)->isPlaying();
 
-    const auto baseRowForColumn = [&](int column)
+    // Mirrors the press-side scale: the top cell only belongs to the value
+    // ramp when the Modulation top-row overlay is writable for that column.
+    const auto modulationTopCellReserved = [&](int column)
     {
-        if (column == kMonomeModPrevColumn || column == kMonomeModNextColumn)
-            return seq.bipolar ? (1 + ((modulationMaxRow - 1) / 2)) : modulationMaxRow;
-        return seq.bipolar ? (modulationMaxRow / 2) : modulationMaxRow;
+        return column == kMonomeModPrevColumn
+            || column == kMonomeModNextColumn
+            || layout.topRowMode != MonomeLayoutState::TopRowMode::Modulation;
     };
 
     const auto valueToRow = [&](float v, int column)
     {
         v = juce::jlimit(0.0f, 1.0f, v);
-        const bool reservedTopCell = (column == kMonomeModPrevColumn || column == kMonomeModNextColumn);
+        const bool reservedTopCell = modulationTopCellReserved(column);
         const int topRow = reservedTopCell ? 1 : 0;
         const int usableRows = reservedTopCell ? juce::jmax(1, modulationMaxRow - 1) : modulationMaxRow;
         if (seq.bipolar)
@@ -215,6 +217,13 @@ bool MlrVSTAudioProcessor::renderMonomeControlPageStripRow(const MonomeLayoutSta
         return juce::jlimit(topRow,
                             modulationMaxRow,
                             topRow + static_cast<int>(std::round((1.0f - v) * usableRows)));
+    };
+
+    // Base (neutral) row derives from the SAME mapping as rendered values so a
+    // flat lane at neutral paints as a flat line on the base row.
+    const auto baseRowForColumn = [&](int column)
+    {
+        return valueToRow(seq.bipolar ? 0.5f : 0.0f, column);
     };
 
     const auto curveLevelForRow = [&](int sourceRow, bool isPoint)

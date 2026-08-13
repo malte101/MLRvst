@@ -180,12 +180,12 @@ bool MlrVSTAudioProcessor::isMonomeControlRowUtilityCell(const MonomeLayoutState
         return false;
 
     if (layout.stepEditModeActive)
-        return x == 13 || x == 14;
+        return (x == 13 || x == 14) && x != getControlButtonForMode(ControlMode::StepEdit);
 
     if (layout.topRowEditSupported && x == layout.topRowEditToggleColumn)
         return true;
 
-    if ((!controlModeActive || currentControlMode == ControlMode::Normal) && x >= 13 && x <= 15)
+    if ((!controlModeActive || currentControlMode == ControlMode::Normal) && x >= 14 && x <= 15)
     {
         if (x == 15)
             return true;

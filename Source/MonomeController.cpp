@@ -107,14 +107,6 @@ int scratchSceneColumnFromAmount(float amount) noexcept
     return juce::jlimit(0, 15, static_cast<int>(std::lround((clamped / 100.0f) * 15.0f)));
 }
 
-float quantizeMonomeRearrangeValue(float value01)
-{
-    return juce::jlimit(0.0f, 1.0f,
-                        std::round(juce::jlimit(0.0f, 1.0f, value01)
-                                   * static_cast<float>(ModernAudioEngine::MaxColumns - 1))
-                            / static_cast<float>(juce::jmax(1, ModernAudioEngine::MaxColumns - 1)));
-}
-
 ScenePerformanceControlTarget sceneControlTargetForModTarget(bool grainMode,
                                                              ModernAudioEngine::ModTarget target)
 {
@@ -1138,7 +1130,10 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 if (sceneLengthCount > 0)
                 {
                     const int sceneSlot = getFocusedSceneSlot();
-                    setSceneLengthCount(sceneSlot, sceneLengthCount);
+                    // setSceneManualBars, not setSceneLengthCount: the latter
+                    // also resets the scene's repeat count to 1 (screen Bars
+                    // combo avoids it for the same reason).
+                    setSceneManualBars(sceneSlot, sceneLengthCount);
                     persistSceneTimingForSlot(sceneSlot);
                     updateMonomeLEDs();
                     return;
@@ -1296,6 +1291,11 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                         {
                             sceneSequenceActive = true;
                             sceneSequenceCurrentStepIndex = 0;
+                            // The attach must also hand playback ownership to
+                            // the chain (matching startSceneChainPlayback and
+                            // the apply path), or owner-dependent logic keeps
+                            // treating playback as manual.
+                            switchScenePlaybackOwner(ScenePlaybackOwner::Chain, true, 0);
                             setActiveScenePlaybackHandle(mainPresetIndex,
                                                          previousSceneSlot,
                                                          true,
@@ -1362,7 +1362,9 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 const int sceneLengthCount = sceneLengthCountFromButton(x);
                 if (sceneLengthCount > 0)
                 {
-                    setSceneLengthCount(focusedSceneSlotIndex, sceneLengthCount);
+                    // Same as the Modulation-page length cells: never reset
+                    // the scene's repeat count as a side effect.
+                    setSceneManualBars(focusedSceneSlotIndex, sceneLengthCount);
                     persistSceneTimingForSlot(focusedSceneSlotIndex);
                     updateMonomeLEDs();
                     return;
@@ -1653,15 +1655,12 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 {
                     const float normalizedY = 1.0f; // y=0 is highest value
                     const bool bipolar = engine->isModBipolar(targetStrip);
-                    const bool rearrangeTarget = (engine->getModTarget(targetStrip) == ModernAudioEngine::ModTarget::Rearrange);
                     float value = normalizedY;
                     if (bipolar)
                     {
                         const float signedValue = (normalizedY * 2.0f) - 1.0f;
                         value = juce::jlimit(0.0f, 1.0f, (signedValue * 0.5f) + 0.5f);
                     }
-                    if (rearrangeTarget)
-                        value = quantizeMonomeRearrangeValue(value);
                     engine->setModStepValue(targetStrip, x, value);
                     if (sceneModPageWritesSceneMotion)
                         syncFocusedSceneMotionState();
@@ -1750,8 +1749,13 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 updateMonomeLEDs();
                 return;
             }
-            else if (stepEditModeActive && (x == 13 || x == 14))
+            else if (stepEditModeActive
+                     && (x == 13 || x == 14)
+                     && x != getControlButtonForMode(ControlMode::StepEdit))
             {
+                // The StepEdit page button itself must stay a page toggle, or
+                // the page can never be left from its own button (and each
+                // escape attempt detunes the strip).
                 const int selectedStripIndex = clampVisibleStrip(stepEditSelectedStrip);
                 if (auto* strip = audioEngine->getStrip(selectedStripIndex))
                 {
@@ -1766,8 +1770,11 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
             else if ((!controlModeActive || currentControlMode == ControlMode::Normal)
                      && isMonomeControlRowUtilityCell(layout, x)
-                     && x >= 13 && x <= 15)
+                     && x >= 14 && x <= 15)
             {
+                // Columns 0-13 carry page assignments; sample-strip utility
+                // cells live on 14/15 only so they can never shadow a page
+                // button. 14 cycles the trigger mode, 15 toggles the engine.
                 const int selectedStripIndex = clampVisibleStrip(getLastMonomePressedStripRow());
                 auto* strip = audioEngine->getStrip(selectedStripIndex);
                 auto* sampleEngine = getSampleModeEngine(selectedStripIndex, false);
@@ -1775,10 +1782,10 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     && sampleEngine != nullptr
                     && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Sample)
                 {
-                    if (x == 13)
-                        sampleEngine->setTriggerMode(SampleTriggerMode::OneShot);
-                    else if (x == 14)
-                        sampleEngine->setTriggerMode(SampleTriggerMode::Loop);
+                    if (x == 14)
+                        sampleEngine->setTriggerMode(sampleEngine->getTriggerMode() == SampleTriggerMode::Loop
+                                                         ? SampleTriggerMode::OneShot
+                                                         : SampleTriggerMode::Loop);
                     else
                         sampleEngine->setLegacyLoopEngineEnabled(!sampleEngine->isLegacyLoopEngineEnabled());
 
@@ -1797,6 +1804,9 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 {
                     currentControlMode = selectedMode;
                     controlModeActive = true;
+                    momentaryHeldPageButtonsMask = static_cast<uint16_t>(
+                        momentaryHeldPageButtonsMask | (1u << static_cast<unsigned>(x)));
+                    momentaryActivePageButton = x;
                 }
                 else
                 {
@@ -2098,7 +2108,10 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 }
                 
                 // Loop length setting mode - ONLY if scratch is disabled and strip is not in Step mode.
-                if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Step
+                // Gated on normalPlaybackMode so a held pad + an open control
+                // page (e.g. Modulation value entry) cannot hijack the press.
+                if (normalPlaybackMode
+                    && strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Step
                     && strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample
                     && loopSetFirstButton >= 0
                     && loopSetStrip == stripIndex
@@ -2205,6 +2218,90 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
     }
     else if (state == 0) // Key up
     {
+        // Engaged-state releases must run before any mode swallow (StepEdit /
+        // Preset early-returns below), or switching pages mid-hold leaves a
+        // momentary scratch or stutter permanently engaged.
+        if (y == GROUP_ROW && x == 8 && momentaryScratchHoldActive)
+        {
+            setMomentaryScratchHold(false);
+            updateMonomeLEDs();
+            return;
+        }
+        if (y == GROUP_ROW && x >= 9 && x <= 15
+            && (momentaryStutterButtonMask.load(std::memory_order_acquire)
+                & stutterButtonBitForColumn(x)) != 0)
+        {
+            const int releasedColumn = x;
+            const int previousActiveColumn = momentaryStutterActiveDivisionButton;
+            const uint8_t bit = stutterButtonBitForColumn(x);
+            uint8_t currentMask = momentaryStutterButtonMask.load(std::memory_order_acquire);
+            currentMask = static_cast<uint8_t>(currentMask & static_cast<uint8_t>(~bit));
+            momentaryStutterButtonMask.store(currentMask, std::memory_order_release);
+
+            if (currentMask == 0)
+            {
+                if (previousActiveColumn >= 9 && previousActiveColumn <= 15)
+                    momentaryStutterRecordedDivisionButton = previousActiveColumn;
+                else
+                    momentaryStutterRecordedDivisionButton = releasedColumn;
+                setMomentaryStutterHold(false);
+            }
+            else
+            {
+                const int activeColumn = stutterColumnFromMask(currentMask);
+                if (activeColumn >= 9 && activeColumn <= 15)
+                {
+                    momentaryStutterActiveDivisionButton = activeColumn;
+                    momentaryStutterDivisionBeats = stutterDivisionBeatsFromButton(activeColumn);
+                    momentaryStutterRecordedDivisionButton = activeColumn;
+                    audioEngine->setMomentaryStutterDivision(momentaryStutterDivisionBeats);
+                    if (momentaryStutterPlaybackActive.load(std::memory_order_acquire) != 0)
+                    {
+                        recordMomentaryStutterSceneDivision(momentaryStutterDivisionBeats,
+                                                            activeColumn,
+                                                            audioEngine != nullptr ? audioEngine->getTimelineBeat() : 0.0);
+                    }
+                }
+            }
+            updateMonomeLEDs();
+            return;
+        }
+
+        // Minimal strip-hold hygiene delivered even when a mode swallow eats
+        // the release: without it, holds made before a page switch leave
+        // isButtonHeld stuck and misfire the stop-combo / loop-set gestures.
+        auto releaseStripHoldAt = [&](int gridX, int gridY)
+        {
+            if (!isDisplayedDataRow(gridY))
+                return;
+            const int stripIndex = gridY - FIRST_STRIP_ROW;
+            if (stripIndex < 0 || stripIndex >= visibleStripCount || gridX >= MaxColumns)
+                return;
+            if (auto* strip = audioEngine->getStrip(stripIndex))
+            {
+                if (strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample)
+                {
+                    const bool gateHoldWasHeld = strip->isButtonHeld(gridX);
+                    if (gateHoldWasHeld)
+                        strip->onButtonRelease(gridX, audioEngine->getGlobalSampleCount());
+                    // A Gate hold must stop on release even when a mode swallow
+                    // ate the normal release path, or the strip sustains forever.
+                    if (gateHoldWasHeld
+                        && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Gate)
+                        stopStrip(stripIndex, false, gridX);
+                }
+                else
+                {
+                    clearSampleModeHeldVisibleSliceSlot(stripIndex, gridX);
+                }
+            }
+            if (stripIndex == loopSetStrip && gridX == loopSetFirstButton)
+            {
+                loopSetFirstButton = -1;
+                loopSetStrip = -1;
+            }
+        };
+
         if (isSceneRecorderCell(x, y))
         {
             const bool holdTriggered = monomeSceneRecorderHoldClearTriggered;
@@ -2254,6 +2351,7 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             deletedTap = false;
             lastTap = nowMs;
 
+            releaseStripHoldAt(x, y);
             updateMonomeLEDs();
             return;
         }
@@ -2271,6 +2369,9 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                     if (auto* strip = audioEngine->getStrip(stripIndex))
                     {
                         MonomeFileBrowserActions::handleButtonRelease(*this, *strip, stripIndex, x);
+                        // Same hygiene as the preset/StepEdit swallows: a Gate
+                        // hold on a favorite column must still release/stop.
+                        releaseStripHoldAt(x, y);
                         updateMonomeLEDs();
                         return;
                     }
@@ -2330,11 +2431,13 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
 
         if (stepEditModeActive && isDisplayedDataRow(y))
         {
+            releaseStripHoldAt(x, y);
             updateMonomeLEDs();
             return;
         }
 
         // Notify strip of button release (for musical scratching)
+        bool gateHoldReleased = false;
         if (isDisplayedDataRow(y))
         {
             int stripIndex = y - FIRST_STRIP_ROW;
@@ -2343,6 +2446,8 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 auto* strip = audioEngine->getStrip(stripIndex);
                 if (strip)
                 {
+                    gateHoldReleased = strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Gate
+                        && strip->isButtonHeld(x);
                     const bool scratchGestureRelease = strip->getPlayMode() != EnhancedAudioStrip::PlayMode::Sample
                         && strip->getScratchAmount() > kScratchZeroEpsilon
                         && ((strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Grain)
@@ -2376,9 +2481,11 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
             }
         }
         
-        // Gate-playback release should only stop strips during normal launch use,
-        // not while a control page is open and rows are editing parameters.
-        if ((!controlModeActive || currentControlMode == ControlMode::Normal)
+        // Gate-playback release: only a pad that was genuinely held for
+        // playback stops the strip (captured as gateHoldReleased BEFORE
+        // onButtonRelease). Releases of presses that a control page swallowed
+        // must never stop a gate held by another finger on the same row.
+        if (gateHoldReleased
             && isDisplayedDataRow(y))
         {
             int stripIndex = y - FIRST_STRIP_ROW;
@@ -2387,24 +2494,63 @@ void MlrVSTAudioProcessor::handleMonomeKeyPress(int x, int y, int state)
                 auto* strip = audioEngine->getStrip(stripIndex);
                 if (strip && strip->getPlayMode() == EnhancedAudioStrip::PlayMode::Gate)
                 {
-                    stopStrip(stripIndex, true, x);
+                    stopStrip(stripIndex, false, x);
                 }
             }
         }
         
-        // Release control mode in momentary behavior (control-page buttons)
+        // Release control mode in momentary behavior (control-page buttons).
+        // Only the release of a held page button matters; the mode drops to
+        // Normal only when NO page button remains held, otherwise it reverts
+        // to the most suitable still-held button's page.
         if (isControlPageMomentary()
             && y == CONTROL_ROW
             && (x >= 0 && x < NumControlRowPages)
-            && !isMonomeControlRowUtilityCell(layout, x))
+            && (momentaryHeldPageButtonsMask & (1u << static_cast<unsigned>(x))) != 0)
         {
+            // Gate on the tracked bit, not the utility-cell predicate: the
+            // layout can reclassify a column mid-hold (e.g. StepEdit became
+            // active), which would swallow the release and leave the bit
+            // stuck, re-activating a phantom page later. Utility presses
+            // never set a bit, so their releases stay inert here.
+            momentaryHeldPageButtonsMask = static_cast<uint16_t>(
+                momentaryHeldPageButtonsMask & ~(1u << static_cast<unsigned>(x)));
+
             const bool wasStepEditMode = (controlModeActive && currentControlMode == ControlMode::StepEdit);
-            currentControlMode = ControlMode::Normal;
-            controlModeActive = false;
-            monomeTopRowEditOverlayActive = false;
-            if (wasStepEditMode)
-                resetStepEditVelocityGestures();
-            updateMonomeLEDs();  // Update LEDs when returning to normal
+            if (momentaryHeldPageButtonsMask == 0)
+            {
+                momentaryActivePageButton = -1;
+                currentControlMode = ControlMode::Normal;
+                controlModeActive = false;
+                monomeTopRowEditOverlayActive = false;
+                if (wasStepEditMode)
+                    resetStepEditVelocityGestures();
+                updateMonomeLEDs();  // Update LEDs when returning to normal
+            }
+            else if (x == momentaryActivePageButton)
+            {
+                int fallbackButton = -1;
+                for (int button = 0; button < NumControlRowPages; ++button)
+                {
+                    if ((momentaryHeldPageButtonsMask & (1u << static_cast<unsigned>(button))) != 0)
+                        fallbackButton = button;
+                }
+                if (fallbackButton >= 0)
+                {
+                    momentaryActivePageButton = fallbackButton;
+                    currentControlMode = getControlModeForControlButton(fallbackButton);
+                    controlModeActive = true;
+                    monomeTopRowEditOverlayActive = false;
+                    if (wasStepEditMode && currentControlMode != ControlMode::StepEdit)
+                        resetStepEditVelocityGestures();
+                }
+                updateMonomeLEDs();
+            }
+        }
+        else if (!isControlPageMomentary() && momentaryHeldPageButtonsMask != 0)
+        {
+            momentaryHeldPageButtonsMask = 0;
+            momentaryActivePageButton = -1;
         }
         
         // Reset loop setting
@@ -2630,7 +2776,11 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                     monomeSceneRecorderHoldClearTriggered = true;
                     clearPendingMonomeSceneRecorderTap();
                     clearPendingSceneRecorderAction();
-                    const int targetSceneSlot = getFocusedSceneSlot();
+                    // Target the same slot the record gestures use (the ACTIVE
+                    // scene). Chain playback preserves focus, so the focused
+                    // slot can be a different scene than the one recording —
+                    // clearing it would erase the wrong scene's automation.
+                    const int targetSceneSlot = juce::jlimit(0, SceneSlots - 1, activeSceneSlot);
                     const int targetStrip = clampVisibleStrip(getLastMonomePressedStripRow());
                     if (clearSceneStripAutomationAndMotion(targetSceneSlot, targetStrip))
                         monomeSceneRecorderClearBurstUntilMs = nowMs + sceneActionBurstDurationMs;
@@ -2704,6 +2854,20 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
     }
 
+    if (!(controlModeActive && currentControlMode == ControlMode::Preset))
+    {
+        // Leaving the Preset page must drop any pad-hold tracking: a release
+        // swallowed by a page transition otherwise leaves held=true, and the
+        // next Preset-page visit would instantly fire a spurious savePreset
+        // (silently overwriting that slot).
+        for (auto& padHeld : presetPadHeld)
+            padHeld = false;
+        for (auto& saved : presetPadHoldSaveTriggered)
+            saved = false;
+        for (auto& deleted : presetPadDeleteTriggered)
+            deleted = false;
+    }
+
     if (controlModeActive && currentControlMode == ControlMode::Preset)
     {
         for (int y = 0; y < PresetRows; ++y)
@@ -2741,7 +2905,15 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
         }
 
         if (sceneModeActive)
+        {
+            // Scene mode owns row 0 (scene pads 0-6, recorder 7); columns
+            // 8-15 have no preset press handler here, so rendering live
+            // preset LEDs on them advertised dead pads. Blank them first and
+            // let updateSceneSlotLeds redraw anything it actually owns.
+            for (int x = 8; x < gridWidth && x < 16; ++x)
+                newLedState[x][GROUP_ROW] = 0;
             updateSceneSlotLeds();
+        }
 
         // Keep control row visible while preset grid is active.
         for (int x = 0; x < NumControlRowPages && x < gridWidth; ++x)
@@ -3026,7 +3198,11 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                     }
                     else
                     {
-                        newLedState[x][GROUP_ROW] = slowBlinkOn ? 15 : 5;
+                        // Normal mode: only advertise nav when it can actually
+                        // move to another lane (single-target strips got a
+                        // bright blink that did nothing).
+                        newLedState[x][GROUP_ROW] =
+                            sceneStepMotionLaneNavigationLevel(regularModLaneNavigationAvailable(targetStrip));
                     }
                     continue;
                 }
@@ -3432,8 +3608,13 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
             upLevel = canUp ? 9 : 2;
         }
 
-        newLedState[13][CONTROL_ROW] = downLevel;
-        newLedState[14][CONTROL_ROW] = upLevel;
+        // Never overwrite the StepEdit page button's active-page LED with a
+        // pitch-cell level (the button is a page toggle, not a pitch cell).
+        const int stepEditPageButton = getControlButtonForMode(ControlMode::StepEdit);
+        if (stepEditPageButton != 13)
+            newLedState[13][CONTROL_ROW] = downLevel;
+        if (stepEditPageButton != 14)
+            newLedState[14][CONTROL_ROW] = upLevel;
     }
     else if (!controlModeActive || currentControlMode == ControlMode::Normal)
     {
@@ -3445,8 +3626,7 @@ void MlrVSTAudioProcessor::updateMonomeLEDs()
                 if (auto* sampleEngine = getSampleModeEngine(selectedStripIndex, false))
                 {
                     const auto triggerMode = sampleEngine->getTriggerMode();
-                    newLedState[13][CONTROL_ROW] = (triggerMode == SampleTriggerMode::OneShot) ? 15 : 4;
-                    newLedState[14][CONTROL_ROW] = (triggerMode == SampleTriggerMode::Loop) ? 15 : 4;
+                    newLedState[14][CONTROL_ROW] = (triggerMode == SampleTriggerMode::Loop) ? 15 : 8;
                     newLedState[15][CONTROL_ROW] = sampleEngine->isLegacyLoopEngineEnabled() ? 15 : 4;
                 }
             }

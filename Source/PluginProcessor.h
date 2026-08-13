@@ -725,7 +725,9 @@ public:
     {
         std::array<SceneChainStep, MaxSceneChainSteps> steps{};
         juce::File transitionEndSampleDirectory;
-        bool loopEnabled = false;
+        // Chains loop by default (historical behavior); disabling plays the
+        // chain once and holds on the last scene.
+        bool loopEnabled = true;
         int loopStart = 0;
         int loopEnd = 0;
     };
@@ -1063,6 +1065,10 @@ public:
     bool captureSceneTransitionFavorite(int favoriteIndex, int stepIndex);
     bool applySceneTransitionFavorite(int favoriteIndex, int stepIndex);
     void clearSceneChain();
+    void setSceneChainSteps(const std::vector<SceneChainStep>& steps,
+                            bool loopEnabled,
+                            int loopStart,
+                            int loopEnd);
     bool isSceneChainLoopEnabled() const;
     void setSceneChainLoopEnabled(bool enabled);
     int getSceneChainLoopStartStep() const;
@@ -1070,6 +1076,18 @@ public:
     void setSceneChainLoopRange(int startStep, int endStep);
     bool isSceneChainPlaybackActive() const;
     int getSceneChainPlaybackStepIndex() const;
+    struct SceneChainPlaybackStatus
+    {
+        bool active = false;
+        int stepIndex = -1;
+        int queuedStepIndex = -1;
+        int queuedSceneSlot = -1;
+        float progress01 = 0.0f;
+        int repeatIndex = 1;
+        int repeatCount = 1;
+    };
+    // Display-only snapshot for the editor (status strip + chain rail paint).
+    SceneChainPlaybackStatus getSceneChainPlaybackStatus() const;
     bool startSceneChainPlayback(int startStepIndex = 0);
     void stopSceneChainPlayback();
     void recallSceneSlot(int sceneSlot);
@@ -1122,6 +1140,7 @@ public:
                                         int columnHint = -1);
     bool copySceneSlotToClipboard(int sceneSlot);
     bool pasteSceneSlotFromClipboard(int sceneSlot);
+    bool replaceSceneSlotWithScene(int sourceSceneSlot, int destSceneSlot);
     bool hasSceneSlotClipboard() const;
     int getSceneSlotClipboardSourceSlot() const;
     bool copyScenePerformanceClipToClipboard(int sceneSlot);
@@ -1614,6 +1633,11 @@ private:
     std::vector<SoundTouchPitchCacheResult> soundTouchPitchCacheResults;
     std::array<std::atomic<int>, MaxStrips> soundTouchPitchCacheRequestIds{};
     std::array<std::atomic<int>, MaxStrips> soundTouchPitchCacheInFlight{};
+    // One-tick serial stability debounce for the background swing/tempo-match
+    // cache renders (scheduled from the same maintenance timer).
+    std::array<uint32_t, MaxStrips> swingCacheLastObservedSerials{};
+    std::array<uint32_t, MaxStrips> tempoMatchCacheLastObservedSerials{};
+    void maintainStripOfflineCaches();
     std::array<float, MaxStrips> soundTouchPitchCacheObservedTargets{};
     std::array<int, MaxStrips> soundTouchPitchCacheStableTicks{};
     juce::CriticalSection bungeePitchCacheResultLock;
@@ -1685,6 +1709,7 @@ private:
     };
     class SoundTouchPitchCacheJob;
     class BungeePitchCacheJob;
+    class StripOfflineCacheJob;
     class SignalsmithPitchCacheJob;
     class FlipLegacyLoopRenderJob;
     std::array<FlipLegacyLoopSyncCache, MaxStrips> flipLegacyLoopSyncCache{};
@@ -1869,7 +1894,7 @@ private:
     void handleSampleModeLegacyLoopRenderStateChanged(int stripIndex, bool preferInlineBuild = false);
     void handleFlipTempoMatchModeChanged();
     void invalidateFlipLegacyLoopSync(int stripIndex);
-    void stopSampleModeStrip(int stripIndex, bool immediateStop);
+    void stopSampleModeStrip(int stripIndex, bool immediateStop, bool bumpTriggerGeneration = true);
     void timerCallback() override;
     
     void handleMonomeKeyPress(int x, int y, int state);
@@ -2413,6 +2438,7 @@ private:
     bool sceneSwitchHasIncomingPlayback(const SceneSwitchEvent& event) const noexcept;
     void queuePendingSceneParameterState(const juce::ValueTree& state);
     void applyPendingSceneParameterState();
+    void applyPendingSceneRawParameterResync();
     void clearSceneStripLaunchHandles() noexcept;
     SceneStripPlaybackHandle captureSceneStripPlaybackHandle(int stripIndex);
     void refreshSceneStripLaunchHandlesFromEngine();
@@ -2456,9 +2482,9 @@ private:
     bool refreshStoredSceneSlotSnapshot(int mainPresetIndex, int sceneSlot);
     struct SceneStripControlRuntimeState
     {
-        float volume = 1.0f;
-        float pan = 0.0f;
-        float speed = 1.0f;
+        static constexpr int NumControlTargets = static_cast<int>(ScenePerformanceControlTarget::GrainShape) + 1;
+        std::array<float, NumControlTargets> controlValues{};
+        std::array<bool, NumControlTargets> controlValueValid{};
         EnhancedAudioStrip::PlayMode playMode = EnhancedAudioStrip::PlayMode::Loop;
     };
     struct SceneClipSlotRuntimeState
@@ -2511,6 +2537,11 @@ public:
 
     // Row 0, col 8: global momentary scratch modifier.
     bool momentaryScratchHoldActive = false;
+    // Momentary control-page tracking: which page buttons are physically held
+    // and which one owns the current mode, so releasing a *different* page
+    // button cannot cancel a mode whose button is still held.
+    uint16_t momentaryHeldPageButtonsMask = 0;
+    int momentaryActivePageButton = -1;
     std::array<float, MaxStrips> momentaryScratchSavedAmount{};
     std::array<EnhancedAudioStrip::DirectionMode, MaxStrips> momentaryScratchSavedDirection{};
     std::array<bool, MaxStrips> momentaryScratchWasStepMode{};
@@ -2620,6 +2651,14 @@ public:
     int activeSceneMainPresetIndex = 0;
     int activeSceneSlot = 0;
     bool activeSceneNeedsCaptureBeforeManualRecall = true;
+    // Set when the last scene recall could not load stored strip content
+    // (e.g. missing sample file). While set, automatic captures of the active
+    // scene are blocked so the degraded live state cannot overwrite the stored
+    // snapshot; an explicit user save clears it.
+    std::atomic<int> activeSceneRecallDegraded{0};
+    // Last host time-signature bar length in beats (updated per audio block);
+    // lets message-thread scene-length math honor non-4/4 meters.
+    std::atomic<double> hostBarLengthBeats{4.0};
     struct SceneModeGroupSnapshot
     {
         bool valid = false;
@@ -2738,6 +2777,10 @@ public:
     std::vector<SceneFileAudioCacheEntry> sceneFileAudioCache;
     uint64_t sceneFileAudioCacheUseCounter = 0;
     std::atomic<int> suppressOwnedStripParameterSync{0};
+    // Set when a scene recall had no valid parameterState payload: the message
+    // thread rebuilds APVTS parameter values from the raw atomics (which hold
+    // the engine truth after CacheOnly scene writes) before sync resumes.
+    std::atomic<int> pendingSceneRawParameterResync{0};
     std::atomic<juce::ValueTree*> pendingSceneParameterStatePtr{nullptr};
     static constexpr size_t MaxRetiredPendingSceneParameterStates = 4;
     std::array<std::atomic<juce::ValueTree*>, MaxRetiredPendingSceneParameterStates>

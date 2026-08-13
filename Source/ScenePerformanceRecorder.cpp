@@ -1,4 +1,5 @@
 #include "ScenePerformanceRecorder.h"
+#include "SceneAutomationRules.h"
 
 #include <algorithm>
 #include <cmath>
@@ -13,8 +14,6 @@ constexpr int kScenePerformanceDataMagic = 0x53435031; // SCP1
 constexpr int kScenePerformanceDataVersion = 4;
 constexpr double kSceneEventReplaceEpsilonBeats = 1.0 / 1024.0;
 constexpr double kSceneControlThinBeatWindowBeats = 1.0 / 64.0;
-constexpr float kSceneContinuousControlThinValueThreshold = 0.015f;
-constexpr float kSceneDiscreteControlThinValueThreshold = 1.0e-4f;
 
 void sortClipEvents(ScenePerformanceClip& clip)
 {
@@ -40,126 +39,6 @@ void insertEventSorted(ScenePerformanceClip& clip, const ScenePerformanceEvent& 
                                                 return beat < existing.timeBeats;
                                             });
     clip.events.insert(insertPos, event);
-}
-
-float normalizeControlValueForThinning(ScenePerformanceControlTarget target, float value)
-{
-    switch (target)
-    {
-        case ScenePerformanceControlTarget::Speed:
-        {
-            const float safeValue = juce::jlimit(0.125f, 8.0f, value);
-            return juce::jlimit(0.0f, 1.0f, (std::log2(safeValue) + 3.0f) / 6.0f);
-        }
-        case ScenePerformanceControlTarget::Pitch:
-            return juce::jlimit(0.0f, 1.0f, (value + 24.0f) / 48.0f);
-        case ScenePerformanceControlTarget::GrainPitch:
-            return juce::jlimit(0.0f, 1.0f, (value + 48.0f) / 96.0f);
-        case ScenePerformanceControlTarget::Pan:
-        case ScenePerformanceControlTarget::GrainShape:
-            return juce::jlimit(0.0f, 1.0f, (value + 1.0f) * 0.5f);
-        case ScenePerformanceControlTarget::Volume:
-        case ScenePerformanceControlTarget::Swing:
-        case ScenePerformanceControlTarget::GrainSpread:
-        case ScenePerformanceControlTarget::GrainJitter:
-        case ScenePerformanceControlTarget::GrainPositionJitter:
-        case ScenePerformanceControlTarget::GrainRandomDepth:
-        case ScenePerformanceControlTarget::GrainArp:
-        case ScenePerformanceControlTarget::GrainCloud:
-        case ScenePerformanceControlTarget::GrainEmitter:
-        case ScenePerformanceControlTarget::GrainEnvelope:
-        case ScenePerformanceControlTarget::DelayMix:
-        case ScenePerformanceControlTarget::FilterMorph:
-        case ScenePerformanceControlTarget::FilterEnabled:
-        case ScenePerformanceControlTarget::Retrigger:
-        case ScenePerformanceControlTarget::Rearrange:
-        case ScenePerformanceControlTarget::DelaySyncEnabled:
-            return juce::jlimit(0.0f, 1.0f, value);
-        case ScenePerformanceControlTarget::SliceLength:
-            return juce::jlimit(0.0f, 1.0f, (value - 0.02f) / 0.98f);
-        case ScenePerformanceControlTarget::Scratch:
-            return juce::jlimit(0.0f, 1.0f, value / 100.0f);
-        case ScenePerformanceControlTarget::GrainSize:
-            return juce::jlimit(0.0f, 1.0f, (value - 5.0f) / (2400.0f - 5.0f));
-        case ScenePerformanceControlTarget::GrainDensity:
-            return juce::jlimit(0.0f, 1.0f, (value - 0.05f) / (0.9f - 0.05f));
-        case ScenePerformanceControlTarget::GrainPitchJitter:
-            return juce::jlimit(0.0f, 1.0f, value / 48.0f);
-        case ScenePerformanceControlTarget::FilterFrequency:
-        {
-            const float safeValue = juce::jlimit(20.0f, 20000.0f, value);
-            return juce::jlimit(0.0f, 1.0f, std::log(safeValue / 20.0f) / std::log(1000.0f));
-        }
-        case ScenePerformanceControlTarget::FilterResonance:
-            return juce::jlimit(0.0f, 1.0f, (value - 0.1f) / 9.9f);
-        case ScenePerformanceControlTarget::DelayTime:
-            return juce::jlimit(0.0f, 1.0f, (value - 0.25f) / (4.0f - 0.25f));
-        case ScenePerformanceControlTarget::DelayFeedback:
-            return juce::jlimit(0.0f, 1.0f, value / 0.97f);
-        case ScenePerformanceControlTarget::DelayLowCut:
-        {
-            const juce::NormalisableRange<float> range(20.0f, 12000.0f, 1.0f, 0.25f);
-            return juce::jlimit(0.0f, 1.0f, range.convertTo0to1(value));
-        }
-        case ScenePerformanceControlTarget::DelayHighCut:
-        {
-            const juce::NormalisableRange<float> range(200.0f, 20000.0f, 1.0f, 0.3f);
-            return juce::jlimit(0.0f, 1.0f, range.convertTo0to1(value));
-        }
-        case ScenePerformanceControlTarget::DelayMode:
-            return juce::jlimit(0.0f, 1.0f, value / 2.0f);
-        case ScenePerformanceControlTarget::None:
-        default:
-            break;
-    }
-
-    return 0.5f;
-}
-
-float controlValueThinThreshold(ScenePerformanceControlTarget target)
-{
-    switch (target)
-    {
-        case ScenePerformanceControlTarget::Speed:
-        case ScenePerformanceControlTarget::Pitch:
-        case ScenePerformanceControlTarget::Pan:
-        case ScenePerformanceControlTarget::Volume:
-        case ScenePerformanceControlTarget::Swing:
-        case ScenePerformanceControlTarget::GrainSize:
-        case ScenePerformanceControlTarget::GrainDensity:
-        case ScenePerformanceControlTarget::GrainPitch:
-        case ScenePerformanceControlTarget::GrainJitter:
-        case ScenePerformanceControlTarget::GrainRandomDepth:
-        case ScenePerformanceControlTarget::GrainEnvelope:
-        case ScenePerformanceControlTarget::FilterFrequency:
-        case ScenePerformanceControlTarget::FilterResonance:
-        case ScenePerformanceControlTarget::FilterMorph:
-        case ScenePerformanceControlTarget::SliceLength:
-        case ScenePerformanceControlTarget::Scratch:
-        case ScenePerformanceControlTarget::DelayMix:
-        case ScenePerformanceControlTarget::DelayTime:
-        case ScenePerformanceControlTarget::DelayFeedback:
-        case ScenePerformanceControlTarget::DelayLowCut:
-        case ScenePerformanceControlTarget::DelayHighCut:
-        case ScenePerformanceControlTarget::Retrigger:
-        case ScenePerformanceControlTarget::Rearrange:
-        case ScenePerformanceControlTarget::GrainPitchJitter:
-        case ScenePerformanceControlTarget::GrainSpread:
-        case ScenePerformanceControlTarget::GrainPositionJitter:
-        case ScenePerformanceControlTarget::GrainArp:
-        case ScenePerformanceControlTarget::GrainCloud:
-        case ScenePerformanceControlTarget::GrainEmitter:
-        case ScenePerformanceControlTarget::GrainShape:
-            return kSceneContinuousControlThinValueThreshold;
-        case ScenePerformanceControlTarget::FilterEnabled:
-        case ScenePerformanceControlTarget::DelayMode:
-        case ScenePerformanceControlTarget::DelaySyncEnabled:
-            return kSceneDiscreteControlThinValueThreshold;
-        case ScenePerformanceControlTarget::None:
-            return 0.0f;
-    }
-
-    return kSceneContinuousControlThinValueThreshold;
 }
 
 double wrappedForwardBeatDistance(double previousBeat, double currentBeat, double clipLengthBeats)
@@ -758,7 +637,7 @@ void ScenePerformanceRecorder::recordControlEvent(int sceneSlot,
                                               clip.lengthBeats);
     const auto targetIndex = static_cast<size_t>(controlTargetToIndex(safeTarget));
     const auto stateStripIndex = static_cast<size_t>(recordedControlStateStripIndex(safeStripIndex, safeTarget));
-    const float normalizedValue = normalizeControlValueForThinning(safeTarget, safeValue);
+    const float normalizedValue = SceneAutomationRules::normalizeValue(safeTarget, safeValue);
     const double lastRecordedBeat = lastRecordedControlEventBeats[stateStripIndex][targetIndex];
     const float lastRecordedValue = lastRecordedControlEventValues[stateStripIndex][targetIndex];
 
@@ -812,7 +691,7 @@ void ScenePerformanceRecorder::recordControlEvent(int sceneSlot,
         && std::isfinite(lastRecordedValue)
         && wrappedForwardBeatDistance(lastRecordedBeat, wrappedBeat, clip.lengthBeats)
             <= (kSceneControlThinBeatWindowBeats + kSceneEventReplaceEpsilonBeats)
-        && std::abs(normalizedValue - lastRecordedValue) <= controlValueThinThreshold(safeTarget);
+        && std::abs(normalizedValue - lastRecordedValue) <= SceneAutomationRules::valueThinThreshold(safeTarget);
 
     if (hasRecentRecordedPoint)
     {

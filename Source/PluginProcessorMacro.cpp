@@ -319,10 +319,13 @@ void MlrVSTAudioProcessor::setStripFilterFrequencyControlValue(int stripIndex,
 
     const float clamped = juce::jlimit(20.0f, 20000.0f, frequency);
     const auto arrayIndex = static_cast<size_t>(stripIndex);
-    writeStripBoolParameter("stripFilterEnabled" + juce::String(stripIndex),
-                            true,
-                            stripFilterEnabledParams[arrayIndex],
-                            writeMode);
+    // The monome filter row (fastResponse) is an explicit "make the filter
+    // audible" gesture, so it still enables. GUI knob pre-dialing does not.
+    if (fastResponse)
+        writeStripBoolParameter("stripFilterEnabled" + juce::String(stripIndex),
+                                true,
+                                stripFilterEnabledParams[arrayIndex],
+                                writeMode);
     writeStripFloatParameter("stripFilterFrequency" + juce::String(stripIndex),
                              clamped,
                              stripFilterFrequencyParams[arrayIndex],
@@ -334,12 +337,9 @@ void MlrVSTAudioProcessor::setStripFilterFrequencyControlValue(int stripIndex,
     if (auto* strip = audioEngine->getStrip(stripIndex))
     {
         auto state = resolveOwnedStripControlStateFromParameters(stripIndex, *strip);
-        state.filterEnabled = true;
+        if (fastResponse)
+            state.filterEnabled = true;
         state.filterFrequency = clamped;
-        const auto stripFilterType = state.filterMorph < 0.34f
-            ? EnhancedAudioStrip::FilterType::LowPass
-            : (state.filterMorph > 0.66f ? EnhancedAudioStrip::FilterType::HighPass
-                                         : EnhancedAudioStrip::FilterType::BandPass);
         const auto stepFilterType = state.filterMorph < 0.34f
             ? FilterType::LowPass
             : (state.filterMorph > 0.66f ? FilterType::HighPass
@@ -352,7 +352,6 @@ void MlrVSTAudioProcessor::setStripFilterFrequencyControlValue(int stripIndex,
             strip->setFilterFrequency(state.filterFrequency);
         strip->setFilterResonance(state.filterResonance);
         strip->setFilterMorph(state.filterMorph);
-        strip->setFilterType(stripFilterType);
         strip->setFilterAlgorithm(state.filterAlgorithm);
 
         if (auto* stepSampler = strip->getStepSampler())
@@ -374,10 +373,6 @@ void MlrVSTAudioProcessor::setStripFilterResonanceControlValue(int stripIndex,
 
     const float clamped = juce::jlimit(0.1f, 10.0f, resonance);
     const auto arrayIndex = static_cast<size_t>(stripIndex);
-    writeStripBoolParameter("stripFilterEnabled" + juce::String(stripIndex),
-                            true,
-                            stripFilterEnabledParams[arrayIndex],
-                            writeMode);
     writeStripFloatParameter("stripFilterResonance" + juce::String(stripIndex),
                              clamped,
                              stripFilterResonanceParams[arrayIndex],
@@ -389,7 +384,6 @@ void MlrVSTAudioProcessor::setStripFilterResonanceControlValue(int stripIndex,
     if (auto* strip = audioEngine->getStrip(stripIndex))
     {
         auto state = resolveOwnedStripControlStateFromParameters(stripIndex, *strip);
-        state.filterEnabled = true;
         state.filterResonance = clamped;
         applyResolvedStripFilterState(*strip, state);
     }
@@ -404,10 +398,6 @@ void MlrVSTAudioProcessor::setStripFilterMorphControlValue(int stripIndex,
 
     const float clamped = juce::jlimit(0.0f, 1.0f, morph);
     const auto arrayIndex = static_cast<size_t>(stripIndex);
-    writeStripBoolParameter("stripFilterEnabled" + juce::String(stripIndex),
-                            true,
-                            stripFilterEnabledParams[arrayIndex],
-                            writeMode);
     writeStripFloatParameter("stripFilterMorph" + juce::String(stripIndex),
                              clamped,
                              stripFilterMorphParams[arrayIndex],
@@ -419,7 +409,6 @@ void MlrVSTAudioProcessor::setStripFilterMorphControlValue(int stripIndex,
     if (auto* strip = audioEngine->getStrip(stripIndex))
     {
         auto state = resolveOwnedStripControlStateFromParameters(stripIndex, *strip);
-        state.filterEnabled = true;
         state.filterMorph = clamped;
         applyResolvedStripFilterState(*strip, state);
     }
@@ -432,28 +421,17 @@ void MlrVSTAudioProcessor::setStripFilterAlgorithmControlValue(int stripIndex,
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
 
-    const int clampedIndex = juce::jlimit(0, 5, static_cast<int>(algorithm));
-    const auto safeAlgorithm = static_cast<EnhancedAudioStrip::FilterAlgorithm>(clampedIndex);
+    const int clampedIndex = juce::jlimit(0, 6, static_cast<int>(algorithm));
     const auto arrayIndex = static_cast<size_t>(stripIndex);
-    writeStripBoolParameter("stripFilterEnabled" + juce::String(stripIndex),
-                            true,
-                            stripFilterEnabledParams[arrayIndex],
-                            writeMode);
     writeStripFloatParameter("stripFilterAlgorithm" + juce::String(stripIndex),
                              static_cast<float>(clampedIndex),
                              stripFilterAlgorithmParams[arrayIndex],
                              writeMode);
 
-    if (audioEngine == nullptr)
-        return;
-
-    if (auto* strip = audioEngine->getStrip(stripIndex))
-    {
-        auto state = resolveOwnedStripControlStateFromParameters(stripIndex, *strip);
-        state.filterEnabled = true;
-        state.filterAlgorithm = safeAlgorithm;
-        applyResolvedStripFilterState(*strip, state);
-    }
+    // Deliberately no direct engine apply here: setFilterAlgorithm resets the
+    // Moog/ladder model state, and doing that from the message thread races the
+    // audio thread. The per-block parameter sync applies the change safely on
+    // the audio thread via its own change detection.
 }
 
 void MlrVSTAudioProcessor::setStripDelayMixControlValue(int stripIndex,

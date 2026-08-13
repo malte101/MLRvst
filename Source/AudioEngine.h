@@ -231,6 +231,12 @@ struct QuantisedTrigger
     bool clearPendingOnFire = true;
     bool isMomentaryStutter = false;
     bool isSequencerRetrigger = false;
+    bool isRelease = false;
+    bool scratchGesture = false;
+    // Strip cancellation generation at schedule time: a clearPendingTriggers-
+    // ForStrip after this event was popped bumps the strip's generation, so
+    // the fire loop can drop the event instead of firing after a release.
+    uint32_t cancelGeneration = 0;
 };
 
 class QuantizationClock
@@ -256,7 +262,28 @@ public:
     void queueExactTrigger(const QuantisedTrigger& trigger);
     bool hasPendingTrigger(int stripIndex) const;
     void clearPendingTriggers();
-    void clearPendingTriggersForStrip(int stripIndex); // Clear all pending triggers for a specific strip
+    // Clear all pending triggers for a specific strip. bumpGeneration also
+    // invalidates events already popped into the current block's fire list
+    // (correct for live releases/stops); clear-on-fire dedup passes false so
+    // legitimate later same-block events for the strip still fire.
+    void clearPendingTriggersForStrip(int stripIndex, bool bumpGeneration = true);
+
+    // Stamp a trigger with its strip's current cancellation generation; a
+    // later clearPendingTriggersForStrip invalidates it even if it was
+    // already popped from the queue.
+    void stampTrigger(QuantisedTrigger& trigger) const
+    {
+        if (trigger.stripIndex >= 0 && trigger.stripIndex < kMaxCancelStrips)
+            trigger.cancelGeneration = stripCancelGenerations[static_cast<size_t>(trigger.stripIndex)]
+                                           .load(std::memory_order_acquire);
+    }
+    bool isTriggerCurrent(const QuantisedTrigger& trigger) const
+    {
+        if (trigger.stripIndex < 0 || trigger.stripIndex >= kMaxCancelStrips)
+            return true;
+        return trigger.cancelGeneration
+            == stripCancelGenerations[static_cast<size_t>(trigger.stripIndex)].load(std::memory_order_acquire);
+    }
     
     // Get events that should execute within a sample range (for sample-accurate execution)
     std::vector<QuantisedTrigger> getEventsInRange(int64_t blockStart, int64_t blockEnd);
@@ -271,7 +298,9 @@ private:
     double currentPPQ = 0.0; // NEW: Track master PPQ
     std::vector<QuantisedTrigger> pendingTriggers;
     mutable juce::SpinLock pendingTriggersLock;
-    
+    static constexpr int kMaxCancelStrips = 32;
+    std::array<std::atomic<uint32_t>, kMaxCancelStrips> stripCancelGenerations{};
+
     int getQuantSamples() const;
 };
 
@@ -502,7 +531,8 @@ public:
         Ladder12,     // JUCE ladder, 12 dB morph bank
         Ladder24,     // JUCE ladder, 24 dB morph bank
         MoogStilson,  // MoogLadders Stilson LP model
-        MoogHuov      // MoogLadders Huovilainen LP model
+        MoogHuov,     // MoogLadders Huovilainen LP model
+        Comb          // Tuned feedback comb resonator
     };
 
     enum class SwingDivision
@@ -569,6 +599,10 @@ public:
     float cachedMoogSampleRate = -1.0f;
     std::unique_ptr<LadderFilterBase> moogLpL;
     std::unique_ptr<LadderFilterBase> moogLpR;
+    juce::AudioBuffer<float> filterCombBuffer;
+    int filterCombWritePos = 0;
+    float filterCombDampingL = 0.0f;
+    float filterCombDampingR = 0.0f;
     FilterType filterType = FilterType::LowPass;
     std::atomic<int> filterEnabled{0};  // Disabled by default, auto-enables on use
     std::atomic<float> swingAmount{0.0f};   // 0..1 transport swing depth
@@ -969,6 +1003,17 @@ public:
     void captureMomentaryPhaseReference(double hostPpq);
     void enforceMomentaryPhaseReference(double hostPpq, int64_t currentGlobalSample);
     void realignToPpqAnchor(double hostPpq, int64_t currentGlobalSample);
+
+    // Short output blend from the recent output tail, for quantized loop
+    // geometry changes and other position snaps applied outside trigger paths.
+    void armLoopChangeDeclick()
+    {
+        juce::ScopedLock lock(bufferLock);
+        const float fadeMs = juce::jlimit(0.2f, 8.0f, triggerFadeInMs.load(std::memory_order_acquire));
+        armTriggerOutputBlendLocked(
+            juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * fadeMs)),
+            true);
+    }
     
     // StepSampler access
     StepSampler* getStepSampler() { return &stepSampler; }
@@ -1000,7 +1045,7 @@ public:
     void setFilterAlgorithm(FilterAlgorithm algorithm);
     FilterAlgorithm getFilterAlgorithm() const
     {
-        return static_cast<FilterAlgorithm>(juce::jlimit(0, 5, filterAlgorithm.load(std::memory_order_acquire)));
+        return static_cast<FilterAlgorithm>(juce::jlimit(0, 6, filterAlgorithm.load(std::memory_order_acquire)));
     }
     void setDuckEnabled(bool enabled) { duckEnabled.store(enabled ? 1 : 0, std::memory_order_release); }
     bool isDuckEnabled() const { return duckEnabled.load(std::memory_order_acquire) != 0; }
@@ -1068,9 +1113,21 @@ public:
     void setLoopCrossfadeLengthMs(float ms) { loopCrossfadeLengthMs.store(juce::jlimit(1.0f, 50.0f, ms), std::memory_order_release); }
     
     // Play mode setters/getters
-    void setPlayMode(PlayMode mode) 
-    { 
+    void setPlayMode(PlayMode mode)
+    {
+        // process() reads everything mutated below under bufferLock; take it
+        // so a mode switch can never tear state mid-block.
+        juce::ScopedLock playModeLock(bufferLock);
         PlayMode oldMode = playMode;
+        const bool wasAudible = playing && oldMode != PlayMode::Sample;
+        const auto armModeSwitchStopFade = [this]()
+        {
+            const float fadeMs = juce::jlimit(0.2f, 12.0f, triggerFadeInMs.load(std::memory_order_acquire));
+            armSampleFaderFromRecentTailLocked(
+                stoppedOutputSampleFader,
+                juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * fadeMs)),
+                true);
+        };
         playMode = mode;
         resetPlayheadTraversalSpeedStateFromRequestedRatio();
 
@@ -1095,10 +1152,20 @@ public:
             stepTraversalRatioAtLastTick = -1.0;
             stepTraversalPhaseOffsetTicks = 0.0;
 
-            // If the strip already has loop sample content but step sampler
-            // is empty, bootstrap step mode from that content.
-            if (!stepSampler.getHasAudio() && sampleBuffer.getNumSamples() > 0)
+            // Fade the old mode's output instead of hard-cutting it.
+            if (wasAudible)
+                armModeSwitchStopFade();
+
+            // Bootstrap or refresh the step sampler from the strip's sample
+            // content: also reload when the sample changed while the strip was
+            // in another mode (previously Step kept playing the stale sample).
+            if (sampleBuffer.getNumSamples() > 0
+                && (!stepSampler.getHasAudio()
+                    || stepSamplerLoadedVersion != pitchSourceVersion))
+            {
                 stepSampler.loadSampleFromBuffer(sampleBuffer, sourceSampleRate);
+                stepSamplerLoadedVersion = pitchSourceVersion;
+            }
 
             // Step mode should enter at neutral sample pitch until the
             // processor reapplies the current pitch control for this strip.
@@ -1141,6 +1208,8 @@ public:
         }
         else if (mode == PlayMode::Sample)
         {
+            if (wasAudible)
+                armModeSwitchStopFade();
             stepSampler.allNotesOff();
             scrubActive = false;
             tapeStopActive = false;
@@ -1163,6 +1232,8 @@ public:
         }
         else if (oldMode == PlayMode::Step && mode != PlayMode::Step)
         {
+            if (wasAudible)
+                armModeSwitchStopFade();
             stepSampler.allNotesOff();
             lastStepTime = -1.0;
             stepSamplePlaying = false;
@@ -1180,6 +1251,15 @@ public:
         }
         else if (oldMode == PlayMode::Grain && mode != PlayMode::Grain)
         {
+            // Grains vanish instantly and the next mode resumes at a possibly
+            // different position; blend the transition from the recent tail.
+            if (wasAudible)
+            {
+                const float fadeMs = juce::jlimit(0.2f, 8.0f, triggerFadeInMs.load(std::memory_order_acquire));
+                armTriggerOutputBlendLocked(
+                    juce::jmax(16, static_cast<int>(currentSampleRate * 0.001 * fadeMs)),
+                    true);
+            }
             resetGrainState();
             grainEntryIdentitySamplesRemaining = 0;
             grainEntryIdentityTotalSamples = 0;
@@ -1459,6 +1539,12 @@ private:
     std::atomic<int> delayMode{0};
     juce::AudioBuffer<float> stripDelayBuffer;
     int stripDelayWritePos = 0;
+
+    // Ghost-echo guard: after a long stop, stale delay-buffer content is muted
+    // for one delay length on retrigger. Quick stutter retriggers keep tails.
+    int delayGhostMuteSamples = 0;
+    int lastDelaySamplesMax = 0;
+    std::atomic<juce::uint32> delayLastProcessMs { 0 };
     juce::dsp::StateVariableTPTFilter<float> delayLowCutFilterL;
     juce::dsp::StateVariableTPTFilter<float> delayLowCutFilterR;
     juce::dsp::StateVariableTPTFilter<float> delayHighCutFilterL;
@@ -1816,6 +1902,13 @@ public:
     
     Crossfader crossfader;
     StepSampler stepSampler;  // Monophonic sampler for step sequencer
+    // Sample-content version the step sampler last loaded; lets setPlayMode
+    // detect a sample replaced while the strip was in another play mode.
+    uint64_t stepSamplerLoadedVersion = 0;
+    // Previous mapped loop position, used to detect the full-loop seam wrap
+    // for the tail-blend declick (full loops have no pre-roll content, so the
+    // content crossfade cannot run there).
+    double lastSeamPositionInLoop = -1.0;
     
     int pendingColumn = -1;
     int quantizeWaitSamples = 0;
@@ -1825,8 +1918,15 @@ public:
     void updatePlaybackDirection();
     void ensureAnalogFiltersInitialized(FilterAlgorithm algorithm);
     void updateFilterCoefficients(float frequency, float resonance);
+    void resetCombFilterState();
+    void processCombFilterSample(float& left, float& right, float frequency, float resonance, float morph);
     void processFilterSample(float& left, float& right, float frequency, float resonance, float morph);
     double applySwingToPpq(double ppq) const;
+    // Exact closed-form inverse of applySwingToPpq. The step clock feeds this
+    // with raw host ppq so tick k fires AT the delayed swung placement W(k);
+    // feeding the forward warp instead made offbeat steps fire early
+    // (inverted swing relative to the loop swing caches).
+    double applySwingInverseToPpq(double ppq) const;
     float computeGateModulation(double ppq) const;
     void handleLooping();
     float getPanGain(int channel) const; // 0=left, 1=right
@@ -1841,13 +1941,58 @@ public:
 #if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
     bool shouldUseSoundTouchSwingCache(double loopLength, double beatsForLoop, int loopCols,
                                        bool isScratching, double playheadTraversalRatio) const;
+    // Audio-thread check: returns true only when the existing cache matches;
+    // on mismatch it posts a background render request and returns false (the
+    // dry path plays until the worker installs the new cache with a blend).
     bool rebuildSoundTouchSwingCache(double loopStartSamples, double loopLength, double beatsForLoop, int loopCols);
     void invalidateSoundTouchSwingCache();
 #endif
 #if MLRVST_ENABLE_BUNGEE
+    // Audio-thread check with the same request/install semantics; the tempo
+    // key is quantized to 0.1 bpm so host tempo ramps do not thrash rebuilds.
     bool rebuildLoopTempoMatchCache(double hostTempo, double beatsForLoop);
     void invalidateLoopTempoMatchCache();
 #endif
+
+public:
+    // --- Background swing / tempo-match cache rendering (worker side) ---
+    bool swingCacheRenderPending() const
+    {
+        return swingCacheRenderRequested.load(std::memory_order_acquire) != 0
+            && swingCacheRenderInFlight.load(std::memory_order_acquire) == 0;
+    }
+    uint32_t getSwingCacheRequestSerial() const { return swingCacheRequestSerial.load(std::memory_order_acquire); }
+    void markSwingCacheRenderInFlight() { swingCacheRenderInFlight.store(1, std::memory_order_release); }
+    bool tempoMatchRenderPending() const
+    {
+        return tempoMatchRenderRequested.load(std::memory_order_acquire) != 0
+            && tempoMatchRenderInFlight.load(std::memory_order_acquire) == 0;
+    }
+    uint32_t getTempoMatchRequestSerial() const { return tempoMatchRequestSerial.load(std::memory_order_acquire); }
+    void markTempoMatchRenderInFlight() { tempoMatchRenderInFlight.store(1, std::memory_order_release); }
+#if MLRVST_ENABLE_SOUNDTOUCH || MLRVST_ENABLE_BUNGEE
+    bool renderSoundTouchSwingCacheOffline();
+#endif
+#if MLRVST_ENABLE_BUNGEE
+    bool renderLoopTempoMatchCacheOffline();
+#endif
+
+private:
+    std::atomic<int> swingCacheRenderRequested{0};
+    std::atomic<int> swingCacheRenderInFlight{0};
+    std::atomic<uint32_t> swingCacheRequestSerial{0};
+    std::atomic<double> swingCacheRequestLoopStartSamples{0.0};
+    std::atomic<double> swingCacheRequestLoopLength{0.0};
+    std::atomic<double> swingCacheRequestBeats{0.0};
+    std::atomic<int> swingCacheRequestLoopCols{0};
+    std::atomic<int> swingCacheRequestLoopStartCol{0};
+    std::atomic<int> tempoMatchRenderRequested{0};
+    std::atomic<int> tempoMatchRenderInFlight{0};
+    std::atomic<uint32_t> tempoMatchRequestSerial{0};
+    std::atomic<double> tempoMatchRequestTempo{0.0};
+    std::atomic<double> tempoMatchRequestBeats{0.0};
+
+public:  // restore the access level of the declarations that follow
     double getTriggerTargetPositionForColumn(int column, double loopStartSamples, double loopLengthSamples) const;
     double snapToNearestZeroCrossing(double targetPos, int radiusSamples) const;
     double getWrappedSamplePosition(double samplePos, double loopStartSamples, double loopLengthSamples) const;
@@ -1889,6 +2034,9 @@ public:
     void armTriggerOutputBlendFromSilenceLocked(int fadeSamples);
     void applyTriggerOutputBlendToSampleLocked(float& leftSample, float& rightSample);
     bool renderStoppedOutputFadeSampleLocked(float& leftSample, float& rightSample);
+    void renderPendingStoppedFadeBlockLocked(juce::AudioBuffer<float>& output,
+                                             int startSample,
+                                             int numSamples);
     void startPitchCacheOutputBlendLocked();
     bool getPitchCacheSourceLocked(const juce::AudioBuffer<float>*& outSourceBuffer,
                                    double& outSourceSampleRate,
@@ -1929,6 +2077,7 @@ public:
     void publishDisplayedControlState();
     void processDelaySample(float& leftSample, float& rightSample, double tempo);
     void resetDelayState();
+    void armDelayGhostMute();
     float readPitchDelaySample(int channel, double delaySamples) const;
     float readPitchDelaySampleWindowedSinc(int channel, double delaySamples, int taps) const;
     float readPitchDelaySampleOversampled(int channel, double delaySamples, int taps) const;
@@ -2096,6 +2245,11 @@ public:
                            int64_t targetSample,
                            int sampleSliceId = -1,
                            int64_t sampleStartSample = -1);
+    void queueExactRelease(int stripIndex,
+                           int column,
+                           double targetPPQ,
+                           int64_t targetSample,
+                           bool scratchGesture = false);
     void triggerStripWithQuantization(int stripIndex,
                                       int column,
                                       bool useQuantize,
@@ -2113,7 +2267,7 @@ public:
     void setGestureComboProfileStore(const std::shared_ptr<GestureComboProfileStore>& store);
     void setMacroRetriggerAmount(int stripIndex, float amount01);
     float getMacroRetriggerAmount(int stripIndex) const;
-    void clearPendingQuantizedTriggersForStrip(int stripIndex);
+    void clearPendingQuantizedTriggersForStrip(int stripIndex, bool bumpGeneration = true);
     void setMasterDuckTriggerStrip(int stripIndex);
     int getMasterDuckTriggerStrip() const;
     void setSampleModeRenderCallback(SampleModeRenderCallback callback);
@@ -2202,6 +2356,7 @@ public:
     int getModCurrentStep(int stripIndex) const;
     int getModCurrentPage(int stripIndex) const;
     int getModCurrentGlobalStep(int stripIndex) const;
+    int getModCurrentGlobalStepForSlot(int stripIndex, int slot) const;
     int getModTotalActiveSteps(int stripIndex, int slot) const;
     double getModStepLengthBeats(int stripIndex, int slot) const;
     void setModLengthBars(int stripIndex, int bars);

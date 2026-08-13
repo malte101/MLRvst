@@ -14,50 +14,6 @@
 
 namespace
 {
-constexpr int kSceneAutomationGlobalMaskIndex = MlrVSTAudioProcessor::MaxStrips;
-
-double wrapBeatIntoSceneClip(double currentBeat, double sceneStartBeat, double lengthBeats) noexcept
-{
-    const double safeLength = juce::jmax(1.0, lengthBeats);
-    if (!std::isfinite(currentBeat) || !std::isfinite(sceneStartBeat))
-        return 0.0;
-
-    const double relativeBeat = currentBeat - sceneStartBeat;
-    const double wrapped = std::fmod(relativeBeat, safeLength);
-    return wrapped >= 0.0 ? wrapped : wrapped + safeLength;
-}
-
-bool findHeldSceneAutomationEventAtClipBeat(const std::vector<ScenePerformanceEvent>& events,
-                                            int stripIndex,
-                                            ScenePerformanceControlTarget target,
-                                            double clipBeat,
-                                            ScenePerformanceEvent& outEvent)
-{
-    const ScenePerformanceEvent* lastEvent = nullptr;
-    const ScenePerformanceEvent* chosenEvent = nullptr;
-    for (const auto& event : events)
-    {
-        if (event.type != ScenePerformanceEventType::ControlPoint
-            || event.controlTarget != target
-            || event.stripIndex != stripIndex)
-        {
-            continue;
-        }
-
-        lastEvent = &event;
-        if (event.timeBeats <= clipBeat + 1.0e-6)
-            chosenEvent = &event;
-    }
-
-    if (chosenEvent == nullptr)
-        chosenEvent = lastEvent;
-    if (chosenEvent == nullptr)
-        return false;
-
-    outEvent = *chosenEvent;
-    return true;
-}
-
 float sceneStutterAmountFromDivisionBeats(double divisionBeats)
 {
     const double v = juce::jlimit(0.03125, 2.0, divisionBeats);
@@ -670,7 +626,7 @@ void MlrVSTAudioProcessor::applySceneHeldAutomationStateAtBeat(int sceneSlot,
 
     const int safeSceneSlot = juce::jlimit(0, SceneSlots - 1, sceneSlot);
     const double lengthBeats = juce::jmax(1.0, getScenePerformanceClipLengthBeats(safeSceneSlot));
-    const double clipBeat = wrapBeatIntoSceneClip(currentBeat, sceneStartBeat, lengthBeats);
+    const double clipBeat = SceneAutomationRules::wrapBeatIntoClip(currentBeat, sceneStartBeat, lengthBeats);
     const auto events = getScenePerformanceEventsSnapshot(safeSceneSlot);
     if (events.empty())
         return;
@@ -680,7 +636,7 @@ void MlrVSTAudioProcessor::applySceneHeldAutomationStateAtBeat(int sceneSlot,
     {
         for (int maskIndex = 0; maskIndex < static_cast<int>(activeSceneAutomationOverrideMasks.size()); ++maskIndex)
         {
-            const int targetStripIndex = (maskIndex == kSceneAutomationGlobalMaskIndex) ? -1 : maskIndex;
+            const int targetStripIndex = (maskIndex == MaxStrips) ? -1 : maskIndex;
             for (int targetValue = static_cast<int>(ScenePerformanceControlTarget::Speed);
                  targetValue <= static_cast<int>(ScenePerformanceControlTarget::GrainShape);
                  ++targetValue)
@@ -693,11 +649,11 @@ void MlrVSTAudioProcessor::applySceneHeldAutomationStateAtBeat(int sceneSlot,
                 }
 
                 ScenePerformanceEvent chosenEvent;
-                if (findHeldSceneAutomationEventAtClipBeat(events,
-                                                           targetStripIndex,
-                                                           target,
-                                                           clipBeat,
-                                                           chosenEvent))
+                if (SceneAutomationRules::findHeldEventAtClipBeat(events,
+                                                                   targetStripIndex,
+                                                                   target,
+                                                                   clipBeat,
+                                                                   chosenEvent))
                 {
                     playbackScenePerformanceEvent(chosenEvent);
                 }
@@ -871,6 +827,24 @@ void MlrVSTAudioProcessor::processScenePerformancePlayback(const juce::AudioPlay
                                                                                                   blockStartSample + offsetSamples,
                                                                                                   event.sampleSliceId,
                                                                                                   event.sampleStartSample);
+                                                                    return;
+                                                                }
+
+                                                                if (event.type == ScenePerformanceEventType::Trigger
+                                                                    && !event.isNoteOn
+                                                                    && std::isfinite(occurrenceBeat))
+                                                                {
+                                                                    const int maxOffset = juce::jmax(0, numSamples - 1);
+                                                                    const int offsetSamples = juce::jlimit(
+                                                                        0,
+                                                                        maxOffset,
+                                                                        static_cast<int>(std::llround(
+                                                                            (occurrenceBeat - blockStartBeat) * samplesPerBeat)));
+                                                                    audioEngine->queueExactRelease(event.stripIndex,
+                                                                                                  juce::jlimit(0, MaxColumns - 1, event.column),
+                                                                                                  occurrenceBeat,
+                                                                                                  blockStartSample + offsetSamples,
+                                                                                                  event.scratchGesture);
                                                                     return;
                                                                 }
 

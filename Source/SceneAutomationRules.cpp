@@ -6,6 +6,9 @@
 
 namespace SceneAutomationRules
 {
+constexpr float kSceneContinuousControlThinValueThreshold = 0.015f;
+constexpr float kSceneDiscreteControlThinValueThreshold = 1.0e-4f;
+
 float normalizeValue(const ScenePerformanceEvent& event)
 {
     switch (event.controlTarget)
@@ -77,6 +80,15 @@ float normalizeValue(const ScenePerformanceEvent& event)
         default:
             return 0.5f;
     }
+}
+
+float normalizeValue(ScenePerformanceControlTarget target, float value)
+{
+    ScenePerformanceEvent event;
+    event.type = ScenePerformanceEventType::ControlPoint;
+    event.controlTarget = target;
+    event.value = value;
+    return normalizeValue(event);
 }
 
 float denormalizeValue(const ScenePerformanceEvent& event, float normalizedValue)
@@ -190,6 +202,52 @@ float defaultValue(ScenePerformanceControlTarget target) noexcept
         default:
             return 0.0f;
     }
+}
+
+float valueThinThreshold(ScenePerformanceControlTarget target) noexcept
+{
+    switch (target)
+    {
+        case ScenePerformanceControlTarget::Speed:
+        case ScenePerformanceControlTarget::Pitch:
+        case ScenePerformanceControlTarget::Pan:
+        case ScenePerformanceControlTarget::Volume:
+        case ScenePerformanceControlTarget::Swing:
+        case ScenePerformanceControlTarget::GrainSize:
+        case ScenePerformanceControlTarget::GrainDensity:
+        case ScenePerformanceControlTarget::GrainPitch:
+        case ScenePerformanceControlTarget::GrainJitter:
+        case ScenePerformanceControlTarget::GrainRandomDepth:
+        case ScenePerformanceControlTarget::GrainEnvelope:
+        case ScenePerformanceControlTarget::FilterFrequency:
+        case ScenePerformanceControlTarget::FilterResonance:
+        case ScenePerformanceControlTarget::FilterMorph:
+        case ScenePerformanceControlTarget::SliceLength:
+        case ScenePerformanceControlTarget::Scratch:
+        case ScenePerformanceControlTarget::DelayMix:
+        case ScenePerformanceControlTarget::DelayTime:
+        case ScenePerformanceControlTarget::DelayFeedback:
+        case ScenePerformanceControlTarget::DelayLowCut:
+        case ScenePerformanceControlTarget::DelayHighCut:
+        case ScenePerformanceControlTarget::Retrigger:
+        case ScenePerformanceControlTarget::Rearrange:
+        case ScenePerformanceControlTarget::GrainPitchJitter:
+        case ScenePerformanceControlTarget::GrainSpread:
+        case ScenePerformanceControlTarget::GrainPositionJitter:
+        case ScenePerformanceControlTarget::GrainArp:
+        case ScenePerformanceControlTarget::GrainCloud:
+        case ScenePerformanceControlTarget::GrainEmitter:
+        case ScenePerformanceControlTarget::GrainShape:
+            return kSceneContinuousControlThinValueThreshold;
+        case ScenePerformanceControlTarget::FilterEnabled:
+        case ScenePerformanceControlTarget::DelayMode:
+        case ScenePerformanceControlTarget::DelaySyncEnabled:
+            return kSceneDiscreteControlThinValueThreshold;
+        case ScenePerformanceControlTarget::None:
+            return 0.0f;
+    }
+
+    return kSceneContinuousControlThinValueThreshold;
 }
 
 MlrVSTAudioProcessor::ControlMode controlModeForTarget(ScenePerformanceControlTarget target) noexcept
@@ -342,6 +400,13 @@ bool eventUsesSteppedSegments(const ScenePerformanceEvent& event) noexcept
     return event.drawStepped || targetUsesSteppedSegments(event.controlTarget);
 }
 
+bool targetUsesStripRuntimeState(ScenePerformanceControlTarget target) noexcept
+{
+    return target != ScenePerformanceControlTarget::None
+        && target != ScenePerformanceControlTarget::Retrigger
+        && target != ScenePerformanceControlTarget::Rearrange;
+}
+
 int resolvedStripIndexForTarget(int stripIndex, ScenePerformanceControlTarget target) noexcept
 {
     if (targetUsesGlobalStrip(target))
@@ -356,6 +421,73 @@ int columnFromNormalizedValue(float normalizedValue) noexcept
                         MlrVSTAudioProcessor::MaxColumns - 1,
                         static_cast<int>(std::round(juce::jlimit(0.0f, 1.0f, normalizedValue)
                                                     * static_cast<float>(MlrVSTAudioProcessor::MaxColumns - 1))));
+}
+
+int controlTargetIndex(ScenePerformanceControlTarget target) noexcept
+{
+    return juce::jlimit(0,
+                        static_cast<int>(ScenePerformanceControlTarget::GrainShape),
+                        static_cast<int>(target));
+}
+
+int automationMaskIndex(int stripIndex, ScenePerformanceControlTarget target) noexcept
+{
+    if (targetUsesGlobalStrip(target) && stripIndex < 0)
+        return MlrVSTAudioProcessor::MaxStrips;
+
+    return juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
+}
+
+uint64_t automationTargetBit(ScenePerformanceControlTarget target) noexcept
+{
+    if (target == ScenePerformanceControlTarget::None)
+        return 0;
+
+    return uint64_t{ 1 } << juce::jlimit(0, 63, static_cast<int>(target));
+}
+
+double wrapBeatIntoClip(double currentBeat, double sceneStartBeat, double lengthBeats) noexcept
+{
+    const double safeLength = (std::isfinite(lengthBeats) && lengthBeats > 1.0e-6)
+        ? lengthBeats
+        : 0.0;
+    if (!std::isfinite(currentBeat) || !std::isfinite(sceneStartBeat) || safeLength <= 0.0)
+        return 0.0;
+
+    const double relativeBeat = currentBeat - sceneStartBeat;
+    const double wrapped = std::fmod(relativeBeat, safeLength);
+    return wrapped >= 0.0 ? wrapped : wrapped + safeLength;
+}
+
+bool findHeldEventAtClipBeat(const std::vector<ScenePerformanceEvent>& events,
+                             int stripIndex,
+                             ScenePerformanceControlTarget target,
+                             double clipBeat,
+                             ScenePerformanceEvent& outEvent)
+{
+    const ScenePerformanceEvent* lastEvent = nullptr;
+    const ScenePerformanceEvent* chosenEvent = nullptr;
+    for (const auto& event : events)
+    {
+        if (event.type != ScenePerformanceEventType::ControlPoint
+            || event.controlTarget != target
+            || event.stripIndex != stripIndex)
+        {
+            continue;
+        }
+
+        lastEvent = &event;
+        if (event.timeBeats <= clipBeat + 1.0e-6)
+            chosenEvent = &event;
+    }
+
+    if (chosenEvent == nullptr)
+        chosenEvent = lastEvent;
+    if (chosenEvent == nullptr)
+        return false;
+
+    outEvent = *chosenEvent;
+    return true;
 }
 
 ScenePerformanceEvent makeControlPointEvent(int stripIndex,

@@ -13,6 +13,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <memory>
 #include <cstdint>
+#include <vector>
 
 class SceneScheduler
 {
@@ -80,6 +81,11 @@ public:
         int stepIndex,
         const MlrVSTAudioProcessor::SceneTransitionEndSampleSettings& settings);
     static void clearSceneChain(MlrVSTAudioProcessor& processor);
+    static void setSceneChainSteps(MlrVSTAudioProcessor& processor,
+                                   const std::vector<MlrVSTAudioProcessor::SceneChainStep>& steps,
+                                   bool loopEnabled,
+                                   int loopStart,
+                                   int loopEnd);
     static bool isSceneChainLoopEnabled(const MlrVSTAudioProcessor& processor);
     static void setSceneChainLoopEnabled(MlrVSTAudioProcessor& processor, bool enabled);
     static int getSceneChainLoopStartStep(const MlrVSTAudioProcessor& processor);
@@ -107,6 +113,10 @@ public:
                                        int mainPresetIndex,
                                        int currentSceneSlot,
                                        double sceneStartPpq);
+    static void armReturnRouteForSequenceHandoff(MlrVSTAudioProcessor& processor,
+                                                 int outgoingStepIndex,
+                                                 int enteredStepIndex,
+                                                 double targetPpq);
     static void setSceneModeEnabled(MlrVSTAudioProcessor& processor, bool enabled);
     static void captureSceneModeGroupSnapshot(MlrVSTAudioProcessor& processor);
     static void restoreSceneModeGroupSnapshot(MlrVSTAudioProcessor& processor);

@@ -7,17 +7,29 @@
 namespace SceneAutomationRules
 {
 float normalizeValue(const ScenePerformanceEvent& event);
+float normalizeValue(ScenePerformanceControlTarget target, float value);
 float denormalizeValue(const ScenePerformanceEvent& event, float normalizedValue);
 float defaultValue(ScenePerformanceControlTarget target) noexcept;
+float valueThinThreshold(ScenePerformanceControlTarget target) noexcept;
 
 MlrVSTAudioProcessor::ControlMode controlModeForTarget(ScenePerformanceControlTarget target) noexcept;
 int controlRowForTarget(ScenePerformanceControlTarget target) noexcept;
 bool targetUsesGlobalStrip(ScenePerformanceControlTarget target) noexcept;
 bool targetUsesSteppedSegments(ScenePerformanceControlTarget target) noexcept;
 bool eventUsesSteppedSegments(const ScenePerformanceEvent& event) noexcept;
+bool targetUsesStripRuntimeState(ScenePerformanceControlTarget target) noexcept;
 
 int resolvedStripIndexForTarget(int stripIndex, ScenePerformanceControlTarget target) noexcept;
 int columnFromNormalizedValue(float normalizedValue) noexcept;
+int controlTargetIndex(ScenePerformanceControlTarget target) noexcept;
+int automationMaskIndex(int stripIndex, ScenePerformanceControlTarget target) noexcept;
+uint64_t automationTargetBit(ScenePerformanceControlTarget target) noexcept;
+double wrapBeatIntoClip(double currentBeat, double sceneStartBeat, double lengthBeats) noexcept;
+bool findHeldEventAtClipBeat(const std::vector<ScenePerformanceEvent>& events,
+                             int stripIndex,
+                             ScenePerformanceControlTarget target,
+                             double clipBeat,
+                             ScenePerformanceEvent& outEvent);
 
 ScenePerformanceEvent makeControlPointEvent(int stripIndex,
                                             ScenePerformanceControlTarget target,

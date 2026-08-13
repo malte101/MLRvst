@@ -3043,7 +3043,7 @@ void MlrVSTAudioProcessor::invalidateFlipLegacyLoopSync(int stripIndex)
     }
 }
 
-void MlrVSTAudioProcessor::stopSampleModeStrip(int stripIndex, bool immediateStop)
+void MlrVSTAudioProcessor::stopSampleModeStrip(int stripIndex, bool immediateStop, bool bumpTriggerGeneration)
 {
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return;
@@ -3066,7 +3066,7 @@ void MlrVSTAudioProcessor::stopSampleModeStrip(int stripIndex, bool immediateSto
 
     if (renderEngine != nullptr)
     {
-        renderEngine->clearPendingQuantizedTriggersForStrip(stripIndex);
+        renderEngine->clearPendingQuantizedTriggersForStrip(stripIndex, bumpTriggerGeneration);
     }
 
     if (engine != nullptr)

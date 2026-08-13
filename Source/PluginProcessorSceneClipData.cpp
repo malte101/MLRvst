@@ -9,6 +9,7 @@
 
 #include "PluginProcessor.h"
 #include "PlayheadSpeedQuantizer.h"
+#include "SceneAutomationRules.h"
 #include "SceneScheduler.h"
 #include <cmath>
 #include <limits>
@@ -32,90 +33,12 @@ struct ScopedSceneAutosaveSuppression
 
 double wrapBeatIntoSceneClip(double currentBeat, double sceneStartBeat, double lengthBeats) noexcept
 {
-    if (!std::isfinite(currentBeat)
-        || !std::isfinite(sceneStartBeat)
-        || !std::isfinite(lengthBeats)
-        || lengthBeats <= 1.0e-6)
-    {
-        return 0.0;
-    }
-
-    const double relativeBeat = currentBeat - sceneStartBeat;
-    const double wrapped = std::fmod(relativeBeat, lengthBeats);
-    return wrapped >= 0.0 ? wrapped : wrapped + lengthBeats;
+    return SceneAutomationRules::wrapBeatIntoClip(currentBeat, sceneStartBeat, lengthBeats);
 }
 
 float normalizeSceneControlValue(const ScenePerformanceEvent& event)
 {
-    switch (event.controlTarget)
-    {
-        case ScenePerformanceControlTarget::Speed:
-        {
-            const float safeValue = juce::jlimit(0.125f, 8.0f, event.value);
-            return juce::jlimit(0.0f, 1.0f, (std::log2(safeValue) + 3.0f) / 6.0f);
-        }
-        case ScenePerformanceControlTarget::Pitch:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 24.0f) / 48.0f);
-        case ScenePerformanceControlTarget::GrainPitch:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 48.0f) / 96.0f);
-        case ScenePerformanceControlTarget::Pan:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 1.0f) * 0.5f);
-        case ScenePerformanceControlTarget::Volume:
-        case ScenePerformanceControlTarget::Swing:
-        case ScenePerformanceControlTarget::GrainSpread:
-        case ScenePerformanceControlTarget::GrainJitter:
-        case ScenePerformanceControlTarget::GrainPositionJitter:
-        case ScenePerformanceControlTarget::GrainRandomDepth:
-        case ScenePerformanceControlTarget::GrainArp:
-        case ScenePerformanceControlTarget::GrainCloud:
-        case ScenePerformanceControlTarget::GrainEmitter:
-        case ScenePerformanceControlTarget::GrainEnvelope:
-        case ScenePerformanceControlTarget::DelayMix:
-        case ScenePerformanceControlTarget::FilterMorph:
-        case ScenePerformanceControlTarget::FilterEnabled:
-        case ScenePerformanceControlTarget::Retrigger:
-        case ScenePerformanceControlTarget::Rearrange:
-        case ScenePerformanceControlTarget::DelaySyncEnabled:
-            return juce::jlimit(0.0f, 1.0f, event.value);
-        case ScenePerformanceControlTarget::SliceLength:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.02f) / 0.98f);
-        case ScenePerformanceControlTarget::Scratch:
-            return juce::jlimit(0.0f, 1.0f, event.value / 100.0f);
-        case ScenePerformanceControlTarget::GrainSize:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 5.0f) / (2400.0f - 5.0f));
-        case ScenePerformanceControlTarget::GrainDensity:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.05f) / (0.9f - 0.05f));
-        case ScenePerformanceControlTarget::GrainPitchJitter:
-            return juce::jlimit(0.0f, 1.0f, event.value / 48.0f);
-        case ScenePerformanceControlTarget::GrainShape:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 1.0f) * 0.5f);
-        case ScenePerformanceControlTarget::FilterFrequency:
-        {
-            const float safeValue = juce::jlimit(20.0f, 20000.0f, event.value);
-            return juce::jlimit(0.0f, 1.0f, std::log(safeValue / 20.0f) / std::log(1000.0f));
-        }
-        case ScenePerformanceControlTarget::FilterResonance:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.1f) / 9.9f);
-        case ScenePerformanceControlTarget::DelayTime:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.25f) / (4.0f - 0.25f));
-        case ScenePerformanceControlTarget::DelayFeedback:
-            return juce::jlimit(0.0f, 1.0f, event.value / 0.97f);
-        case ScenePerformanceControlTarget::DelayLowCut:
-        {
-            const juce::NormalisableRange<float> range(20.0f, 12000.0f, 1.0f, 0.25f);
-            return juce::jlimit(0.0f, 1.0f, range.convertTo0to1(event.value));
-        }
-        case ScenePerformanceControlTarget::DelayHighCut:
-        {
-            const juce::NormalisableRange<float> range(200.0f, 20000.0f, 1.0f, 0.3f);
-            return juce::jlimit(0.0f, 1.0f, range.convertTo0to1(event.value));
-        }
-        case ScenePerformanceControlTarget::DelayMode:
-            return juce::jlimit(0.0f, 1.0f, event.value / 2.0f);
-        case ScenePerformanceControlTarget::None:
-        default:
-            return 0.5f;
-    }
+    return SceneAutomationRules::normalizeValue(event);
 }
 } // namespace
 
@@ -735,6 +658,52 @@ bool MlrVSTAudioProcessor::pasteSceneSlotFromClipboard(int sceneSlot)
 
         performSceneLoad(mainPresetIndex,
                          safeSceneSlot,
+                         hostPpqSnapshot,
+                         hostTempoSnapshot,
+                         audioEngine != nullptr ? audioEngine->getGlobalSampleCount() : -1,
+                         false);
+    }
+
+    updateMonomeLEDs();
+    return true;
+}
+
+bool MlrVSTAudioProcessor::replaceSceneSlotWithScene(int sourceSceneSlot, int destSceneSlot)
+{
+    const int safeSource = juce::jlimit(0, SceneSlots - 1, sourceSceneSlot);
+    const int safeDest = juce::jlimit(0, SceneSlots - 1, destSceneSlot);
+    if (safeSource == safeDest)
+        return false;
+
+    const int mainPresetIndex = getActiveMainPresetIndexForScenes();
+    const bool replacingActiveScene = isSceneModeEnabled()
+        && audioEngine != nullptr
+        && activeSceneMainPresetIndex == juce::jlimit(0, MaxPresetSlots - 1, mainPresetIndex)
+        && activeSceneSlot == safeDest;
+
+    if (!copySceneForMainPreset(mainPresetIndex, safeSource, safeDest))
+        return false;
+
+    setSceneRepeatCount(safeDest, getSceneRepeatCount(safeSource));
+    setSceneManualBars(safeDest, getSceneManualBars(safeSource));
+
+    if (replacingActiveScene)
+    {
+        double hostPpqSnapshot = std::numeric_limits<double>::quiet_NaN();
+        double hostTempoSnapshot = 120.0;
+        if (!getHostSyncSnapshot(hostPpqSnapshot, hostTempoSnapshot) && audioEngine != nullptr)
+        {
+            const double fallbackPpq = audioEngine->getTimelineBeat();
+            const double fallbackTempo = juce::jmax(1.0, audioEngine->getCurrentTempo());
+            if (std::isfinite(fallbackPpq) && std::isfinite(fallbackTempo) && fallbackTempo > 0.0)
+            {
+                hostPpqSnapshot = fallbackPpq;
+                hostTempoSnapshot = fallbackTempo;
+            }
+        }
+
+        performSceneLoad(mainPresetIndex,
+                         safeDest,
                          hostPpqSnapshot,
                          hostTempoSnapshot,
                          audioEngine != nullptr ? audioEngine->getGlobalSampleCount() : -1,

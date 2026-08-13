@@ -9,101 +9,16 @@
 
 #include "PluginProcessor.h"
 #include "PlayheadSpeedQuantizer.h"
+#include "SceneAutomationRules.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
 
 namespace
 {
-constexpr int kSceneAutomationGlobalMaskIndex = MlrVSTAudioProcessor::MaxStrips;
-
-int sceneAutomationMaskIndex(int stripIndex, ScenePerformanceControlTarget target) noexcept
-{
-    if (target == ScenePerformanceControlTarget::Retrigger && stripIndex < 0)
-        return kSceneAutomationGlobalMaskIndex;
-
-    return juce::jlimit(0, MlrVSTAudioProcessor::MaxStrips - 1, stripIndex);
-}
-
-uint64_t sceneAutomationTargetBit(ScenePerformanceControlTarget target) noexcept
-{
-    if (target == ScenePerformanceControlTarget::None)
-        return 0;
-
-    return uint64_t{ 1 } << juce::jlimit(0, 63, static_cast<int>(target));
-}
-
 float normalizeSceneControlValue(const ScenePerformanceEvent& event)
 {
-    switch (event.controlTarget)
-    {
-        case ScenePerformanceControlTarget::Speed:
-        {
-            const float safeValue = juce::jlimit(0.125f, 8.0f, event.value);
-            return juce::jlimit(0.0f, 1.0f, (std::log2(safeValue) + 3.0f) / 6.0f);
-        }
-        case ScenePerformanceControlTarget::Pitch:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 24.0f) / 48.0f);
-        case ScenePerformanceControlTarget::GrainPitch:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 48.0f) / 96.0f);
-        case ScenePerformanceControlTarget::Pan:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 1.0f) * 0.5f);
-        case ScenePerformanceControlTarget::Volume:
-        case ScenePerformanceControlTarget::Swing:
-        case ScenePerformanceControlTarget::GrainSpread:
-        case ScenePerformanceControlTarget::GrainJitter:
-        case ScenePerformanceControlTarget::GrainPositionJitter:
-        case ScenePerformanceControlTarget::GrainRandomDepth:
-        case ScenePerformanceControlTarget::GrainArp:
-        case ScenePerformanceControlTarget::GrainCloud:
-        case ScenePerformanceControlTarget::GrainEmitter:
-        case ScenePerformanceControlTarget::GrainEnvelope:
-        case ScenePerformanceControlTarget::DelayMix:
-        case ScenePerformanceControlTarget::FilterMorph:
-        case ScenePerformanceControlTarget::FilterEnabled:
-        case ScenePerformanceControlTarget::Retrigger:
-        case ScenePerformanceControlTarget::Rearrange:
-        case ScenePerformanceControlTarget::DelaySyncEnabled:
-            return juce::jlimit(0.0f, 1.0f, event.value);
-        case ScenePerformanceControlTarget::SliceLength:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.02f) / 0.98f);
-        case ScenePerformanceControlTarget::Scratch:
-            return juce::jlimit(0.0f, 1.0f, event.value / 100.0f);
-        case ScenePerformanceControlTarget::GrainSize:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 5.0f) / (2400.0f - 5.0f));
-        case ScenePerformanceControlTarget::GrainDensity:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.05f) / (0.9f - 0.05f));
-        case ScenePerformanceControlTarget::GrainPitchJitter:
-            return juce::jlimit(0.0f, 1.0f, event.value / 48.0f);
-        case ScenePerformanceControlTarget::GrainShape:
-            return juce::jlimit(0.0f, 1.0f, (event.value + 1.0f) * 0.5f);
-        case ScenePerformanceControlTarget::FilterFrequency:
-        {
-            const float safeValue = juce::jlimit(20.0f, 20000.0f, event.value);
-            return juce::jlimit(0.0f, 1.0f, std::log(safeValue / 20.0f) / std::log(1000.0f));
-        }
-        case ScenePerformanceControlTarget::FilterResonance:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.1f) / 9.9f);
-        case ScenePerformanceControlTarget::DelayTime:
-            return juce::jlimit(0.0f, 1.0f, (event.value - 0.25f) / (4.0f - 0.25f));
-        case ScenePerformanceControlTarget::DelayFeedback:
-            return juce::jlimit(0.0f, 1.0f, event.value / 0.97f);
-        case ScenePerformanceControlTarget::DelayLowCut:
-        {
-            const juce::NormalisableRange<float> range(20.0f, 12000.0f, 1.0f, 0.25f);
-            return juce::jlimit(0.0f, 1.0f, range.convertTo0to1(event.value));
-        }
-        case ScenePerformanceControlTarget::DelayHighCut:
-        {
-            const juce::NormalisableRange<float> range(200.0f, 20000.0f, 1.0f, 0.3f);
-            return juce::jlimit(0.0f, 1.0f, range.convertTo0to1(event.value));
-        }
-        case ScenePerformanceControlTarget::DelayMode:
-            return juce::jlimit(0.0f, 1.0f, event.value / 2.0f);
-        case ScenePerformanceControlTarget::None:
-        default:
-            return 0.5f;
-    }
+    return SceneAutomationRules::normalizeValue(event);
 }
 
 constexpr std::array<ScenePerformanceControlTarget, 24> kSceneTransitionSeedTargets{{
@@ -274,7 +189,12 @@ bool MlrVSTAudioProcessor::resolveScenePerformanceControlEvent(ControlMode mode,
 
         case ControlMode::Pan:
             outEvent.controlTarget = ScenePerformanceControlTarget::Pan;
-            outEvent.value = juce::jlimit(-1.0f, 1.0f, (safeColumn - 8) / 8.0f);
+            // Piecewise map so column 15 reaches full right (+1.0); the left
+            // half keeps its historical 1/8 spacing.
+            outEvent.value = juce::jlimit(-1.0f,
+                                          1.0f,
+                                          safeColumn <= 8 ? (safeColumn - 8) / 8.0f
+                                                          : (safeColumn - 8) / 7.0f);
             return true;
 
         case ControlMode::Volume:
@@ -283,7 +203,9 @@ bool MlrVSTAudioProcessor::resolveScenePerformanceControlEvent(ControlMode mode,
             return true;
 
         case ControlMode::Swing:
-            return false;
+            outEvent.controlTarget = ScenePerformanceControlTarget::Swing;
+            outEvent.value = juce::jlimit(0.0f, 1.0f, safeColumn / 15.0f);
+            return true;
 
         case ControlMode::GrainSize:
         {
@@ -299,7 +221,10 @@ bool MlrVSTAudioProcessor::resolveScenePerformanceControlEvent(ControlMode mode,
                     outEvent.value = 0.05f + (unit * (0.9f - 0.05f));
                     return true;
                 case 2:
-                    outEvent.controlTarget = ScenePerformanceControlTarget::Pitch;
+                    // Grain page row 2 is GRAIN pitch: recording it as strip
+                    // Pitch created a phantom second event with a different
+                    // target that the recorder's same-target dedup missed.
+                    outEvent.controlTarget = ScenePerformanceControlTarget::GrainPitch;
                     outEvent.value = -24.0f + (unit * 48.0f);
                     return true;
                 default:
@@ -758,8 +683,9 @@ MlrVSTAudioProcessor::handleLiveSceneControlTouch(int stripIndex,
 
     if (sceneClipHasAutomationTarget(sceneSlot, probeEvent.stripIndex, target))
     {
-        const auto maskIndex = static_cast<size_t>(sceneAutomationMaskIndex(probeEvent.stripIndex, target));
-        activeSceneAutomationOverrideMasks[maskIndex].fetch_or(sceneAutomationTargetBit(target),
+        const auto maskIndex = static_cast<size_t>(
+            SceneAutomationRules::automationMaskIndex(probeEvent.stripIndex, target));
+        activeSceneAutomationOverrideMasks[maskIndex].fetch_or(SceneAutomationRules::automationTargetBit(target),
                                                                std::memory_order_acq_rel);
 
         if (liveValueAlreadyApplied)
@@ -792,12 +718,8 @@ MlrVSTAudioProcessor::handleLiveSceneControlTouch(int stripIndex,
         refreshStutterBaseline();
     }
 
-    if (target == ScenePerformanceControlTarget::Volume
-        || target == ScenePerformanceControlTarget::Pan
-        || target == ScenePerformanceControlTarget::Speed)
-    {
+    if (SceneAutomationRules::targetUsesStripRuntimeState(target))
         syncActiveSceneClipSlotRuntimeStateFromEngine(true);
-    }
 
     queueActiveSceneAutosave();
     return ManualSceneControlHandling::PassedThrough;

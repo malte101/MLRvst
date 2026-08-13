@@ -375,10 +375,10 @@ void GlobalSettingsStore::loadGlobalControls(MlrVSTAudioProcessor& owner)
     }
 
     owner.cancelMacroMidiLearn();
-    anyRestored = restoreFloatParam("masterVolume", "masterVolume", 0.0, 1.0) || anyRestored;
+    // masterVolume, quantize, and inputMonitor are session state, not preferences:
+    // fresh instances always start at their factory defaults (1.0 / 1-16 / 1.0).
     anyRestored = restoreFloatParam("limiterThreshold", "limiterThreshold", 0.0, 0.0) || anyRestored;
     anyRestored = restoreBoolParam("limiterEnabled", "limiterEnabled") || anyRestored;
-    anyRestored = restoreChoiceParam("quantize", "quantize", 0, 9) || anyRestored;
     anyRestored = restoreChoiceParam("innerLoopLength", "innerLoopLength", 0, 4) || anyRestored;
     owner.innerLoopLengthSelection.store(owner.innerLoopLengthParam != nullptr
                                              ? juce::jlimit(0, 4, static_cast<int>(owner.innerLoopLengthParam->load(std::memory_order_acquire)))
@@ -388,7 +388,6 @@ void GlobalSettingsStore::loadGlobalControls(MlrVSTAudioProcessor& owner)
                                                     std::memory_order_release);
     anyRestored = restoreChoiceParam("quality", "quality", 0, 3) || anyRestored;
     anyRestored = restoreFloatParam("pitchSmoothing", "pitchSmoothing", 0.0, 1.0) || anyRestored;
-    anyRestored = restoreFloatParam("inputMonitor", "inputMonitor", 0.0, 1.0) || anyRestored;
     anyRestored = restoreFloatParam("crossfadeLength", "crossfadeLength", 1.0, 50.0) || anyRestored;
     anyRestored = restoreFloatParam("triggerFadeIn", "triggerFadeIn", 0.01, 120.0) || anyRestored;
     anyRestored = restoreChoiceParam("outputRouting", "outputRouting", 0, 1) || anyRestored;
@@ -539,22 +538,16 @@ void GlobalSettingsStore::saveControlPages(const MlrVSTAudioProcessor& owner)
     }
     xml.setAttribute("momentary", owner.isControlPageMomentary());
     xml.setAttribute("swingDivision", owner.swingDivisionSelection.load(std::memory_order_acquire));
-    if (owner.masterVolumeParam)
-        xml.setAttribute("masterVolume", static_cast<double>(owner.masterVolumeParam->load(std::memory_order_acquire)));
     if (owner.limiterThresholdParam)
         xml.setAttribute("limiterThreshold", 0.0);
     if (owner.limiterEnabledParam)
         xml.setAttribute("limiterEnabled", owner.limiterEnabledParam->load(std::memory_order_acquire) >= 0.5f);
-    if (owner.quantizeParam)
-        xml.setAttribute("quantize", static_cast<int>(owner.quantizeParam->load(std::memory_order_acquire)));
     if (owner.innerLoopLengthParam)
         xml.setAttribute("innerLoopLength", static_cast<int>(owner.innerLoopLengthParam->load(std::memory_order_acquire)));
     if (owner.grainQualityParam)
         xml.setAttribute("quality", static_cast<int>(owner.grainQualityParam->load(std::memory_order_acquire)));
     if (owner.pitchSmoothingParam)
         xml.setAttribute("pitchSmoothing", static_cast<double>(owner.pitchSmoothingParam->load(std::memory_order_acquire)));
-    if (owner.inputMonitorParam)
-        xml.setAttribute("inputMonitor", static_cast<double>(owner.inputMonitorParam->load(std::memory_order_acquire)));
     if (owner.crossfadeLengthParam)
         xml.setAttribute("crossfadeLength", static_cast<double>(owner.crossfadeLengthParam->load(std::memory_order_acquire)));
     if (owner.triggerFadeInParam)

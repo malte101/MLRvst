@@ -923,7 +923,7 @@ bool MlrVSTAudioProcessor::parsePreparedSceneSwitchPayloadTemplate(PreparedScene
             stripState.filterMorph = legacyFilterType == 0 ? 0.0f : (legacyFilterType == 1 ? 0.5f : 1.0f);
         }
         stripState.filterAlgorithm = static_cast<EnhancedAudioStrip::FilterAlgorithm>(
-            clampPreparedInt(stripXml->getIntAttribute("filterAlgorithm", 0), 0, 5, 0));
+            clampPreparedInt(stripXml->getIntAttribute("filterAlgorithm", 0), 0, 6, 0));
         stripState.swingAmount = clampPreparedFloat(stripXml->getDoubleAttribute("swingAmount", 0.0),
                                                     0.0f,
                                                     0.0f,
@@ -1126,7 +1126,7 @@ bool MlrVSTAudioProcessor::parsePreparedSceneSwitchPayloadTemplate(PreparedScene
                                              "stripFilterAlgorithm" + juce::String(stripIndex),
                                              static_cast<int>(stripState.filterAlgorithm)),
                 0,
-                5,
+                6,
                 static_cast<int>(stripState.filterAlgorithm)));
         preparedParams.ownedControls.delayMix = clampPreparedFloat(
             readPreparedStateFloatProperty(payload.parameterState,
@@ -1709,10 +1709,13 @@ bool MlrVSTAudioProcessor::capturePreparedSceneSwitchPayloadTemplate(PreparedSce
             : strip->getFilterMorph();
         preparedParams.ownedControls.filterAlgorithm =
             static_cast<EnhancedAudioStrip::FilterAlgorithm>(
-                stripFilterAlgorithmParams[static_cast<size_t>(stripIndex)] != nullptr
-                    ? juce::roundToInt(
-                          stripFilterAlgorithmParams[static_cast<size_t>(stripIndex)]->load(std::memory_order_acquire))
-                    : static_cast<int>(strip->getFilterAlgorithm()));
+                juce::jlimit(
+                    0,
+                    6,
+                    stripFilterAlgorithmParams[static_cast<size_t>(stripIndex)] != nullptr
+                        ? juce::roundToInt(
+                              stripFilterAlgorithmParams[static_cast<size_t>(stripIndex)]->load(std::memory_order_acquire))
+                        : static_cast<int>(strip->getFilterAlgorithm())));
         preparedParams.ownedControls.delayMix = stripDelayMixParams[static_cast<size_t>(stripIndex)] != nullptr
             ? stripDelayMixParams[static_cast<size_t>(stripIndex)]->load(std::memory_order_acquire)
             : 0.0f;

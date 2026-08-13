@@ -73,3 +73,7 @@ compile_commands.json
 # Persistent local native dependency prefixes (generated, not tracked)
 third_party/_native/*
 !third_party/_native/README.md
+
+# CMake build tree (only the release artefacts below are tracked)
+cmake-build-release/*
+!cmake-build-release/mlrVST_artefacts/

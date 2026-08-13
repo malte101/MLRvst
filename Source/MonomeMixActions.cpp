@@ -292,7 +292,8 @@ void handleButtonPress(MlrVSTAudioProcessor& processor,
 
         case panMode:
         {
-            float pan = (x - 8) / 8.0f;
+            // Piecewise so column 15 reaches full right (+1.0).
+            float pan = x <= 8 ? (x - 8) / 8.0f : (x - 8) / 7.0f;
             pan = juce::jlimit(-1.0f, 1.0f, pan);
             processor.setStripPanControlValue(stripIndex,
                                               pan,
@@ -390,7 +391,10 @@ void renderRow(const EnhancedAudioStrip& strip,
             else
                 pan = strip.getPan();
 
-            int panX = 8 + static_cast<int>(pan * 8.0f);
+            // Inverse of the piecewise press map (right half spans 7 columns).
+            int panX = pan <= 0.0f
+                ? 8 + static_cast<int>(std::round(pan * 8.0f))
+                : 8 + static_cast<int>(std::round(pan * 7.0f));
             panX = juce::jlimit(0, 15, panX);
 
             for (int x = 0; x < 16; ++x)
@@ -413,9 +417,11 @@ void renderRow(const EnhancedAudioStrip& strip,
             else
                 vol = strip.getVolume();
 
-            const int numLit = static_cast<int>(vol * 16.0f);
+            // Press stores column/15; light columns 0..round(vol*15) so the
+            // pressed pad itself is always lit (was off by one for 1-14).
+            const int litTop = juce::jlimit(0, 15, static_cast<int>(std::round(vol * 15.0f)));
             for (int x = 0; x < 16; ++x)
-                newLedState[x][y] = (x < numLit) ? 12 : 2;
+                newLedState[x][y] = (x <= litTop && vol > 0.0f) ? 12 : 2;
             break;
         }
 

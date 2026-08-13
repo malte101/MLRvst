@@ -36,23 +36,17 @@ bool isGrainModTarget(ModernAudioEngine::ModTarget target)
 
 bool modTargetUsesForcedBipolar(ModernAudioEngine::ModTarget target)
 {
-    return target == ModernAudioEngine::ModTarget::Speed;
+    // Pan/Cutoff/Resonance apply paths hardcode the bipolar mapping, so their
+    // stored steps must never be converted by the BIP toggle.
+    return target == ModernAudioEngine::ModTarget::Speed
+        || target == ModernAudioEngine::ModTarget::Pan
+        || target == ModernAudioEngine::ModTarget::Cutoff
+        || target == ModernAudioEngine::ModTarget::Resonance;
 }
 
 float quantizeModLaneRate(float rate) noexcept
 {
     return PlayheadSpeedQuantizer::quantizeRatio(juce::jlimit(0.125f, 8.0f, rate));
-}
-
-float defaultRearrangeStepValueForIndex(int absoluteStep, int totalSteps) noexcept
-{
-    if (totalSteps <= 1)
-        return 0.0f;
-
-    const int wrappedStep = juce::jlimit(0, juce::jmax(0, totalSteps - 1), absoluteStep);
-    return juce::jlimit(0.0f, 1.0f,
-                        static_cast<float>(wrappedStep)
-                            / static_cast<float>(juce::jmax(1, totalSteps - 1)));
 }
 
 float filterCutoffToNormalized(float hz) noexcept
@@ -431,10 +425,7 @@ void ModernAudioEngine::resetModSequencerSlotToDefaults(int stripIndex, int slot
     seq.lastGlobalStep.store(0, std::memory_order_release);
     for (size_t stepIndex = 0; stepIndex < seq.steps.size(); ++stepIndex)
     {
-        const float stepValue = (target == ModTarget::Rearrange)
-            ? defaultRearrangeStepValueForIndex(static_cast<int>(stepIndex % static_cast<size_t>(ModSteps)),
-                                                ModSteps)
-            : defaultValue;
+        const float stepValue = defaultValue;
         seq.steps[stepIndex].store(stepValue, std::memory_order_release);
         seq.stepSubdivisions[stepIndex].store(1, std::memory_order_release);
         seq.stepEndValues[stepIndex].store(stepValue, std::memory_order_release);
@@ -1048,6 +1039,16 @@ int ModernAudioEngine::getModCurrentGlobalStep(int stripIndex) const
     if (stripIndex < 0 || stripIndex >= MaxStrips)
         return 0;
     const auto& seq = getActiveModSequencer(stripIndex);
+    const int lengthBars = juce::jlimit(1, MaxModBars, seq.lengthBars.load(std::memory_order_acquire));
+    const int totalSteps = juce::jmax(ModSteps, ModSteps * lengthBars);
+    return juce::jlimit(0, totalSteps - 1, seq.lastGlobalStep.load(std::memory_order_acquire));
+}
+
+int ModernAudioEngine::getModCurrentGlobalStepForSlot(int stripIndex, int slot) const
+{
+    if (stripIndex < 0 || stripIndex >= MaxStrips)
+        return 0;
+    const auto& seq = getModSequencer(stripIndex, slot);
     const int lengthBars = juce::jlimit(1, MaxModBars, seq.lengthBars.load(std::memory_order_acquire));
     const int totalSteps = juce::jmax(ModSteps, ModSteps * lengthBars);
     return juce::jlimit(0, totalSteps - 1, seq.lastGlobalStep.load(std::memory_order_acquire));
